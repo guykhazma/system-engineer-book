@@ -1,0 +1,424 @@
+<section class="chapter" id="ch02">
+<h1>Chapter 2 — The CPU Up Close</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch01">Chapter 1</a> (the real
+machine vs. the RAM model — the two cost models). &nbsp;·&nbsp; <strong>Pairs with:</strong>
+<a href="#ch03">Chapter 3</a> (the memory hierarchy — the other reason "one instruction = one unit"
+fails). This chapter attacks the RAM model's <em>second</em> false assumption.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From <a href="#ch01">Chapter 1</a>, recall and answer from memory: (1) The RAM model makes three
+false assertions about real hardware; §1.1 named them. One was "all memory accesses cost the same"
+(the memory-hierarchy leak). What was the <em>second</em> one — the one this chapter is about? (2) Why
+is "one operation = one unit of time" called a <em>useful lie</em> rather than simply a mistake?
+(3) <em>Predict:</em> a modern CPU executes instructions one after another, finishing each before
+starting the next — true or false? Answers resolve in §2.1&ndash;2.2.</p>
+</aside>
+
+<p>In <a href="#ch01">Chapter 1</a> we said the RAM model tells three lies, dealt with the first (memory
+is not uniform-cost), and promised to return for the second: that <em>one instruction takes one unit of
+time.</em> This is the chapter. A modern CPU does not execute your instructions one at a time, in order,
+each in a tidy tick of the clock. It executes many at once, frequently out of their written order, and
+it <em>guesses</em> — commits to work before it knows whether that work is needed. Understanding this is
+what separates code that keeps the processor busy from code that leaves it stalling, and the difference,
+for the same big-O, can again be a large constant factor.</p>
+
+<p>We will stay conceptual and correct. This chapter describes <em>mechanisms</em> — the pipeline,
+superscalar and out-of-order execution, branch prediction, instruction-level parallelism — and gives
+their costs only as orders of magnitude with explicit caveats, because the exact pipeline depth and
+misprediction penalty are microarchitecture-specific numbers that differ from chip to chip and that
+this book will not invent for you. The mechanisms, though, are general and stable, and knowing them
+changes how you read a hot loop. The through-line: <strong>straight-line, predictable, independent
+work is fast because it keeps the machine full; branchy, dependent, unpredictable work is slow because
+it forces the machine to wait or to throw work away.</strong></p>
+
+<h2>2.1 Fetch–decode–execute, and why it isn't one step</h2>
+
+<p>At the coarsest level a CPU repeats a cycle: <strong>fetch</strong> the next instruction from memory,
+<strong>decode</strong> it into control signals, <strong>execute</strong> it (compute, or read/write
+memory), and make its results available. This is the von Neumann fetch–decode–execute loop, and if a
+processor really did it one instruction at a time — finish all stages for instruction 1, then start
+instruction 2 — then "one instruction = one unit of time" would be roughly true and this chapter would
+be short. Early processors worked essentially that way.</p>
+
+<p>The trouble is that the stages use <em>different parts</em> of the chip. While the execute unit is
+busy with instruction 1, the fetch unit is idle; while instruction 1 is being decoded, the fetch unit
+is idle again. Doing one instruction start-to-finish before beginning the next wastes most of the
+hardware most of the time. The entire architecture of a fast CPU is a series of answers to the question
+<em>how do we stop leaving hardware idle?</em> — and each answer breaks the RAM model's tidy accounting
+a little more. We take them in order: pipelining (overlap the stages), superscalar (duplicate the
+units), out-of-order (reorder to avoid waiting), and speculation (guess so you never have to wait for a
+branch). Bryant and O'Hallaron develop this progression in detail in <em>Computer Systems: A
+Programmer's Perspective</em> (CS:APP), Chapters 4 and 5; we take the conceptual tour.</p>
+
+<h2>2.2 Pipelining: overlap the stages</h2>
+
+<p>The first idea is an assembly line. Split instruction processing into stages (conceptually:
+fetch, decode, execute, memory, write-back — real designs have more, and the exact count is a
+microarchitecture-specific number we will not invent), and let each stage work on a <em>different</em>
+instruction at the same time. While instruction 1 is in "execute," instruction 2 is in "decode," and
+instruction 3 is in "fetch." Once the pipeline is full, an instruction <em>completes</em> every clock
+cycle even though each individual instruction still takes several cycles to pass all the way through.
+Throughput goes up by roughly the number of stages, though the latency of any single instruction does
+not.</p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="10" y="20" fill="#555">cycle &rarr;</text>
+<text x="70" y="20" fill="#555">1</text><text x="150" y="20" fill="#555">2</text>
+<text x="230" y="20" fill="#555">3</text><text x="310" y="20" fill="#555">4</text>
+<text x="390" y="20" fill="#555">5</text><text x="470" y="20" fill="#555">6</text>
+<text x="550" y="20" fill="#555">7</text>
+<!-- instr I1 -->
+<text x="10" y="52" fill="#14406b">I1</text>
+<rect x="50" y="38" width="70" height="20" fill="#eaf2ea" stroke="#2e6b34"/><text x="62" y="52">F</text>
+<rect x="130" y="38" width="70" height="20" fill="#eef2f6" stroke="#14406b"/><text x="142" y="52">D</text>
+<rect x="210" y="38" width="70" height="20" fill="#fbf8f0" stroke="#8a6d1a"/><text x="222" y="52">E</text>
+<rect x="290" y="38" width="70" height="20" fill="#f0f7f7" stroke="#1a6d6d"/><text x="302" y="52">M</text>
+<rect x="370" y="38" width="70" height="20" fill="#f7f4fb" stroke="#5a3a8c"/><text x="382" y="52">W</text>
+<!-- I2 -->
+<text x="10" y="82" fill="#14406b">I2</text>
+<rect x="130" y="68" width="70" height="20" fill="#eaf2ea" stroke="#2e6b34"/><text x="142" y="82">F</text>
+<rect x="210" y="68" width="70" height="20" fill="#eef2f6" stroke="#14406b"/><text x="222" y="82">D</text>
+<rect x="290" y="68" width="70" height="20" fill="#fbf8f0" stroke="#8a6d1a"/><text x="302" y="82">E</text>
+<rect x="370" y="68" width="70" height="20" fill="#f0f7f7" stroke="#1a6d6d"/><text x="382" y="82">M</text>
+<rect x="450" y="68" width="70" height="20" fill="#f7f4fb" stroke="#5a3a8c"/><text x="462" y="82">W</text>
+<!-- I3 -->
+<text x="10" y="112" fill="#14406b">I3</text>
+<rect x="210" y="98" width="70" height="20" fill="#eaf2ea" stroke="#2e6b34"/><text x="222" y="112">F</text>
+<rect x="290" y="98" width="70" height="20" fill="#eef2f6" stroke="#14406b"/><text x="302" y="112">D</text>
+<rect x="370" y="98" width="70" height="20" fill="#fbf8f0" stroke="#8a6d1a"/><text x="382" y="112">E</text>
+<rect x="450" y="98" width="70" height="20" fill="#f0f7f7" stroke="#1a6d6d"/><text x="462" y="112">M</text>
+<rect x="530" y="98" width="70" height="20" fill="#f7f4fb" stroke="#5a3a8c"/><text x="542" y="112">W</text>
+<text x="50" y="155" fill="#333" font-size="10">Once full, one instruction completes per cycle (F=fetch, D=decode, E=execute, M=memory, W=write-back).</text>
+</svg>
+<figcaption>Figure 2.1: A pipeline overlaps stages so different instructions occupy different units in
+the same cycle. Stage names and count are illustrative; real pipelines have more stages.</figcaption>
+</figure>
+
+<p>Pipelining is why "one instruction = one unit of time" is doubly wrong: an instruction takes several
+cycles of latency, yet the machine can <em>complete</em> one (or more) per cycle. But the assembly line
+only runs smoothly if the next instruction is always ready and its inputs are available. Two things
+break that smooth flow — a dependency where an instruction needs a result that is not ready yet
+(a <strong>data hazard</strong>, which forces a stall), and a branch where the CPU does not yet know
+<em>which</em> instruction comes next (a <strong>control hazard</strong>). The rest of the chapter is
+about how the hardware fights these two, and how your code can help or hurt that fight.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In a filled pipeline, an instruction's <em>latency</em> is several cycles but the pipeline's
+<em>throughput</em> is about one instruction per cycle. In one sentence, why are those two numbers
+different? (Answer after the next section.)</p>
+</aside>
+
+<h2>2.3 Superscalar and out-of-order: more units, smarter order</h2>
+
+<p>If one assembly line is good, several are better. A <strong>superscalar</strong> processor has
+multiple execution units and can fetch, decode, and issue several instructions <em>per cycle</em>,
+so its peak throughput is more than one instruction per cycle — provided it can find independent
+instructions to feed the parallel units. That proviso is everything. Two instructions can run in the
+same cycle only if neither needs the other's result; if instruction 2 uses instruction 1's output,
+they must run in sequence no matter how many units are idle.</p>
+
+<p>To keep those units fed, modern CPUs execute <strong>out of order</strong>. Rather than stalling the
+whole machine when the next instruction in program order is waiting on a slow input (say, a value still
+coming from DRAM — recall <a href="#ch01">Chapter 1</a>: that is hundreds of cycles), the processor
+looks ahead in the instruction stream, finds later instructions whose inputs <em>are</em> ready, and
+executes those now, filling the gap. Results are then reassembled into the original program order
+before they become visible, so the program's observed behavior is still that of straightforward
+sequential execution — the reordering is invisible to correctness but decisive for speed. This is
+why a cache miss does not necessarily stall the CPU: if there is independent work nearby, the machine
+does that work while the miss is serviced, hiding the latency.</p>
+
+<p>The practical lesson lands directly on how you write hot code. The processor can only overlap work
+it can prove is independent, and it can only look a bounded distance ahead. Code with lots of
+<strong>instruction-level parallelism</strong> (ILP) — many operations that do not depend on each
+other's results — gives the out-of-order engine plenty to chew on and runs near the machine's peak.
+Code that is a long <em>dependency chain</em> — each step needing the previous step's result — starves
+the parallel units no matter how many there are, because there is never more than one thing that can
+run next. Same instruction count, very different speed; and, as in <a href="#ch01">Chapter 1</a>, the
+difference is exactly the constant factor big-O throws away.</p>
+
+<p><em>(Answer to the quick check: latency counts the cycles for one instruction to traverse all
+stages; throughput counts how often a new instruction completes. Because stages overlap, a new
+instruction can finish every cycle even though each one individually took several cycles to get
+through.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: dependency chains vs. independent work</span>
+<p><strong>1. In words.</strong> Summing an array into a single accumulator forces each add to wait
+for the previous add's result — a dependency chain, low ILP. Summing into several independent partial
+accumulators and combining them at the end lets the superscalar, out-of-order engine run several adds
+per cycle — high ILP.</p>
+<p><strong>2. As a picture.</strong> One long chain <code>a&rarr;a&rarr;a&rarr;a</code> (each arrow
+"must finish before") versus four short parallel chains that only merge at the very end.</p>
+<figure>
+<svg viewBox="0 0 620 150" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="10" y="30" fill="#8c3a1d">chain (low ILP):</text>
+<circle cx="150" cy="26" r="10" fill="#fbf5f2" stroke="#8c3a1d"/>
+<circle cx="220" cy="26" r="10" fill="#fbf5f2" stroke="#8c3a1d"/>
+<circle cx="290" cy="26" r="10" fill="#fbf5f2" stroke="#8c3a1d"/>
+<circle cx="360" cy="26" r="10" fill="#fbf5f2" stroke="#8c3a1d"/>
+<line x1="160" y1="26" x2="210" y2="26" stroke="#8c3a1d" marker-end="url(#a2)"/>
+<line x1="230" y1="26" x2="280" y2="26" stroke="#8c3a1d" marker-end="url(#a2)"/>
+<line x1="300" y1="26" x2="350" y2="26" stroke="#8c3a1d" marker-end="url(#a2)"/>
+<defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8c3a1d"/></marker></defs>
+<text x="10" y="100" fill="#2e6b34">4 independent (high ILP):</text>
+<circle cx="200" cy="80" r="9" fill="#eaf2ea" stroke="#2e6b34"/>
+<circle cx="200" cy="105" r="9" fill="#eaf2ea" stroke="#2e6b34"/>
+<circle cx="200" cy="130" r="9" fill="#eaf2ea" stroke="#2e6b34"/>
+<circle cx="200" cy="55" r="9" fill="#eaf2ea" stroke="#2e6b34"/>
+<circle cx="380" cy="92" r="10" fill="#eef2f6" stroke="#14406b"/><text x="373" y="96" font-size="9">Σ</text>
+<line x1="209" y1="55" x2="371" y2="88" stroke="#2e6b34"/>
+<line x1="209" y1="80" x2="371" y2="90" stroke="#2e6b34"/>
+<line x1="209" y1="105" x2="371" y2="94" stroke="#2e6b34"/>
+<line x1="209" y1="130" x2="371" y2="97" stroke="#2e6b34"/>
+</svg>
+<figcaption>Figure 2.2: A dependency chain serializes execution; independent operations expose
+parallelism the CPU can exploit. Combining partial sums at the end recovers the same result.</figcaption>
+</figure>
+<p><strong>3. As a trace.</strong> Both compute the same sum of <em>n</em> numbers — identical operation
+count, identical O(<em>n</em>). The chained version can retire roughly one add per dependency latency;
+the four-accumulator version can keep several execution units busy at once, finishing in a fraction of
+the wall-clock time. (This is a real and measurable effect; CS:APP Chapter 5 develops it as "loop
+unrolling with multiple accumulators," and the performance-engineering chapters of this volume return
+to it.)</p>
+</aside>
+
+<h2>2.4 Branch prediction and the cost of a miss</h2>
+
+<p>Now the control hazard. When the CPU reaches a conditional branch — an <code>if</code>, a loop
+test, a <code>switch</code> — it does not yet know which way execution will go, because that depends on
+a condition that may not be computed yet. But the pipeline needs to fetch <em>something</em> next; it
+cannot sit idle for the several cycles it takes to resolve the branch. So the processor
+<strong>predicts</strong> which way the branch will go and speculatively executes down the predicted
+path, doing real work on the assumption that its guess is right.</p>
+
+<p>Modern <strong>branch predictors</strong> are remarkably good — they track the history of each
+branch and find patterns, and on predictable branches (a loop that runs a million times and exits
+once; a check that is almost always false) they are right the overwhelming majority of the time, so the
+speculation is nearly free and the pipeline never stalls. This is why a loop with a highly predictable
+exit condition runs fast: the CPU correctly guesses "keep looping" every time until the one time it
+does not.</p>
+
+<p>The cost arrives on a <strong>misprediction</strong>. When the branch resolves and the guess was
+wrong, all the speculatively executed work on the wrong path must be discarded, and the pipeline must
+be refilled from the correct target — the instructions already in flight are thrown away and the
+machine restarts fetching from the right place. The penalty is roughly proportional to how deep the
+pipeline is: everything that was in flight is lost. On modern deeply pipelined CPUs this penalty is on
+the order of <em>ten to a few tens of cycles</em> per misprediction — an order of magnitude, not a
+figure to quote precisely, since the exact number is specific to each microarchitecture and this book
+will not invent one for a particular chip. (CS:APP, Chapter 5, works a concrete example for one
+processor; treat any single number as machine-specific.) What matters is the shape: a mispredicted
+branch costs many times what a correctly predicted one does.</p>
+
+<p>The consequence for your code is direct and sometimes surprising. A branch that is
+<em>unpredictable</em> — one that goes each way about half the time, in no pattern the predictor can
+learn — pays the misprediction penalty roughly half the time it executes. In a tight loop, that can
+dominate the loop's cost. This is the mechanism behind a famous and initially baffling observation:
+processing a <em>sorted</em> array can be markedly faster than processing the same data
+<em>unsorted</em>, when the loop body contains a data-dependent branch, because sorting makes the
+branch predictable (long runs of the same outcome) whereas the shuffled data makes it a coin flip the
+predictor cannot learn. The arithmetic is identical; only the predictability changed. When you see a
+performance mystery like that, the branch predictor is a prime suspect.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the unpredictable branch in the hot loop</span>
+<p>The error is to assume that because two versions of a loop do the same arithmetic, they cost the
+same — forgetting that a <em>data-dependent, unpredictable branch</em> inside a hot loop can add a
+misprediction penalty on a large fraction of iterations, dwarfing the arithmetic. It is the CPU-level
+cousin of the <a href="#ch01">Chapter 1</a> trap ("same big-O, so same speed"): same operation count,
+very different wall-clock time, because one version keeps the pipeline full and the other keeps
+flushing it. The tells: a branch whose outcome depends on the data and follows no pattern, in code that
+runs an enormous number of times. The fixes are the standard toolkit — make the branch predictable
+(e.g. by sorting), or remove it entirely by turning control flow into data flow (branchless code,
+conditional-move or arithmetic tricks, table lookups, or SIMD masks — the performance-engineering
+chapters cover these). But confirm with measurement first: on <em>predictable</em> branches the
+predictor already makes the branch nearly free, and a branchless rewrite there just adds complexity
+for no gain.</p>
+</aside>
+
+<h2>2.5 What this means for the code you write</h2>
+
+<p>Step back and the theme of the chapter is one sentence: <strong>the CPU runs fastest when you feed
+it a steady stream of predictable, independent work, and stalls when you feed it dependencies and
+surprises.</strong> That single idea reorganizes a pile of otherwise-disconnected performance folklore
+into consequences of how the machine actually works:</p>
+
+<ul>
+<li><strong>Straight-line code with predictable branches</strong> keeps the pipeline full and
+speculation cheap — fast.</li>
+<li><strong>Independent operations (high ILP)</strong> let the superscalar, out-of-order engine run
+several things per cycle — fast.</li>
+<li><strong>Long dependency chains</strong> serialize execution and starve the parallel units — slow,
+even at the same instruction count.</li>
+<li><strong>Unpredictable, data-dependent branches</strong> cause mispredictions that flush the
+pipeline — slow, sometimes dramatically.</li>
+<li><strong>A cache miss (Chapter 1) need not stall the CPU</strong> if there is independent work
+nearby for the out-of-order engine to do while it waits — which is why ILP and memory behavior are
+entangled, and why both matter together.</li>
+</ul>
+
+<p>None of this changes an algorithm's big-O, and none of it should tempt you to abandon big-O — a
+pipeline-friendly O(<em>n</em><sup>2</sup>) is still a disaster. This is, exactly as in
+<a href="#ch01">Chapter 1</a>, the <em>second</em> cost model at work: after you have chosen a good
+algorithm, the constant factor that decides real speed is set by how well your code fits the machine —
+its memory hierarchy (Chapter 1 and <a href="#ch03">Chapter 3</a>) and its pipelined, speculative,
+superscalar core (this chapter). <a href="#ch03">Chapter 3</a> now returns to the memory side and turns
+"data location matters" into the concrete, exploitable rules of caches and locality — the other half of
+mechanical sympathy.</p>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> In a review, someone asks why sorting an array before a filtering loop made
+the loop faster, even though sorting is extra work and the loop does the same comparisons either way.
+Cover the paragraph below and explain it in two or three sentences, using <em>branch predictor</em>,
+<em>misprediction</em>, and <em>pipeline</em>.</p>
+<p><em>Model answer.</em> "The loop has a data-dependent branch. On the unsorted data that branch goes
+each way unpredictably, so the branch predictor is wrong about half the time, and every misprediction
+flushes the pipeline — a penalty on the order of tens of cycles per miss, paid on a huge fraction of
+iterations. Sorting makes the branch outcomes come in long predictable runs, so the predictor is almost
+always right and the pipeline stays full; the arithmetic is identical, but the misprediction cost
+nearly vanished. Net of the one-time sort, the loop got cheaper because we made it <em>predictable</em>,
+not because we did less arithmetic." Naming the mechanism — rather than saying "sorting is just faster"
+— is what marks the answer as senior.</p>
+</aside>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain <strong>pipelining</strong> and why it makes an instruction's <em>latency</em> (several
+cycles) differ from the pipeline's <em>throughput</em> (about one per cycle).</li>
+<li>Say what <strong>superscalar</strong> and <strong>out-of-order</strong> execution each add, and
+why both depend on finding <em>independent</em> instructions.</li>
+<li>Contrast a <strong>dependency chain</strong> (low ILP, serialized) with <strong>independent
+work</strong> (high ILP, parallel) and give the multiple-accumulator sum as the example.</li>
+<li>Describe <strong>branch prediction</strong> and the cost of a <strong>misprediction</strong> (flush
+the pipeline; penalty on the order of tens of cycles — machine-specific, an order of magnitude only).</li>
+<li>Explain why processing a <strong>sorted</strong> array can beat the same data unsorted when the loop
+has a data-dependent branch.</li>
+<li>State the chapter's one sentence: the CPU is fast on predictable, independent work and stalls on
+dependencies and surprises — and why this is the RAM model's <em>second</em> lie.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate your confidence before checking. An overconfident miss
+is the signal to reread.</p>
+<ol>
+<li><strong>R1.</strong> Why does executing one instruction fully before starting the next waste the
+hardware, and what is pipelining's fix? (§2.1&ndash;2.2)</li>
+<li><strong>R2.</strong> What must be true of two instructions for a superscalar CPU to run them in the
+same cycle, and what does out-of-order execution do when the next in-order instruction is stalled?
+(§2.3)</li>
+<li><strong>R3.</strong> Define instruction-level parallelism. Why is a single-accumulator sum lower
+ILP than a multi-accumulator sum computing the same total? (§2.3)</li>
+<li><strong>R4.</strong> What does a CPU do at a conditional branch before the condition is known, and
+what exactly is discarded on a misprediction? Give the penalty as an order of magnitude with its
+caveat. (§2.4)</li>
+<li><strong>R5.</strong> Explain the sorted-vs-unsorted array speed difference in terms of the branch
+predictor. Which of the two cost models from Chapter 1 does this belong to? (§2.4&ndash;2.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP)</strong>, Chapter 4 ("Processor Architecture") and Chapter 5 ("Optimizing Program
+Performance"). Chapter 4 builds a pipelined processor from scratch; Chapter 5 covers superscalar/out-
+of-order machines, branch misprediction, dependency chains, and multiple accumulators, all with
+concrete (processor-specific) numbers. The primary source for this chapter.</li>
+<li><strong>Agner Fog, optimization manuals</strong> (agner.org, free). Deep, empirical detail on
+microarchitecture, pipelines, and branch prediction across real x86 CPUs. Dated in places — verify
+against current parts — but the mechanism-level explanations are excellent.</li>
+<li><strong>MIT 6.172, <em>Performance Engineering of Software Systems</em></strong> (free OCW). The
+lectures on modern processors, ILP, and branch behavior connect these mechanisms to measurable speedups
+in real code.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex2.1"><span class="ex-label">2.1</span> <span class="ex-tag warm">warm-up</span>
+Name the four techniques, in the order this chapter introduces them, that a fast CPU uses to stop
+leaving hardware idle, and give a one-line description of what each one does.</div>
+
+<div class="exercise" id="ex2.2"><span class="ex-label">2.2</span> <span class="ex-tag warm">warm-up</span>
+Distinguish <em>latency</em> and <em>throughput</em> for a single instruction passing through a
+pipeline. Why can a pipeline complete about one instruction per cycle while each instruction still
+takes several cycles from start to finish?</div>
+
+<div class="exercise" id="ex2.3"><span class="ex-label">2.3</span> <span class="ex-tag warm">warm-up</span>
+Define a <em>data hazard</em> and a <em>control hazard</em> in one sentence each, and say which of the
+two branch prediction is designed to address.</div>
+
+<div class="exercise" id="ex2.4"><span class="ex-label">2.4</span> <span class="ex-tag core">core</span>
+Two loops compute the same sum of an array of doubles. Loop A accumulates into a single variable; loop
+B accumulates into four independent partial sums and adds them at the end. Both do the same number of
+additions. Explain, using ILP and the out-of-order engine, why B can be substantially faster, and name
+the one condition on the additions that makes B's parallelism possible.</div>
+
+<div class="exercise" id="ex2.5"><span class="ex-label">2.5</span> <span class="ex-tag core">core</span>
+A hot loop contains <code>if (x[i] &gt; threshold) count++;</code>. On dataset P the branch is taken
+in long predictable runs; on dataset Q it is taken about half the time in no pattern. The arithmetic is
+identical. Explain why the loop can run several times faster on P, and estimate qualitatively where the
+extra time on Q goes.</div>
+
+<div class="exercise" id="ex2.6"><span class="ex-label">2.6</span> <span class="ex-tag complexity">cost</span>
+A branch mispredicts with probability <em>p</em> per execution, and each misprediction costs about
+<em>k</em> cycles (an order-of-magnitude, machine-specific number — state that caveat). The loop body
+otherwise takes about <em>b</em> cycles. (a) Write the approximate average cost per iteration. (b) For
+what range of <em>p</em> does the misprediction term dominate the body? (c) Explain why making the
+branch predictable attacks <em>p</em>, and a branchless rewrite attacks <em>k</em> (by removing the
+branch), and why you would measure before choosing.</div>
+
+<div class="exercise" id="ex2.7"><span class="ex-label">2.7</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Explain why a cache miss (Chapter 1) does not always stall
+the CPU. Steps 1&ndash;3 given; complete step 4.
+<br><strong>Step 1 (given):</strong> A load that misses to DRAM takes on the order of hundreds of
+cycles to return its value (Chapter 1).
+<br><strong>Step 2 (given):</strong> A modern CPU executes out of order: when the next in-order
+instruction is waiting, it looks ahead for later instructions whose inputs are already available.
+<br><strong>Step 3 (given):</strong> If there is independent work near the missing load, the machine
+can execute that work during the hundreds of cycles the miss is being serviced.
+<br><strong>Step 4 (you):</strong> State the conclusion about whether the miss stalls the CPU, and name
+the property of the surrounding code that determines whether the latency gets hidden or not. Explain
+<em>why that property, and not the miss latency alone, decides the outcome.</em></div>
+
+<div class="exercise" id="ex2.8"><span class="ex-label">2.8</span> <span class="ex-tag mixed">mixed</span>
+For each observation, decide whether the dominant mechanism is the <em>memory hierarchy</em>
+(Chapter 1), <em>branch prediction</em>, or an <em>instruction-level dependency chain</em> (this
+chapter) — and justify in one line: (a) a loop got 3&times; faster after the input array was sorted, with
+no change to the arithmetic; (b) a loop got faster after splitting one accumulator into four; (c) a
+traversal got much slower when the same data was stored as a linked list instead of an array; (d) a
+tight numeric loop with no branches and no memory pressure is already near peak throughput.</div>
+
+<div class="exercise" id="ex2.9"><span class="ex-label">2.9</span> <span class="ex-tag mixed">mixed</span>
+A colleague says: "My function is O(<em>n</em>) and yours is O(<em>n</em>), but yours runs 5&times;
+faster — that's impossible, big-O says they're the same." Decide which cost model resolves the paradox,
+list three distinct mechanisms from Chapters 1&ndash;2 that could each independently produce a 5&times;
+gap at equal big-O, and state the single action that would identify which one is responsible here.</div>
+
+<div class="exercise" id="ex2.10"><span class="ex-label">2.10</span> <span class="ex-tag stretch">stretch</span>
+Speculation means the CPU does work it might have to throw away. (a) Explain why this is still a net
+performance win on typical code. (b) Give a case where heavy speculation on an unpredictable branch is
+a net <em>loss</em>. (c) Speculative execution has also had <em>security</em> consequences in real
+processors. Without inventing specifics, state at a high level why executing instructions before you
+know they should run could, in principle, leak information — and note that the precise mechanisms and
+mitigations are a real, separate topic you would need primary sources to describe accurately.</div>
+
+<div class="exercise" id="ex2.11"><span class="ex-label">2.11</span> <span class="ex-tag lab">lab</span>
+Measure a dependency chain. In C (or any compiled language), write two loops that sum a large array of
+<code>double</code>: one with a single accumulator, one with four independent accumulators combined at
+the end. Compile with optimization <em>off</em> for the reduction (or use a language/setting that will
+not auto-vectorize away the difference), time both, and report the ratio. State which numbers are yours
+and note that the exact ratio depends on your CPU and compiler. If you cannot prevent the compiler from
+transforming the loop, say so and report what you observed instead — do not report a number you did not
+actually measure.</div>
+
+</section>
+</section>

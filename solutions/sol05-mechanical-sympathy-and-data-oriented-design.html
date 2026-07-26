@@ -1,0 +1,113 @@
+<section class="solutions" id="sol05">
+<h1>Chapter 5 — Solutions</h1>
+
+<div class="solution" id="sol5.1"><span class="sol-label">5.1</span>
+<strong>Array-of-structs (AoS):</strong> one array whose elements are whole records, so a record's own
+fields are adjacent in memory. <strong>Struct-of-arrays (SoA):</strong> one array per field, so the same
+field across different records is contiguous. <strong>SoA</strong> stores "the same field across
+different records" contiguously.</div>
+
+<div class="solution" id="sol5.2"><span class="sol-label">5.2</span>
+(a) <strong>8 of 64 bytes</strong> — one <code>double</code> per fetched line. (b) SoA uses all 8 values
+per line, so AoS moves roughly <strong>8&times; more memory</strong> for the same field. (c) SoA restores
+<strong>spatial locality</strong>: consecutive values of the scanned field are adjacent, so each line is
+full of values the loop uses (§3.1&ndash;3.2).</div>
+
+<div class="solution" id="sol5.3"><span class="sol-label">5.3</span>
+A hot loop reads only a couple of a record's many fields, so most of every fetched cache line is fields
+the loop never touches — dead weight that lowers useful-bytes-per-line. (Split the few hot fields into
+their own compact record; move the rest to a cold side-structure.)</div>
+
+<div class="solution" id="sol5.4"><span class="sol-label">5.4</span>
+(a) <strong>AoS</strong> — reads/writes all fields of one particle before moving on, so a record's
+adjacent fields are all used from one or two fetched lines. (b) <strong>SoA</strong> — summing one column
+over ten million rows is a stride-1 scan of that field; contiguous storage uses every byte of every line.
+(c) <strong>SoA</strong> — a SIMD kernel over one field wants that field contiguous so a vector load
+grabs consecutive values. (d) <strong>AoS</strong> — position, color, and size of one object are used
+together, so keeping a record's fields adjacent brings them in one fetch. <em>Method-selection cue:</em>
+"one field across records / SIMD one channel" &rarr; SoA; "whole record at a time" &rarr; AoS.</div>
+
+<div class="solution" id="sol5.5"><span class="sol-label">5.5</span>
+(a) The <code>double</code> needs 8-byte alignment, so the compiler inserts <strong>padding</strong> after
+<code>flag</code> to place <code>value</code> at an 8-byte offset, and adds tail padding so an array keeps
+every element aligned — pushing the size above 13 bytes (commonly to 24). (b) Order large/strictly-aligned
+first: <code>struct S { double value; int id; char flag; };</code> — <code>value</code> at offset 0,
+<code>id</code> at 8, <code>flag</code> at 12, then a little tail padding to the struct's alignment; this
+minimizes internal gaps. (c) A smaller struct means <strong>more records per cache line and per page</strong>,
+so a scan over ten million of them fetches fewer lines and touches fewer pages — better spatial locality
+and less TLB pressure, for free, from field ordering alone. <em>Tempting wrong answer:</em> "field order
+doesn't affect layout in C" — it does, through alignment padding. <strong>Feed-forward:</strong> §5.4.</div>
+
+<div class="solution" id="sol5.6"><span class="sol-label">5.6</span>
+(a) The scan uses <strong>8 useful bytes of each 64-byte line</strong> (assuming one field per record on a
+line), a fraction of <strong>8/64 = 1/8</strong> when <em>S</em>&nbsp;&ge;&nbsp;64; for smaller <em>S</em>
+a line may hold more than one record's copies but you still touch one field's worth per record. (b) As
+<em>S</em> grows past the line size, each record's scanned field sits on its own line, so the AoS scan
+moves ~<em>S</em>/8 lines' worth where SoA moves 1 — the bandwidth ratio grows with <em>S</em> (bounded by
+one line fetched per record). (c) The measured speedup can be smaller than the bandwidth ratio because the
+SoA loop may be limited by something other than bandwidth — e.g. a <strong>single-accumulator dependency
+chain</strong> (Ch 2 §2.3) that caps how fast it can consume values, so it cannot fully cash in the
+saved bandwidth. That is exactly why this chapter's demo measured ~4&times;, not the naive 8&times;;
+removing the accumulator ceiling widens it. <em>No-fabrication note:</em> 8&times; is the arithmetic
+ceiling; ~4&times; is what was measured — keep them distinct. <strong>Feed-forward:</strong> §5.2 and
+Chapter 6.</div>
+
+<div class="solution" id="sol5.7"><span class="sol-label">5.7</span>
+<strong>Step 4:</strong> Decide empirically. <strong>Measure</strong> where the runtime actually goes —
+profile both loops (or time them separately) to learn which dominates and by how much; the layout should
+favor whichever loop owns the most wall-clock time. If loop A (scan) dominates, lean SoA; if loop B
+(whole-record) dominates, lean AoS. A <strong>hybrid</strong> can serve both partly: hot/cold-split so the
+field loop A scans lives in its own contiguous array (SoA for that field) while the fields loop B updates
+together stay grouped — or duplicate/derive the scanned field into a packed side-array refreshed when
+needed. The posture "pick the layout that helps the hotter loop, then re-measure" is right because the
+interaction of layout with the prefetcher, the accumulator dependency, and the two loops' real proportions
+is hard to predict on paper (the demo's ~4&times;-not-8&times; is proof), so the paper argument only picks
+the <em>candidate</em> and the measurement decides. This reflects the <strong>measure-before-you-optimize</strong>
+discipline of Part 1. <strong>Feed-forward:</strong> §5.2&ndash;5.3, Chapter 6.</div>
+
+<div class="solution" id="sol5.8"><span class="sol-label">5.8</span>
+(a) <strong>Hot/cold splitting</strong> — moving a cold field out raises useful-bytes-per-line for the hot
+loop. (b) <strong>SoA / whole-line use</strong> — column arrays make the column scan stride-1. (c)
+<strong>Capacity miss fixed by blocking</strong> — tiling keeps each block resident (Ch 3 §3.3). (d)
+<strong>TLB / huge-page effect</strong> — 2&nbsp;MiB pages raise TLB reach for the random index (Ch 4
+§4.5). (e) <strong>ILP / multiple accumulators</strong> — independent accumulators break the dependency
+chain (Ch 2 §2.3). <em>Method-selection cue:</em> "cold field moved" &rarr; hot/cold; "rows&rarr;columns"
+&rarr; SoA; "tiling" &rarr; capacity/blocking; "huge pages" &rarr; TLB; "more accumulators" &rarr; ILP.</div>
+
+<div class="solution" id="sol5.9"><span class="sol-label">5.9</span>
+Candidate causes across Chapters 2&ndash;5 (at least three, incl. a layout cause and an earlier one):
+<strong>AoS-when-scanning-one-field / poor useful-bytes-per-line</strong> (§5.2); <strong>cold fields
+bloating hot records</strong>, fixable by hot/cold splitting (§5.3); <strong>a capacity miss</strong> from
+a working set exceeding cache (Ch 3 §3.3); <strong>TLB misses</strong> on a large scattered footprint (Ch
+4); <strong>a single-accumulator dependency chain / low ILP</strong> (Ch 2 §2.3); a <strong>data-dependent
+branch</strong> misprediction (Ch 2 §2.4). First measurement: run a <strong>profiler reporting cache-miss
+rate (and, if available, TLB-miss and branch-miss rates)</strong> — it distinguishes the big mechanism
+families in one shot, telling you whether to reach for a layout change, a blocking change, or a
+branch/ILP fix before touching code. <em>Tempting wrong answer:</em> "rewrite the layout first" — that
+guesses; measure first. <strong>Feed-forward:</strong> §5.2 and Chapter 6.</div>
+
+<div class="solution" id="sol5.10"><span class="sol-label">5.10</span>
+(a) Both follow from one fact: <strong>a whole cache line moves as a unit</strong>. Single-threaded, you
+want the bytes you use together on one line (packing) so one fetch serves them all. Multi-threaded, if two
+cores write different variables on one line, that same all-or-nothing line movement forces the line to
+bounce between caches on every write (false sharing). Same mechanism, opposite consequence depending on
+who writes. (b) Deliberately pad a struct up to a full line for <strong>per-thread counters/state written
+by different threads</strong> — pad so each thread's variable sits on its own line, eliminating false
+sharing; you trade away memory (and some single-thread locality) to stop the coherence ping-pong. (c) The
+choice depends on core count because false sharing only occurs when <em>multiple cores write</em> the
+shared line; with one writer, packing is pure win — so "how many cores write this?" decides whether to
+pack or spread. <em>Tempting wrong answer:</em> "packing is always good for cache performance" — true
+single-threaded, false under concurrent writers. <strong>Feed-forward:</strong> §5.5 and the concurrency
+Part.</div>
+
+<div class="solution" id="sol5.11"><span class="sol-label">5.11</span>
+Machine-specific by design. A correct write-up records the cache-line size, defines a line-sized record,
+confirms both sums are identical (equal work), reports two measured times and the observed SoA/AoS ratio,
+and compares it to the book's ~3.7&ndash;4&times; and to the ~8&times; bandwidth ceiling — expecting a
+several-fold win that varies with hardware. The second part should show the ratio widening toward
+8&times; once the accumulator dependency is removed (multiple accumulators / vectorization), confirming
+the demo's explanation for why it measured ~4&times;. Essential discipline: report only measured numbers,
+and if a loop is elided, consume the result and say what was done. <strong>Feed-forward:</strong> §5.2,
+§5.6, and the Chapter 6 capstone.</div>
+
+</section>

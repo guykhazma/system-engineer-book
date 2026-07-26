@@ -1,0 +1,444 @@
+<section class="chapter" id="ch03">
+<h1>Chapter 3 — The Memory Hierarchy &amp; Caches</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch01">Chapter 1</a> (the memory
+wall and the latency hierarchy), <a href="#ch02">Chapter 2</a> (the CPU; why a miss need not stall).
+&nbsp;·&nbsp; <strong>Pairs with:</strong> the rest of Part 1 and the performance-engineering chapters,
+which turn these rules into measured speedups. This chapter makes "data location matters" concrete and
+exploitable.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From the previous two chapters, from memory: (1) <a href="#ch01">Chapter 1</a> said accessing DRAM
+costs on the order of ~100&nbsp;ns while a nearby cache hit costs ~1&nbsp;ns — about how many orders of
+magnitude apart is that? (2) <a href="#ch02">Chapter 2</a> said a cache miss does <em>not</em> always
+stall the CPU. Under what condition does the latency get hidden? (3) <em>Predict:</em> you sum every
+element of a large 2-D array. Does the <em>order</em> in which you visit the elements — row by row vs.
+column by column — change how long it takes, given that you touch exactly the same elements either way?
+By the end of this chapter you will have a measured answer.</p>
+</aside>
+
+<p><a href="#ch01">Chapter 1</a> told you the memory wall exists and that hardware answers it with a
+hierarchy of caches. <a href="#ch02">Chapter 2</a> told you the CPU can sometimes hide a miss behind
+other work. This chapter is where "memory access cost varies" stops being a warning and becomes a set
+of concrete, mechanical rules you can design against — because caches are not magic, they follow simple
+policies, and once you know the policies you can write code that hits the cache instead of missing it.
+The payoff is the largest, cheapest performance win available to most programs: not a better algorithm,
+just the same algorithm arranged so the data is where the CPU expects it.</p>
+
+<p>We will finish with a measurement, not a claim. At the end of the chapter is a short C program that
+traverses the same array two ways — the cache-friendly way and the cache-hostile way — and the exact
+speed ratio it produced when run for this book, on a specific machine, so you can see the effect is real
+and roughly how big it is. The number is machine-dependent, and we will say so; but it is measured, not
+invented.</p>
+
+<h2>3.1 The cache line: memory moves in blocks, not bytes</h2>
+
+<p>The first and most important fact about caches overturns a picture you have probably carried since
+you first learned about memory: that you read one byte, or one <code>int</code>, at a time. You do not.
+When the CPU needs a value that is not already in cache, it does not fetch just that value — it fetches
+an entire aligned <strong>cache line</strong> (also called a cache block) containing it, and installs
+the whole line in the cache. On the common x86-64 processors this line is <strong>64 bytes</strong>;
+Bryant and O'Hallaron state this standard size in <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP, Chapter 6), and it is what <code>getconf LEVEL1_DCACHE_LINESIZE</code> reports on such
+machines. (It is a hardware parameter, not a law of nature — verify it on your target — but 64 bytes is
+the near-universal value on current x86-64.)</p>
+
+<p>This single mechanism explains most of cache behavior. When you touch one byte, the seven-plus
+neighbors sharing its 64-byte line come along for free — they are now in cache, and touching them next
+costs a cheap hit instead of an expensive miss. So the cost of a memory access is not really "per
+access"; it is "per line brought in." A program that uses every byte of each line it fetches gets the
+full value of every expensive DRAM trip. A program that touches one byte per line and then moves far
+away wastes 63 of every 64 bytes it pays to move — it pays full price for the line and uses a fraction
+of it. That ratio, <em>useful bytes per line fetched</em>, is the hidden efficiency knob behind an
+enormous amount of performance.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>On a machine with 64-byte cache lines, you read one <code>int</code> (4 bytes). How many bytes does
+the hardware actually move into the cache, and how many neighboring <code>int</code>s are now cheap to
+access? (Answer after the next section.)</p>
+</aside>
+
+<h2>3.2 Locality: the property caches reward</h2>
+
+<p>Caches work — they successfully hide the memory wall — because real programs exhibit
+<strong>locality of reference</strong>, a strong tendency to access memory that is close in time or
+space to what they just accessed. There are two kinds, and CS:APP (Chapter 6) frames them as the two
+properties good code should have:</p>
+
+<ul>
+<li><strong>Temporal locality:</strong> if you access a location, you are likely to access it
+<em>again soon</em>. A loop variable, an accumulator, a hot lookup table — accessed repeatedly, so
+after the first (missing) access they sit in cache and every later access is a hit.</li>
+<li><strong>Spatial locality:</strong> if you access a location, you are likely to access
+<em>nearby</em> locations soon. Walking an array in order, reading struct fields together — because
+memory arrives a whole line at a time, spatial locality means the neighbors you fetched are exactly the
+ones you are about to use.</li>
+</ul>
+
+<p>The hardware bets on both. The cache keeps recently used lines (exploiting temporal locality), and
+by fetching a full line it pre-loads spatial neighbors (exploiting spatial locality). Some CPUs also
+<em>prefetch</em> — detect a sequential access pattern and fetch lines ahead of the program's demand,
+so the data is already resident by the time the loop reaches it. All of this is automatic and invisible
+until you fight it. Your job is to write code whose access pattern <em>has</em> locality, so that the
+hardware's bets pay off. Code with good locality runs near the speed of cache; code that scatters its
+accesses runs near the speed of DRAM; and from <a href="#ch01">Chapter 1</a> you know that is about a
+100&times; difference, available on the same algorithm.</p>
+
+<p><em>(Answer to the quick check: the hardware moves the full 64-byte line, so 64 bytes; that line
+holds 16 <code>int</code>s, so the 15 neighbors sharing the line are now cheap hits.)</em></p>
+
+<h2>3.3 Hits, misses, and the three C's</h2>
+
+<p>An access that finds its line already in cache is a <strong>hit</strong>; one that does not is a
+<strong>miss</strong>, and a miss pays to fetch the line from the next level down (another cache, or
+DRAM). Since misses are where the time goes, it helps to classify <em>why</em> a miss happened. The
+classic taxonomy, the <strong>three C's</strong> (presented in CS:APP, Chapter 6), sorts every miss
+into one of three causes:</p>
+
+<ul>
+<li><strong>Compulsory (cold) miss:</strong> the first-ever reference to a line. It was never in cache,
+so the first touch must miss. Unavoidable in principle — you have to load data at least once — but you
+can make each compulsory miss <em>count</em> by using the whole line (spatial locality) once you have
+paid for it.</li>
+<li><strong>Capacity miss:</strong> the line was in cache but got evicted because the program's working
+set — the data it is actively using — is simply larger than the cache. If you stream through 512&nbsp;MB
+repeatedly and the cache holds a few MB, lines you will need again get pushed out before you return to
+them. The fix is to shrink the working set (e.g. process data in cache-sized <em>blocks</em>, a
+technique called blocking or tiling).</li>
+<li><strong>Conflict miss:</strong> the line was evicted not because the cache was full overall, but
+because too many of the addresses you are using map to the <em>same</em> small set of cache slots and
+crowd each other out. This one depends on the cache's <em>associativity</em>, which we take next.</li>
+</ul>
+
+<h2>3.4 Associativity, conceptually</h2>
+
+<p>A cache cannot let any line live in any slot — searching the whole cache on every access would be
+too slow. Instead each memory address maps to a restricted set of slots. In a <strong>direct-mapped</strong>
+cache, each address has exactly one slot it may occupy; simple and fast, but two hot addresses that
+happen to map to the same slot will endlessly evict each other even if the rest of the cache is empty —
+that is a conflict miss. At the other extreme, a <strong>fully associative</strong> cache lets a line go
+in any slot (no conflict misses, but expensive to build). Real caches are <strong>set-associative</strong>:
+a compromise where each address maps to a small <em>set</em> of slots (say 8, an "8-way" cache) and the
+line may occupy any slot within its set. This kills most conflict misses while staying cheap enough to
+build.</p>
+
+<p>You rarely need to compute set indices by hand, and this book will not turn associativity into
+arithmetic drills. What you need is the intuition: conflict misses are why a data structure can perform
+badly at one size or memory alignment and fine at another, seemingly at random. A classic symptom is a
+loop that slows sharply when an array's row length (its "stride") is a power of two that aligns many
+accesses onto the same cache sets. When performance changes with the exact size or alignment of your
+data rather than the amount of it, suspect conflict misses — and know the deeper treatment (and the
+set-index arithmetic) is in CS:APP, Chapter 6.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Classify each miss: (a) the very first read of a freshly allocated array; (b) re-reading a 1&nbsp;GB
+array in a loop when the cache holds only a few MB; (c) two hot variables that keep evicting each other
+though the cache is mostly empty. (Answer below the demonstration.)</p>
+</aside>
+
+<h2>3.5 Why arrays are fast and pointer-chasing is slow</h2>
+
+<p>Now the payoff that ties the chapter together, and the reason "same big-O, different speed" keeps
+recurring. Consider two ways to store a sequence of integers you will walk from start to finish. An
+<strong>array</strong> stores them contiguously: element <em>i</em>+1 sits right after element
+<em>i</em> in memory. A <strong>linked list</strong> stores each element in its own separately
+allocated node, connected by pointers; consecutive nodes can be anywhere in the heap, often far apart.
+Both take O(<em>n</em>) to traverse — the same number of "steps" — and the RAM model says they cost the
+same. The real machine disagrees, sometimes by more than 10&times;.</p>
+
+<p>Walking the array has excellent spatial locality: each 64-byte line brought in holds many
+consecutive elements, so most accesses are hits, and the hardware prefetcher, seeing the sequential
+pattern, fetches lines ahead of you so the data is waiting. Walking the linked list is
+<strong>pointer-chasing</strong>: each node's address is only known once you have read the
+<em>previous</em> node's pointer, so the accesses are (a) to scattered, effectively random addresses —
+poor spatial locality, a likely cache miss per node — and (b) a strict dependency chain, since you
+cannot fetch node <em>i</em>+1 until node <em>i</em> arrives. That dependency defeats the
+latency-hiding trick from <a href="#ch02">Chapter 2</a>: there is no independent work to overlap with
+the miss, so the CPU stalls on the full DRAM latency at every step. Poor locality and a serial
+dependency, together, are why pointer-chasing through memory is one of the slowest things a program can
+do, and why cache-friendly, array-based layouts underpin most high-performance data structures. (This
+is the mechanism behind the array-vs-list remark back in <a href="#ch01">Chapter 1</a>'s warning box —
+now you know exactly why.)</p>
+
+<h2>3.6 A measured demonstration: row-major vs. column-major</h2>
+
+<p>Let us prove the effect rather than assert it, with the cleanest possible experiment: the
+<em>same</em> arithmetic on the <em>same</em> data, differing only in access order. Store an
+<em>N</em>&times;<em>N</em> matrix of <code>long</code> in a single contiguous block in row-major order
+(row 0, then row 1, …), and sum every element two ways. The <strong>row-major</strong> traversal walks
+memory in order — inner loop over columns, so consecutive accesses are adjacent in memory (stride 1),
+excellent spatial locality. The <strong>column-major</strong> traversal walks down columns — inner loop
+over rows, so each step jumps <em>N</em> elements forward in memory (stride <em>N</em>), touching a
+different cache line almost every time. Same elements, same additions, same result; only the order
+differs.</p>
+
+<pre><code>#define N 8192            /* an N x N matrix of long = 512 MiB, far larger than cache */
+
+/* row-major: inner index j varies fastest -&gt; contiguous, stride 1 */
+for (int i = 0; i &lt; N; i++)
+    for (int j = 0; j &lt; N; j++)
+        sum_row += a[(size_t)i * N + j];
+
+/* column-major: inner index i varies fastest -&gt; stride of N longs per step */
+for (int j = 0; j &lt; N; j++)
+    for (int i = 0; i &lt; N; i++)
+        sum_col += a[(size_t)i * N + j];</code></pre>
+
+<p>Both loops produced the identical sum (a correctness check that they really do the same work). Built
+with <code>gcc -O2</code> and run for this book on a 12th-generation Intel Core i7 (i7-12700H) laptop,
+on a 512&nbsp;MiB matrix that dwarfs the cache, the row-major traversal took roughly
+<strong>0.04&nbsp;s</strong> and the column-major traversal roughly <strong>0.95&ndash;0.99&nbsp;s</strong>
+— the column-major version was about <strong>24&ndash;26&times; slower</strong> across repeated runs,
+for doing the very same additions in a different order. <strong>This exact ratio is
+machine-dependent</strong> — it depends on cache sizes, prefetcher, memory bandwidth, and compiler, and
+you should expect a different number on your hardware — but the <em>direction and rough magnitude</em>
+(a large multiplier, not a few percent) is the robust, reproducible result, and you can reproduce it
+yourself with the lab exercise. The mechanism is exactly §3.1&ndash;3.2: the row-major loop uses all 8
+<code>long</code>s of every 64-byte line it fetches and lets the prefetcher run ahead; the column-major
+loop touches one <code>long</code> per line and throws the other 7 away, so it issues many times more line
+fetches and stalls on the misses it cannot hide.</p>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="20" fill="#2e6b34">row-major (stride 1): uses the whole line</text>
+<g>
+<rect x="20" y="30" width="24" height="24" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="44" y="30" width="24" height="24" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="68" y="30" width="24" height="24" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="92" y="30" width="24" height="24" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="116" y="30" width="24" height="24" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="140" y="30" width="24" height="24" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="164" y="30" width="24" height="24" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="188" y="30" width="24" height="24" fill="#cfe8cf" stroke="#2e6b34"/>
+<text x="220" y="47" fill="#333" font-size="10">&larr; one 64-byte line, all 8 used</text>
+</g>
+<text x="20" y="100" fill="#8c3a1d">column-major (stride N): one use per line, 7 wasted</text>
+<g>
+<rect x="20" y="110" width="24" height="24" fill="#f0c9bd" stroke="#8c3a1d"/>
+<rect x="44" y="110" width="24" height="24" fill="#f7eae4" stroke="#c99"/>
+<rect x="68" y="110" width="24" height="24" fill="#f7eae4" stroke="#c99"/>
+<rect x="92" y="110" width="24" height="24" fill="#f7eae4" stroke="#c99"/>
+<rect x="116" y="110" width="24" height="24" fill="#f7eae4" stroke="#c99"/>
+<rect x="140" y="110" width="24" height="24" fill="#f7eae4" stroke="#c99"/>
+<rect x="164" y="110" width="24" height="24" fill="#f7eae4" stroke="#c99"/>
+<rect x="188" y="110" width="24" height="24" fill="#f7eae4" stroke="#c99"/>
+<text x="220" y="127" fill="#333" font-size="10">next access jumps N elements &rarr; a different line</text>
+<rect x="20" y="150" width="24" height="24" fill="#f0c9bd" stroke="#8c3a1d"/>
+<text x="52" y="167" fill="#333" font-size="10">... only the shaded byte used before moving on</text>
+</g>
+<text x="20" y="205" fill="#555" font-size="10">Measured (i7-12700H, 512 MiB, gcc -O2): column-major ~24&ndash;26&times; slower. Machine-dependent.</text>
+</svg>
+<figcaption>Figure 3.1: The two traversals do identical arithmetic. Row-major consumes every element
+of each fetched line; column-major uses one element per line and moves on, wasting most of the memory
+bandwidth it pays for.</figcaption>
+</figure>
+
+<p><em>(Answer to the §3.4 quick check: (a) compulsory/cold — first-ever reference; (b) capacity — the
+working set exceeds the cache; (c) conflict — addresses collide on the same cache set despite free space
+elsewhere.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: locality pays</span>
+<p><strong>1. In words.</strong> Memory arrives one cache line at a time, so code that uses all of each
+line it fetches (good spatial locality) moves far less memory and hits far more often than code that
+touches one item per line and jumps away.</p>
+<p><strong>2. As a picture.</strong> Figure 3.1: a fully-consumed line vs. a line touched once and
+abandoned.</p>
+<p><strong>3. As a trace / measurement.</strong> The row-major vs. column-major experiment: identical
+sum, identical operation count, ~24&ndash;26&times; wall-clock difference on the test machine because
+one order has spatial locality and the other does not. Prose says "locality matters"; the number says
+how much.</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: ignoring cache locality (the "same big-O, so same speed" fallacy, memory
+edition)</span>
+<p>The recurring error of this Part, now at the cache level: judging two implementations equivalent
+because they have the same complexity and the same operation count, while ignoring that one has good
+locality and the other does not. Column-major matrix traversal, linked lists walked as pointer chains,
+arrays-of-pointers-to-objects scattered across the heap, hash tables with poor probe locality — all can
+be an order of magnitude slower than a cache-friendly layout doing the identical logical work. The tell
+is a hot loop over a data structure larger than cache whose access pattern is <em>not</em> sequential.
+The fixes are layout, not algorithm: store data contiguously in the order you traverse it; keep
+frequently-used fields together; process large data in cache-sized blocks (blocking/tiling); prefer
+arrays of values to arrays of pointers. And, as always in this Part: confirm by <em>measuring</em>, on
+your data and your machine, rather than trusting any single ratio — including this chapter's ~25&times;,
+which is one machine's number, not a constant of nature.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A reviewer asks why you rewrote a nested loop to swap the order of the two
+indices when "it computes exactly the same thing." Cover the paragraph below and answer in two or three
+sentences, using <em>cache line</em>, <em>spatial locality</em>, and <em>stride</em>.</p>
+<p><em>Model answer.</em> "It computes the same result, but the original visited the array with a large
+stride, touching one element per 64-byte cache line and then jumping to a different line — so it moved
+roughly a line's worth of memory per element and got almost no reuse. Swapping the loop order makes the
+inner traversal stride-1, so each fetched line is fully consumed before we move on: far fewer misses,
+the prefetcher can run ahead, and we use the memory bandwidth we're already paying for. Same big-O and
+same arithmetic; the change is purely spatial locality, and on our data it measured about an order of
+magnitude faster." Naming the mechanism — line, stride, locality — rather than "I made it faster" is the
+senior register.</p>
+</aside>
+
+<h2>3.7 The rules, and where Part 1 goes next</h2>
+
+<p>Three chapters in, the cost model the RAM abstraction hides is now concrete. <a href="#ch01">Chapter
+1</a> established that where data lives dominates cost and that this is a second cost model alongside
+big-O. <a href="#ch02">Chapter 2</a> opened the CPU and showed why predictable, independent work runs
+fast. This chapter turned "data location matters" into rules you can design against: memory moves in
+64-byte lines, so use the whole line (spatial locality) and reuse hot data (temporal locality); classify
+your misses (compulsory, capacity, conflict) to know which fix applies (use each line, shrink the
+working set, avoid alignment collisions); and remember that contiguous array access is fast while
+pointer-chasing is slow because it has neither locality nor independent work to hide the misses. These
+are not micro-optimizations to sprinkle on at the end — they are how you get an order of magnitude on
+the same algorithm, and you can now <em>see</em> them in code.</p>
+
+<p>The rest of Part 1 builds directly on this. The next chapters take the model down to how data is
+actually laid out in memory — bytes, alignment, the stack and the heap — so you can control locality
+deliberately rather than by accident, and the performance-engineering chapters return with profiling
+tools that <em>show</em> you the misses and mispredictions these three chapters taught you to predict.
+The habit to carry forward is the one this Part has drilled from three angles: when two pieces of code
+have the same big-O but different speed, the difference is the machine — its memory hierarchy and its
+pipeline — and you now know where to look.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the <strong>cache line</strong> size on common x86-64 (64 bytes, per CS:APP) and explain why
+memory moving in lines, not bytes, is the key fact behind cache behavior.</li>
+<li>Define <strong>temporal</strong> and <strong>spatial</strong> locality and say which one a full-line
+fetch and which one a prefetcher exploits.</li>
+<li>Name the <strong>three C's</strong> — compulsory, capacity, conflict — and give the fix each one
+points to.</li>
+<li>Explain <strong>associativity</strong> conceptually (direct-mapped vs. set-associative vs. fully
+associative) and why conflict misses make performance depend on size/alignment, not just data volume.</li>
+<li>Explain why <strong>array traversal is fast and pointer-chasing is slow</strong> in terms of
+locality <em>and</em> the dependency chain from <a href="#ch02">Chapter 2</a>.</li>
+<li>Describe the <strong>row-major vs. column-major</strong> demonstration, its measured order-of-
+magnitude result, <em>and</em> why the exact number is machine-dependent.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a cache line, what is its common size on x86-64, and why does its
+existence mean cost is "per line fetched," not "per byte"? (§3.1)</li>
+<li><strong>R2.</strong> Define temporal and spatial locality and give a code example of each. (§3.2)</li>
+<li><strong>R3.</strong> Name the three C's and, for each, the design change that reduces it. (§3.3)</li>
+<li><strong>R4.</strong> Why can a loop's speed change sharply with the array's size or alignment even
+when the amount of data is the same? Which of the three C's is this? (§3.4)</li>
+<li><strong>R5.</strong> Give two independent reasons a linked-list traversal is slower than an array
+traversal of the same length, one about locality and one about dependencies. (§3.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP)</strong>, Chapter 6 ("The Memory Hierarchy"). The source for this chapter's cache-line size,
+locality framing, three-C's taxonomy, and set-associativity arithmetic, plus the "memory mountain"
+experiment that visualizes read throughput across sizes and strides. The free CMU 15-213 materials
+cover it.</li>
+<li><strong>Drepper, "What Every Programmer Should Know About Memory"</strong> (2007, free). The
+deepest freely available treatment of cache organization, associativity, prefetching, and access
+patterns. Its absolute numbers are dated — read for mechanism — but its analysis of why layout matters
+is unmatched.</li>
+<li><strong>MIT 6.172, <em>Performance Engineering of Software Systems</em></strong> (free OCW).
+Lectures on cache-efficient algorithms, blocking/tiling, and measuring cache behavior with real tools —
+the applied continuation of this chapter.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex3.1"><span class="ex-label">3.1</span> <span class="ex-tag warm">warm-up</span>
+On a machine with 64-byte cache lines, how many <code>double</code>s (8 bytes each) fit in one line?
+If you read one <code>double</code> from a cold line, how many neighbors become cheap hits, and which
+kind of locality does that reward?</div>
+
+<div class="exercise" id="ex3.2"><span class="ex-label">3.2</span> <span class="ex-tag warm">warm-up</span>
+Give a one-sentence code example of temporal locality and one of spatial locality, and say which cache
+mechanism (line fill, retention of recent lines, prefetching) exploits each.</div>
+
+<div class="exercise" id="ex3.3"><span class="ex-label">3.3</span> <span class="ex-tag warm">warm-up</span>
+Classify each miss as compulsory, capacity, or conflict: (a) the first read of a just-<code>malloc</code>ed
+buffer; (b) repeatedly scanning a 4&nbsp;GB dataset with an 8&nbsp;MB last-level cache; (c) a loop that
+slows down only when an array's row length is a particular power of two.</div>
+
+<div class="exercise" id="ex3.4"><span class="ex-label">3.4</span> <span class="ex-tag core">core</span>
+You must sum an <em>N</em>&times;<em>N</em> matrix stored in row-major order. One colleague writes the
+inner loop over columns, another over rows. (a) Which is faster and why, in terms of cache lines and
+stride? (b) Both are O(<em>N</em><sup>2</sup>) and do the same additions — reconcile that with a large
+measured speed difference. (c) Name the kind of miss the slow version suffers most.</div>
+
+<div class="exercise" id="ex3.5"><span class="ex-label">3.5</span> <span class="ex-tag core">core</span>
+A profile shows a data structure of 5&nbsp;million small objects is slow to traverse. It is currently an
+array of <em>pointers</em>, each pointing to a separately <code>malloc</code>ed object. Propose a layout
+change that would improve locality, and explain both why it reduces misses (spatial locality) and why it
+helps the CPU hide the remaining misses (recall the dependency argument from <a href="#ch02">Chapter
+2</a>).</div>
+
+<div class="exercise" id="ex3.6"><span class="ex-label">3.6</span> <span class="ex-tag complexity">cost</span>
+A traversal touches one 8-byte value per 64-byte cache line (stride 8 values). (a) What fraction of each
+fetched line does it use? (b) Compared with a stride-1 traversal of the same values, roughly how many
+times more memory must it move? (c) Explain how this back-of-the-envelope ratio relates to (though it
+will not exactly equal) the measured row-major/column-major slowdown, and name two hardware factors that
+make the measured number differ from this simple estimate.</div>
+
+<div class="exercise" id="ex3.7"><span class="ex-label">3.7</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Explain why the column-major traversal in §3.6 stalls the
+CPU more than the row-major one, tying it to <a href="#ch02">Chapter 2</a>. Steps 1&ndash;3 given;
+complete step 4.
+<br><strong>Step 1 (given):</strong> Column-major access has stride <em>N</em>, so almost every access
+lands on a new cache line — a likely miss to DRAM (~100&nbsp;ns, Chapter 1).
+<br><strong>Step 2 (given):</strong> A cache miss need not stall the CPU if there is independent work
+nearby to overlap with it (Chapter 2 §2.3).
+<br><strong>Step 3 (given):</strong> A summation into one accumulator, walking predictably, does have
+some independent memory-level parallelism — but the row-major version keeps far more useful data
+resident per fetched line, so it issues far fewer misses to begin with.
+<br><strong>Step 4 (you):</strong> Complete the explanation: state which effect dominates the
+~25&times; gap here — the sheer <em>number</em> of misses (locality) or the inability to hide each one
+(dependencies) — and justify your choice. Explain <em>why the number of misses is the primary lever in
+this particular experiment,</em> and what you would change about the code to test your claim.</div>
+
+<div class="exercise" id="ex3.8"><span class="ex-label">3.8</span> <span class="ex-tag mixed">mixed</span>
+For each speedup, decide whether the primary mechanism is <em>spatial locality / cache lines</em>,
+<em>a capacity miss fixed by blocking</em>, <em>branch prediction</em> (Chapter 2), or an <em>ILP /
+dependency chain</em> (Chapter 2), and justify in a line: (a) tiling a large matrix multiply into
+cache-sized blocks; (b) sorting the input before a data-dependent filter loop; (c) switching an
+array-of-structs traversal to consume each cache line fully; (d) summing into four accumulators instead
+of one.</div>
+
+<div class="exercise" id="ex3.9"><span class="ex-label">3.9</span> <span class="ex-tag mixed">mixed</span>
+Two implementations of the same O(<em>n</em>) aggregation differ by 15&times; in wall-clock time. Without
+running anything yet, list the candidate causes drawn from all of Chapters 1&ndash;3 (name at least
+three distinct mechanisms), then describe the <em>single</em> measurement you would take first to narrow
+it down and why that one is most informative.</div>
+
+<div class="exercise" id="ex3.10"><span class="ex-label">3.10</span> <span class="ex-tag stretch">stretch</span>
+The chapter reports a specific ~24&ndash;26&times; row-major/column-major ratio and repeatedly insists it
+is machine-dependent. (a) List three properties of a machine that would change this ratio, and say for
+each whether it would tend to raise or lower it. (b) Explain why the <em>existence</em> and rough
+<em>magnitude</em> (a large multiplier) of the effect is nonetheless robust across machines, even though
+the exact number is not. (c) Why is reporting "about 25&times; on this specific CPU, and reproduce it
+yourself" more honest and more useful than printing a single universal multiplier?</div>
+
+<div class="exercise" id="ex3.11"><span class="ex-label">3.11</span> <span class="ex-tag lab">lab</span>
+Reproduce the demonstration on your own machine. First run <code>getconf LEVEL1_DCACHE_LINESIZE</code>
+and <code>lscpu</code> (or the macOS <code>sysctl hw</code> equivalents) and record your cache-line size
+and L1/L2/L3 sizes. Then write the two-loop matrix-sum program (size it so the matrix comfortably
+exceeds your last-level cache), verify both loops produce the identical sum, time each, and report
+<em>your</em> ratio. Note how it compares to the book's ~25&times; and to your §3.6 stride estimate.
+Report only numbers you actually measured; if the compiler optimizes a loop away, change the code (e.g.
+consume the sum) and say what you did.</div>
+
+</section>
+</section>

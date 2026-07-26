@@ -1,0 +1,113 @@
+<section class="solutions" id="sol08">
+<h1>Chapter 8 — Solutions</h1>
+
+<div class="solution" id="sol8.1"><span class="sol-label">8.1</span>
+(a) A <strong>stack frame</strong> (activation record) is the block of storage for one function call — its
+locals, arguments, saved return address, and bookkeeping. (b) Subtracting the frame's size from the
+<strong>stack-pointer register</strong> (moving it down) allocates it — one arithmetic operation. (c) A
+local's lifetime ends when execution <strong>leaves its block/function</strong> and the frame is popped.</div>
+
+<div class="solution" id="sol8.2"><span class="sol-label">8.2</span>
+Heap reason (any one): the object must <strong>outlive the function that creates it</strong>, its size is
+only known at runtime, or it is too large for the stack. Cost the heap imposes: the allocator does real work
+(searching/splitting free lists), and — the big one — <strong>you must free it exactly once</strong>, an
+obligation the stack does not have (frames free automatically on return). <strong>Feed-forward:</strong>
+§8.2, §8.5.</div>
+
+<div class="solution" id="sol8.3"><span class="sol-label">8.3</span>
+(1) <strong>Runaway/unbounded recursion</strong> (missing base case or too deep for the input) — fix by
+bounding the recursion or converting to iteration with an explicit (heap-backed) stack. (2) <strong>Very
+large automatic arrays/locals</strong> — fix by allocating large or runtime-sized buffers on the
+<strong>heap</strong> instead. <em>Tempting wrong answer:</em> "increase the stack limit" — a band-aid that
+does not fix unbounded recursion. <strong>Feed-forward:</strong> §8.3.</div>
+
+<div class="solution" id="sol8.4"><span class="sol-label">8.4</span>
+<code>int *f(void){ int x=7; return &amp;x; }</code> returns the address of the local <code>x</code>, which
+lives in <code>f</code>'s stack frame. On <code>return</code>, that frame is <strong>popped</strong> — the
+stack pointer moves back — so <code>x</code>'s storage is no longer reserved for it and can be reused by the
+next call. The returned pointer therefore <strong>dangles</strong>, and reading/writing through it is
+<strong>undefined behavior</strong> (C §6.2.4: using a pointer to an automatic object past its lifetime).
+gcc emits <code>warning: function returns address of local variable [-Wreturn-local-addr]</code>; clang
+emits <code>-Wreturn-stack-address</code>. <em>Tempting wrong answer:</em> "it returns 7 because the value
+is still in memory" — not guaranteed; UB imposes no such promise. <strong>Feed-forward:</strong> §8.4.</div>
+
+<div class="solution" id="sol8.5"><span class="sol-label">8.5</span>
+(a) <strong>Caller owns the storage:</strong> <code>void f(int *out){ *out = 7; }</code>, called
+<code>int x; f(&amp;x);</code> — <code>x</code> lives in the caller's frame and outlives <code>f</code>.
+(b) <strong>Heap:</strong> <code>int *f(void){ int *p = malloc(sizeof(int)); if(!p) return NULL; *p = 7;
+return p; }</code> — the block outlives the call; <strong>the caller must <code>free</code> it</strong>
+exactly once, after its last use (ownership transfers to the caller). <em>Method note:</em> the choice is
+"who owns the memory?" — make it explicit. <strong>Feed-forward:</strong> §8.4–8.5.</div>
+
+<div class="solution" id="sol8.6"><span class="sol-label">8.6</span>
+"It worked" is not evidence of correctness because the bug is <strong>undefined behavior</strong>: the C
+standard imposes no requirements, so the program is free to <em>appear</em> to work — the dead frame's bytes
+may simply still hold the old value until something reuses them. Correctness is a property of the code
+against the standard, not of one run's observed output. The danger of a bug that appears to work is that it
+is <strong>latent</strong>: it hides through testing and surfaces later when the optimization level, compiler,
+or call pattern changes — often in production, and possibly as data corruption rather than an obvious crash.
+<em>Tempting wrong answer:</em> "if it passes tests it's fine" — UB can pass tests and still be a defect.
+<strong>Feed-forward:</strong> §8.4.</div>
+
+<div class="solution" id="sol8.7"><span class="sol-label">8.7</span>
+(a) A stack frame's locals are reserved by <strong>subtracting the frame size from the stack pointer</strong>
+— a single register adjustment, with no per-variable work and nothing to track. (b) One <code>malloc</code>
+may <strong>search a free list</strong> for a fitting block, <strong>split</strong> it, update bookkeeping,
+and, if the pool is exhausted, <strong>ask the OS for more memory</strong> — orders of magnitude more work.
+(c) Rule of thumb: for a small scratch buffer needed each iteration, use a <strong>stack local (or one
+buffer reused across iterations)</strong>, not a per-iteration <code>malloc</code>/<code>free</code> — the
+stack version is nearly free and avoids allocator traffic and fragmentation in the hot loop.
+<em>Tempting wrong answer:</em> "malloc a fresh buffer each iteration for cleanliness" — needless cost in a
+hot loop. <strong>Feed-forward:</strong> §8.1–8.2.</div>
+
+<div class="solution" id="sol8.8"><span class="sol-label">8.8</span>
+<strong>Step 4:</strong> The nodes must be allocated on the <strong>heap</strong> (they outlive the helper
+and their count is dynamic). The <strong>caller becomes responsible for freeing</strong> every node —
+exactly once each, after it is done traversing the list (walking and freeing node by node). If that
+responsibility is forgotten, the result is a <strong>memory leak</strong> (Ch 9 preview): the nodes are
+never reclaimed. The design principle is <strong>ownership</strong> — decide and document who owns the
+memory and therefore who frees it. <em>Method note:</em> "outlives its creator" + "size known only at
+runtime" is the standard signal for heap allocation with transferred ownership.
+<strong>Feed-forward:</strong> §8.5 and §9.1, §9.3.</div>
+
+<div class="solution" id="sol8.9"><span class="sol-label">8.9</span>
+(a) <strong>Stack overflow</strong> (Ch 8) — deep recursion only on large inputs exhausts the bounded stack.
+(b) <strong>Dangling pointer to a local</strong> (Ch 8) — correct in tests, garbage after unrelated code
+changes the call pattern that reuses the frame; classic UB signature. (c) <strong>TLB miss / page-walk</strong>
+(Ch 4) — huge pages helping points at translation reach. (d) <strong>Struct padding/alignment</strong> (Ch
+7) — the compiler pads to align members. <em>Method-selection cue:</em> "deep recursion, large input" &rarr;
+overflow; "works then garbage after unrelated change" &rarr; dangling/UB; "huge pages helped" &rarr; TLB;
+"bigger than its fields" &rarr; padding. <strong>Feed-forward:</strong> §8.3–8.4.</div>
+
+<div class="solution" id="sol8.10"><span class="sol-label">8.10</span>
+(a) <strong>Well-defined</strong> — using <code>&amp;local</code> within the same function is fine; the
+object is alive. (b) <strong>Undefined behavior</strong> — the local's frame is popped on return, so the
+pointer dangles (§8.4). (c) <strong>Performance/robustness issue tending to undefined behavior</strong> —
+<code>int big[8000000]</code> is ~32&nbsp;MB, likely overflowing a few-MB stack; if it overflows, the access
+faults (typically a crash). (d) <strong>Undefined behavior</strong> — storing <code>&amp;local</code> in a
+global and reading it after return is the same dangling-pointer bug as (b), just via a longer-lived stash.
+<em>Tempting wrong answer:</em> calling (d) safe "because a global is permanent" — the global outlives the
+object, which is exactly the problem. <strong>Feed-forward:</strong> §8.3–8.4.</div>
+
+<div class="solution" id="sol8.11"><span class="sol-label">8.11</span>
+(a) Both violate the property that <strong>a pointer must not be used outside its target's lifetime</strong>.
+(b) The stack version is easier to catch because the direct pattern — returning <code>&amp;local</code> — is
+statically visible, and compilers warn (<code>-Wreturn-local-addr</code> / <code>-Wreturn-stack-address</code>);
+the heap version (use-after-free) generally is not statically detectable, since the <code>free</code> and the
+later use can be far apart and flow-dependent, so it usually needs a runtime tool (Ch 9's sanitizers). (c)
+Both stem from "the storage is reclaimed whether or not a pointer still refers to it" — the frame pop (stack)
+and <code>free</code> (heap) both end the object's lifetime without invalidating the pointers that name it,
+leaving a dangling handle. <em>Tempting wrong answer:</em> "they're unrelated bugs" — they are the same
+lifetime violation in different regions. <strong>Feed-forward:</strong> §8.4 and §9.3.</div>
+
+<div class="solution" id="sol8.12"><span class="sol-label">8.12</span>
+Machine-specific by design. A correct write-up records the exact warning (on gcc,
+<code>-Wreturn-local-addr</code>; on clang, <code>-Wreturn-stack-address</code>); reports what the run
+actually did on that machine (on the book's machine the plain build <strong>segfaulted</strong>, but the
+write-up must note this is <em>not</em> guaranteed by the standard — a different build could print a value or
+garbage); and shows the caller-owned fix (<code>void f(int *out){ *out = 7; }</code>) compiling warning-free
+and behaving correctly. Essential discipline: never rely on the observed (b) outcome — UB is not obligated to
+crash — and reason about lifetime instead. <em>Tempting wrong answer:</em> "it segfaults, so it's at least
+safe to detect" — the crash is not reliable. <strong>Feed-forward:</strong> §8.4, and Ch 9's tools.</div>
+
+</section>

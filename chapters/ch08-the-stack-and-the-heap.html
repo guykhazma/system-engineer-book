@@ -1,0 +1,427 @@
+<section class="chapter" id="ch08">
+<h1>Chapter 8 — The Stack &amp; the Heap</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch07">Chapter 7</a> (a pointer is an
+address; the address-space regions, including stack and heap), <a href="#ch04">Chapter 4</a> (virtual
+memory), <a href="#ch05">Chapter 5</a> (locality). &nbsp;·&nbsp; <strong>Pairs with:</strong>
+<a href="#ch09">Chapter 9</a> (the heap's controls, <code>malloc</code>/<code>free</code>). Chapter 7
+named the regions; this chapter takes the two with real lifetimes — the <strong>stack</strong> and the
+<strong>heap</strong> — and answers where an object should live, what each costs, and how a pointer that
+outlives its storage becomes one of C's classic bugs.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch07">Chapter 7</a> — of the five address-space regions, which
+two grow <em>toward</em> each other, and in which directions? (2) <a href="#ch04">Chapter 4</a> — a local
+variable and a <code>malloc</code>'d block both have <em>virtual</em> addresses; does that mean they have
+the same <em>lifetime</em>? Guess what determines when each stops being valid. (3) <em>Predict:</em> a
+function creates a local <code>int n</code>, and returns <code>&amp;n</code> (its address) to the caller.
+The caller then reads through that pointer. Do you expect that to reliably give back the value of
+<code>n</code> — and if not, what has gone wrong by the time the caller looks? By the end you will be able
+to state precisely why this is a bug.</p>
+</aside>
+
+<p>Every object in a C program has a <strong>storage duration</strong> — a lifetime — and getting lifetimes
+wrong is the source of a whole family of bugs that the previous chapter's "a pointer is just an address"
+model does not, by itself, warn you about. A pointer stays a valid handle only as long as the object it
+points at is alive; the moment that object's lifetime ends, the pointer becomes <strong>dangling</strong>,
+and using it is undefined behavior. This chapter is about the two storage durations you manage most
+directly. <strong>Automatic</strong> storage — the stack — is created and destroyed for you as functions
+run, is essentially free to allocate, and has a lifetime tied strictly to a block's execution.
+<strong>Dynamic</strong> storage — the heap — you allocate and free by hand, is managed by a real
+allocator with real cost, and lives exactly as long as you keep it alive. We will see how the call stack
+works and why pushing a frame is nearly free; why the heap is different and must be managed; what stack
+overflow is; and then the payoff — the lifetime rules that make "return a pointer to a local" a bug, shown
+correct and broken, and compiled to see what actually happens.</p>
+
+<h2>8.1 Automatic storage: the call stack and stack frames</h2>
+
+<p>When a function is called, the machine needs somewhere to put that call's local variables, its
+arguments, the address to return to when it finishes, and some bookkeeping. That somewhere is a
+<strong>stack frame</strong> (or activation record), pushed onto the <strong>call stack</strong> — the
+stack region from <a href="#ch07">Chapter 7</a>. The stack is a last-in-first-out structure that mirrors
+the call structure of the program: calling a function <em>pushes</em> a new frame on top; returning
+<em>pops</em> it off. Because calls nest (a function calls a function calls a function) and returns unwind
+in the reverse order, LIFO is exactly the right discipline, and the region grows <em>downward</em> (toward
+lower addresses) as frames stack up, as Chapter 7's address printout showed the stack sitting high and the
+CPU pushing toward the heap.</p>
+
+<p>The hardware makes this cheap. A CPU register, the <strong>stack pointer</strong>, holds the address of
+the current top of the stack. Allocating a frame for a new call is, in essence, <em>subtracting</em> the
+frame's size from the stack pointer — moving it down to reserve that many bytes — and deallocating on
+return is adding it back. That is the sense in which stack allocation is "free": reserving space for all of
+a function's locals is a single arithmetic adjustment of one register, not a search or a bookkeeping
+operation. There is no per-variable cost and nothing to track; the locals are simply the bytes between the
+old and new stack-pointer positions. CS:APP (Chapter 3) develops the exact frame layout and the
+call/return instruction sequence; the shape to hold is: <strong>a call pushes a frame by bumping a
+pointer, a return pops it by bumping the pointer back, and the whole frame's storage appears and vanishes
+together.</strong></p>
+
+<p>Two consequences follow immediately. First, automatic variables have a lifetime tied to their block:
+they come into existence when execution enters the block (or function) and <strong>cease to exist when
+execution leaves it</strong> — the frame is popped, and those bytes are no longer reserved for them (C
+standard §6.2.4, automatic storage duration). Second, that is why locals are so cheap and why you do not
+free them: the pop reclaims the entire frame at once. The flip side — the danger — is that the storage is
+reclaimed <em>whether or not any pointer still refers to it</em>. Hold onto that; it is the whole of §8.4.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is allocating a function's local variables often described as "free," in terms of what the CPU
+actually does to reserve the space? And what event reclaims all of a function's locals at once? (Answer
+after the next section.)</p>
+</aside>
+
+<h2>8.2 Dynamic storage: the heap, and why it must be managed</h2>
+
+<p>The stack's discipline — allocate on call, free on return, strict LIFO — is exactly what makes it cheap,
+and also what makes it insufficient. Plenty of data does not follow call structure: a buffer whose size you
+only learn at runtime, a data structure that must outlive the function that built it, a result you want to
+hand back to a caller. For these you need storage whose lifetime you control independently of the call
+stack. That is the <strong>heap</strong>, and you obtain it through the allocation functions
+<code>malloc</code> and friends (the subject of <a href="#ch09">Chapter 9</a>): <code>malloc(n)</code> asks
+for <em>n</em> bytes and returns a pointer to them; that block stays alive until <em>you</em> explicitly
+<code>free</code> it, across as many function calls and returns as you like.</p>
+
+<p>This freedom is not free. Unlike the stack — where "allocate" is a pointer bump and "free" is a pointer
+bump back — the heap must track, out of a large pool, which regions are in use and which are available, in
+whatever arbitrary order you allocate and free them. That tracking is the job of the <strong>allocator</strong>,
+a nontrivial piece of software (typically inside the C library) that maintains data structures — free
+lists, size classes — to satisfy requests and reclaim freed blocks. Because allocations and frees can
+interleave in any order, the allocator must search for a suitable free block, may split or coalesce blocks,
+and can leave the pool <strong>fragmented</strong> (free space chopped into pieces too small to be useful).
+So a heap allocation is a genuine function call doing real work, orders of magnitude more expensive than a
+stack allocation, and the memory it returns must be explicitly returned or it is <strong>leaked</strong>.
+Chapter 9 opens the allocator up; for now the contrast is the point.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: stack vs. heap</span>
+<p><strong>1. In words.</strong> The stack is automatic storage with LIFO lifetime tied to calls,
+allocated/freed by bumping the stack pointer — nearly free, but a local dies when its function returns. The
+heap is manually managed storage with a lifetime <em>you</em> control, allocated by a real allocator —
+flexible, but costly and yours to free.</p>
+<p><strong>2. As a picture.</strong> Figure 8.1: the stack, a tidy pile of frames growing down, each
+pushed/popped whole; the heap, a pool of scattered blocks (some in use, some free) that an allocator hands
+out and reclaims in any order.</p>
+<p><strong>3. As a table.</strong> Stack: allocate = pointer bump, free = automatic on return, lifetime =
+the block, cost ≈ free, failure = overflow. Heap: allocate = <code>malloc</code> (search/split), free =
+manual <code>free</code>, lifetime = until you free it, cost = real, failures = leak / use-after-free /
+double-free (Ch 9).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 230" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">Stack: LIFO frames, grow down, bump the pointer</text>
+<rect x="30" y="26" width="150" height="24" fill="#dbe7f3" stroke="#14406b"/><text x="40" y="42" font-size="9">main() frame</text>
+<rect x="30" y="50" width="150" height="24" fill="#cfe0f0" stroke="#14406b"/><text x="40" y="66" font-size="9">f() frame</text>
+<rect x="30" y="74" width="150" height="24" fill="#bcd3ea" stroke="#14406b"/><text x="40" y="90" font-size="9">g() frame  &larr; top (SP)</text>
+<line x1="200" y1="38" x2="200" y2="98" stroke="#8c3a1d" marker-end="url(#d)"/>
+<text x="206" y="72" font-size="8" fill="#8c3a1d">grows down</text>
+<text x="30" y="120" font-size="8.5" fill="#555">return g() &rarr; pop its frame (bump SP back); its locals vanish.</text>
+
+<text x="340" y="16" fill="#2e6b34">Heap: allocator hands out blocks in any order</text>
+<rect x="350" y="26" width="260" height="80" fill="#f2f7f2" stroke="#2e6b34"/>
+<rect x="358" y="34" width="55" height="24" fill="#cfe8cf" stroke="#2e6b34"/><text x="366" y="50" font-size="8">in use</text>
+<rect x="418" y="34" width="40" height="24" fill="#fff" stroke="#8a8f98" stroke-dasharray="3 2"/><text x="424" y="50" font-size="8">free</text>
+<rect x="463" y="34" width="80" height="24" fill="#cfe8cf" stroke="#2e6b34"/><text x="471" y="50" font-size="8">in use</text>
+<rect x="358" y="66" width="30" height="24" fill="#fff" stroke="#8a8f98" stroke-dasharray="3 2"/><text x="360" y="82" font-size="7">free</text>
+<rect x="393" y="66" width="70" height="24" fill="#cfe8cf" stroke="#2e6b34"/><text x="401" y="82" font-size="8">in use</text>
+<rect x="468" y="66" width="50" height="24" fill="#fff" stroke="#8a8f98" stroke-dasharray="3 2"/><text x="472" y="82" font-size="7">free</text>
+<text x="350" y="122" font-size="8.5" fill="#555">malloc searches for a free block; free returns one; gaps = fragmentation.</text>
+<text x="20" y="150" font-size="9" fill="#333">Stack allocate/free = one register adjustment (≈ free). Heap allocate/free = allocator does real work.</text>
+<text x="20" y="168" font-size="9" fill="#8c3a1d">Danger: a stack local's storage is reclaimed on return whether or not a pointer still refers to it (§8.4).</text>
+<defs><marker id="d" markerWidth="8" markerHeight="8" refX="4" refY="6" orient="auto"><path d="M0,0 L8,0 L4,6 Z" fill="#8c3a1d"/></marker></defs>
+</svg>
+<figcaption>Figure 8.1: The stack pushes/pops whole frames by bumping a pointer (nearly free, LIFO
+lifetime); the heap is a managed pool the allocator hands out and reclaims in any order (flexible, costly,
+yours to free).</figcaption>
+</figure>
+
+<h2>8.3 Stack overflow</h2>
+
+<p>The stack is fast but <strong>bounded</strong>: the OS reserves a finite region for it (commonly on the
+order of a few megabytes per thread by default on Linux, though the exact size is configurable and
+platform-dependent — check <code>ulimit -s</code> rather than assume a number). If the program keeps
+pushing frames without returning — most often through unbounded or runaway <strong>recursion</strong>, or
+by declaring a very large local array — the stack pointer eventually runs past the end of that reserved
+region. This is <strong>stack overflow</strong>: the access falls on a page with no valid mapping (often a
+deliberately unmapped <em>guard page</em>), the hardware faults, and the OS typically terminates the
+process (on Linux, a segmentation fault). The two everyday causes are worth naming: recursion with no base
+case or too deep a recursion for the input, and large automatic arrays (declaring <code>int
+buf[10000000];</code> as a local tries to reserve tens of megabytes on a few-megabyte stack). The fixes
+match the causes: bound the recursion (or convert it to iteration with an explicit heap-backed structure),
+and put large or runtime-sized buffers on the <em>heap</em>, where the space is far larger and the size can
+be chosen at runtime. Stack overflow is the stack's characteristic failure, just as leaks and
+use-after-free (Ch 9) are the heap's.</p>
+
+<p><em>(Answer to the §8.1 quick check: stack allocation is "free" because reserving space for a call's
+locals is just subtracting the frame size from the stack-pointer register — one arithmetic adjustment, no
+per-variable work. Returning from the function — popping the frame by moving the stack pointer back —
+reclaims all of that function's locals at once.)</em></p>
+
+<h2>8.4 Lifetimes and the dangling-pointer bug: why you can't return a pointer to a local</h2>
+
+<p>Now the payoff, and one of the most important bugs in this book. Because a stack frame is reclaimed the
+instant its function returns (§8.1), <strong>a pointer to a local variable is only valid until that
+function returns.</strong> After the return, the local's storage is no longer reserved for it — the frame
+has been popped, the stack pointer moved back, and those bytes are free to be reused by the very next
+function call. A pointer still holding that address is a <strong>dangling pointer</strong>: it names
+storage whose lifetime has ended. Reading or writing through it is <strong>undefined behavior</strong> (C
+standard §6.2.4: the lifetime of an object with automatic storage duration ends when execution leaves its
+block; using a pointer to an object past its lifetime is UB). This is the answer to the opener's prediction
+— returning <code>&amp;n</code> and dereferencing it later does <em>not</em> reliably give back
+<code>n</code>, because <code>n</code> no longer exists.</p>
+
+<p>Here is the bug and its correct counterpart, side by side:</p>
+
+<pre><code>/* BUG: returns the address of a local; the frame is gone on return. */
+int *make_counter_bug(void) {
+    int n = 0;
+    return &amp;n;          /* dangling: n dies when this function returns */
+}
+
+/* CORRECT: the caller owns the storage; the callee just fills it in. */
+void fill_counter(int *out) {
+    *out = 0;            /* writes into storage the caller keeps alive */
+}
+
+int main(void) {
+    int *p = make_counter_bug();
+    printf("%d\n", *p);  /* undefined behavior: *p reads a dead local */
+
+    int n;
+    fill_counter(&amp;n);    /* n lives in main's frame, valid throughout */
+    printf("%d\n", n);   /* well-defined */
+}</code></pre>
+
+<p>Two things about the buggy version deserve care. First, <strong>the compiler warns you.</strong> Built
+with <code>gcc -Wall</code> on this machine, <code>make_counter_bug</code> produces
+<code>warning: function returns address of local variable [-Wreturn-local-addr]</code>; clang emits the
+analogous <code>-Wreturn-stack-address</code>. This is a bug the toolchain actively flags — heed it. Second,
+<strong>what happens at runtime is not guaranteed</strong>, and this is the crux of undefined behavior. On
+this machine, compiling the buggy program (at both <code>-O0</code> and <code>-O2</code>) and running it
+produced a <strong>segmentation fault</strong> (the process crashed). But that outcome is <em>not</em> part
+of any contract: UB means the standard imposes no requirements at all, so a different compiler, optimization
+level, or run could instead print <code>0</code>, print stale garbage, or appear to "work" — which is worse,
+because the latent bug hides until conditions change. Do <em>not</em> reason "it segfaulted, so at least
+it's detectable": you cannot rely on the crash any more than on the value. The correct fix, shown on the
+right, is the standard pattern — <strong>the caller owns the storage and passes a pointer in</strong>
+(<code>fill_counter(&amp;n)</code>), so the object outlives the callee's frame; or, when the callee must
+create the object, allocate it on the <em>heap</em> and return that pointer (the caller then frees it — Ch
+9). Either way the rule is the same: <em>never hand out a pointer whose target will die before the pointer
+does.</em></p>
+
+<aside class="warning">
+<span class="box-title">Trap: returning (or storing) a pointer to a stack local</span>
+<p>The recurring lifetime bug: a function returns <code>&amp;local</code>, or stores <code>&amp;local</code>
+into a longer-lived structure (a global, an out-parameter's target, a caller's list), and something reads
+through that pointer after the function has returned. The local's frame is gone, so the pointer dangles and
+the access is undefined behavior — it may crash, may return stale or overwritten bytes, or may
+<em>appear</em> to work until the next call reuses the frame, which is the dangerous case because it hides
+in testing. The tells: returning the address of a local or parameter; taking <code>&amp;</code> of a local
+and stashing it somewhere that outlives the function; a pointer that "worked yesterday" now returning
+garbage after unrelated code changed the call pattern. Heed <code>-Wreturn-local-addr</code> /
+<code>-Wreturn-stack-address</code> — the compiler catches the direct return. The fixes: return by value for
+small objects; take an out-pointer the caller owns; or heap-allocate and transfer ownership (documenting who
+frees). And do not trust a crash to reveal it — UB is not obligated to crash, so the discipline is to reason
+about lifetime, not to test-and-see.</p>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Two functions each need to give the caller an <code>int</code> the caller can keep: one returns
+<code>&amp;local</code>; the other takes <code>int *out</code> and writes <code>*out</code>. Which one is
+correct and why? Where does the correct one's storage actually live? (Answer below the next section.)</p>
+</aside>
+
+<h2>8.5 Choosing where an object should live</h2>
+
+<p>The stack/heap choice, made well, is mostly mechanical once you ask two questions: <em>how long must
+this object live,</em> and <em>how big is it (and is that known at compile time)?</em> Prefer the
+<strong>stack</strong> when the object's lifetime fits within the function that creates it and its size is
+known and modest — this is the common case, and it is free, automatically cleaned up, and cache-friendly
+(a frame's locals are hot and contiguous). Reach for the <strong>heap</strong> when the object must
+<em>outlive</em> the function that creates it (you need to return it, or store it in a longer-lived
+structure), when its size is only known at runtime or is too large for the stack (§8.3), or when its
+lifetime genuinely does not nest with call structure (shared data structures, caches, anything with a
+dynamic graph of owners). The cost of the heap is not only the allocator's time (§8.2) but the obligation
+it creates: <em>someone must free it, exactly once, after the last use</em> — and getting that wrong is the
+entire subject of the next chapter. This is why the guidance leans toward the stack: it removes the
+question. The senior habit is to make lifetime an explicit, stated design decision — "this object lives on
+the stack in <code>f</code>," or "the heap owns this and <code>g</code> frees it" — rather than reaching for
+<code>malloc</code> reflexively or letting ownership stay implicit.</p>
+
+<p><em>(Answer to the §8.4 quick check: the <code>int *out</code> version is correct — it writes into
+storage the caller already owns and keeps alive (a local in the caller's frame, or wherever the caller got
+the pointer), so the object outlives the callee's return. The <code>&amp;local</code> version returns a
+dangling pointer to a frame that is popped on return. The correct one's storage lives in the
+<em>caller's</em> frame, not the callee's.)</em></p>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> In code review, someone defends a helper that does <code>char *label(int id) {
+char buf[32]; sprintf(buf, "id-%d", id); return buf; }</code> with "it compiles and it worked in my test."
+Cover the paragraph and explain the problem in two or three sentences, using <em>stack frame</em>,
+<em>lifetime</em>, and <em>undefined behavior</em>.</p>
+<p><em>Model answer.</em> "<code>buf</code> is an automatic array in <code>label</code>'s stack frame, so
+its lifetime ends the instant <code>label</code> returns — the returned pointer dangles, and any read through
+it is undefined behavior. It 'worked in your test' only by luck: UB isn't required to crash, so the frame's
+bytes happened to still hold the string until something reused them, which is exactly the bug that hides
+until the call pattern changes. The compiler will even warn with <code>-Wreturn-local-addr</code>. Fix it by
+having the caller pass in a buffer it owns — <code>label(id, char *out, size_t n)</code> — or by returning a
+heap allocation the caller frees." Naming the frame's lifetime and calling the crash <em>unreliable</em>
+— rather than "it segfaults sometimes" — is the senior register, and it points at the real fix: make
+ownership explicit.</p>
+</aside>
+
+<h2>8.6 What to carry forward</h2>
+
+<p>Objects have lifetimes, and a pointer is only valid while its target lives. <strong>Automatic (stack)
+storage</strong> is created and destroyed with function calls: a frame is pushed by bumping the stack
+pointer down and popped by bumping it back, which is why stack allocation is nearly free and why a local's
+lifetime ends exactly when its function returns. <strong>Dynamic (heap) storage</strong> is managed by a
+real allocator, costs real time, lives until you free it, and exists precisely for objects that must
+outlive their creating call or whose size or lifetime does not fit the stack's LIFO discipline. The stack's
+characteristic failure is <strong>overflow</strong> (runaway recursion or huge locals); the heap's failures
+are the next chapter's. And the through-line bug of this chapter — <strong>returning or storing a pointer
+to a stack local</strong> — is undefined behavior because the storage is reclaimed on return whether or not
+a pointer still refers to it; the compiler warns, the crash is <em>not</em> guaranteed, and the fix is to
+make the storage outlive the pointer (caller-owned or heap-owned).</p>
+
+<p><a href="#ch09">Chapter 9</a> picks up the heap's controls in full: what <code>malloc</code>,
+<code>calloc</code>, <code>realloc</code>, and <code>free</code> actually promise; what the allocator is
+doing underneath (free lists, size classes, fragmentation); and the precise catalogue of manual-memory bugs
+— use-after-free, double-free, leak, buffer overflow, uninitialized read — each stated exactly as the
+undefined (or indeterminate) behavior it is, with the real tools that catch them. The dangling-pointer idea
+you just learned on the stack reappears there on the heap as <em>use-after-free</em>: the same bug — a
+pointer outliving its storage — in the region where <em>you</em> control the lifetime, and therefore
+<em>you</em> can get it wrong.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain what a <strong>stack frame</strong> is, why a call pushing one and a return popping one is
+nearly <strong>free</strong>, and what a local's <strong>lifetime</strong> is tied to.</li>
+<li>Say why the <strong>heap</strong> must be <strong>managed</strong> (an allocator tracking free space in
+arbitrary allocate/free order) and how that makes it costlier than the stack.</li>
+<li>Define <strong>stack overflow</strong>, name its two common causes, and give the matching fixes.</li>
+<li>State precisely why <strong>returning a pointer to a local</strong> is a bug — in terms of frame
+lifetime — and why it is <strong>undefined behavior</strong> rather than "returns garbage."</li>
+<li>Explain why a crash from that bug is <em>not</em> guaranteed, and give the two correct patterns
+(caller-owned storage, or heap-allocate-and-transfer-ownership).</li>
+<li>Decide, for a given object, whether it belongs on the <strong>stack</strong> or the <strong>heap</strong>,
+from its lifetime and size.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a stack frame, and in what sense is allocating one "free"? What reclaims a
+function's locals? (§8.1)</li>
+<li><strong>R2.</strong> Why must the heap be managed by an allocator, and name two costs that follow.
+(§8.2)</li>
+<li><strong>R3.</strong> What is stack overflow, what are its two usual causes, and how do you fix each?
+(§8.3)</li>
+<li><strong>R4.</strong> Precisely why is returning a pointer to a local undefined behavior, and why is a
+crash <em>not</em> guaranteed? (§8.4)</li>
+<li><strong>R5.</strong> Give two questions that decide whether an object belongs on the stack or the heap,
+and the correct fix for a callee that must hand the caller an object it created. (§8.4–8.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP)</strong>, Chapter 3 (procedure calls, the stack frame, the call/return sequence and stack-pointer
+mechanics). The reference for how frames are pushed and popped; the free CMU 15-213 materials cover it.</li>
+<li><strong>Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP)</strong>, the
+address-space and memory-API chapters (free full text). The OS view of the stack and heap regions, stack
+limits and guard pages, and the allocation interface.</li>
+<li><strong>cppreference.com</strong> and the <strong>C standard</strong> — storage duration (§6.2.4) and
+object lifetime. The authority for when an automatic object's lifetime ends and why using a pointer past
+it is undefined.</li>
+<li><strong>Beej's Guide to C</strong> (free). Practical treatment of the stack, the heap, and the common
+lifetime mistakes, with runnable examples.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex8.1"><span class="ex-label">8.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: (a) what is a stack frame? (b) what CPU operation allocates one? (c) when does an
+automatic (local) variable's lifetime end?</div>
+
+<div class="exercise" id="ex8.2"><span class="ex-label">8.2</span> <span class="ex-tag warm">warm-up</span>
+Name one reason to allocate on the heap rather than the stack, and one cost the heap imposes that the stack
+does not.</div>
+
+<div class="exercise" id="ex8.3"><span class="ex-label">8.3</span> <span class="ex-tag warm">warm-up</span>
+Give the two most common causes of stack overflow, and the matching fix for each.</div>
+
+<div class="exercise" id="ex8.4"><span class="ex-label">8.4</span> <span class="ex-tag core">core</span>
+Explain, in terms of stack frames and the stack pointer, precisely why this is a bug:
+<code>int *f(void) { int x = 7; return &amp;x; }</code>. State what happens to <code>x</code>'s storage on
+return, why using the returned pointer is undefined behavior, and what warning gcc/clang emit.</div>
+
+<div class="exercise" id="ex8.5"><span class="ex-label">8.5</span> <span class="ex-tag core">core</span>
+Rewrite <code>int *f(void) { int x = 7; return &amp;x; }</code> two correct ways: (a) so the <em>caller</em>
+owns the storage; (b) so the object lives on the heap. For (b), state who is responsible for freeing it and
+when.</div>
+
+<div class="exercise" id="ex8.6"><span class="ex-label">8.6</span> <span class="ex-tag core">core</span>
+A colleague says "my function returns a pointer to a local and it works fine — I tested it." Explain why
+"it worked" is <em>not</em> evidence the code is correct, using the definition of undefined behavior. What
+is the danger of a bug that happens to appear to work?</div>
+
+<div class="exercise" id="ex8.7"><span class="ex-label">8.7</span> <span class="ex-tag complexity">cost</span>
+Compare the cost of one stack allocation vs. one heap allocation. (a) In terms of operations, what does the
+machine do to allocate a stack frame's worth of locals? (b) What must an allocator potentially do to satisfy
+one <code>malloc</code>? (c) Given (a) and (b), state a rule of thumb for a hot loop that needs a small
+scratch buffer each iteration, and justify it.</div>
+
+<div class="exercise" id="ex8.8"><span class="ex-label">8.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Decide where a function's result should live for: a helper
+that builds a linked list of unknown length and returns it to its caller. Steps 1–3 given; complete step 4.
+<br><strong>Step 1 (given):</strong> The list must <em>outlive</em> the helper that builds it — the caller
+uses it after the helper returns.
+<br><strong>Step 2 (given):</strong> Its size (number of nodes) is only known at runtime.
+<br><strong>Step 3 (given):</strong> Both facts rule out automatic (stack) storage: the nodes would die on
+return, and the count is not fixed at compile time.
+<br><strong>Step 4 (you):</strong> State where the nodes must therefore be allocated, who becomes
+responsible for freeing them and when, and what bug (from the next chapter's preview) results if that
+responsibility is forgotten. Name the design principle: who owns the memory?</div>
+
+<div class="exercise" id="ex8.9"><span class="ex-label">8.9</span> <span class="ex-tag mixed">mixed</span>
+For each symptom, decide which mechanism from Chapters 4–8 is the primary cause and justify in a line: (a) a
+recursive function crashes with a segfault only on large inputs; (b) a function returns a pointer that gives
+correct values in unit tests but garbage in production after unrelated code was added; (c) a random-access
+loop over a huge array is slower than DRAM latency predicts and huge pages help; (d) a struct is larger than
+the sum of its fields.</div>
+
+<div class="exercise" id="ex8.10"><span class="ex-label">8.10</span> <span class="ex-tag mixed">mixed</span>
+Without running anything, classify each as <em>well-defined</em>, <em>undefined behavior</em>, or
+<em>a performance issue only</em>, and say why, drawing on Chapters 7–8: (a) taking <code>&amp;local</code>
+and using it <em>within</em> the same function; (b) returning <code>&amp;local</code> and dereferencing it
+in the caller; (c) declaring <code>int big[8000000];</code> as a local and using it; (d) storing
+<code>&amp;local</code> into a global and reading it after the function returns.</div>
+
+<div class="exercise" id="ex8.11"><span class="ex-label">8.11</span> <span class="ex-tag stretch">stretch</span>
+The chapter draws a parallel: a dangling pointer to a stack local (this chapter) and a use-after-free on the
+heap (<a href="#ch09">Chapter 9</a>) are "the same bug in different regions." (a) State the one property both
+violate. (b) Explain why the stack version is in some ways <em>easier</em> to catch (name the compiler
+warning) while the heap version generally is not. (c) Argue why "the storage is reclaimed whether or not a
+pointer still refers to it" is the root of <em>both</em>.</div>
+
+<div class="exercise" id="ex8.12"><span class="ex-label">8.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, compile (with <code>-Wall</code>) the buggy <code>int *f(void){ int x=7; return
+&amp;x; }</code> and a <code>main</code> that dereferences the result. (a) Record the exact compiler warning.
+(b) Run it and report what happens on <em>your</em> machine (crash, a value, garbage) — and note that this
+outcome is not guaranteed by the standard. (c) Then write the caller-owned-storage fix and confirm it is
+warning-free and correct. Report only what you actually observed, and state why (b) must not be relied
+upon.</div>
+
+</section>
+</section>

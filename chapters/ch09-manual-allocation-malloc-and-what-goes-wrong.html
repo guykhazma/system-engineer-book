@@ -1,0 +1,461 @@
+<section class="chapter" id="ch09">
+<h1>Chapter 9 — Manual Allocation: <code>malloc</code>/<code>free</code> and What Goes Wrong</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch08">Chapter 8</a> (stack vs. heap;
+the dangling-pointer bug; lifetimes), <a href="#ch07">Chapter 7</a> (pointers, arrays, bounds), <a href="#ch05">Chapter
+5</a> (locality). &nbsp;·&nbsp; <strong>Closes the core of Part 2</strong> and sets up
+<strong>Rust</strong> (Part 5), where the compiler enforces by rule what this chapter makes you do by hand.
+Here are the heap's controls — <code>malloc</code>, <code>calloc</code>, <code>realloc</code>,
+<code>free</code> — what the allocator does underneath, and the precise catalogue of ways manual memory
+management goes wrong, each stated as the undefined behavior it is.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch08">Chapter 8</a> — why is a pointer to a stack local invalid
+after its function returns, and what one word names a pointer whose target's lifetime has ended? (2)
+<a href="#ch07">Chapter 7</a> — pointer arithmetic and indexing are only defined <em>within</em> an array
+(plus one-past-the-end). What is stepping outside those bounds, in the language's terms? (3)
+<em>Predict:</em> you <code>free(p)</code> a heap block, then a moment later read <code>p[0]</code> anyway.
+What do you think happens — a guaranteed crash, the old value still there, or something the standard refuses
+to define? By the end you will be able to name this bug and say precisely why its behavior is not
+guaranteed.</p>
+</aside>
+
+<p>The heap gives you storage whose lifetime you control — and hands you, in exchange, the entire
+responsibility for managing it correctly. No garbage collector will reclaim what you forget; no bounds
+checker will stop you writing past the end; no runtime will notice you using a block after you freed it. C
+gives you the raw controls and trusts you completely, which is exactly why this chapter matters: the bugs
+here are not "the program crashes," they are <strong>undefined behavior</strong>, and understanding that
+distinction precisely is the difference between a mysterious, occasional failure and a controllable one.
+We will cover the four allocation functions and what each actually promises; sketch what an allocator does
+underneath (free lists, size classes, fragmentation — at the level this book needs); then catalogue the
+canonical memory bugs — use-after-free, double-free, memory leak, buffer overflow, uninitialized read —
+each stated exactly, with why it is dangerous going beyond "it crashes." Finally we meet the real tools that
+catch them, and run one — AddressSanitizer — on this machine to see what it reports. This is the chapter
+that most directly motivates Rust: every rule here that you must hold in your head, Rust's type system
+checks for you.</p>
+
+<h2>9.1 The allocation functions and what they promise</h2>
+
+<p>Four functions from <code>&lt;stdlib.h&gt;</code> make up the manual-allocation interface. Their
+<em>documented</em> behavior (cppreference; the C standard §7.22.3) is precise, and precision matters
+because the failure modes live in the gaps:</p>
+
+<ul>
+<li><strong><code>void *malloc(size_t size)</code></strong> — allocates <code>size</code> bytes and returns
+a pointer to the block, suitably aligned for any object type. <strong>The contents are
+uninitialized</strong> — indeterminate bytes, <em>not</em> zeroed. Returns <code>NULL</code> on failure
+(and if <code>size</code> is 0, returns either <code>NULL</code> or a unique pointer you may not
+dereference). You must check the return value before using it.</li>
+<li><strong><code>void *calloc(size_t n, size_t size)</code></strong> — allocates space for <code>n</code>
+objects of <code>size</code> bytes each, <strong>initialized to all-zero bytes</strong>. Because it takes
+the count and element size separately, mainstream implementations guard the <code>n * size</code>
+multiplication against overflow (returning <code>NULL</code> rather than silently under-allocating) — which
+is a practical reason to prefer it over <code>malloc(n * size)</code> when allocating an array. Use it when
+you want zeroed memory or are allocating an array.</li>
+<li><strong><code>void *realloc(void *ptr, size_t size)</code></strong> — resizes the block
+<code>ptr</code> previously returned to <code>size</code> bytes, preserving the contents up to the smaller
+of old and new sizes. It <em>may move</em> the block (returning a new address), so you must assign its
+result — <code>p = realloc(p, n)</code> loses the block on failure; the safe idiom uses a temporary. On
+failure it returns <code>NULL</code> and leaves the <em>original</em> block valid and unchanged.
+<code>realloc(NULL, size)</code> behaves like <code>malloc(size)</code>.</li>
+<li><strong><code>void free(void *ptr)</code></strong> — returns a block previously obtained from
+<code>malloc</code>/<code>calloc</code>/<code>realloc</code> to the allocator. <code>free(NULL)</code> is
+explicitly a <strong>no-op</strong> (always safe). Passing anything else — a pointer not from the
+allocator, or one already freed — is <strong>undefined behavior</strong>.</li>
+</ul>
+
+<p>The contract, stated as rules you must uphold: allocate, check for <code>NULL</code>, use only within the
+requested size, free exactly once when done, and never touch the block after freeing. Every bug in §9.3
+below is a violation of one of these — and the language does not enforce a single one of them for you.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Does <code>malloc</code> zero the memory it returns? Does <code>calloc</code>? And why is
+<code>p = realloc(p, n)</code> a dangerous idiom — what do you lose if the <code>realloc</code> fails?
+(Answer after the next section.)</p>
+</aside>
+
+<h2>9.2 What an allocator does, conceptually</h2>
+
+<p>Between your <code>malloc</code> call and the memory you get back sits the <strong>allocator</strong> —
+usually part of the C library — managing a large pool of memory it obtained from the OS. You do not need
+its internals to use it, but a conceptual picture explains the costs and one of the bugs (fragmentation).
+The allocator's job is to satisfy variable-sized requests, in arbitrary allocate/free order, out of that
+pool. To do so it tracks which regions are free, typically via <strong>free lists</strong>: linked lists of
+available blocks it searches to find one big enough for a request. To make that search fast, modern
+allocators group free blocks into <strong>size classes</strong> — separate lists for "16-byte blocks,"
+"32-byte blocks," and so on — so a request goes straight to a list of right-sized blocks instead of scanning
+one giant list. When a block is freed, the allocator may <strong>coalesce</strong> it with adjacent free
+blocks into a larger one, and it records bookkeeping (typically a small header near each block) so
+<code>free</code> knows the block's size.</p>
+
+<p>Two consequences matter for this book. First, <strong>cost</strong>: because a request may involve
+searching a list, splitting a block, or (when the pool is exhausted) asking the OS for more memory, a heap
+allocation is far more expensive than the stack's pointer-bump (Ch 8) — which is why hot loops avoid
+per-iteration <code>malloc</code>. Second, <strong>fragmentation</strong>: after many allocations and frees
+of varying sizes, the free space can end up chopped into many small, non-adjacent pieces. You may have
+plenty of total free memory yet be unable to satisfy a large request because no single free block is big
+enough — this is <em>external</em> fragmentation. (There is also <em>internal</em> fragmentation: rounding a
+request up to a size class wastes the slack.) Fragmentation is not undefined behavior — it is a performance
+and capacity problem — but it is a real cost of manual allocation, and it is why allocation patterns (many
+small short-lived blocks vs. few large long-lived ones) affect a program's memory footprint. CS:APP
+(Chapter 9) develops allocator design in depth, including the free-list and coalescing mechanics; this
+book keeps the model conceptual.</p>
+
+<figure>
+<svg viewBox="0 0 640 170" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">The allocator manages a pool; free lists track available blocks by size class.</text>
+<rect x="20" y="26" width="600" height="30" fill="#f5f8fb" stroke="#14406b"/>
+<rect x="26" y="30" width="70" height="22" fill="#cfe8cf" stroke="#2e6b34"/><text x="34" y="45" font-size="8">in use</text>
+<rect x="98" y="30" width="40" height="22" fill="#fff" stroke="#8a8f98" stroke-dasharray="3 2"/><text x="102" y="45" font-size="8">free</text>
+<rect x="140" y="30" width="120" height="22" fill="#cfe8cf" stroke="#2e6b34"/><text x="148" y="45" font-size="8">in use</text>
+<rect x="262" y="30" width="30" height="22" fill="#fff" stroke="#8a8f98" stroke-dasharray="3 2"/><text x="265" y="45" font-size="7">free</text>
+<rect x="294" y="30" width="80" height="22" fill="#cfe8cf" stroke="#2e6b34"/><text x="302" y="45" font-size="8">in use</text>
+<rect x="376" y="30" width="50" height="22" fill="#fff" stroke="#8a8f98" stroke-dasharray="3 2"/><text x="380" y="45" font-size="7">free</text>
+<rect x="428" y="30" width="90" height="22" fill="#cfe8cf" stroke="#2e6b34"/><text x="436" y="45" font-size="8">in use</text>
+<rect x="520" y="30" width="94" height="22" fill="#fff" stroke="#8a8f98" stroke-dasharray="3 2"/><text x="528" y="45" font-size="7">free</text>
+<text x="20" y="82" font-size="9" fill="#8c3a1d">Fragmentation: total free space is large, but scattered — a big request may find no single block that fits.</text>
+<text x="20" y="104" font-size="9" fill="#333">size-class free lists:  [16B] &rarr; &#9633; &rarr; &#9633;    [32B] &rarr; &#9633;    [64B] &rarr; &#9633; &rarr; &#9633; &rarr; &#9633;</text>
+<text x="20" y="126" font-size="9" fill="#555">malloc: pick a size class, take a free block (maybe split). free: return it, maybe coalesce with neighbors.</text>
+<text x="20" y="150" font-size="9" fill="#555">Cost follows: allocate/free do real work; the stack's pointer-bump (Ch 8) does not. Fragmentation is a capacity cost, not UB.</text>
+</svg>
+<figcaption>Figure 9.1: An allocator satisfies variable-sized requests from a pool using size-classed free
+lists, splitting and coalescing blocks. Interleaved allocate/free of varying sizes leaves external
+fragmentation — free space too scattered to satisfy a large request.</figcaption>
+</figure>
+
+<p><em>(Answer to the §9.1 quick check: <code>malloc</code> does <strong>not</strong> zero its memory —
+the contents are indeterminate; <code>calloc</code> <strong>does</strong> zero it. <code>p = realloc(p,
+n)</code> is dangerous because if <code>realloc</code> returns <code>NULL</code> on failure, you have
+overwritten your only pointer to the still-valid original block — leaking it; assign to a temporary and
+check it first.)</em></p>
+
+<h2>9.3 The canonical memory bugs — each stated precisely</h2>
+
+<p>Now the catalogue. The critical framing, which this whole book has been building toward: most of these
+are <strong>undefined behavior (UB)</strong>, a specific term from the C standard (§3.4.3) meaning behavior
+"for which this International Standard imposes <em>no requirements</em>." That is stronger and stranger than
+"it crashes." Under UB the program may crash, may produce wrong results, may appear to work, may corrupt
+unrelated data, may do different things on different runs or compilers — and, crucially, the optimizer is
+permitted to assume UB <em>never happens</em>, so code near a latent UB bug can be transformed in surprising
+ways. It is worth distinguishing three standard categories you will meet:</p>
+
+<ul>
+<li><strong>Undefined behavior</strong> (§3.4.3): no requirements at all — anything may happen (e.g.
+use-after-free, out-of-bounds access, double-free).</li>
+<li><strong>Unspecified behavior</strong> (§3.4.4): the standard offers two or more possibilities and does
+not say which you get (e.g. the order function arguments are evaluated) — but each possibility is a valid,
+non-catastrophic outcome.</li>
+<li><strong>Implementation-defined behavior</strong> (§3.4.1): unspecified behavior that each implementation
+must <em>document</em> (e.g. <code>sizeof(int)</code>, byte order from Ch 7).</li>
+</ul>
+
+<p>The bugs below are firmly in the first category (with uninitialized reads a closely related
+"indeterminate value" case). Do not read any of the realistic outcomes as guarantees — they are what
+<em>tends</em> to happen, offered only so you recognize the symptom.</p>
+
+<p><strong>Use-after-free.</strong> Reading or writing a block after you have <code>free</code>d it. The
+pointer still holds the old address, but the block's lifetime has ended (it may already be handed to another
+allocation). This is exactly <a href="#ch08">Chapter 8</a>'s dangling-pointer bug, now on the heap, and it
+is <strong>undefined behavior</strong>. Realistically it may read stale data, read data that now belongs to
+an unrelated allocation, corrupt the allocator's bookkeeping, or crash — and it is a serious security
+vulnerability class, because an attacker who controls what gets allocated into the freed slot can influence
+what your dangling pointer reads or writes. This is the answer to the opener: reading <code>p[0]</code>
+after <code>free(p)</code> is not a guaranteed crash and not a guaranteed old value — it is UB.</p>
+
+<p><strong>Double-free.</strong> Calling <code>free(p)</code> twice on the same block (without a
+reallocation in between). Also <strong>undefined behavior</strong>: the second <code>free</code> corrupts
+the allocator's internal structures (it tries to reclaim a block already on a free list), which can crash
+immediately, silently corrupt the heap so a <em>later</em> unrelated allocation misbehaves, or — again — be
+exploited. Note <code>free(NULL)</code> is <em>not</em> a double-free and is always safe; the bug is
+freeing the same non-null block twice.</p>
+
+<p><strong>Memory leak.</strong> Losing the last pointer to a heap block without freeing it, so the memory
+can never be reclaimed. This one is <em>not</em> undefined behavior — the program stays well-defined — but
+it is a real defect: a long-running program that leaks steadily grows its memory footprint until it exhausts
+memory and is killed or drags the system into swap. Leaks are the mirror of use-after-free: use-after-free
+frees too <em>early</em> (while a pointer still needs it), a leak frees too <em>late</em> (never).</p>
+
+<p><strong>Buffer overflow (out-of-bounds access).</strong> Reading or writing outside the bounds of an
+allocation — <code>a[4]</code> on a 4-element array, or writing 20 bytes into a 16-byte block. Recall from
+<a href="#ch07">Chapter 7</a> that pointer arithmetic and indexing are only defined within the array (plus
+one-past-the-end); going past that is <strong>undefined behavior</strong>. An out-of-bounds <em>write</em>
+is especially dangerous: it can overwrite adjacent data, allocator metadata, or (on the stack) a return
+address — the classic memory-corruption vulnerability behind a large fraction of security exploits. An
+out-of-bounds <em>read</em> can leak adjacent memory (the Heartbleed class of bug).</p>
+
+<p><strong>Uninitialized read.</strong> Reading memory before anything has been written to it — a
+<code>malloc</code>'d block (whose contents are indeterminate, §9.1) or an uninitialized local (Ch 8) —
+and using the value. Using such an <strong>indeterminate value</strong> is at best unspecified and, in
+general (for objects whose address is never taken, or trap representations), undefined; either way the value
+is meaningless and the behavior unreliable. The realistic symptom is a bug that changes with optimization
+level, unrelated code, or run-to-run — because the "value" is whatever bytes happened to be there. The fix
+is trivial and non-negotiable: initialize before you read (or use <code>calloc</code> for zeroed memory).</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: the memory bugs are lifetime/bounds violations</span>
+<p><strong>1. In words.</strong> Every bug here breaks one of §9.1's rules: touch a block outside its
+<em>lifetime</em> (use-after-free, double-free), outside its <em>bounds</em> (buffer overflow), before it is
+<em>initialized</em> (uninitialized read), or never end its lifetime (leak). Most are undefined behavior —
+no guaranteed outcome.</p>
+<p><strong>2. As a picture.</strong> A timeline of one block: <code>malloc</code> (born, contents garbage)
+&rarr; initialize &rarr; use &rarr; <code>free</code> (dead). Reading before "initialize" = uninitialized
+read; touching after "dead" = use-after-free; freeing "dead" again = double-free; never reaching "dead" =
+leak; touching left/right of the block's extent = overflow.</p>
+<p><strong>3. As UB, not "a crash."</strong> Each undefined case may crash, corrupt, leak data, or seem
+fine — and may differ by compiler, optimization, or run. The tools in §9.4 turn these unreliable,
+sometimes-invisible faults into loud, located errors.</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: assuming undefined behavior is deterministic ("it didn't crash, so it's fine")</span>
+<p>The most dangerous misconception in manual memory management is treating a memory bug as if it had a
+reliable outcome — "the use-after-free returns the old value," "the overflow just writes the next byte," "it
+ran fine, so it's correct." <strong>Undefined behavior means the standard imposes no requirements</strong>
+(C §3.4.3): the outcome is not defined, may vary with compiler/optimization/run, and the optimizer may
+assume the bug cannot occur and transform your code accordingly — so a UB bug can even change behavior
+elsewhere in the function. A program that "works in testing" with a latent use-after-free or overflow is not
+correct; it is <em>unexploded</em>. The tells: relying on a specific value or crash from a bug; "it only
+fails in release builds" or "only under load" or "only on the other machine" — all classic UB signatures.
+The discipline: reason about lifetimes and bounds to <em>prevent</em> these (§9.1's rules), and use the
+sanitizers/Valgrind of §9.4 to <em>detect</em> them — never conclude "no crash = no bug." This is precisely
+the guarantee Rust's type system will provide by construction in Part 5.</p>
+</aside>
+
+<h2>9.4 Tools that catch these bugs — and one run on this machine</h2>
+
+<p>Because these bugs are unreliable by nature, you do not hunt them by staring; you use tools that
+instrument memory accesses and turn a silent UB into a loud, located report. Two real, widely used ones:</p>
+
+<ul>
+<li><strong>AddressSanitizer (ASan)</strong> — a compiler feature (in gcc and clang) enabled with
+<code>-fsanitize=address</code>. It instruments the program to check every memory access against
+"shadow memory" and surrounds allocations with <em>redzones</em>, catching heap and stack buffer overflows,
+use-after-free, double-free, and (with its LeakSanitizer component) leaks — reporting the bug's type,
+address, and source location, with a modest runtime slowdown. It detects <em>addressability</em> bugs
+(touching memory you shouldn't); it does <em>not</em> catch reads of uninitialized-but-valid memory — that
+is MemorySanitizer's job (clang), or Valgrind's.</li>
+<li><strong>Valgrind (Memcheck)</strong> — a runtime instrumentation tool that runs your unmodified binary
+on a synthetic CPU, checking each access. It detects use-after-free, invalid frees, leaks, out-of-bounds on
+heap blocks, and — unlike ASan — use of uninitialized values, at a larger slowdown. (Valgrind was not
+installed on this machine, so the runs below use ASan.)</li>
+</ul>
+
+<p>To make this concrete, four tiny buggy programs were compiled with <code>gcc -fsanitize=address -g</code>
+and run on this machine. ASan's actual reports (trimmed to the key lines):</p>
+
+<pre><code>/* use-after-free: read p[0] after free(p) */
+==ERROR: AddressSanitizer: heap-use-after-free ... READ of size 4
+  0x... is located 0 bytes inside of 16-byte region [freed by thread T0 here ...]
+SUMMARY: AddressSanitizer: heap-use-after-free  uaf.c:6 in main
+
+/* buffer overflow: a[4] = 7 on a 4-int (16-byte) block */
+==ERROR: AddressSanitizer: heap-buffer-overflow ... WRITE of size 4
+  0x... is located 0 bytes to the right of 16-byte region [0x..10,0x..20)
+SUMMARY: AddressSanitizer: heap-buffer-overflow  oob.c:4 in main
+
+/* double-free: free(p); free(p); */
+==ERROR: AddressSanitizer: attempting double-free ...
+  [freed by thread T0 here ...]
+
+/* memory leak: malloc(1024), never freed */
+==ERROR: LeakSanitizer: detected memory leaks
+Direct leak of 1024 byte(s) in 1 object(s) allocated from: ... leak.c:3</code></pre>
+
+<p>Every bug was caught, named, and pinned to a source line — the whole point of the tools. For contrast,
+the <strong>uninitialized read</strong> (printing an uninitialized <code>int</code>) ran under ASan
+<em>without</em> an error, printing a garbage value — confirming ASan does not cover that class (you would
+reach for Valgrind or MemorySanitizer, or catch the simple case at compile time: <code>gcc -Wall</code>
+flags it with <code>-Wuninitialized</code>). The lesson is twofold: these tools convert probabilistic,
+sometimes-invisible UB into deterministic, located failures — run your tests under a sanitizer — and no
+single tool catches everything, so know which catches which. <strong>Outputs above are from this specific
+machine and toolchain (gcc 11 on x86-64); exact addresses and wording vary by version.</strong></p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Which of these does AddressSanitizer catch: use-after-free, heap buffer overflow, double-free, memory
+leak, uninitialized read? Which one is the odd one out, and what tool would you use for it? (Answer below
+the communicate box.)</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate closes a bug report with "I can't reproduce the crash — it runs fine
+for me, so I think it's a flaky test." The code has a use-after-free. Cover the paragraph and respond in two
+or three sentences, using <em>undefined behavior</em> and naming a tool.</p>
+<p><em>Model answer.</em> "A use-after-free is undefined behavior, so 'runs fine for me' is exactly what we'd
+expect some of the time — the standard makes no promise about the outcome, and it can depend on the build,
+the timing, or what got allocated into the freed slot, which is why it's intermittent rather than flaky.
+Instead of trying to reproduce by luck, let's build the tests with <code>-fsanitize=address</code> (or run
+under Valgrind); ASan will turn the use-after-free into a deterministic, located error pointing at the exact
+line. 'Can't reproduce' isn't evidence the bug is gone — with UB, no crash doesn't mean no bug." Naming the
+behavior as UB and reaching for a sanitizer — rather than accepting "flaky" — is the senior register, and it
+converts an intermittent mystery into a caught, fixable defect.</p>
+</aside>
+
+<p><em>(Answer to the §9.4 quick check: AddressSanitizer catches use-after-free, heap buffer overflow,
+double-free, and (via LeakSanitizer) memory leaks. The odd one out is the <strong>uninitialized read</strong>
+— ASan does not detect it; use Valgrind or MemorySanitizer, or catch simple cases with <code>gcc -Wall</code>
+(<code>-Wuninitialized</code>).)</em></p>
+
+<h2>9.5 What to carry forward — and the bridge to Rust</h2>
+
+<p>Manual allocation is a contract you uphold by hand. <code>malloc</code> gives uninitialized bytes (check
+for <code>NULL</code>), <code>calloc</code> gives zeroed bytes (and, on mainstream implementations, checks its <em>n</em>&times;<em>size</em> multiply for overflow), <code>realloc</code>
+resizes and may move (assign to a temporary), and <code>free</code> returns a block exactly once
+(<code>free(NULL)</code> is a safe no-op). Underneath, the allocator manages a pool with free lists and size
+classes, splitting and coalescing blocks, at real cost, and can leave the pool fragmented. And the ways it
+goes wrong form a small, precise catalogue: <strong>use-after-free</strong> and <strong>double-free</strong>
+(lifetime violations), <strong>buffer overflow</strong> (bounds violation), <strong>uninitialized read</strong>
+(reading before writing), and <strong>memory leak</strong> (never freeing) — the first four undefined
+behavior, meaning <em>no guaranteed outcome</em>, not "a crash," and the last a defined-but-real defect.
+AddressSanitizer and Valgrind turn these unreliable faults into located errors, and each covers a different
+subset — which is why you run your tests under them rather than trusting that "it didn't crash."</p>
+
+<p>Step back and notice the shape of the last three chapters. You learned that a pointer is an address into
+regioned memory (Ch 7), that objects have lifetimes and a pointer can outlive its target (Ch 8), and that on
+the heap <em>you</em> own every lifetime and every bound — and can violate them, silently, with the language
+offering no net (Ch 9). Every safe program in C is one where the programmer has, in their head, proven that
+no pointer is used outside its target's lifetime, no access falls outside its bounds, and every allocation
+is freed exactly once. That proof obligation is real and it is heavy — the bugs above are what happens when
+it fails. This is the exact setup for <strong>Rust</strong> (Part 5): its ownership, borrowing, and lifetime
+system is a way to make the compiler <em>check that proof</em> — to enforce, as type rules verified before
+the program ever runs, the very invariants you just had to maintain by hand. When you reach that Part, the
+motivation will already be in your hands: you will have felt the weight of the net that Rust removes by
+building the guarantees into the language.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State what <code>malloc</code>, <code>calloc</code>, <code>realloc</code>, and <code>free</code> each
+do and promise — including which zeroes, which may move, and why <code>free(NULL)</code> is safe.</li>
+<li>Sketch what an <strong>allocator</strong> does (free lists, size classes, split/coalesce) and define
+<strong>fragmentation</strong> — and say why it is a capacity cost, not UB.</li>
+<li>Name and precisely define the five canonical bugs, and say which are <strong>undefined behavior</strong>
+and which is not.</li>
+<li>Explain why "undefined behavior" is stronger than "it crashes," and why "no crash" is <em>not</em>
+evidence of correctness.</li>
+<li>Say which bugs <strong>AddressSanitizer</strong> catches, which it does not, and what tool covers the
+gap.</li>
+<li>Explain, in one sentence, how this chapter motivates <strong>Rust</strong> — the compiler enforcing
+what you had to prove by hand.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does each of <code>malloc</code>/<code>calloc</code>/<code>realloc</code>/<code>free</code>
+promise, and what is the safe <code>realloc</code> idiom? (§9.1)</li>
+<li><strong>R2.</strong> What does an allocator do underneath, and what is external fragmentation? (§9.2)</li>
+<li><strong>R3.</strong> Define use-after-free, double-free, buffer overflow, uninitialized read, and leak
+— which are UB? (§9.3)</li>
+<li><strong>R4.</strong> What precisely does "undefined behavior" mean, and why is "it ran fine" not
+evidence of correctness? (§9.3)</li>
+<li><strong>R5.</strong> Which bugs does AddressSanitizer catch and which does it miss, and how does this
+chapter set up Rust? (§9.4–9.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP)</strong>, Chapter 9 (dynamic memory allocation: allocator design, free lists, coalescing,
+fragmentation, and the common memory bugs). The reference for §9.2's allocator model; the free CMU 15-213
+materials cover it.</li>
+<li><strong>cppreference.com</strong> and the <strong>C standard</strong> — <code>&lt;stdlib.h&gt;</code>
+memory functions (§7.22.3), and the definitions of undefined (§3.4.3), unspecified (§3.4.4), and
+implementation-defined (§3.4.1) behavior. The authority for what each function promises and what the
+language leaves undefined.</li>
+<li><strong>The AddressSanitizer and Valgrind documentation</strong> — the tools' own manuals for what each
+detects and how to run them. Primary sources; verify flags against your compiler/tool version.</li>
+<li><strong>The Rust Programming Language ("the book") and the Rustonomicon</strong> (free). Read ahead to
+ownership and borrowing to see how the invariants this chapter enforced by hand become compiler-checked
+rules — the payoff Part 5 develops.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex9.1"><span class="ex-label">9.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: (a) does <code>malloc</code> zero its memory? (b) does <code>calloc</code>? (c) is
+<code>free(NULL)</code> safe?</div>
+
+<div class="exercise" id="ex9.2"><span class="ex-label">9.2</span> <span class="ex-tag warm">warm-up</span>
+Write the <em>safe</em> <code>realloc</code> idiom (using a temporary), and explain in one sentence what goes
+wrong with <code>p = realloc(p, n);</code> when the allocation fails.</div>
+
+<div class="exercise" id="ex9.3"><span class="ex-label">9.3</span> <span class="ex-tag warm">warm-up</span>
+Match each bug to its one-line definition: use-after-free, double-free, memory leak, buffer overflow,
+uninitialized read. Then mark which are undefined behavior.</div>
+
+<div class="exercise" id="ex9.4"><span class="ex-label">9.4</span> <span class="ex-tag core">core</span>
+Explain precisely why "the use-after-free returns the old value, so it's harmless" is wrong. Use the C
+standard's definition of undefined behavior, and give two realistic outcomes other than "returns the old
+value."</div>
+
+<div class="exercise" id="ex9.5"><span class="ex-label">9.5</span> <span class="ex-tag core">core</span>
+For each snippet, name the bug and state whether it is undefined behavior: (a)
+<code>free(p); return p[0];</code> (b) <code>int *p = malloc(4*sizeof(int)); p[4] = 0;</code> (c)
+<code>free(p); free(p);</code> (d) <code>int *p = malloc(sizeof(int)); printf("%d", *p);</code> (e)
+<code>int *p = malloc(1024); p = NULL;</code></div>
+
+<div class="exercise" id="ex9.6"><span class="ex-label">9.6</span> <span class="ex-tag core">core</span>
+Explain the difference between a <em>memory leak</em> and a <em>use-after-free</em> in terms of freeing "too
+late" vs. "too early," and state why exactly one of the two is undefined behavior and the other is not.</div>
+
+<div class="exercise" id="ex9.7"><span class="ex-label">9.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is a heap allocation much more expensive than a stack allocation (tie to §9.2 and Ch 8)? (b) What
+is external fragmentation, and why can it make a large <code>malloc</code> fail even when total free memory
+exceeds the request? (c) Is fragmentation undefined behavior? Classify it.</div>
+
+<div class="exercise" id="ex9.8"><span class="ex-label">9.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Diagnose and fix: <code>char *dup(const char *s) { char *r =
+malloc(strlen(s)); strcpy(r, s); return r; }</code>. Steps 1–3 given; complete step 4.
+<br><strong>Step 1 (given):</strong> <code>strcpy</code> copies the string <em>including</em> its
+terminating <code>'\0'</code>, so it writes <code>strlen(s) + 1</code> bytes.
+<br><strong>Step 2 (given):</strong> <code>malloc(strlen(s))</code> reserves only <code>strlen(s)</code>
+bytes — one too few.
+<br><strong>Step 3 (given):</strong> So <code>strcpy</code> writes one byte past the end of the block: a
+heap buffer overflow, which is undefined behavior.
+<br><strong>Step 4 (you):</strong> Give the corrected allocation size, add the one check the function is
+missing (what if <code>malloc</code> returns <code>NULL</code>?), and name the tool from §9.4 that would
+have caught the original overflow and the line it would point to.</div>
+
+<div class="exercise" id="ex9.9"><span class="ex-label">9.9</span> <span class="ex-tag mixed">mixed</span>
+For each observation, decide whether the cause is a <em>use-after-free</em>, a <em>buffer overflow</em>, an
+<em>uninitialized read</em>, a <em>leak</em>, or a <em>non-memory performance issue</em>, and justify in a
+line: (a) a long-running server's memory grows without bound until the OOM killer stops it; (b) a test prints
+a different number each run and only in release builds; (c) an out-of-bounds write corrupts an unrelated
+variable's value; (d) the program crashes inside <code>free</code> with heap-corruption after the same
+pointer is released twice; (e) a random-access loop over a huge array is slow and huge pages help (careful —
+one of these is not a memory <em>bug</em>).</div>
+
+<div class="exercise" id="ex9.10"><span class="ex-label">9.10</span> <span class="ex-tag mixed">mixed</span>
+Without running code, decide for each whether it is <em>undefined behavior</em>, <em>a defined-but-real
+defect</em>, or <em>well-defined and fine</em>, drawing on Chapters 7–9: (a) <code>free(NULL);</code> (b)
+allocating in a loop and never freeing; (c) <code>a[n]</code> where <code>a</code> has exactly
+<code>n</code> elements; (d) reading a <code>calloc</code>'d block before writing it; (e) reading a
+<code>malloc</code>'d block before writing it.</div>
+
+<div class="exercise" id="ex9.11"><span class="ex-label">9.11</span> <span class="ex-tag stretch">stretch</span>
+The chapter says this material "motivates Rust." (a) State the three proof obligations a C programmer carries
+for heap memory (lifetime, bounds, free-exactly-once). (b) For each of use-after-free, double-free, and leak,
+name which obligation it violates. (c) In one or two sentences, describe what it would mean for a
+<em>compiler</em> to check these obligations before the program runs — and why that is more reliable than a
+sanitizer that checks at runtime.</div>
+
+<div class="exercise" id="ex9.12"><span class="ex-label">9.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (if a sanitizer is available), write four tiny programs that each contain exactly one of:
+a use-after-free, a heap buffer overflow, a double-free, and a leak. Compile each with
+<code>-fsanitize=address -g</code> and run it. (a) Record the exact error type and source line ASan reports
+for each. (b) Write a fifth program with an uninitialized read and confirm whether ASan flags it; if not,
+note what tool would. Report only what you actually observed, and label your compiler/tool versions, since
+the exact output varies.</div>
+
+</section>
+</section>

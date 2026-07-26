@@ -1,0 +1,116 @@
+<section class="solutions" id="sol02">
+<h1>Chapter 2 — Solutions</h1>
+
+<div class="solution" id="sol2.1"><span class="sol-label">2.1</span>
+In order: (1) <strong>pipelining</strong> — overlap the stages so different instructions occupy
+different units in the same cycle; (2) <strong>superscalar</strong> — duplicate execution units and
+issue several instructions per cycle; (3) <strong>out-of-order</strong> — reorder execution to run
+later independent instructions while an earlier one is stalled; (4) <strong>speculation / branch
+prediction</strong> — guess a branch's direction and execute down the predicted path so the pipeline
+need not wait for the branch to resolve.</div>
+
+<div class="solution" id="sol2.2"><span class="sol-label">2.2</span>
+<strong>Latency</strong> is the number of cycles for one instruction to pass through all stages;
+<strong>throughput</strong> is how often a new instruction <em>completes</em>. Because the stages
+overlap — while one instruction is in "execute," the next is in "decode," and so on — a new instruction
+can finish every cycle even though each individually spends several cycles traversing the pipeline. The
+two numbers measure different things: time-through-one vs. completions-per-time.</div>
+
+<div class="solution" id="sol2.3"><span class="sol-label">2.3</span>
+A <strong>data hazard</strong>: an instruction needs a result that an earlier, not-yet-finished
+instruction will produce, so it cannot proceed until that value is ready. A <strong>control
+hazard</strong>: the CPU does not yet know which instruction comes next because an unresolved branch
+determines it. <strong>Branch prediction addresses the control hazard</strong> — it guesses the branch
+direction so fetching can continue instead of stalling.</div>
+
+<div class="solution" id="sol2.4"><span class="sol-label">2.4</span>
+In loop A each add depends on the previous add's result (they all target one accumulator), forming a
+single dependency chain: the out-of-order engine can never have more than one add in flight, so the
+superscalar units sit mostly idle and the loop runs at roughly one add per dependency latency. In loop
+B the four partial sums are <em>independent</em>, so up to four adds can be in flight at once, keeping
+multiple execution units busy and finishing in a fraction of the time — same number of additions, more
+ILP. The enabling condition: floating-point addition is not associative, so B only computes the "same"
+result if you accept that the grouping (and thus rounding) differs, or the compiler is allowed to
+reassociate — B's parallelism is possible precisely because its adds have no data dependency between
+them. <em>Method-selection note:</em> the tell that ILP is the lever is "same operation count, one
+version serializes them." <strong>Feed-forward:</strong> §2.3 and the threeways box.</div>
+
+<div class="solution" id="sol2.5"><span class="sol-label">2.5</span>
+On P the data-dependent branch resolves in long predictable runs, so the branch predictor is almost
+always right, speculation is nearly free, and the pipeline stays full. On Q the branch is a patternless
+coin flip: the predictor is wrong about half the time, and each misprediction flushes the speculatively
+executed work and refills the pipeline — a penalty on the order of tens of cycles (machine-specific)
+paid on ~50% of iterations. The extra time on Q is spent flushing and refilling the pipeline, not doing
+arithmetic. <em>Tempting wrong answer:</em> "Q must be doing more comparisons" — no, the arithmetic is
+identical; the cost is misprediction, not extra work. <strong>Feed-forward:</strong> §2.4.</div>
+
+<div class="solution" id="sol2.6"><span class="sol-label">2.6</span>
+(a) Average cost per iteration &approx; <em>b</em> + <em>p</em>·<em>k</em> cycles (caveat: <em>k</em> is
+an order-of-magnitude, microarchitecture-specific figure). (b) The misprediction term dominates when
+<em>p</em>·<em>k</em> &gt; <em>b</em>, i.e. roughly <em>p</em> &gt; <em>b</em>/<em>k</em>; for a cheap
+body and a ~tens-of-cycles penalty, even a modest <em>p</em> (a branch that misses a nontrivial
+fraction of the time) makes misprediction the largest term. (c) Making the branch predictable lowers
+<em>p</em> (the predictor is right more often); a branchless rewrite removes the branch so there is no
+<em>k</em> to pay at all. You measure first because on an already-predictable branch <em>p</em> is
+already tiny, so a branchless rewrite adds complexity for no gain — and may even be slower if it does
+more arithmetic unconditionally. <strong>Feed-forward:</strong> §2.4 warning box.</div>
+
+<div class="solution" id="sol2.7"><span class="sol-label">2.7</span>
+<strong>Step 4:</strong> The miss stalls the CPU <em>only if there is no independent work to do while
+it is serviced.</em> The deciding property is the amount of <strong>instruction-level parallelism in
+the surrounding code</strong> — whether there are nearby instructions whose inputs are ready and do not
+depend on the missing load. If there is enough such work, the out-of-order engine hides the miss
+latency behind it; if the code is a tight dependency chain that all waits on the loaded value, the
+machine has nothing else to do and stalls for the full miss. It is that property, not the miss latency
+alone, that decides the outcome, because the latency is a fixed cost of reaching DRAM — what varies,
+and what you control by how you write the code, is whether the CPU can <em>overlap</em> useful work
+with it. <strong>Feed-forward:</strong> §2.3 (out-of-order) and Chapter 1 §1.2 (miss latency).</div>
+
+<div class="solution" id="sol2.8"><span class="sol-label">2.8</span>
+(a) <strong>Branch prediction</strong> — sorting changed only predictability, not arithmetic. (b)
+<strong>Dependency chain / ILP</strong> — splitting an accumulator exposes independent work. (c)
+<strong>Memory hierarchy</strong> — a linked list scatters accesses to random addresses (cache misses,
+Chapter 1) where an array streams contiguously. (d) None of the three is a bottleneck — no branches, no
+memory pressure, presumably enough ILP — so the loop is already near peak; the lesson is that when none
+of the mechanisms is being violated, there is little constant-factor slack left to recover.
+<em>Method-selection cue:</em> match the symptom — "sorting helped" &rarr; branches; "extra
+accumulators helped" &rarr; ILP; "layout/pointers hurt" &rarr; memory.</div>
+
+<div class="solution" id="sol2.9"><span class="sol-label">2.9</span>
+The <strong>real cost model</strong> (Chapter 1 §1.4) resolves it: equal big-O guarantees equal
+<em>scaling</em>, never equal <em>speed</em>; a 5&times; gap lives entirely in the constant factor big-O
+discards. Three independent mechanisms that could each cause it: (1) <strong>memory access pattern</strong>
+— one version streams cache-friendly memory, the other chases pointers into DRAM (Chapter 1,
+<a href="#ch03">Chapter 3</a>); (2) <strong>branch misprediction</strong> — one has an unpredictable
+data-dependent branch flushing the pipeline (§2.4); (3) <strong>dependency chains / low ILP</strong> —
+one serializes its work and starves the superscalar units (§2.3). The single identifying action:
+<strong>profile / measure</strong> (e.g. with a profiler reporting cache misses and branch
+mispredictions) — the mechanism is an empirical question, not one big-O can answer. <em>Tempting wrong
+answer:</em> "it's impossible / the benchmark is wrong," which is the Chapter 1 trap of trusting big-O
+for a speed question. <strong>Feed-forward:</strong> §2.5 and Chapter 1 §1.4.</div>
+
+<div class="solution" id="sol2.10"><span class="sol-label">2.10</span>
+(a) On typical code branches are highly predictable, so speculation is almost always correct and the
+CPU keeps working instead of stalling several cycles at every branch — the occasional wasted work is
+far cheaper than stalling on every branch. (b) On an unpredictable branch the predictor is wrong a
+large fraction of the time, so much speculative work is discarded and the misprediction penalty
+dominates — a net loss versus not having to speculate at all. (c) At a high level: because speculatively
+executed instructions can affect microarchitectural state (such as what ends up in the cache) even when
+their results are later discarded, that residual state can, in principle, be observed and used to infer
+data that should not have been accessible — this is the basis of the real speculative-execution
+vulnerability class. The precise mechanisms and mitigations are a genuine, separate topic (touched on in
+Volume 4); describing them accurately requires primary sources, and this answer deliberately does not
+invent specifics. <em>No-fabrication note:</em> full credit requires the high-level reasoning
+<em>and</em> the acknowledgement that the details need real sources, not invented ones.</div>
+
+<div class="solution" id="sol2.11"><span class="sol-label">2.11</span>
+Machine- and compiler-specific by design. A correct write-up reports two measured times (single vs.
+four accumulators) and their ratio, with the four-accumulator version typically faster when the
+compiler has not already reassociated or vectorized the single-accumulator loop. It must state which
+numbers are the reader's own and note the ratio depends on CPU and compiler. Crucially, if optimization
+collapses the difference (the compiler reassociates or auto-vectorizes both), the correct response is to
+<em>report that</em> and describe what was observed — never to quote a ratio that was not actually
+measured. <em>Method note:</em> the exercise is as much about honest measurement discipline (no
+fabricated numbers) as about ILP. <strong>Feed-forward:</strong> §2.3 threeways box.</div>
+
+</section>

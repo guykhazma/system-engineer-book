@@ -1,0 +1,435 @@
+<section class="chapter" id="ch01">
+<h1>Chapter 1 — The Real Machine vs. the RAM Model</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> nothing — this is the beginning of Volume 1.
+&nbsp;·&nbsp; <strong>Pairs with:</strong> <a href="#ch02">Chapter 2</a> (the CPU up close),
+<a href="#ch03">Chapter 3</a> (the memory hierarchy and caches). Together these three install the
+cost model the rest of the volume optimizes against.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on — predict first</span>
+<p>No prior chapter to recall, so instead make three <em>guesses</em> and write them down; the point
+is to have a number in your head to be surprised by. (1) A modern CPU core can do roughly how many
+simple operations — additions, comparisons — per second: about a million, a billion, or a trillion?
+(2) Reading a value that happens to sit in the CPU's fastest cache versus reading one that must come
+from main memory (DRAM): same speed, about 10&times; apart, or about 100&times; apart? (3) When you
+write <code>x = a + b</code> in C, is "fetch <code>a</code> from memory" the same cost as "add"?
+Answers resolve over the course of this chapter.</p>
+</aside>
+
+<p>Every algorithms course you have ever taken quietly lied to you, and the lie was a good one. It
+said: assume the machine can read any piece of memory, do one arithmetic operation, and write the
+result, each in one fixed unit of time, the same unit regardless of <em>which</em> piece of memory or
+<em>which</em> operation. On that assumption you learned to count operations, and counting operations
+told you whether an algorithm scaled. That assumption is the <strong>RAM model</strong>, and it is the
+foundation of asymptotic analysis. It is also false about the machine on your desk in ways that span
+six orders of magnitude — and the whole of performance engineering, the whole reason this volume
+exists, lives in the gap between the model and the metal.</p>
+
+<p>This chapter is about that gap. We will state precisely what the RAM model assumes, see exactly
+where a real processor and a real memory system diverge from it, and meet the single most important
+divergence — the <strong>memory wall</strong>, the enormous and growing distance between how fast a
+CPU can compute and how long it takes to fetch a byte from DRAM. The goal is not to make you distrust
+big-O; big-O is right about what it claims. The goal is to make you fluent in the second cost model
+that big-O deliberately hides — the one denominated in <em>where the data is</em>, not <em>how many
+operations you do</em> — because at the level this book operates, that second model is where the
+performance is won and lost.</p>
+
+<h2>1.1 What the RAM model assumes</h2>
+
+<p>The <strong>Random Access Machine</strong> (RAM) model is the idealized computer that theoretical
+analysis runs on. It has a processor that executes instructions one at a time, in program order, and
+a memory of cells that the processor can read or write by address. Its defining assumption is
+<strong>uniform cost</strong>: every basic operation — an arithmetic op, a comparison, a load from
+memory, a store to memory — takes the same constant amount of time, usually idealized as "one unit,"
+and crucially that unit does not depend on which address you touch. Reading cell 5 costs the same as
+reading cell 5,000,000,000. There is no notion of "nearby" or "far away" memory; access is, as the
+name says, uniformly <em>random-access</em>.</p>
+
+<p>This is a spectacularly useful abstraction, and you should not give it up. Because every operation
+costs one unit, the running time of an algorithm is just the <em>number of operations</em> it
+performs, which you can count by reading the code. That is what lets you say a linear scan is
+O(<em>n</em>), a comparison sort is O(<em>n</em> log <em>n</em>), and a nested-loop join is
+O(<em>n</em><sup>2</sup>), and to know — before running anything — that the last one will eventually
+outrun any machine you can buy. The RAM model throws away every detail of real hardware precisely so
+that <em>growth rate</em> survives, and growth rate is the thing that no amount of faster hardware can
+fix. Nothing in this chapter contradicts that. An O(<em>n</em><sup>2</sup>) algorithm is a disaster on
+any real machine too.</p>
+
+<p>What the model buys with that simplification is a blind spot, and the blind spot is the subject of
+this volume. By declaring every operation equal, the RAM model asserts three things that are simply
+untrue of the computer in front of you:</p>
+
+<ul>
+<li><strong>All memory accesses cost the same.</strong> They do not. On real hardware the cost of a
+load depends enormously on <em>where the data currently sits</em> — in a register, in a small fast
+cache, in a larger slower cache, in DRAM, on an SSD, or across a network — and those costs differ by
+factors of ten to factors of ten million.</li>
+<li><strong>One instruction takes one unit of time.</strong> It does not. A real CPU overlaps
+instructions, executes them out of order, guesses the outcome of branches, and can retire several
+instructions in a single clock tick or stall for hundreds of ticks on a single one — the subject of
+<a href="#ch02">Chapter 2</a>.</li>
+<li><strong>Operations are independent and equal.</strong> They are not. A multiply may cost more
+than an add; a division much more; and an instruction that depends on the result of the previous one
+cannot start until that result is ready, so <em>dependencies</em> between operations, not just their
+count, govern speed.</li>
+</ul>
+
+<p>Each of these is a place where the abstraction leaks. This chapter takes the first one — the
+uniform-cost-memory assumption — because it is the largest leak by far, and because understanding it
+reorganizes how you think about all fast code. <a href="#ch02">Chapter 2</a> takes the second (the
+CPU), and <a href="#ch03">Chapter 3</a> takes the mechanism, caches, that turns the first assumption
+from "false" into "false but predictable, and therefore exploitable."</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the RAM model's uniform-cost assumption in one sentence, and name the real-hardware fact that
+most directly contradicts it. (Answer below the next section — try it from memory first.)</p>
+</aside>
+
+<h2>1.2 The memory wall</h2>
+
+<p>Here is the historical fact that makes the uniform-cost assumption not just wrong but
+<em>catastrophically</em> wrong on a modern machine. For several decades, the speed at which a CPU
+can execute instructions improved much faster, year over year, than the speed at which main memory
+(DRAM) can deliver a requested byte. Processor throughput raced ahead; DRAM <em>latency</em> — the
+time from "I want the byte at this address" to "here is the byte" — improved only slowly. The two
+curves diverged, and the widening gap between them was named the <strong>memory wall</strong> by Wulf
+and McKee in 1995, whose short paper "Hitting the Memory Wall" pointed out the then-uncomfortable
+consequence: as the gap grows, the average time to touch memory comes to dominate program
+performance, no matter how fast the processor's arithmetic is (Wulf &amp; McKee, <em>ACM SIGARCH
+Computer Architecture News</em>, 1995).</p>
+
+<p>The consequence for us is stark and it is worth stating as baldly as possible. On a modern
+processor, the time to fetch a single value from DRAM is on the order of a <em>hundred nanoseconds</em>
+— and in that same hundred nanoseconds, a single core can execute on the order of hundreds of
+instructions. So a load that misses every cache and goes to main memory is not "one unit" of work in
+any meaningful sense; measured against the arithmetic the core could otherwise be doing, it is
+hundreds of units. A program that spends its time chasing pointers through DRAM can leave the
+processor's arithmetic units idle more than 90% of the time, waiting. The CPU is not slow. It is
+<em>waiting for memory.</em> That single sentence explains an enormous fraction of the real-world
+performance problems this volume teaches you to see.</p>
+
+<p>The hardware's answer to the memory wall is not faster DRAM — DRAM latency is hard physics and
+improves slowly. The answer is the <strong>memory hierarchy</strong>: small, fast, expensive
+memories (caches) placed close to the processor, holding copies of the data the program is most
+likely to touch next, backed by progressively larger, slower, cheaper memories behind them. The
+hierarchy does not repeal the memory wall; it <em>hides</em> it, but only for programs whose access
+patterns let the caches do their job. Learning to write those programs — to earn the cache's help
+rather than fight it — is a large part of what "systems performance" means, and it is the whole
+subject of <a href="#ch03">Chapter 3</a>. For now the load-bearing idea is only this: <em>the cost of
+an operation is dominated by where its data lives, and the gap between "close" and "far" is the
+central fact of modern performance.</em></p>
+
+<p><em>(Answer to the quick check: the RAM model assumes every basic operation, including any memory
+access, costs one fixed unit of time independent of the address. The fact that most directly
+contradicts it is the memory hierarchy — accessing data in a nearby cache is one to two orders of
+magnitude faster than reaching main memory, and further tiers are slower still.)</em></p>
+
+<h2>1.3 Latency, as orders of magnitude only</h2>
+
+<p>To reason about the real cost model you need anchors: a rough sense of how far apart the tiers of
+the hierarchy are. But here we must be careful, because this is exactly the kind of place where a
+confident, precise-looking number is worse than useless. <strong>The absolute latencies below are
+approximate, they are machine-dependent, and they drift as hardware changes.</strong> What is stable
+— what you should actually memorize — is the <em>shape</em>: the ordering of the tiers and the rough
+number of orders of magnitude between them. Treat every specific figure as "as of the mid-2020s, on
+a typical server-class x86-64 core, give or take a large factor."</p>
+
+<p>With that caveat stated as loudly as it can be, here is the ordering. It is the single most
+important picture in this volume.</p>
+
+<table>
+<tr><th>Where the data is</th><th>Rough access latency (order of magnitude)</th><th>Relative to L1</th></tr>
+<tr><td>CPU register</td><td>&lt; 1 ns (available essentially at once, within the pipeline)</td><td>&mdash;</td></tr>
+<tr><td>L1 cache</td><td>~1 ns (a few clock cycles)</td><td>1&times;</td></tr>
+<tr><td>L2 cache</td><td>a few ns (~10 cycles)</td><td>~10&times;</td></tr>
+<tr><td>L3 cache</td><td>~10 ns (tens of cycles)</td><td>~10&ndash;50&times;</td></tr>
+<tr><td>Main memory (DRAM)</td><td>~100 ns (hundreds of cycles)</td><td>~100&times;</td></tr>
+<tr><td>Local SSD (NVMe)</td><td>tens of &micro;s</td><td>~10<sup>4</sup>&ndash;10<sup>5</sup>&times;</td></tr>
+<tr><td>Same-datacenter network round trip</td><td>hundreds of &micro;s to ~1 ms</td><td>~10<sup>5</sup>&ndash;10<sup>6</sup>&times;</td></tr>
+</table>
+
+<p>The register-through-DRAM rows follow the memory-hierarchy access times given for a specific Intel
+Core i7 in Bryant and O'Hallaron's <em>Computer Systems: A Programmer's Perspective</em> (CS:APP,
+Chapter 6), which are themselves presented there as approximate and processor-specific; the SSD and
+network rows are conventional community orders of magnitude of the kind popularized by the widely
+circulated "latency numbers every programmer should know" list (attributed to Jeff Dean, and later
+made time-adjustable by Colin Scott). <strong>Use them as ratios, never as guarantees.</strong> If
+your program's performance depends on whether L2 is 8 cycles or 14 on your particular chip, you are
+measuring, not reading a book — and measuring is exactly what <a href="#ch03">Chapter 3</a> and the
+performance-engineering chapters teach.</p>
+
+<p>Read the table for its shape and three facts fall out. First, the jumps are <em>multiplicative</em>,
+not additive: each tier is roughly 10&times; to 100&times; slower than the one above it, so the
+distance from register to network round trip is not "a lot" but a factor of around a million. Second,
+there is a cliff between on-chip (register, L1/L2/L3 — nanoseconds) and off-chip (DRAM and below —
+DRAM at ~100&nbsp;ns, then a huge further step to SSD at microseconds), and the memory wall is the
+height of that cliff. Third — and this is the one that reorganizes how you write code — the
+difference between a cache hit and a cache miss to DRAM is the same ~100&times; that the difference
+between a good and a bad algorithm often is. You can lose two orders of magnitude of performance
+without changing your algorithm's big-O at all, purely by where your data lands.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: RAM model vs. real machine</span>
+<p><strong>1. In words.</strong> The RAM model charges one unit for every memory access. The real
+machine charges wildly different amounts depending on which tier of the hierarchy holds the data —
+from under a nanosecond in a register to ~100&nbsp;ns in DRAM and far more below that.</p>
+<p><strong>2. As a picture.</strong> A pyramid: registers at the tiny fast apex, then L1, L2, L3,
+then DRAM, then SSD, then network at the wide slow base. Size grows and speed falls as you descend.</p>
+<figure>
+<svg viewBox="0 0 620 300" font-family="DejaVu Sans, sans-serif" font-size="12">
+<polygon points="310,20 200,110 420,110" fill="#eaf2ea" stroke="#2e6b34"/>
+<polygon points="200,110 420,110 150,190 470,190" fill="#eef2f6" stroke="#14406b"/>
+<polygon points="150,190 470,190 90,280 530,280" fill="#fbf5f2" stroke="#8c3a1d"/>
+<text x="310" y="70" text-anchor="middle" fill="#2e6b34">registers · L1</text>
+<text x="310" y="98" text-anchor="middle" fill="#2e6b34" font-size="10">&lt;1&ndash;1 ns</text>
+<text x="310" y="150" text-anchor="middle" fill="#14406b">L2 · L3 · DRAM</text>
+<text x="310" y="172" text-anchor="middle" fill="#14406b" font-size="10">~10 ns &rarr; ~100 ns</text>
+<text x="310" y="235" text-anchor="middle" fill="#8c3a1d">SSD · network</text>
+<text x="310" y="258" text-anchor="middle" fill="#8c3a1d" font-size="10">&micro;s &rarr; ms</text>
+<text x="545" y="60" fill="#555" font-size="10">faster,</text>
+<text x="545" y="76" fill="#555" font-size="10">smaller,</text>
+<text x="545" y="92" fill="#555" font-size="10">costlier</text>
+<text x="30" y="250" fill="#555" font-size="10">slower,</text>
+<text x="30" y="266" fill="#555" font-size="10">larger,</text>
+<text x="30" y="282" fill="#555" font-size="10">cheaper</text>
+</svg>
+<figcaption>Figure 1.1: The memory hierarchy. Latency rises multiplicatively as you descend; the
+RAM model pretends the whole pyramid is a single flat tier.</figcaption>
+</figure>
+<p><strong>3. As a trace.</strong> Consider summing an array of 8 million longs (64&nbsp;MB), one
+value at a time. The RAM model says: 8&times;10<sup>6</sup> loads + 8&times;10<sup>6</sup> adds =
+1.6&times;10<sup>7</sup> "units," done. The real machine says: the array does not fit in cache, so the
+cost is dominated by streaming 64&nbsp;MB up from DRAM; the adds are essentially free, hidden under
+the wait for memory. Same operation count, completely different account of where the time goes — and
+only the second account predicts what you will actually measure.</p>
+</aside>
+
+<h2>1.4 Why "one operation = one unit of time" is a useful lie</h2>
+
+<p>It would be easy to draw the wrong conclusion from all this — to decide the RAM model is broken and
+should be discarded. That is exactly backwards, and getting the relationship right is the whole point
+of this chapter. The RAM model is a <em>useful lie</em>, in the precise sense that it is false in its
+literal claims but true and indispensable for the job it is meant to do. Its job is to predict how
+cost <em>scales</em>, and for that job the constant-factor differences between memory tiers are noise:
+whether a memory access costs 1&nbsp;ns or 100&nbsp;ns, an O(<em>n</em><sup>2</sup>) algorithm still
+loses to an O(<em>n</em> log <em>n</em>) one once <em>n</em> is large enough. The uniform-cost lie is
+what makes asymptotic analysis <em>possible</em>, and asymptotic analysis is non-negotiable. You must
+know it and you must trust it, for what it is for.</p>
+
+<p>The mistake is not using the RAM model. The mistake is using it for a question it was never built
+to answer: <em>how fast will this actually run?</em> The RAM model has nothing to say about constant
+factors, and on modern hardware the constant factors span a hundredfold, all of it hidden inside the
+word "one" in "one unit of time." Two algorithms with identical O(<em>n</em>) complexity can differ by
+50&times; in wall-clock time because one walks memory in an order the caches love and the other
+scatters its accesses across DRAM — and the RAM model, by construction, cannot see the difference. So
+the discipline is to hold two cost models at once and know which question each one answers:</p>
+
+<table>
+<tr><th>Question</th><th>Right model</th><th>Denominated in</th></tr>
+<tr><td>Will this scale? Which algorithm as <em>n</em>&rarr;&infin;?</td><td>RAM / big-O</td><td>operation count</td></tr>
+<tr><td>How fast will it actually run at this size on this machine?</td><td>the real cost model</td><td>where the data lives; bytes moved across tiers</td></tr>
+</table>
+
+<p>This is the through-line of the entire volume. Every technique that is coming — cache-friendly data
+layout, avoiding pointer chasing, keeping the CPU's pipeline fed, minimizing system calls, batching
+I/O — is a way of respecting the second model <em>after</em> you have already satisfied the first. You
+pick a good algorithm with big-O; then you make it fast with mechanical sympathy. Neither replaces the
+other. An engineer who knows only big-O writes asymptotically optimal code that runs ten times slower
+than it should; an engineer who knows only micro-optimization polishes an O(<em>n</em><sup>2</sup>)
+disaster. You need both, in that order.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: trusting the RAM model for performance</span>
+<p>The classic error this chapter exists to prevent: reasoning that because two implementations have
+the same big-O, they will perform about the same — and therefore choosing between them on style or
+convenience rather than measuring. "They're both O(<em>n</em>), so it doesn't matter" is true about
+<em>scaling</em> and can be false about <em>speed</em> by one to two orders of magnitude, because
+big-O deliberately discards the very constant factor — where the data lives — that dominates real
+time. A linked list and an array can both be O(<em>n</em>) to traverse; the array is often many times
+faster because it streams contiguous memory the cache can prefetch, while the list chases pointers
+into random DRAM addresses (we will measure a version of this in <a href="#ch03">Chapter 3</a>). The
+fix is not to distrust big-O — it is right about scaling — but to <em>stop asking big-O a question it
+cannot answer</em>. When the question is "how fast," the answer comes from the memory hierarchy and,
+ultimately, from measurement, never from the operation count alone.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A colleague says, "Both loops are O(<em>n</em>), so they'll perform the
+same." Cover the paragraph below and articulate, in two or three sentences, why that reasoning is
+incomplete — using the words <em>cache</em>, <em>constant factor</em>, and <em>memory hierarchy</em>.</p>
+<p><em>Model answer.</em> "They have the same <em>asymptotic</em> cost, which tells us they scale the
+same way — but big-O throws away the constant factor, and on real hardware that constant is dominated
+by where the data lives in the memory hierarchy. If one loop streams contiguous memory and the other
+chases pointers into random DRAM addresses, they can differ by 10&times; to 100&times; in wall-clock
+time despite identical big-O, because a cache hit and a DRAM miss are about two orders of magnitude
+apart. So same complexity, potentially very different speed — we should measure before assuming they
+tie." This answer signals seniority precisely because it separates the two cost models and names which
+one governs the question being asked.</p>
+</aside>
+
+<h2>1.5 Mechanical sympathy: the thesis of this volume</h2>
+
+<p>There is a phrase for the discipline this chapter is pointing at, borrowed from motor racing and
+popularized in software by Martin Thompson: <strong>mechanical sympathy</strong>. A driver with
+mechanical sympathy understands enough about how the car works to get the most out of it without
+breaking it; a programmer with mechanical sympathy understands enough about how the machine works to
+write code that runs <em>with</em> the grain of the hardware rather than against it. It does not mean
+writing assembly, and it does not mean premature micro-optimization. It means knowing that the machine
+has a memory hierarchy, a pipelined out-of-order CPU, a cost for crossing into the operating system,
+and a real network underneath every abstraction — and letting that knowledge shape the code you write
+by default.</p>
+
+<p>That is the promise of this volume, and this chapter is its foundation. We have established the
+one idea everything else builds on: <em>the RAM model's uniform cost is a useful lie, and real
+performance comes from the cost model it hides — the one where the price of an operation is set by
+where its data lives.</em> From here the volume descends into the machine to make that concrete.
+<a href="#ch02">Chapter 2</a> opens up the CPU itself — pipelining, out-of-order execution, branch
+prediction — to explain the second broken assumption, that one instruction takes one unit of time.
+<a href="#ch03">Chapter 3</a> opens up the memory hierarchy — cache lines, locality, the three kinds
+of miss — to turn "memory access cost varies" from a warning into a set of concrete, exploitable
+rules. By the end of Part 1 you will look at a loop and see not an operation count but a pattern of
+movement through the hierarchy, and that shift in vision is the beginning of writing fast code.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the RAM model's <strong>uniform-cost assumption</strong> and name the three real-hardware
+facts it gets wrong (memory is not uniform-cost; instructions do not take one unit each; operations
+are not independent and equal).</li>
+<li>Explain the <strong>memory wall</strong>: CPU throughput outgrew DRAM latency for decades, so
+average memory-access time comes to dominate performance (Wulf &amp; McKee, 1995).</li>
+<li>Recite the memory hierarchy <strong>in order</strong> — register &lt; L1 &lt; L2 &lt; L3 &lt;
+DRAM &lt; SSD &lt; network — and say <em>why the numbers are orders of magnitude only</em> (machine-
+dependent, drift with hardware).</li>
+<li>Say why "one operation = one unit of time" is a <strong>useful lie</strong>: right about scaling,
+silent about the ~100&times; constant factor that decides real speed.</li>
+<li>Hold both cost models at once and state <strong>which question each answers</strong> (big-O:
+scaling; the real cost model: actual speed).</li>
+<li>Define <strong>mechanical sympathy</strong> and say why it comes <em>after</em> choosing a good
+algorithm, not instead of it.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover everything above. Answer from memory; then check yourself against the section noted. Rate your
+confidence (low/med/high) before you look — an overconfident miss is your most valuable signal.</p>
+<ol>
+<li><strong>R1.</strong> What single assumption defines the RAM model, and what does adopting it buy
+you? (§1.1)</li>
+<li><strong>R2.</strong> What is the memory wall, who named it, and what is its consequence for
+program performance? (§1.2)</li>
+<li><strong>R3.</strong> Put these in order of increasing latency and give the rough order-of-
+magnitude gaps: DRAM, L1 cache, register, network round trip, L3 cache, SSD. Why must you present
+them as orders of magnitude? (§1.3)</li>
+<li><strong>R4.</strong> Two implementations have identical O(<em>n</em>) complexity. Can one be
+50&times; slower? Explain in terms of what big-O discards. (§1.4)</li>
+<li><strong>R5.</strong> Which cost model answers "will it scale?" and which answers "how fast will
+it run?" — and in what units is each denominated? (§1.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP)</strong>, Chapter 6 ("The Memory Hierarchy"). The canonical treatment; its Core i7 access-
+time figures are the source of this chapter's register-through-DRAM orders of magnitude, and it is
+careful to present them as processor-specific. The free CMU 15-213 course materials cover the same
+ground.</li>
+<li><strong>Wulf &amp; McKee, "Hitting the Memory Wall: Implications of the Obvious"</strong>
+(<em>ACM SIGARCH Computer Architecture News</em>, 1995). The two-page paper that named the memory
+wall; short, readable, and prescient.</li>
+<li><strong>Drepper, "What Every Programmer Should Know About Memory"</strong> (2007). A long, free,
+seminal write-up on caches and DRAM. Dated in its specific numbers — read it for the mechanisms, not
+the figures — but unmatched in depth on why the hierarchy exists.</li>
+<li><strong>"Latency Numbers Every Programmer Should Know."</strong> The community list attributed to
+Jeff Dean, and Colin Scott's interactive, year-adjustable version. Use strictly as orders of
+magnitude; the absolute numbers are dated hardware and are meant to be read as ratios.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex1.1"><span class="ex-label">1.1</span> <span class="ex-tag warm">warm-up</span>
+State the RAM model's uniform-cost assumption in one sentence. Then list the three things it asserts
+about real hardware that this chapter says are false.</div>
+
+<div class="exercise" id="ex1.2"><span class="ex-label">1.2</span> <span class="ex-tag warm">warm-up</span>
+Put these seven locations in order from fastest to slowest access, and give the rough order-of-
+magnitude latency for each: L2 cache, DRAM, register, network round trip (same datacenter), L1 cache,
+local NVMe SSD, L3 cache.</div>
+
+<div class="exercise" id="ex1.3"><span class="ex-label">1.3</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, explain the memory wall and why it makes the RAM model's uniform-cost assumption
+worse over time rather than better.</div>
+
+<div class="exercise" id="ex1.4"><span class="ex-label">1.4</span> <span class="ex-tag core">core</span>
+A DRAM access costs roughly 100&nbsp;ns and a single core executes on the order of a few billion
+simple operations per second. (a) Roughly how many simple operations could the core have executed in
+the time of one DRAM access? (b) In one or two sentences, explain what this ratio implies for a
+program that spends most of its time following pointers into randomly located memory. State clearly
+which of your numbers are order-of-magnitude approximations.</div>
+
+<div class="exercise" id="ex1.5"><span class="ex-label">1.5</span> <span class="ex-tag core">core</span>
+Your colleague replaced an O(<em>n</em> log <em>n</em>) sort with an O(<em>n</em>)
+bucketing pass and is puzzled that the "faster" version runs slower on their real dataset. Give two
+distinct explanations grounded in this chapter, and say what single action would settle which one (if
+either) is right.</div>
+
+<div class="exercise" id="ex1.6"><span class="ex-label">1.6</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> You must argue in a design review that a proposed change
+— switching a hot lookup table from a hash map spread across the heap to a sorted array searched by
+binary search — could be faster <em>despite</em> binary search's O(log <em>n</em>) being asymptotically
+worse than the hash map's O(1). Steps 1&ndash;3 are done; complete step 4.
+<br><strong>Step 1 (given):</strong> Both are cheap in big-O for realistic <em>n</em>, so scaling is
+not the deciding factor here — this is a constant-factor question.
+<br><strong>Step 2 (given):</strong> The constant factor is dominated by the memory hierarchy: how
+many <em>slow</em> memory accesses each structure makes per lookup.
+<br><strong>Step 3 (given):</strong> A hash map lookup typically jumps to one effectively random heap
+location (likely a cache miss); a binary search over a small contiguous sorted array touches a handful
+of locations, but they are close together and the array may sit largely in cache.
+<br><strong>Step 4 (you):</strong> Complete the argument — state the conclusion about which is likely
+to make fewer costly trips to slow memory, and name the one thing you would do before trusting the
+argument. Explain <em>why that final step and not simply "pick the lower big-O."</em></div>
+
+<div class="exercise" id="ex1.7"><span class="ex-label">1.7</span> <span class="ex-tag mixed">mixed</span>
+For each situation, decide whether the RAM/big-O model or the real cost model is the right tool, and
+say why in one line: (a) choosing between a nested-loop join and a hash join for tables that will grow
+to billions of rows; (b) explaining why two O(<em>n</em>) array-processing loops on a fixed 100&nbsp;MB
+array differ by 8&times; in wall-clock time; (c) deciding whether an algorithm will still be viable
+when the input is 1000&times; bigger; (d) explaining why a linked-list traversal is slower than an
+array traversal of the same length.</div>
+
+<div class="exercise" id="ex1.8"><span class="ex-label">1.8</span> <span class="ex-tag mixed">mixed</span>
+A teammate presents two claims: (i) "This algorithm is O(<em>n</em>), so it's optimal." (ii) "This
+one's O(<em>n</em>) too but ten times faster in practice." Are these claims in contradiction? Decide
+which cost model each claim belongs to, explain whether both can be true at once, and state what
+information you would still need to choose between the two implementations for production.</div>
+
+<div class="exercise" id="ex1.9"><span class="ex-label">1.9</span> <span class="ex-tag core">core</span>
+Define <em>mechanical sympathy</em> in your own words, and explain the ordering rule this chapter
+gives: why you apply it <em>after</em> choosing a good algorithm, not instead of choosing one. Give a
+one-sentence example of each failure mode (knowing only big-O; knowing only micro-optimization).</div>
+
+<div class="exercise" id="ex1.10"><span class="ex-label">1.10</span> <span class="ex-tag stretch">stretch</span>
+The latency table in §1.3 is labelled "orders of magnitude only, machine-dependent." Give three
+distinct reasons the specific numbers cannot be trusted as exact for <em>your</em> machine, and
+explain why the <em>ratios</em> between tiers are nonetheless far more stable than the absolute values.
+What would you do to get numbers you could actually trust for a performance decision?</div>
+
+<div class="exercise" id="ex1.11"><span class="ex-label">1.11</span> <span class="ex-tag lab">lab</span>
+On your machine, discover the real numbers instead of trusting the book. Run <code>getconf
+LEVEL1_DCACHE_LINESIZE</code> and <code>lscpu</code> (or <code>sysctl hw</code> on macOS) and write
+down your L1/L2/L3 cache sizes and the cache-line size. Then, in any language, write a loop that sums
+a large array that comfortably exceeds your L3 size and one that fits inside L1, timing each per
+element. Report the two per-element times and their ratio. State clearly which numbers are yours (the
+cache sizes, the measured ratio) and which came from the book (nothing — that's the point of the
+exercise).</div>
+
+</section>
+</section>

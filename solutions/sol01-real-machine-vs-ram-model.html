@@ -1,0 +1,114 @@
+<section class="solutions" id="sol01">
+<h1>Chapter 1 — Solutions</h1>
+
+<div class="solution" id="sol1.1"><span class="sol-label">1.1</span>
+<strong>Uniform cost:</strong> every basic operation — arithmetic, comparison, and any memory read or
+write — costs the same fixed unit of time, independent of which address is accessed. The three false
+assertions about real hardware: (1) all memory accesses cost the same (they vary by orders of
+magnitude with which tier of the hierarchy holds the data); (2) one instruction takes one unit of time
+(real CPUs overlap, reorder, and speculate, retiring several per cycle or stalling for hundreds —
+<a href="#ch02">Chapter 2</a>); (3) operations are independent and equally priced (some ops cost more
+than others, and a dependent instruction must wait for its input). <em>Method note:</em> the trap is
+listing symptoms ("caches exist") without naming the underlying assumption they violate — always tie
+the fact back to <em>uniform cost</em>.</div>
+
+<div class="solution" id="sol1.2"><span class="sol-label">1.2</span>
+Fastest to slowest: <strong>register</strong> (&lt;1&nbsp;ns) &lt; <strong>L1</strong> (~1&nbsp;ns)
+&lt; <strong>L2</strong> (a few ns) &lt; <strong>L3</strong> (~10&nbsp;ns) &lt; <strong>DRAM</strong>
+(~100&nbsp;ns) &lt; <strong>NVMe SSD</strong> (tens of &micro;s) &lt; <strong>same-datacenter network
+round trip</strong> (hundreds of &micro;s to ~1&nbsp;ms). All figures are orders of magnitude, machine-
+dependent (§1.3).</div>
+
+<div class="solution" id="sol1.3"><span class="sol-label">1.3</span>
+The memory wall is the large and historically widening gap between how fast a CPU can execute
+instructions and how long DRAM takes to return a requested byte, because processor throughput improved
+much faster than DRAM latency for decades (Wulf &amp; McKee, 1995). It makes uniform cost worse over
+time because the ratio between "one arithmetic op" and "one DRAM access" grew, so pricing a DRAM access
+at the same "one unit" as an add gets more wrong every hardware generation, not less.</div>
+
+<div class="solution" id="sol1.4"><span class="sol-label">1.4</span>
+(a) A few billion ops/second is ~3&times;10<sup>9</sup>/s, so in 100&nbsp;ns = 10<sup>&minus;7</sup>&nbsp;s
+the core could do on the order of <strong>a few hundred operations</strong> (3&times;10<sup>9</sup>
+&times; 10<sup>&minus;7</sup> = 300). (b) A program dominated by random pointer-following spends most
+of its time <em>waiting</em> for DRAM, leaving the arithmetic units idle for hundreds of potential
+operations per miss — so it can run at a small fraction of the core's peak throughput even though its
+big-O looks fine. <em>Order-of-magnitude flags:</em> both the 100&nbsp;ns and the few-billion-ops/s are
+approximate and machine-dependent; the point is the ratio (~10<sup>2</sup>), not the exact count.
+<strong>Feed-forward:</strong> if this surprised you, revisit §1.2.</div>
+
+<div class="solution" id="sol1.5"><span class="sol-label">1.5</span>
+Two explanations: (1) <strong>Constant factors dominate at this size.</strong> Big-O ignores the
+constant, and the O(<em>n</em>) bucketing pass may do far more <em>slow</em> memory traffic per element
+(e.g. scattering writes across buckets spread through DRAM) than the O(<em>n</em> log <em>n</em>) sort,
+which may stream memory in a cache-friendly order (§1.4). (2) <strong>Wrong regime.</strong> The
+asymptotic advantage only shows up once <em>n</em> is large enough; on this dataset <em>n</em> may be
+small enough that the log&nbsp;<em>n</em> factor is tiny and the bucketing's larger constant wins for
+the wrong reasons (§1.4). The single settling action: <strong>measure both on the real data</strong> —
+big-O cannot answer a "how fast" question. <em>Tempting wrong answer:</em> "the O(<em>n</em>) version
+must be faster, the benchmark is flawed" — this is trusting the RAM model for a speed question, exactly
+the §1.4 trap. <strong>Feed-forward:</strong> §1.4 and the warning box.</div>
+
+<div class="solution" id="sol1.6"><span class="sol-label">1.6</span>
+<strong>Step 4:</strong> The binary search over a small contiguous sorted array is likely to make
+<em>fewer trips to slow memory</em> per lookup — its handful of accesses are clustered and cache-
+friendly and the small array may live largely in cache, whereas the hash map's single lookup typically
+lands on a random heap address and pays a full cache/DRAM miss. So the asymptotically worse structure
+can win on real hardware because <em>the metric that matters here is costly-memory-accesses per lookup,
+not operation count.</em> The one thing to do before trusting the argument: <strong>benchmark both on
+the real data and access pattern.</strong> <em>Why this final step and not "pick the lower big-O":</em>
+big-O measures scaling and is silent about the constant factor — where the data lives — which is the
+entire basis of the argument; only measurement can confirm the memory-access reasoning holds for your
+actual sizes and hardware. <strong>Feed-forward:</strong> §1.4; the array-vs-pointer effect is measured
+in <a href="#ch03">Chapter 3</a>.</div>
+
+<div class="solution" id="sol1.7"><span class="sol-label">1.7</span>
+(a) <strong>RAM/big-O</strong> — the tables grow without bound, so the deciding factor is scaling
+(quadratic vs linear), which is exactly what big-O captures. (b) <strong>Real cost model</strong> —
+same size, same O(<em>n</em>); the 8&times; gap can only come from constant factors, i.e. memory-access
+patterns. (c) <strong>RAM/big-O</strong> — "1000&times; bigger" is a scaling question. (d) <strong>Real
+cost model</strong> — identical length and O(<em>n</em>); the difference is contiguous streaming vs
+random pointer-chasing through the hierarchy. <em>Method-selection cue:</em> if the question mentions
+"grows / bigger / scales," reach for big-O; if it fixes the size and asks "why is one faster," reach
+for the real cost model.</div>
+
+<div class="solution" id="sol1.8"><span class="sol-label">1.8</span>
+The claims are <strong>not in contradiction</strong>. Claim (i) is about the RAM/big-O model (optimal
+<em>scaling</em>); claim (ii) is about the real cost model (<em>speed</em> at a given size, set by
+constant factors the memory hierarchy dominates). Both can be true simultaneously: two O(<em>n</em>)
+algorithms are equally optimal asymptotically yet differ 10&times; in wall-clock time. To choose for
+production you still need: the actual input sizes you will run at, and a <strong>measurement</strong>
+of both on representative data and hardware. <em>Tempting wrong answer:</em> "'optimal' means fastest,
+so (i) and (ii) conflict" — conflating asymptotic optimality with speed, the core confusion of §1.4.</div>
+
+<div class="solution" id="sol1.9"><span class="sol-label">1.9</span>
+<strong>Mechanical sympathy</strong> is writing code that works <em>with</em> the grain of the hardware
+— its memory hierarchy, pipeline, and I/O costs — rather than against it, by understanding enough of
+how the machine works to get the most from it. The ordering rule: choose a good <em>algorithm</em>
+first (a bad big-O cannot be rescued by micro-optimization — no cache trick fixes an accidental
+quadratic), <em>then</em> apply mechanical sympathy to win the constant factor. Failure modes:
+knowing only big-O &rarr; asymptotically optimal code that needlessly runs 10&times; slow; knowing only
+micro-optimization &rarr; a lovingly hand-tuned O(<em>n</em><sup>2</sup>) that dies at scale.</div>
+
+<div class="solution" id="sol1.10"><span class="sol-label">1.10</span>
+Three reasons the absolute numbers can't be trusted: (1) they are <strong>microarchitecture-specific</strong>
+— cache sizes, latencies, and cycle counts differ across CPU models and generations; (2) they
+<strong>drift with hardware</strong> over time, so any printed figure is dated; (3) measured latency
+depends on <strong>context</strong> — contention, frequency scaling, what else is resident in cache, and
+access pattern — so there is no single "the" latency. The ratios are more stable because they reflect
+the <em>structural</em> reason each tier exists (each is a deliberate size/speed tradeoff a step down
+from the last), and that layering persists even as every absolute number moves. To get trustworthy
+numbers: <strong>measure on the actual target machine</strong> under representative load (a microbenchmark
+or a profiler), which is the discipline the performance-engineering chapters build. <strong>Feed-forward:</strong>
+§1.3; measurement technique in <a href="#ch03">Chapter 3</a>.</div>
+
+<div class="solution" id="sol1.11"><span class="sol-label">1.11</span>
+Answers are machine-specific by design; a correct write-up (i) reports real cache-line size (commonly
+64&nbsp;bytes on x86-64) and your actual L1/L2/L3 sizes from <code>getconf</code>/<code>lscpu</code>,
+(ii) reports two measured per-element times — the in-L1 loop should be markedly faster per element than
+the exceeds-L3 loop, which is bottlenecked on DRAM bandwidth — and (iii) states the ratio you observed.
+The learning goal is the habit: on a "how fast" question you <em>generated your own numbers</em> rather
+than quoting the book's orders of magnitude. Exact values depend entirely on your hardware; the
+<em>shape</em> (in-cache faster than out-of-cache) is what must appear. <strong>Feed-forward:</strong>
+the mechanism behind the ratio is §1.2&ndash;1.3 and all of <a href="#ch03">Chapter 3</a>.</div>
+
+</section>

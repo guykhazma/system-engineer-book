@@ -1,0 +1,178 @@
+/* The Data Engineer's Path — print stylesheet (WeasyPrint) */
+
+@page {
+  size: A4;
+  margin: 22mm 18mm 20mm 18mm;
+  @bottom-center { content: counter(page); font-family: "DejaVu Sans", sans-serif; font-size: 8.5pt; color: #555; }
+  @top-left { content: string(booktitle); font-family: "DejaVu Sans", sans-serif; font-size: 8pt; color: #888; }
+  @top-right { content: string(chaptertitle); font-family: "DejaVu Sans", sans-serif; font-size: 8pt; color: #888; }
+}
+@page :first { @top-left { content: none; } @top-right { content: none; } @bottom-center { content: none; } }
+@page cover { @top-left { content: none; } @top-right { content: none; } @bottom-center { content: none; } }
+@page part  { @top-left { content: none; } @top-right { content: none; } }
+
+html { font-size: 10.5pt; }
+body {
+  font-family: "DejaVu Serif", serif;
+  line-height: 1.5;
+  color: #1a1a1a;
+  string-set: booktitle "The Data Engineer's Path";
+}
+
+/* ---------- structure ---------- */
+.cover { page: cover; page-break-after: always; text-align: center; padding-top: 60mm; }
+.cover h1 { font-family: "DejaVu Sans", sans-serif; font-size: 26pt; margin-bottom: 4mm; color: #14406b; border: none; }
+.cover .subtitle { font-size: 12pt; color: #444; margin-bottom: 30mm; }
+.cover .meta { font-size: 9pt; color: #777; }
+
+.part-page { page: part; page-break-before: always; padding-top: 55mm; }
+.part-page .part-num { font-family: "DejaVu Sans", sans-serif; font-size: 11pt; letter-spacing: 2px; text-transform: uppercase; color: #14406b; }
+.part-page h1 { font-family: "DejaVu Sans", sans-serif; font-size: 20pt; color: #14406b; border: none; margin-top: 2mm;
+  bookmark-level: 1; bookmark-label: content(); bookmark-state: open; }
+.part-page .part-blurb { margin-top: 8mm; font-size: 10.5pt; color: #333; max-width: 130mm; }
+
+section.chapter { page-break-before: always; }
+section.chapter > h1 {
+  font-family: "DejaVu Sans", sans-serif; font-size: 17pt; color: #14406b;
+  border-bottom: 1.2pt solid #14406b; padding-bottom: 2mm; margin-bottom: 5mm;
+  string-set: chaptertitle content();
+  bookmark-level: 2; bookmark-label: content();
+}
+/* per-chapter navigation pointer (prerequisites + related chapters), sits just under the h1 */
+.chapter-nav { font-family: "DejaVu Sans", sans-serif; font-size: 8.6pt; color: #555;
+  background: #f5f8fb; border-left: 2pt solid #8a8f98; padding: 1.8mm 3mm; margin: 0 0 4mm;
+  page-break-inside: avoid; page-break-after: avoid; }
+.chapter-nav strong { color: #14406b; }
+.chapter-nav a { color: #14406b; }
+
+h2 { font-family: "DejaVu Sans", sans-serif; font-size: 12.5pt; color: #14406b; margin: 6mm 0 2.5mm;
+  bookmark-level: 3; bookmark-label: content(); }
+h3 { font-family: "DejaVu Sans", sans-serif; font-size: 10.5pt; color: #333; margin: 4mm 0 2mm; }
+h1, h2, h3 { page-break-after: avoid; }
+p { margin: 0 0 2.8mm; text-align: justify; hyphens: auto; }
+ul, ol { margin: 0 0 2.8mm 5mm; padding-left: 4mm; }
+li { margin-bottom: 1.3mm; }
+strong { color: #000; }
+a { color: #14406b; text-decoration: none; }
+
+/* ---------- code ---------- */
+code { font-family: "DejaVu Sans Mono", monospace; font-size: 8.6pt; background: #f4f4f2; padding: 0 1pt; }
+pre {
+  font-family: "DejaVu Sans Mono", monospace; font-size: 8.2pt; line-height: 1.4;
+  background: #f7f7f5; border: 0.5pt solid #ddd; border-left: 2pt solid #14406b;
+  padding: 2.5mm 3mm; margin: 3mm 0; white-space: pre-wrap; word-wrap: break-word;
+  page-break-inside: avoid;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+
+/* ---------- figures & tables ---------- */
+figure { margin: 4mm 0; text-align: center; page-break-inside: avoid; }
+figure svg { max-width: 100%; height: auto; }
+figcaption { font-family: "DejaVu Sans", sans-serif; font-size: 8.3pt; color: #555; margin-top: 1.5mm; text-align: center; }
+table { border-collapse: collapse; margin: 3.5mm auto; font-size: 8.8pt; page-break-inside: avoid; width: 100%; }
+th { font-family: "DejaVu Sans", sans-serif; background: #eef2f6; border: 0.5pt solid #bbb; padding: 1.4mm 2mm; text-align: left; font-size: 8.6pt; }
+td { border: 0.5pt solid #ccc; padding: 1.3mm 2mm; vertical-align: top; }
+
+/* ---------- boxes (asides) ---------- */
+aside { page-break-inside: avoid; margin: 3.5mm 0; padding: 2.5mm 3.5mm; font-size: 9.2pt; border: 0.5pt solid #ccc; }
+aside > .box-title { font-family: "DejaVu Sans", sans-serif; font-weight: bold; font-size: 8.6pt; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 1.5mm; display: block; }
+
+/* Green — key ideas, required at chapter end (first). */
+aside.takeaway { background: #f2f7f2; border-left: 2.5pt solid #2e6b34; }
+aside.takeaway .box-title { color: #2e6b34; }
+
+/* Blue — further reading, required at chapter end (last). */
+aside.further-reading { background: #f5f8fb; border-left: 2.5pt solid #14406b; }
+aside.further-reading .box-title { color: #14406b; }
+
+/* Red — operational trap / common mistake. */
+aside.warning { background: #fbf5f2; border-left: 2.5pt solid #8c3a1d; }
+aside.warning .box-title { color: #8c3a1d; }
+
+/* Purple — "Say it like an engineer": how to articulate the idea in an interview / design review. */
+aside.communicate { background: #f7f4fb; border-left: 2.5pt solid #5a3a8c; }
+aside.communicate .box-title { color: #5a3a8c; }
+
+/* Amber — complexity / cost callout: time, space, and I/O complexity of the thing just described. */
+aside.complexity { background: #fbf8f0; border-left: 2.5pt solid #8a6d1a; }
+aside.complexity .box-title { color: #8a6d1a; }
+
+/* Teal — hands-on lab: something the reader runs (DuckDB / PySpark / pyiceberg). */
+aside.lab { background: #f0f7f7; border-left: 2.5pt solid #1a6d6d; }
+aside.lab .box-title { color: #1a6d6d; }
+
+aside ul { margin-bottom: 0; }
+aside.takeaway ul, aside.complexity ul { margin-bottom: 0; }
+
+/* ---------- exercises & solutions ---------- */
+/* Exercises live at the end of a chapter (before further-reading). Solutions are
+   collected per-chapter at the back of the book, keyed by the same exN.k ids. */
+section.exercises { margin: 5mm 0 0; padding-top: 3mm; border-top: 1pt solid #14406b; }
+section.exercises > h2 { border: none; }
+.exercise { page-break-inside: avoid; margin: 3mm 0; }
+.exercise .ex-label {
+  font-family: "DejaVu Sans", sans-serif; font-weight: bold; color: #14406b; font-size: 9.5pt;
+  margin-right: 2mm;
+}
+.exercise .ex-tag {
+  font-family: "DejaVu Sans", sans-serif; font-size: 7.4pt; text-transform: uppercase;
+  letter-spacing: 0.6px; color: #fff; background: #8a8f98; padding: 0.3mm 1.4mm;
+  border-radius: 2pt; margin-left: 1.5mm; vertical-align: middle;
+}
+.exercise .ex-tag.warm { background: #2e6b34; }      /* warm-up / recall */
+.exercise .ex-tag.core { background: #14406b; }      /* core / applied */
+.exercise .ex-tag.stretch { background: #8c3a1d; }   /* stretch / open-ended */
+.exercise .ex-tag.lab { background: #1a6d6d; }       /* runnable lab */
+.exercise .ex-tag.complexity { background: #8a6d1a; }/* complexity analysis */
+
+section.solutions { page-break-before: always; }
+section.solutions > h1 {
+  font-family: "DejaVu Sans", sans-serif; font-size: 15pt; color: #14406b;
+  border-bottom: 1pt solid #14406b; padding-bottom: 2mm; margin-bottom: 4mm;
+  string-set: chaptertitle content(); bookmark-level: 2; bookmark-label: content();
+}
+.solution { margin: 3mm 0; page-break-inside: avoid; }
+.solution .sol-label { font-family: "DejaVu Sans", sans-serif; font-weight: bold; color: #2e6b34; font-size: 9.5pt; }
+
+/* ---------- TOC ---------- */
+nav.toc { page-break-before: always; }
+nav.toc h1 { font-family: "DejaVu Sans", sans-serif; font-size: 17pt; color: #14406b; border-bottom: 1.2pt solid #14406b; padding-bottom: 2mm; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; }
+nav.toc li { margin: 0; }
+nav.toc a { text-decoration: none; color: #1a1a1a; }
+nav.toc .toc-part { font-family: "DejaVu Sans", sans-serif; font-weight: bold; color: #14406b; margin-top: 4mm; font-size: 10.5pt; }
+nav.toc .toc-ch { margin-left: 4mm; font-size: 9.5pt; margin-top: 1mm; }
+nav.toc .toc-ch a::after { content: leader('.') target-counter(attr(href), page); }
+
+/* ---------- cheat sheet (back matter) ---------- */
+section.cheatsheet { page-break-before: always; }
+section.cheatsheet > h1 {
+  font-family: "DejaVu Sans", sans-serif; font-size: 17pt; color: #14406b;
+  border-bottom: 1.2pt solid #14406b; padding-bottom: 2mm; margin-bottom: 4mm;
+  string-set: chaptertitle content(); bookmark-level: 1; bookmark-label: content(); bookmark-state: open;
+}
+section.cheatsheet h2 { font-size: 11pt; bookmark-level: 2; }
+section.cheatsheet table { font-size: 8.2pt; margin: 2mm auto; }
+section.cheatsheet th, section.cheatsheet td { padding: 1mm 1.6mm; }
+section.cheatsheet pre { font-size: 7.8pt; }
+section.cheatsheet .cs-intro { font-size: 9pt; color: #444; font-style: italic; }
+
+/* ---------- concept index (back matter) ---------- */
+section.index { page-break-before: always; }
+section.index > h1 {
+  font-family: "DejaVu Sans", sans-serif; font-size: 17pt; color: #14406b;
+  border-bottom: 1.2pt solid #14406b; padding-bottom: 2mm; margin-bottom: 5mm;
+  string-set: chaptertitle content(); bookmark-level: 1; bookmark-label: content();
+}
+section.index .idx-cols { column-count: 2; column-gap: 8mm; font-size: 8.6pt; line-height: 1.35; }
+section.index .idx-letter { font-family: "DejaVu Sans", sans-serif; font-weight: bold; color: #14406b;
+  font-size: 10pt; margin: 3mm 0 1mm; break-after: avoid; }
+section.index .idx-entry { margin: 0 0 0.6mm; text-indent: -3mm; padding-left: 3mm; break-inside: avoid; }
+section.index .idx-entry a { color: #14406b; text-decoration: none; }
+
+/* --- Pedagogy conventions (PEDAGOGY.md): retrieval, faded/mixed practice, multi-representation --- */
+aside.recall { border-left: 4px solid #6a4fb3; background: #f4f1fb; }
+:root[data-theme="dark"] aside.recall, @media (prefers-color-scheme: dark) { }
+aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
+.exercise .ex-tag.faded { background: #6a4fb3; }   /* worked->faded->independent */
+.exercise .ex-tag.mixed { background: #9c4a8a; }   /* interleaved: pick the method */

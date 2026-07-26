@@ -1,0 +1,384 @@
+<section class="chapter" id="ch06">
+<h1>Chapter 6 — The Cost Model, Applied (Capstone Lab)</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> all of Part 1 —
+<a href="#ch01">Chapter 1</a> (the latency hierarchy), <a href="#ch02">Chapter 2</a> (the CPU),
+<a href="#ch03">Chapter 3</a> (caches), <a href="#ch04">Chapter 4</a> (the TLB),
+<a href="#ch05">Chapter 5</a> (data layout). &nbsp;·&nbsp; <strong>Pairs with:</strong> the
+performance-engineering Part, which turns these estimates into profiled, tool-verified analysis. This
+chapter is the capstone: you <em>predict</em> from the cost model, then <em>measure</em>, then
+<em>reconcile</em>.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, across the whole Part: (1) <a href="#ch01">Chapter 1</a>'s orders of magnitude — an L1
+hit ~1&nbsp;ns, an L2 hit a few ns, a DRAM access ~100&nbsp;ns. About how many times slower is DRAM than
+L2? (2) <a href="#ch03">Chapter 3</a> — what does the hardware <em>prefetcher</em> do for a sequential
+access pattern? (3) <em>Predict, and write it down:</em> you sum a 1&nbsp;MiB array (fits in L2) and a
+512&nbsp;MiB array (lives in DRAM), touching the same total number of elements. From the latency numbers
+alone, how many times slower would you guess the DRAM sum is — 2&times;? 10&times;? 100&times;? Hold your
+number; this chapter measures it, and the answer is a lesson.</p>
+</aside>
+
+<p>Everything in Part 1 has been building one instrument: a <strong>cost model</strong> — a set of
+orders of magnitude and mechanisms that lets you estimate, before writing or profiling a line, roughly
+how fast a piece of code <em>can</em> go and what will limit it. This closing chapter uses that
+instrument for real. First we assemble the estimation toolkit and the single most useful classification
+in performance work — is this workload <strong>compute-bound</strong>, <strong>memory-bound</strong>, or
+<strong>I/O-bound</strong>? Then we run the capstone lab: predict the cost of two array sums from the
+model, measure them on real hardware, and — this is the whole point — <em>reconcile the surprise</em>
+when the measurement defies the naive prediction. The reconciliation is where the model earns its keep,
+because a cost model you cannot correct against reality is just a table of numbers to misquote.</p>
+
+<h2>6.1 Back-of-the-envelope estimation</h2>
+
+<p>Back-of-the-envelope estimation means getting the right <em>order of magnitude</em> with arithmetic
+you can do in your head, using the ratios from this Part — not predicting a benchmark to three digits.
+The toolkit is small, and every number in it is one you already have (treat all as approximate and
+machine-dependent; the register-through-DRAM figures anchor to CS:APP, the SSD/network ones to the
+community "latency numbers" list, both introduced in <a href="#ch01">Chapter 1</a>):</p>
+
+<ul>
+<li><strong>Latencies</strong> (time to get <em>one</em> scattered item): L1 ~1&nbsp;ns, L2 a few ns, L3
+~10&nbsp;ns, DRAM ~100&nbsp;ns, local SSD tens of &micro;s, network round trip hundreds of &micro;s and
+up — multiplicative jumps, ~10&ndash;100&times; per tier.</li>
+<li><strong>Bandwidths</strong> (throughput for <em>streaming</em> many contiguous items): memory
+delivers on the order of <em>gigabytes per second</em> per core when accessed sequentially, because the
+prefetcher and full-line fetches keep the pipe full. Latency and bandwidth are <em>different</em> numbers
+answering different questions — the distinction is the hinge of this whole chapter.</li>
+<li><strong>Compute</strong>: a core executes on the order of a few instructions per cycle at a few GHz —
+so ~10<sup>9</sup>&ndash;10<sup>10</sup> simple operations per second per core (Chapters 1&ndash;2).</li>
+<li><strong>Sizes that gate tier</strong>: which tier your data lives in is set by working-set size
+versus cache sizes (measure your own with <code>lscpu</code>/<code>getconf</code>). Fits in L2 &rarr;
+L2 speed; spills past L3 &rarr; DRAM speed; larger than RAM &rarr; SSD/I-O speed.</li>
+</ul>
+
+<p>The method: estimate how many operations and how many bytes the work requires, divide by the relevant
+rate, and take the <em>larger</em> of the compute-time and memory-time estimates as your floor — because
+the resource in shorter supply is the bottleneck. That single comparison is the next section.</p>
+
+<h2>6.2 Compute-bound, memory-bound, or I/O-bound</h2>
+
+<p>The most useful question you can ask about a workload is <em>what resource is it waiting on?</em>
+Three broad answers, each pointing at a different toolkit:</p>
+
+<ul>
+<li><strong>Compute-bound:</strong> the bottleneck is the CPU's execution units — lots of arithmetic per
+byte of data, data already in cache. Time scales with operations, not memory traffic. The levers are
+Chapter 2's: better ILP, fewer/ predictable branches, vectorization, a lower-complexity algorithm.</li>
+<li><strong>Memory-bound:</strong> the bottleneck is moving data between the CPU and memory — little
+arithmetic per byte, or a working set that spills to DRAM. Time scales with bytes moved and miss counts,
+not with the arithmetic. The levers are Chapters 3&ndash;5's: locality, layout (AoS/SoA), blocking, and
+fewer, fuller cache lines and pages.</li>
+<li><strong>I/O-bound:</strong> the bottleneck is the disk or network — the workload spends its time
+waiting on tens-of-microseconds-and-up operations. Time scales with I/O operations and their latency; the
+levers are batching, asynchrony, and reducing round trips (the low-level I/O Part).</li>
+</ul>
+
+<p>The deciding ratio is <em>work per byte</em>: an operation that does much arithmetic on each byte it
+loads (a dense matrix multiply) tends compute-bound; one that does almost nothing per byte (summing an
+array, copying memory) tends memory-bound; one dominated by waiting on storage or a socket is I/O-bound.
+Crucially, <em>the same algorithm can change class with its input size</em>: a sum whose array fits in
+cache may be limited by the add pipeline (compute-ish), while the identical sum over an array that spills
+to DRAM becomes memory-bound. This is why "profile before you optimize" is not a platitude — apply the
+memory toolkit to a compute-bound loop and you get nothing. Estimate the class first; the estimate tells
+you which chapter to open.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Classify each as most likely compute-, memory-, or I/O-bound: (a) summing a 500&nbsp;MiB array once;
+(b) a dense N&times;N matrix multiply with N small enough to fit in cache; (c) reading 10,000 small
+records from an SSD one at a time. (Answer after the lab.)</p>
+</aside>
+
+<h2>6.3 The capstone lab, part 1: predict, measure, reconcile a surprise</h2>
+
+<p>Now the payoff. We will estimate, then measure, the cost of summing an array that fits in L2 versus
+one that spills to DRAM — and confront the gap between the naive prediction and the result.</p>
+
+<p><strong>The prediction (naive, from latency numbers).</strong> A 1&nbsp;MiB array of
+<code>long</code> fits in this machine's per-core L2 (1.25&nbsp;MiB); a 512&nbsp;MiB array is far past the
+24&nbsp;MiB L3, so it lives in DRAM. If you reach for the <em>latency</em> numbers — L2 a few ns, DRAM
+~100&nbsp;ns — the tempting estimate is that the DRAM sum should be roughly <strong>an order of magnitude
+or more slower</strong>, maybe 10&ndash;100&times;. Write that prediction down; it is the one most readers
+make, and it is wrong — instructively.</p>
+
+<p><strong>The measurement.</strong> Summing into a <code>long</code>, touching the same total element
+count in both cases (the 1&nbsp;MiB array swept many times, the 512&nbsp;MiB array once), built with
+<code>gcc -O2</code> and run for this book on an i7-12700H (best of 5):</p>
+
+<pre><code>/* both sum the SAME number of elements; only where the data lives differs */
+for (pass ...) for (i &lt; n) sum += a[i];   /* small n: L2-resident;  big n: DRAM */</code></pre>
+
+<table>
+<tr><th>Working set</th><th>Time (same total elements)</th><th>ns / element</th><th>Effective GB/s</th></tr>
+<tr><td>L2-resident (1&nbsp;MiB, many passes)</td><td>~0.048&ndash;0.050 s</td><td>~0.71&ndash;0.75</td><td>~10.7&ndash;11.2</td></tr>
+<tr><td>DRAM-resident (512&nbsp;MiB, one pass)</td><td>~0.082&ndash;0.086 s</td><td>~1.22&ndash;1.28</td><td>~6.3&ndash;6.6</td></tr>
+</table>
+
+<p>The DRAM sum was only about <strong>1.7&times;</strong> slower than the L2 sum — <em>not</em> the
+10&ndash;100&times; the latency numbers suggested. (These figures are machine-dependent; the point is the
+<em>ratio's</em> surprise, not the digits.)</p>
+
+<p><strong>The reconciliation — why the prediction was wrong.</strong> The naive estimate used the wrong
+number. The ~100&nbsp;ns DRAM figure is a <em>latency</em> — the time to get <em>one</em> scattered item
+when you must wait for it. But a sequential sum does not wait for one item at a time: the access pattern
+is stride-1, so the <strong>hardware prefetcher</strong> (Chapter 3) sees it coming and streams lines
+ahead of the loop, and the CPU has many independent loads in flight. The workload is therefore
+<strong>bandwidth-bound, not latency-bound</strong> — its speed is set by how fast memory can stream
+contiguous data, not by the latency of a single miss. And streaming bandwidth from DRAM, while lower than
+from L2, is within a small factor of it; here the loop achieved ~11&nbsp;GB/s out of L2 and ~6&nbsp;GB/s
+out of DRAM (both also partly capped by the single-accumulator add dependency of §2.3, which is why
+neither is dramatic). Prefetching converted a would-be 100&times; latency gap into a ~1.7&times;
+bandwidth gap. <em>That</em> is the lesson of the capstone: <strong>use latency for scattered access and
+bandwidth for streaming access</strong> — reach for the wrong one and your estimate is off by orders of
+magnitude.</p>
+
+<h2>6.4 The capstone lab, part 2: when the memory wall really bites</h2>
+
+<p>So does the ~100&nbsp;ns DRAM latency ever show up? Yes — precisely when the prefetcher <em>cannot</em>
+help, i.e. when access is scattered and dependent, so there is no stream to run ahead of and no
+independent work to overlap. That is the pointer-chasing pattern of <a href="#ch03">Chapter 3</a>. To
+expose it, chase a pointer around a random cyclic permutation (each step's address comes from the
+previous read) over the same two working sets — L2-resident and DRAM-resident — timing an equal number of
+dependent steps. Measured on the same machine (best of 3):</p>
+
+<table>
+<tr><th>Working set (random pointer-chase)</th><th>ns / dependent step</th><th>DRAM/L2 ratio</th></tr>
+<tr><td>L2-resident (1&nbsp;MiB)</td><td>~6 ns</td><td rowspan="2" style="vertical-align:middle">~24&ndash;25&times;</td></tr>
+<tr><td>DRAM-resident (512&nbsp;MiB)</td><td>~150&ndash;158 ns</td></tr>
+</table>
+
+<p>Now the latency gap appears in full: ~24&ndash;25&times;, and the DRAM chase costs ~150&nbsp;ns per
+step — comfortably in the ~100&nbsp;ns order of magnitude Chapter 1 gave for a DRAM access, and in fact
+somewhat <em>more</em>. That surplus over the bare ~100&nbsp;ns is itself a Part-1 lesson: a random chase
+over 512&nbsp;MiB also <strong>thrashes the TLB</strong> (<a href="#ch04">Chapter 4</a>) — each jump lands
+on a new page whose translation is likely evicted — so part of the ~150&nbsp;ns is the page-table walk
+stacked on top of the data miss. Same hardware, same data sizes as §6.3; the <em>only</em> change is
+sequential&rarr;random access, and the cost went from a ~1.7&times; bandwidth gap to a ~25&times; latency
+gap. This is the whole Part in one contrast: <em>where your data lives</em> matters, but <em>how you walk
+it</em> decides whether the memory wall is hidden or paid in full.</p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="18" fill="#14406b">Same L2 vs DRAM data, two access patterns</text>
+<text x="20" y="44" fill="#2e6b34">Sequential sum (bandwidth-bound):</text>
+<rect x="230" y="32" width="60" height="16" fill="#cfe8cf" stroke="#2e6b34"/><text x="296" y="44" font-size="9">L2 ~0.7 ns/elem</text>
+<rect x="230" y="54" width="103" height="16" fill="#bcdcbc" stroke="#2e6b34"/><text x="340" y="66" font-size="9">DRAM ~1.25 ns/elem &mdash; only ~1.7&times;</text>
+<text x="20" y="96" fill="#8c3a1d">Random pointer-chase (latency-bound):</text>
+<rect x="230" y="84" width="14" height="16" fill="#f0c9bd" stroke="#8c3a1d"/><text x="250" y="96" font-size="9">L2 ~6 ns/step</text>
+<rect x="230" y="106" width="360" height="16" fill="#e2a48f" stroke="#8c3a1d"/><text x="230" y="140" font-size="9" fill="#8c3a1d">DRAM ~150 ns/step &mdash; ~25&times; (memory wall + TLB walk exposed)</text>
+<line x1="230" y1="160" x2="590" y2="160" stroke="#999"/>
+<text x="20" y="180" font-size="10" fill="#555">Prefetching hides latency for sequential access; a dependent random walk cannot be prefetched, so it pays full DRAM latency.</text>
+<text x="20" y="196" font-size="9" fill="#777">Measured, i7-12700H, gcc -O2. Machine-dependent; the contrast, not the digits, is the point.</text>
+</svg>
+<figcaption>Figure 6.1: The same data sizes, two access patterns. Sequential streaming is bandwidth-bound
+(DRAM only ~1.7&times; slower than L2); a dependent random chase is latency-bound (~25&times;), exposing
+the full memory wall plus TLB cost.</figcaption>
+</figure>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: latency vs. bandwidth decides the estimate</span>
+<p><strong>1. In words.</strong> DRAM's ~100&nbsp;ns is a <em>latency</em> — the wait for one scattered
+item. Sequential access is not a series of waits; the prefetcher streams data, so it runs at memory
+<em>bandwidth</em>, within a small factor of cache. Predict streaming with bandwidth, scattered access
+with latency.</p>
+<p><strong>2. As a picture.</strong> Figure 6.1: a small sequential gap (bandwidth) beside a large random
+gap (latency) over the identical data sizes.</p>
+<p><strong>3. As measurements.</strong> Sequential sum: DRAM ~1.7&times; L2. Random chase: DRAM
+~25&times; L2, ~150&nbsp;ns/step. The model predicted 100&times; from latency; the streaming case
+corrected it to ~1.7&times;; the scattered case confirmed the latency really is there when nothing hides
+it.</p>
+</aside>
+
+<p><em>(Answer to the §6.2 quick check: (a) <strong>memory-bound</strong> — one add per 8 bytes, streams
+from DRAM; (b) <strong>compute-bound</strong> — much arithmetic per byte, data resident in cache; (c)
+<strong>I/O-bound</strong> — dominated by per-record SSD latency, and batching/async would help.)</em></p>
+
+<aside class="warning">
+<span class="box-title">Trap: guessing instead of profiling (and estimating with the wrong number)</span>
+<p>Two failures this Part has hammered, together at last. The first: <em>optimizing without measuring</em>
+— rewriting a loop's layout or algorithm on a hunch, when a five-minute profile would have shown the time
+is somewhere else entirely. The second, subtler: <em>estimating with the wrong model</em> — as in §6.3,
+where the ~100&nbsp;ns latency number predicts a 100&times; gap for a workload that is actually
+bandwidth-bound and shows ~1.7&times;. A back-of-the-envelope estimate is a hypothesis about the
+bottleneck, not a verdict; it tells you where to <em>look</em> and which class you expect, and then you
+measure to confirm the class and find the real limiter. The tell that you have mis-estimated is exactly
+the §6.3 surprise: a measurement off from your prediction by more than a small factor — treat that gap as
+information (usually you used latency where bandwidth applies, or vice versa), reconcile it, and update
+the model. Guessing the cause and skipping the measurement is how good engineers waste days; the
+discipline of Part 1 is estimate, measure, reconcile, in that order.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A colleague says: "DRAM is 100&times; slower than cache, so our big sequential
+scan over the 500&nbsp;MiB table must be crippled — let's cache it in a fancy structure." Cover the
+paragraph and answer in three or four sentences, using <em>latency</em>, <em>bandwidth</em>,
+<em>prefetcher</em>, and <em>bound</em>.</p>
+<p><em>Model answer.</em> "That 100&times; is a <em>latency</em> figure — the wait for one scattered
+access. Our scan is sequential, so the prefetcher streams the data and we run at memory <em>bandwidth</em>,
+which is within a small factor of cache; the scan is bandwidth-bound, not latency-bound, so it's probably
+only a couple of times slower than if it fit in cache, not 100&times;. Before we build anything, let's
+measure the scan's GB/s and confirm it's near memory bandwidth — if it is, a fancy cache buys little and
+the win, if any, is fewer bytes touched, not lower latency. Where latency <em>would</em> bite is if we
+switched to scattered, pointer-chasing access — then we'd pay the full ~100&nbsp;ns-plus per step."
+Naming which resource bounds the workload, and measuring before building, is the senior register.</p>
+</aside>
+
+<h2>6.5 Closing Part 1: from the machine to the code that respects it</h2>
+
+<p>Six chapters ago the RAM model told a comforting lie: every operation costs one unit, memory is
+uniform, and speed follows big-O. Part 1 replaced it with the real cost model. You know the machine now —
+the CPU that overlaps and predicts (<a href="#ch02">Chapter 2</a>), the cache hierarchy that moves memory
+in lines and rewards locality (<a href="#ch03">Chapter 3</a>), the TLB that translates addresses and
+punishes scattered pages (<a href="#ch04">Chapter 4</a>) — and you know how to spend that knowledge:
+lay data out for the access pattern (<a href="#ch05">Chapter 5</a>), and estimate before you optimize,
+distinguishing latency from bandwidth and compute-bound from memory-bound from I/O-bound (this chapter).
+The habit that unifies all of it is the one the whole Part drilled: when two pieces of code have the same
+big-O but different speed, the difference is the machine — and you now know where to look, what to
+estimate, and how to confirm it by measuring.</p>
+
+<p>This closes Part 1, "The Machine &amp; the Cost Model," and opens the rest of the volume. Part 2 takes
+you into <strong>C and manual memory</strong>: pointers, the stack and heap, alignment and layout under
+your direct control, and undefined behavior — programming with no safety net so you understand the net.
+Everything you estimated here in the abstract, you will there arrange in bytes by hand. The cost model is
+no longer something the machine hides from you; it is a tool you carry into every line you write.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Do a <strong>back-of-the-envelope</strong> estimate: turn a workload into operations and bytes, divide
+by the right rate, and take the larger estimate as the floor.</li>
+<li>Distinguish <strong>latency</strong> from <strong>bandwidth</strong> and say which applies to
+scattered vs. streaming access — and why using the wrong one mispredicts by orders of magnitude.</li>
+<li>Classify a workload as <strong>compute-, memory-, or I/O-bound</strong> from its work-per-byte, and
+name which chapter's levers each class points to.</li>
+<li>Explain the <strong>§6.3 surprise</strong>: why the sequential DRAM sum was only ~1.7&times; slower
+than the L2 sum, not 100&times; (prefetcher &rarr; bandwidth-bound).</li>
+<li>Explain the <strong>§6.4 contrast</strong>: why the random pointer-chase <em>did</em> show ~25&times;
+and ~150&nbsp;ns/step, and what part of that surplus is TLB cost.</li>
+<li>State the discipline in order — <strong>estimate, measure, reconcile</strong> — and why a
+prediction-vs-measurement gap is information, not failure.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Give the back-of-the-envelope method for deciding whether code is compute- or
+memory-bound, and the "work per byte" intuition behind it. (§6.1&ndash;6.2)</li>
+<li><strong>R2.</strong> What is the difference between latency and bandwidth, and which one governs a
+sequential scan? (§6.1, §6.3)</li>
+<li><strong>R3.</strong> Why was the sequential DRAM sum only ~1.7&times; slower than the L2 sum when the
+latency numbers suggested far more? (§6.3)</li>
+<li><strong>R4.</strong> Why did the random pointer-chase show ~25&times; and ~150&nbsp;ns/step, and why
+is that <em>more</em> than the bare DRAM latency? (§6.4)</li>
+<li><strong>R5.</strong> State the estimate–measure–reconcile discipline and explain why a gap between
+prediction and measurement is useful rather than embarrassing. (§6.3, warning box)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>MIT 6.172, <em>Performance Engineering of Software Systems</em></strong> (free OCW). The
+applied home of this chapter: profiling, distinguishing compute- from memory-bound work, and measuring
+bandwidth vs. latency with real tools — the direct continuation into the performance-engineering Part.</li>
+<li><strong>Agner Fog, optimization manuals</strong> (free, <em>agner.org</em>). Microarchitectural
+detail behind the compute-bound levers — throughput vs. latency of instructions, and how many can be in
+flight. Dated in specifics; verify against your CPU.</li>
+<li><strong>Drepper, "What Every Programmer Should Know About Memory"</strong> (2007, free) and
+<strong>Bryant &amp; O'Hallaron, CS:APP</strong>, Chapters 6 and 9. The mechanisms this chapter estimates
+against — cache and memory bandwidth, prefetching, and translation cost. Read Drepper for mechanism, not
+its dated absolute numbers; the "latency numbers" list (Jeff Dean / Colin Scott) supplies the SSD/network
+orders of magnitude, strictly as ratios.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex6.1"><span class="ex-label">6.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define latency and bandwidth, and say which one you would use to estimate the time
+to (a) fetch one random element from a huge array, and (b) stream through a huge array in order.</div>
+
+<div class="exercise" id="ex6.2"><span class="ex-label">6.2</span> <span class="ex-tag warm">warm-up</span>
+Classify each workload as compute-, memory-, or I/O-bound and give the one-line reason: (a)
+<code>memcpy</code> of 1&nbsp;GiB; (b) computing SHA-256 over data already in L1; (c) fetching 1,000 rows
+one-by-one from a remote database.</div>
+
+<div class="exercise" id="ex6.3"><span class="ex-label">6.3</span> <span class="ex-tag warm">warm-up</span>
+State the estimate–measure–reconcile discipline in order, and say in one sentence why a gap between your
+prediction and the measurement is useful information.</div>
+
+<div class="exercise" id="ex6.4"><span class="ex-label">6.4</span> <span class="ex-tag core">core</span>
+You must sum a 512&nbsp;MiB array of <code>long</code> once. (a) Estimate the time two ways: from DRAM
+<em>latency</em> (~100&nbsp;ns per element) and from streaming <em>bandwidth</em> (assume ~6&nbsp;GB/s for
+this loop). (b) Which estimate is right for a sequential sum, and why? (c) By roughly what factor do the
+two estimates differ, and what does that factor tell you about the cost of using the wrong model?</div>
+
+<div class="exercise" id="ex6.5"><span class="ex-label">6.5</span> <span class="ex-tag core">core</span>
+Explain the §6.3 result to a teammate: the DRAM sum was only ~1.7&times; slower than the L2 sum. (a) Why
+did the prefetcher make this bandwidth-bound rather than latency-bound? (b) Why was even the L2 sum not
+much faster than a naive "few-ns-per-access" guess would allow (name the §2.3 factor)? (c) What single
+change to the code would let it approach memory bandwidth more closely?</div>
+
+<div class="exercise" id="ex6.6"><span class="ex-label">6.6</span> <span class="ex-tag complexity">cost</span>
+A kernel does <em>F</em> floating-point operations and moves <em>B</em> bytes. Your core can do ~10<sup>10</sup>
+ops/s and stream ~10<sup>10</sup> bytes/s. (a) Write the compute-time and memory-time estimates. (b) Give
+the condition on <em>F</em>/<em>B</em> (work per byte) under which the kernel is compute-bound. (c) A sum
+does one add per 8 bytes — is it compute- or memory-bound by this test, and does the measurement in §6.3
+agree?</div>
+
+<div class="exercise" id="ex6.7"><span class="ex-label">6.7</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Reconcile why the random pointer-chase over 512&nbsp;MiB
+cost ~150&nbsp;ns/step while the sequential sum over the same array cost ~1.25&nbsp;ns/element. Steps
+1&ndash;3 given; complete step 4.
+<br><strong>Step 1 (given):</strong> Both touch DRAM-resident data of the same size; the only difference
+is access pattern (sequential vs. dependent-random).
+<br><strong>Step 2 (given):</strong> Sequential access is prefetchable and has many independent loads in
+flight, so it runs at bandwidth (§6.3).
+<br><strong>Step 3 (given):</strong> The random chase is a dependency chain — each step's address comes
+from the previous read — so it cannot be prefetched or overlapped and pays full latency per step (§3.5).
+<br><strong>Step 4 (you):</strong> Complete the reconciliation: explain why ~150&nbsp;ns/step is
+<em>more</em> than the ~100&nbsp;ns bare DRAM latency (name the Chapter 4 mechanism), and state the one
+measurement that would confirm that extra cost is translation, not data. Then say what this pair of
+results teaches about when to estimate with latency vs. bandwidth.</div>
+
+<div class="exercise" id="ex6.8"><span class="ex-label">6.8</span> <span class="ex-tag mixed">mixed</span>
+For each observation, name the most likely bottleneck class (compute / memory / I/O) <em>and</em> the
+specific mechanism from Chapters 1&ndash;6, and justify in a line: (a) a sequential scan runs at ~6&nbsp;GB/s
+and adding threads barely helps; (b) a loop with a data-dependent branch speeds up 3&times; after sorting
+the input; (c) a random lookup into a 2&nbsp;GiB index costs ~160&nbsp;ns and huge pages help; (d) a dense
+matrix multiply that fits in cache is limited by how many multiply-adds per cycle the core issues.</div>
+
+<div class="exercise" id="ex6.9"><span class="ex-label">6.9</span> <span class="ex-tag mixed">mixed</span>
+A report claims a data pipeline stage is "slow because DRAM is 100&times; slower than cache." Given only
+that the stage streams sequentially through a 4&nbsp;GiB file-backed array, (a) say why the 100&times;
+framing is probably the wrong model, (b) predict the rough class and the rough slowdown vs. an in-cache
+version, and (c) name the two measurements you would take to confirm your reframing before anyone
+optimizes.</div>
+
+<div class="exercise" id="ex6.10"><span class="ex-label">6.10</span> <span class="ex-tag stretch">stretch</span>
+The chapter measured a sequential DRAM/L2 ratio of ~1.7&times; and a random one of ~25&times; on one
+machine. (a) Explain why the <em>random</em> ratio is far more portable across machines than the sequential
+one (think about what each is bounded by). (b) Give one machine change that would raise the sequential
+ratio and one that would lower the random ns-per-step. (c) Argue why reporting both ratios — with the
+access pattern that produced each — is more honest and more useful than a single "DRAM is N&times; slower"
+headline number.</div>
+
+<div class="exercise" id="ex6.11"><span class="ex-label">6.11</span> <span class="ex-tag lab">lab</span>
+<strong>Capstone.</strong> On your own machine: (1) record your L2 and L3 sizes and cache-line size.
+(2) <em>Predict</em>, from the cost model and before running, the time to sum an L2-sized array vs. a
+DRAM-sized array (same total elements), stating whether you expect it bandwidth- or latency-bound and
+your predicted ratio — write it down first. (3) Measure both (verify identical sums; best of several
+runs) and report ns/element and effective GB/s. (4) Then measure the <em>random pointer-chase</em> version
+over the same two sizes and report ns/step. (5) <em>Reconcile</em>: compare each measurement to your
+prediction, explain any surprise using latency-vs-bandwidth and (for the random case) the TLB, and if you
+can, capture cache-miss and TLB-miss counters (e.g. <code>perf stat</code>) to support your explanation.
+Report only numbers you actually measured; if a loop is elided, consume the result and say what you did.</div>
+
+</section>
+</section>

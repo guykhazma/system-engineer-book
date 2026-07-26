@@ -1,0 +1,396 @@
+<section class="chapter" id="ch05">
+<h1>Chapter 5 — Mechanical Sympathy &amp; Data-Oriented Design</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch03">Chapter 3</a> (cache lines,
+locality, the three C's), <a href="#ch04">Chapter 4</a> (the TLB), <a href="#ch01">Chapter 1</a>
+(mechanical sympathy as this volume's thesis). &nbsp;·&nbsp; <strong>Pairs with:</strong>
+<a href="#ch06">Chapter 6</a> (the capstone lab) and the performance-engineering Part. This is where the
+last four chapters stop being knowledge <em>about</em> the machine and become a way of <em>designing your
+data</em>.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch03">Chapter 3</a> — memory moves in 64-byte lines, so the
+cost of an access is really "per line fetched." If a loop uses only 8 of the 64 bytes in each line it
+brings in, roughly what fraction of the memory bandwidth it pays for is wasted? (2) <a href="#ch01">Chapter
+1</a> named this volume's thesis after a driving metaphor — what is the two-word term, and who is it
+attributed to? (3) <em>Predict:</em> you have 16 million "particles," each a struct with 8 fields, and
+you need to sum just <em>one</em> field across all of them. Does it matter for speed whether you store
+them as one array of whole structs, or as eight separate arrays — one per field? By the end you will have
+a measured answer.</p>
+</aside>
+
+<p>Chapters 1 through 4 were reconnaissance: the CPU, the cache hierarchy, and the translation layer, each
+with its own cost model that the RAM abstraction hides. This chapter spends that reconnaissance. The term
+<strong>mechanical sympathy</strong> — popularized in software by Martin Thompson, and introduced back in
+<a href="#ch01">Chapter 1</a> — names the posture: understand enough about how the machine works to get
+the most out of it. <strong>Data-oriented design</strong> is that posture applied to one specific and
+enormously consequential decision — <em>how you lay your data out in memory</em> — and its central claim,
+which the rest of this chapter defends, is blunt: <em>the fastest code respects the memory system.</em>
+You do not earn an order of magnitude here by a cleverer algorithm; you earn it by arranging the same
+data so the cache lines you fetch are full of bytes you actually use and the pages you touch are few.
+This chapter turns Chapter 3's rules into design choices — array-of-structs versus struct-of-arrays,
+splitting hot fields from cold, padding and alignment — and, as promised, measures one of them on real
+hardware.</p>
+
+<h2>5.1 The design question: lay data out for the access pattern</h2>
+
+<p>Data-oriented design inverts the habit most of us learned first. Object-oriented instinct groups data
+by <em>conceptual entity</em>: a <code>Particle</code> "has" a position, a velocity, a mass, so we put
+them in one struct and make an array of those. That models the domain cleanly — and it is often exactly
+wrong for performance, because <em>the hardware does not care about your conceptual entities; it cares
+about which bytes travel together in a cache line.</em> The design question data-oriented design asks
+first is not "what is the natural object?" but "<strong>what is the hot loop's access pattern, and which
+bytes does it actually touch together?</strong>" You then lay memory out to match that pattern, so every
+fetched line and every translated page is spent on bytes the loop needs. Everything in this chapter is a
+special case of that one move.</p>
+
+<h2>5.2 Array-of-structs vs. struct-of-arrays</h2>
+
+<p>The canonical layout choice. Suppose each record has several fields and you have many records. There
+are two natural layouts:</p>
+
+<ul>
+<li><strong>Array-of-structs (AoS):</strong> one array, each element a full struct — all of record 0's
+fields, then all of record 1's, and so on. Fields of the <em>same record</em> are adjacent in memory.</li>
+<li><strong>Struct-of-arrays (SoA):</strong> one array <em>per field</em> — every record's
+<code>x</code> in one contiguous array, every <code>y</code> in another, and so on. The same field across
+<em>different records</em> is adjacent in memory.</li>
+</ul>
+
+<p>Which wins depends entirely on the access pattern, and neither is universally better — this is a
+genuine trade-off, not a rule. The deciding question is <em>which bytes your hot loop touches together</em>:</p>
+
+<ul>
+<li>If the hot loop <strong>scans one field (or a few) across many records</strong> — sum every
+<code>x</code>, filter by one attribute, do SIMD over one channel — <strong>SoA wins</strong>. In SoA
+those values are contiguous, so each 64-byte line is full of the values you want and the traversal is
+stride-1 with perfect spatial locality (§3.1&ndash;3.2). In AoS the same scan strides over the whole
+struct, touching a few bytes per line and wasting the rest — the column-major mistake of §3.6, in a new
+costume.</li>
+<li>If the hot loop <strong>uses most fields of one record at a time</strong> — process particle
+<em>i</em> completely, then particle <em>i</em>+1 — <strong>AoS wins</strong>. All of record <em>i</em>'s
+fields share a line or two, so one fetch brings the whole record; SoA would instead touch one element in
+each of many separate arrays, scattering the access across many lines and pages.</li>
+</ul>
+
+<h3>A measured demonstration: sum one field of 16 million records</h3>
+
+<p>Let us measure the SoA-favoring case. Define a record of 8 <code>double</code>s — position, velocity,
+mass, charge — which is exactly <strong>64 bytes</strong>, one cache line, in AoS. Make 16&nbsp;million of
+them and sum a single field, <code>x</code>, two ways: over the array-of-structs (each step strides
+64&nbsp;bytes to the next record's <code>x</code>, using 8 of every 64 bytes fetched) and over a
+contiguous per-field array (stride-1, every byte of every line used).</p>
+
+<pre><code>struct Particle { double x, y, z, vx, vy, vz, mass, charge; };  /* 64 bytes = 1 line */
+
+/* AoS: sum one field -&gt; stride of 64 bytes, 8 of 64 bytes used per line */
+for (size_t i = 0; i &lt; N; i++) sum += aos[i].x;
+
+/* SoA: the x field is its own contiguous array -&gt; stride 1, whole line used */
+for (size_t i = 0; i &lt; N; i++) sum += soa_x[i];</code></pre>
+
+<p>Built with <code>gcc -O2</code> and run for this book on a 12th-generation Intel Core i7 (i7-12700H),
+over 16&nbsp;million records (best of 5 timed runs), the AoS scan of one field took roughly
+<strong>0.12&nbsp;s</strong> and the SoA scan roughly <strong>0.032&nbsp;s</strong> — the SoA layout was
+about <strong>3.7&ndash;4&times; faster</strong> for computing the identical sum, differing only in how
+the data was laid out. <strong>This exact ratio is machine-dependent</strong> and code-dependent, and you
+should expect a different number on your hardware. Note it is a clear multiple, but <em>less</em> than
+the naive 8&times; you might predict from "AoS moves 8&times; the memory": the SoA loop is not purely
+bandwidth-bound — summing into a single accumulator has a dependency chain (§2.3) that caps its speed, so
+it cannot fully cash in the bandwidth it saves, which compresses the ratio. Remove that ceiling (multiple
+accumulators, vectorization) and the gap widens toward the bandwidth-bound 8&times;. The robust, portable
+result is the <em>direction and rough magnitude</em>: laying the scanned field out contiguously is a
+large, several-fold win, for the same arithmetic — because SoA turns a one-value-per-line scan into a
+whole-line scan.</p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="18" fill="#8c3a1d">AoS: sum one field &rarr; 8 of 64 bytes used per line</text>
+<g>
+<rect x="20" y="26" width="18" height="22" fill="#f0c9bd" stroke="#8c3a1d"/>
+<rect x="38" y="26" width="126" height="22" fill="#f7eae4" stroke="#c99"/>
+<text x="60" y="41" font-size="8" fill="#555">y z vx vy vz mass charge (unused)</text>
+<rect x="164" y="26" width="18" height="22" fill="#f0c9bd" stroke="#8c3a1d"/>
+<rect x="182" y="26" width="126" height="22" fill="#f7eae4" stroke="#c99"/>
+<rect x="308" y="26" width="18" height="22" fill="#f0c9bd" stroke="#8c3a1d"/>
+<rect x="326" y="26" width="126" height="22" fill="#f7eae4" stroke="#c99"/>
+<text x="470" y="41" font-size="9" fill="#8c3a1d">only shaded x used; jump 64B each step</text>
+</g>
+<text x="20" y="90" fill="#2e6b34">SoA: x is its own array &rarr; every byte of every line is an x</text>
+<g>
+<rect x="20" y="98" width="40" height="22" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="60" y="98" width="40" height="22" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="100" y="98" width="40" height="22" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="140" y="98" width="40" height="22" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="180" y="98" width="40" height="22" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="220" y="98" width="40" height="22" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="260" y="98" width="40" height="22" fill="#cfe8cf" stroke="#2e6b34"/>
+<rect x="300" y="98" width="40" height="22" fill="#cfe8cf" stroke="#2e6b34"/>
+<text x="350" y="113" font-size="9" fill="#2e6b34">contiguous x&rsquo;s; stride 1, whole line used</text>
+</g>
+<text x="20" y="165" fill="#333" font-size="10">Measured (i7-12700H, 16M records, gcc -O2, best of 5): AoS one-field scan ~0.12 s vs SoA ~0.032 s.</text>
+<text x="20" y="182" fill="#555" font-size="10">SoA ~3.7&ndash;4&times; faster for the same sum. Machine-dependent.</text>
+</svg>
+<figcaption>Figure 5.1: Summing one field. AoS strides over whole records, using a fraction of each
+fetched line; SoA stores that field contiguously, so every fetched line is full of values the loop uses.</figcaption>
+</figure>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>You process each record fully — read all 8 fields of particle <em>i</em>, do the physics, then move to
+particle <em>i</em>+1 — for every record. Which layout, AoS or SoA, is better <em>here</em>, and why does
+the answer flip from the sum-one-field case? (Answer after the next section.)</p>
+</aside>
+
+<h2>5.3 Hot/cold field splitting</h2>
+
+<p>AoS-vs-SoA is the all-or-nothing version; hot/cold splitting is the surgical one. Often a record has a
+few fields touched by the hot loop (the <strong>hot</strong> fields) and several touched rarely — logging
+metadata, debug info, a rarely-read description (the <strong>cold</strong> fields). If they all live in
+one struct, every cache line the hot loop fetches is padded out with cold bytes it will not use, lowering
+useful-bytes-per-line exactly as the AoS one-field scan did. <strong>Hot/cold splitting</strong> divides
+the record: put the hot fields in one compact struct (so more hot records fit per line and per page) and
+move the cold fields to a separate structure, referenced by index or pointer, touched only on the rare
+path. The hot loop now streams through dense hot records; the cold data is out of its way. This is the
+same principle as SoA — group by access frequency instead of by conceptual entity — applied at the
+granularity of "hot vs. cold" rather than "field by field." The tell that you want it: a struct where a
+hot loop reads two of twelve fields, and the other ten are dead weight in every line.</p>
+
+<p><em>(Answer to the §5.2 quick check: <strong>AoS wins</strong> when you use most fields of one record
+at a time. All of particle <em>i</em>'s fields are adjacent, so one or two line fetches bring the whole
+record and every byte is used; SoA would scatter that record's fields across eight separate arrays —
+eight different lines and possibly pages per record. The answer flips because the access pattern flipped:
+SoA is contiguous <em>across records for one field</em>; AoS is contiguous <em>across fields for one
+record</em>. Match the layout to whichever direction your hot loop travels.)</em></p>
+
+<h2>5.4 Padding and alignment</h2>
+
+<p>Two low-level facts about how the compiler places your struct in memory, both from the C model
+(CS:APP, Chapter 3 covers data alignment). First, <strong>alignment</strong>: each type has an alignment
+requirement — an 8-byte <code>double</code> is typically placed at an 8-byte-aligned address — because
+aligned accesses are efficient and, on some architectures, misaligned ones are slow or forbidden. To
+honor this inside a struct, the compiler inserts <strong>padding</strong>: unused bytes between fields so
+each field lands at a legal offset, plus tail padding so an array of the struct keeps every element
+aligned. The consequence for layout: field <em>order</em> changes struct size. A struct declared
+<code>{ char a; double b; char c; }</code> can be substantially larger than its 10 bytes of real data
+because padding is inserted around the fields; reordering to put the large, strictly-aligned fields first
+and pack the small ones together can shrink it. A smaller struct means more records per cache line and
+per page — a direct locality win, for free, from field ordering alone.</p>
+
+<p>Second, alignment interacts with the cache line. A value that straddles a 64-byte line boundary can
+require touching <em>two</em> lines to read one value; keeping hot structures aligned to line boundaries
+(and sized so they tile the line cleanly, as our 64-byte <code>Particle</code> did) avoids that. There is
+a tension worth naming: padding a struct <em>up</em> to a nice size can help alignment and, as we will see
+next, avoid a concurrency hazard — but padding also makes the struct <em>bigger</em>, which hurts the
+locality of a scan. Like everything in this Part, it is a trade-off resolved by knowing the access
+pattern and, when it matters, measuring.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: group data by how it's accessed</span>
+<p><strong>1. In words.</strong> The hardware moves and translates memory in fixed blocks (lines, pages).
+Lay data out so the bytes a hot loop uses together are stored together — by field (SoA), by temperature
+(hot/cold), and by alignment — so every block you pay for is full of bytes you need.</p>
+<p><strong>2. As a picture.</strong> Figure 5.1: an AoS line mostly wasted on unused fields vs. an SoA
+line entirely full of the scanned field.</p>
+<p><strong>3. As a measurement.</strong> Summing one field of 16&nbsp;M records: SoA ~0.032&nbsp;s vs. AoS
+~0.12&nbsp;s on the test machine — ~3.7&ndash;4&times; for the identical arithmetic, purely from layout.
+Prose says "group by access pattern"; the number says the grouping is worth several-fold.</p>
+</aside>
+
+<h2>5.5 A preview: false sharing</h2>
+
+<p>One layout hazard belongs to the concurrency Part but is worth planting now, because it is the mirror
+image of everything above. So far, packing related data into the same cache line has been <em>good</em> —
+it raises useful-bytes-per-line. But when <em>multiple threads</em> write to <em>different</em> variables
+that happen to share one cache line, the line ping-pongs between the cores' caches: each write forces the
+line out of the other core's cache to maintain coherence, even though the threads touch logically
+independent data. This is <strong>false sharing</strong> — no real data is shared, but the cache line is,
+and the hardware's coherence protocol pays for it. The fix runs <em>opposite</em> to the locality advice
+of this chapter: pad or align the per-thread variables so each lands on its <em>own</em> cache line,
+deliberately <em>spreading</em> them out. That single-threaded packing helps and multi-threaded sharing
+hurts is not a contradiction — it is the same fact (a whole line moves as a unit) cutting two ways
+depending on whether one core or several are writing it. The full treatment, with a measurement, waits
+for the concurrency Part; for now, file it: <em>when you add threads, revisit which variables share a
+line.</em></p>
+
+<aside class="warning">
+<span class="box-title">Trap: AoS when you scan one field (packing the wrong axis)</span>
+<p>The recurring layout error: choosing a struct layout to model the domain cleanly, then running a hot
+loop that touches only one or two fields of each record — so every cache line and every page you fetch is
+mostly bytes the loop ignores. It is the column-major mistake (§3.6) wearing an object-oriented costume,
+and it silently caps a scan at a fraction of its potential bandwidth. The tells: a hot loop over a large
+array of multi-field structs that reads only a couple of fields; a SIMD kernel that wants one channel
+contiguous but finds it strided; a profiler showing high cache-miss rate on a sequential-looking loop.
+The fixes are the chapter's: switch the scanned field(s) to <strong>SoA</strong>, or <strong>split hot
+from cold</strong> so the hot loop streams dense records; and reorder fields to shrink padding. And the
+inverse trap for later: do <em>not</em> reflexively pack everything tight once threads are involved —
+that invites false sharing (§5.5). As always, confirm the layout change with a measurement on your data
+and machine — the ~4&times; here is one machine's number, not a law.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> In review, someone asks why you "denormalized a clean <code>Particle</code>
+struct into a bunch of parallel arrays — it's uglier and the objects made more sense." Cover the paragraph
+and answer in two or three sentences, using <em>struct-of-arrays</em>, <em>cache line</em>, and <em>access
+pattern</em>.</p>
+<p><em>Model answer.</em> "The hot loop scans a single field across all records, so with the struct layout
+each 64-byte line we fetched held one useful value and seven fields the loop never reads — we were paying
+for eight times the bandwidth we used. Splitting that field into its own contiguous array (struct-of-
+arrays) makes the scan stride-1, so every fetched line is full of values we sum, and it measured several
+times faster for the identical result. If a different loop needed whole records at once I'd keep them as
+structs — the layout follows the access pattern, not the domain model." Naming the access pattern and
+useful-bytes-per-line — rather than "arrays are faster" — is the senior register, and it makes the
+trade-off explicit so the reviewer can check it against the <em>other</em> loops.</p>
+</aside>
+
+<h2>5.6 The rule, and where Part 1 lands</h2>
+
+<p>Five chapters of machine knowledge reduce, at the design level, to one instruction:
+<strong>lay your data out for the way the hot loop touches it.</strong> Memory moves in cache lines and
+is translated in pages (Chapters 3&ndash;4), so the layout that keeps each fetched line and each touched
+page full of bytes the loop actually uses wins — array-of-structs when you use whole records, struct-of-
+arrays when you scan a field, hot/cold splitting when a record is mostly cold, tight field ordering to
+shrink padding, and (later, under threads) deliberate spreading to avoid false sharing. None of this
+changes an algorithm's big-O; all of it can change its speed by a large factor, as the AoS/SoA
+measurement showed. That is why "the fastest code respects the memory system" is not a slogan but a
+design discipline — the practical cash value of mechanical sympathy.</p>
+
+<p>Part 1 is almost complete. You now have the machine (CPU, caches, TLB) and the design posture
+(data-oriented layout) to exploit it. <a href="#ch06">Chapter 6</a> closes the Part with the skill that
+ties it together: <strong>back-of-the-envelope cost estimation</strong> — using the orders of magnitude
+from Chapters 1&ndash;5 to <em>predict</em> whether a workload is compute-, memory-, or I/O-bound, then
+measuring to confirm. It is where "respect the memory system" becomes a number you can estimate before
+you write the code — and the bridge into Part 2, where you take manual control of that memory in C.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the central question of <strong>data-oriented design</strong> (what does the hot loop touch
+together?) and connect <strong>mechanical sympathy</strong> (Martin Thompson) to it.</li>
+<li>Define <strong>AoS</strong> and <strong>SoA</strong> and say which wins for (a) scanning one field
+across records and (b) using whole records one at a time — and <em>why</em> each.</li>
+<li>Explain <strong>hot/cold splitting</strong> and the tell that you want it.</li>
+<li>Explain <strong>padding and alignment</strong>: why field order changes struct size, and why a
+smaller struct improves locality.</li>
+<li>Describe <strong>false sharing</strong> in one sentence and why its fix (spread data out) is the
+<em>opposite</em> of single-threaded packing.</li>
+<li>Recall the AoS/SoA <strong>measured result</strong> (~3.7&ndash;4&times; on the test machine),
+<em>why</em> it was less than the naive 8&times;, and why the exact number is machine-dependent.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What single question does data-oriented design ask before choosing a layout, and
+why is "what is the natural object?" the wrong one for performance? (§5.1)</li>
+<li><strong>R2.</strong> Define AoS and SoA and give the access pattern that favors each. (§5.2)</li>
+<li><strong>R3.</strong> What is hot/cold field splitting, and how does it raise useful-bytes-per-line?
+(§5.3)</li>
+<li><strong>R4.</strong> Why does reordering a struct's fields change its size, and why can that be a
+locality win? (§5.4)</li>
+<li><strong>R5.</strong> What is false sharing, and why is its fix the opposite of the packing advice in
+the rest of the chapter? (§5.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Drepper, "What Every Programmer Should Know About Memory"</strong> (2007, free). The deepest
+free treatment of why layout and access pattern dominate memory performance; its sections on data
+structures and access patterns are the direct background for this chapter. Read for mechanism; its
+absolute numbers are dated.</li>
+<li><strong>MIT 6.172, <em>Performance Engineering of Software Systems</em></strong> (free OCW). Lectures
+on cache-efficient data structures, data layout, and measuring the effect — the applied continuation of
+this chapter, and where the performance-engineering Part picks up.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP)</strong>, Chapter 3 (data alignment and struct layout) and Chapter 6 (locality). The reference
+for how the compiler pads and aligns structs, and why alignment matters.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex5.1"><span class="ex-label">5.1</span> <span class="ex-tag warm">warm-up</span>
+Define array-of-structs and struct-of-arrays in one sentence each, and state which stores "the same field
+across different records" contiguously.</div>
+
+<div class="exercise" id="ex5.2"><span class="ex-label">5.2</span> <span class="ex-tag warm">warm-up</span>
+A record is 8 <code>double</code>s (64 bytes). You sum one field across many records in AoS. (a) How many
+bytes of each 64-byte line does the sum use? (b) Roughly how many times more memory does the AoS one-field
+scan move than an SoA scan of the same field? (c) Which kind of locality (§3.2) does SoA restore?</div>
+
+<div class="exercise" id="ex5.3"><span class="ex-label">5.3</span> <span class="ex-tag warm">warm-up</span>
+Give the tell — in one sentence — that a struct is a candidate for hot/cold field splitting.</div>
+
+<div class="exercise" id="ex5.4"><span class="ex-label">5.4</span> <span class="ex-tag core">core</span>
+For each workload, choose AoS or SoA and justify in terms of the access pattern and cache lines: (a) a
+physics step that reads and writes all fields of one particle before moving to the next; (b) a query that
+sums one numeric column over ten million rows; (c) a SIMD kernel that multiplies every record's
+<code>x</code> by a scalar; (d) rendering that, per object, reads its position, color, and size together.</div>
+
+<div class="exercise" id="ex5.5"><span class="ex-label">5.5</span> <span class="ex-tag core">core</span>
+A struct is declared <code>struct S { char flag; double value; int id; };</code>. (a) Explain why its
+size is larger than 1+8+4 = 13 bytes. (b) Reorder the fields to minimize padding and explain your
+ordering. (c) State the locality benefit of the smaller struct when you have an array of ten million of
+them.</div>
+
+<div class="exercise" id="ex5.6"><span class="ex-label">5.6</span> <span class="ex-tag complexity">cost</span>
+You scan one 8-byte field of records that are <em>S</em> bytes each, laid out AoS, over a large array.
+(a) In terms of <em>S</em> and the 64-byte line, how many useful bytes per fetched line does the scan
+use, and what fraction is that? (b) As <em>S</em> grows, what happens to the AoS/SoA bandwidth ratio for
+this scan? (c) Why might the <em>measured</em> speedup be smaller than this bandwidth ratio predicts (name
+one reason from Chapter 2 and relate it to why this chapter's demo measured ~4&times;, not 8&times;)?</div>
+
+<div class="exercise" id="ex5.7"><span class="ex-label">5.7</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Argue which layout to choose for a mixed workload that has
+<em>two</em> hot loops: loop A sums one field over all records; loop B updates all fields of each record
+in turn. Steps 1&ndash;3 given; complete step 4.
+<br><strong>Step 1 (given):</strong> Loop A (scan one field) favors SoA — contiguous field, whole lines
+used.
+<br><strong>Step 2 (given):</strong> Loop B (whole record at a time) favors AoS — one record's fields
+adjacent, one fetch per record.
+<br><strong>Step 3 (given):</strong> A single layout cannot be optimal for both; the choice depends on
+which loop dominates the runtime and by how much.
+<br><strong>Step 4 (you):</strong> State how you would <em>decide</em>: what you would measure to learn
+which loop dominates, how hot/cold splitting or a hybrid layout might serve both partly, and why "pick the
+layout that helps the hotter loop, then re-measure" is the right posture rather than reasoning it out on
+paper. Name the discipline this reflects.</div>
+
+<div class="exercise" id="ex5.8"><span class="ex-label">5.8</span> <span class="ex-tag mixed">mixed</span>
+For each speedup, decide whether the primary mechanism is <em>SoA / whole-line use</em> (Ch 5),
+<em>hot/cold splitting</em> (Ch 5), a <em>TLB / huge-page effect</em> (Ch 4), a <em>capacity miss fixed
+by blocking</em> (Ch 3), or <em>ILP / multiple accumulators</em> (Ch 2), and justify in a line: (a) moving
+a rarely-read description field out of a hot record; (b) summing a column after switching from row-structs
+to column arrays; (c) tiling a matrix multiply; (d) enabling 2&nbsp;MiB pages for a random-access index;
+(e) summing into four accumulators instead of one.</div>
+
+<div class="exercise" id="ex5.9"><span class="ex-label">5.9</span> <span class="ex-tag mixed">mixed</span>
+Two versions of the same aggregation over ten million records differ by 5&times; in wall time; both are
+O(<em>n</em>). Without running anything, list at least three distinct candidate causes drawn from Chapters
+2&ndash;5 (include at least one layout cause and one from an earlier chapter), then name the single
+measurement you would take first and why it best narrows the field.</div>
+
+<div class="exercise" id="ex5.10"><span class="ex-label">5.10</span> <span class="ex-tag stretch">stretch</span>
+This chapter both tells you to <em>pack</em> related data into shared lines (SoA, hot/cold, tight padding)
+and warns that packing per-thread data into a shared line causes <em>false sharing</em>. (a) Explain why
+these are not contradictory — reduce both to the one fact about cache lines that drives them. (b) Give a
+single scenario where you would deliberately pad a struct <em>up</em> to a full cache line, and say what
+you are trading away. (c) Why does the right choice depend on how many cores write the data?</div>
+
+<div class="exercise" id="ex5.11"><span class="ex-label">5.11</span> <span class="ex-tag lab">lab</span>
+Reproduce the AoS/SoA demonstration on your own machine. Define a record of several fields (size it to a
+whole number of your cache line, e.g. 64 bytes), make enough records to comfortably exceed your last-level
+cache, and sum one field two ways: over the array-of-structs and over a contiguous per-field array. Verify
+both produce the identical sum, time each (best of several runs), and report <em>your</em> ratio. Then try
+to widen it toward the bandwidth ceiling by removing the accumulator dependency (several accumulators, or
+let the compiler vectorize) and report what changed. Report only numbers you actually measured; if a loop
+is optimized away, consume the sum and say what you did.</div>
+
+</section>
+</section>

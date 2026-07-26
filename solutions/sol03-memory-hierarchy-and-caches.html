@@ -1,0 +1,118 @@
+<section class="solutions" id="sol03">
+<h1>Chapter 3 — Solutions</h1>
+
+<div class="solution" id="sol3.1"><span class="sol-label">3.1</span>
+64 / 8 = <strong>8 doubles</strong> per line. Reading one from a cold line brings in the whole line, so
+the <strong>7 neighbors</strong> become cheap hits. This rewards <strong>spatial locality</strong> —
+you get the nearby elements for free because memory arrives a full line at a time.</div>
+
+<div class="solution" id="sol3.2"><span class="sol-label">3.2</span>
+<strong>Temporal:</strong> a loop accumulator <code>sum += x[i]</code> — <code>sum</code> is reused every
+iteration, so after its first access it stays resident (retention of recently used lines).
+<strong>Spatial:</strong> walking <code>x[0], x[1], x[2], …</code> — consecutive elements share lines
+(line fill) and the sequential pattern lets the <em>prefetcher</em> fetch ahead. Line fill and
+prefetching exploit spatial locality; keeping recent lines exploits temporal.</div>
+
+<div class="solution" id="sol3.3"><span class="sol-label">3.3</span>
+(a) <strong>Compulsory (cold)</strong> — first-ever reference to those lines. (b) <strong>Capacity</strong>
+— the 4&nbsp;GB working set vastly exceeds the 8&nbsp;MB cache, so lines are evicted before reuse. (c)
+<strong>Conflict</strong> — a specific power-of-two row length aligns many accesses onto the same cache
+sets, so they evict each other despite free space elsewhere.</div>
+
+<div class="solution" id="sol3.4"><span class="sol-label">3.4</span>
+(a) <strong>Inner loop over columns (row-major order) is faster</strong>: consecutive accesses are
+adjacent in memory (stride 1), so each 64-byte line is fully used and the prefetcher runs ahead. Inner
+loop over rows strides by <em>N</em> elements, touching a new line almost every access. (b) Same big-O
+and same additions govern <em>scaling</em>, not <em>speed</em>; the constant factor — memory moved and
+misses incurred — differs by roughly an order of magnitude because only one version has spatial locality
+(this is the Chapter 1 §1.4 point, now concrete). (c) The slow version suffers mostly <strong>capacity
+misses</strong> (the whole matrix far exceeds cache, and its poor locality means it re-fetches lines it
+effectively wasted) &mdash; with a real <strong>conflict</strong> component too, since the power-of-two
+dimension (N&nbsp;=&nbsp;8192) gives a power-of-two stride that aliases into a few cache sets (the very symptom
+&sect;3.4 described); its lack of spatial reuse is what turns each fetch into wasted bandwidth.
+<em>Tempting wrong answer:</em> "they're both O(<em>N</em><sup>2</sup>) so the difference must be a
+measurement error" — the §3.6 trap. <strong>Feed-forward:</strong> §3.6.</div>
+
+<div class="solution" id="sol3.5"><span class="sol-label">3.5</span>
+Replace the array-of-pointers with a contiguous <strong>array of the objects themselves</strong> (array
+of structs, or a struct-of-arrays if you only touch some fields), laid out in traversal order. Why it
+reduces misses: the objects now share cache lines, so walking them in order has spatial locality — each
+fetched line yields several objects instead of one random-heap object per pointer (fewer misses). Why it
+helps hide the rest: sequential, contiguous access is prefetchable and, unlike pointer-chasing, does not
+force a dependency chain where each object's address depends on reading the previous one — so the
+out-of-order engine (Chapter 2 §2.3) can overlap independent accesses and hide the misses that remain.
+<em>Method note:</em> the two wins are distinct — locality (fewer misses) and independence (hide the
+misses) — and the pointer layout loses on both. <strong>Feed-forward:</strong> §3.5.</div>
+
+<div class="solution" id="sol3.6"><span class="sol-label">3.6</span>
+(a) 8 bytes used of 64 fetched = <strong>1/8</strong> of each line. (b) A stride-1 traversal uses all 8
+values per line, so the stride-8 traversal moves roughly <strong>8&times; more memory</strong> for the
+same values. (c) That ~8&times; is a floor on the slowdown from wasted bandwidth alone; the measured
+row-major/column-major ratio was larger (~24&ndash;26&times;) because real effects compound it — two
+that push the measured number above the naive estimate: (i) the hardware <strong>prefetcher</strong>
+helps the sequential (row-major) loop even more, widening the gap; (ii) <strong>loss of memory-level
+parallelism / stalling</strong> on the strided loop, and possibly <strong>TLB misses</strong> from
+touching many pages, add cost the simple bytes-moved model ignores. <em>No-fabrication note:</em> the
+8&times; is arithmetic; the ~25&times; is measured — do not present the estimate as the measurement.
+<strong>Feed-forward:</strong> §3.6.</div>
+
+<div class="solution" id="sol3.7"><span class="sol-label">3.7</span>
+<strong>Step 4:</strong> In this particular experiment the dominant lever is the <strong>number of
+misses (locality)</strong>, not the inability to hide each one. The column-major loop touches a new line
+almost every iteration and uses only 1 of 8 values per line, so it issues roughly 8&times; as many line
+fetches and moves many times more memory than the row-major loop; that sheer volume of DRAM traffic is
+the main cost. The dependency argument is secondary here because both versions are simple predictable
+summations with similar per-iteration dependency structure — what differs overwhelmingly is how many
+expensive lines each one demands. The number of misses is primary <em>because the two loops differ in
+locality but not meaningfully in their dependency chains</em> — so the variable that changed is misses.
+To test the claim: measure cache misses and memory traffic for both (e.g. with a profiler's
+cache-miss counters) and confirm the column-major loop's miss count is the multiple that tracks its
+slowdown. <strong>Feed-forward:</strong> §3.5&ndash;3.6, Chapter 2 §2.3.</div>
+
+<div class="solution" id="sol3.8"><span class="sol-label">3.8</span>
+(a) <strong>Capacity miss fixed by blocking</strong> — tiling keeps each block's working set inside cache
+so it is reused before eviction. (b) <strong>Branch prediction</strong> — sorting makes the filter's
+data-dependent branch predictable (Chapter 2 §2.4). (c) <strong>Spatial locality / cache lines</strong> —
+consuming each line fully raises useful-bytes-per-line. (d) <strong>ILP / dependency chain</strong> —
+independent accumulators expose parallelism (Chapter 2 §2.3). <em>Method-selection cue:</em> "tiling/
+blocking" &rarr; capacity; "sorting helped a branch" &rarr; prediction; "layout/stride" &rarr; spatial
+locality; "extra accumulators" &rarr; ILP.</div>
+
+<div class="solution" id="sol3.9"><span class="sol-label">3.9</span>
+Candidate causes across Chapters 1&ndash;3 (at least three): <strong>poor spatial locality / high miss
+rate</strong> (§3.1&ndash;3.5); <strong>capacity misses</strong> from a working set exceeding cache,
+fixable by blocking (§3.3); <strong>branch mispredictions</strong> from a data-dependent branch (Ch 2
+§2.4); <strong>a serial dependency chain / low ILP</strong> (Ch 2 §2.3); pointer-chasing combining bad
+locality <em>and</em> dependencies (§3.5). The first measurement: <strong>run a profiler that reports
+cache-miss rate and branch-misprediction rate</strong> — it is most informative because it directly
+distinguishes the two biggest mechanism families (memory vs. branches) in one shot, telling you which
+chapter's toolkit to reach for before you change any code. <em>Tempting wrong answer:</em> "start
+rewriting the layout" — that guesses the cause; measure first (the discipline of this whole Part).
+<strong>Feed-forward:</strong> §3.6 and Chapter 1 §1.4.</div>
+
+<div class="solution" id="sol3.10"><span class="sol-label">3.10</span>
+(a) Three properties and their effect on the ratio: <strong>cache/last-level-cache size</strong> — a
+much larger cache (or a smaller matrix) shrinks the gap by keeping more of the working set resident;
+<strong>memory bandwidth and prefetcher quality</strong> — a stronger prefetcher and higher bandwidth
+help the sequential loop more, tending to <em>raise</em> the ratio; <strong>compiler behavior</strong> —
+if the compiler vectorizes or reorders one loop, the ratio can move either way. (b) The effect's
+existence and rough size are robust because they follow from a structural fact true of essentially all
+cache-based machines: memory moves in lines, and a strided traversal wastes most of each line — so a
+large (not small) multiplier is guaranteed even though its exact value tracks the specific hardware. (c)
+Reporting "about 25&times; on this specific CPU, reproduce it yourself" is honest because the number was
+measured on one machine and genuinely varies; it is more useful because it teaches the reader the
+<em>method</em> (measure on your own hardware) rather than a false universal constant they might quote
+as fact — which is exactly the no-fabrication discipline of this book. <strong>Feed-forward:</strong>
+§3.6 and the warning box.</div>
+
+<div class="solution" id="sol3.11"><span class="sol-label">3.11</span>
+Machine-specific by design. A correct write-up records the reader's real cache-line size (commonly
+64&nbsp;bytes) and L1/L2/L3 sizes; confirms both loops produce the identical sum (proving equal work);
+reports two measured times and the observed ratio; and compares that ratio to the book's ~25&times; and
+to the ~8&times; stride estimate from §3.6, expecting it to sit somewhere around or above the estimate
+and to vary with hardware. The essential discipline: report only measured numbers, and if the compiler
+elides a loop, change the code (consume the result / use a <code>volatile</code> sink) and say what was
+done — never quote a number you did not observe. <strong>Feed-forward:</strong> §3.6; deeper measurement
+in the performance-engineering chapters.</div>
+
+</section>

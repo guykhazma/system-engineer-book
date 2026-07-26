@@ -1,0 +1,518 @@
+<section class="chapter" id="ch07">
+<h1>Chapter 7 — Pointers &amp; Memory Layout</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch04">Chapter 4</a> (virtual
+addresses; a pointer holds a <em>virtual</em> address the hardware translates), <a href="#ch05">Chapter
+5</a> (alignment and struct padding, met there as a layout lever), <a href="#ch03">Chapter 3</a> (cache
+lines and locality). &nbsp;·&nbsp; <strong>Opens Part 2</strong> and pairs with <a href="#ch08">Chapter
+8</a> (stack vs. heap) and <a href="#ch09">Chapter 9</a> (manual allocation). Part 1 told you what memory
+<em>costs</em>; Part 2 hands you the controls. This chapter is the first: what a pointer actually is, how
+arithmetic on it works, and how your program's bytes are arranged in the address space.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch04">Chapter 4</a> — when your C pointer holds a number like
+<code>0x7ffd3a08</code> and you dereference it, is that the physical address of a DRAM cell, or a
+<em>virtual</em> address the hardware translates first? (2) <a href="#ch05">Chapter 5</a> said a struct
+like <code>{ char a; double b; char c; }</code> is bigger than its 10 bytes of real data — what is the
+compiler inserting, and why? (3) <em>Predict:</em> <code>p</code> is a pointer to an <code>int</code> and
+<code>q</code> is a pointer to a <code>double</code>. You write <code>p + 1</code> and <code>q + 1</code>.
+Do both advance the address by the same number of bytes? If not, what decides each step? By the end of the
+chapter you will be able to compute the exact byte a pointer expression lands on.</p>
+</aside>
+
+<p>A pointer is the most demystifiable idea in systems programming, because underneath the syntax it is
+just a number: <strong>a pointer is a variable that holds a memory address.</strong> That is the whole
+secret. The type decoration — <code>int *</code>, <code>double *</code>, <code>struct Particle *</code> —
+does not change what is stored (an address); it tells the compiler what <em>kind</em> of thing lives at
+that address, which is exactly what it needs to know to read the right number of bytes when you
+dereference, and to scale arithmetic correctly when you do math on the pointer. This chapter builds the
+model from that one fact. We will see what a pointer holds and what dereferencing does; how pointer
+arithmetic silently multiplies by the pointee's size; why arrays and pointers are close cousins but
+<em>not</em> the same thing; how your program's memory is carved into regions (text, data, bss, heap,
+stack); and how <code>sizeof</code>, alignment, and struct padding decide the exact byte layout — with
+every size on this page <em>verified with the compiler</em> rather than asserted, because in C those sizes
+are implementation-defined and you must never guess them.</p>
+
+<h2>7.1 A pointer is an address</h2>
+
+<p>When you declare <code>int x = 42;</code>, the compiler arranges for <code>x</code> to live at some
+address in memory — say byte 0x7ffd…a0. When you then write <code>int *p = &amp;x;</code>, the
+<strong>address-of</strong> operator <code>&amp;</code> yields that address, and <code>p</code> stores it.
+So <code>p</code> holds a number that names a location; <code>*p</code> — the <strong>dereference</strong>
+— means "go to the location named by <code>p</code> and read (or write) the object there." Because
+<code>p</code> was declared <code>int *</code>, <code>*p</code> reads <code>sizeof(int)</code> bytes and
+interprets them as an <code>int</code>. Reconnecting to <a href="#ch04">Chapter 4</a>: the number in
+<code>p</code> is a <em>virtual</em> address in this process's address space; dereferencing it triggers
+the translation-and-fetch machinery we already dissected. The pointer is the programmer-visible handle on
+the very addresses that chapter was translating.</p>
+
+<p>How big is a pointer? Big enough to hold an address on this machine. On the x86-64 machine used
+throughout this book, compiled with gcc, a data pointer is <strong>8 bytes</strong> (64 bits) — verified,
+not assumed:</p>
+
+<pre><code>printf("%zu\n", sizeof(void*));   /* prints 8 on this machine (x86-64, LP64) */</code></pre>
+
+<p>The C standard does <em>not</em> fix the size of a pointer — it is implementation-defined, and different
+pointer types need not even be the same size in general (a subtlety that rarely bites on flat-address-space
+machines like x86-64, where all object pointers are the same width). What the standard <em>does</em>
+guarantee is narrower and worth stating precisely: <code>void*</code> can hold any object pointer and
+round-trip it back unchanged, and <code>sizeof(char) == 1</code> by definition — a <code>char</code> is
+one <em>byte</em>, the unit <code>sizeof</code> counts in (cppreference, "sizeof operator"; the C standard,
+§6.5.3.4). Everything else about sizes we will measure.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p><code>int *p = &amp;x;</code>. In one sentence each: what does <code>p</code> hold, and what does
+<code>*p</code> do? And why does the <em>type</em> <code>int *</code> matter when you write <code>*p</code>,
+if the stored value is "just an address"? (Answer after the next section.)</p>
+</aside>
+
+<h2>7.2 Pointer arithmetic scales by the pointee size</h2>
+
+<p>Here is the feature that trips up everyone once. When you add an integer to a pointer, C does
+<em>not</em> add that integer to the raw address. It scales: <code>p + n</code> advances the address by
+<code>n * sizeof(*p)</code> bytes, so that <code>p + n</code> points at the <em>n</em>-th object of that
+type past <code>p</code>, not the <em>n</em>-th byte. This is deliberate — it makes <code>p + 1</code> mean
+"the next element," which is what you almost always want — but it means the byte step depends entirely on
+the pointer's type. Verified on this machine:</p>
+
+<pre><code>int    arr[4];   /* &amp;arr[1] - &amp;arr[0] == 4 bytes  (sizeof(int)   == 4) */
+double darr[4];  /* &amp;darr[1]- &amp;darr[0]== 8 bytes  (sizeof(double)== 8) */</code></pre>
+
+<p>Running exactly that on the book's machine, the <code>int</code> pointer stepped <strong>4 bytes</strong>
+and the <code>double</code> pointer stepped <strong>8 bytes</strong> — each equal to the pointee's
+<code>sizeof</code>, which is what "answers your prediction from the opener": no, <code>p + 1</code> and
+<code>q + 1</code> do <em>not</em> advance by the same number of bytes; each advances by its own element
+size. The mirror image is pointer <em>subtraction</em>: <code>q - p</code> for two pointers into the same
+array yields the number of <em>elements</em> between them (of type <code>ptrdiff_t</code>), again dividing
+out the element size. Indexing is just sugar for this: <code>arr[i]</code> is defined as
+<code>*(arr + i)</code>, so the subscript is scaled arithmetic wearing brackets.</p>
+
+<p>Two precision points the C standard is strict about, both worth carrying into the UB chapter
+(<a href="#ch09">Chapter 9</a>). First, pointer arithmetic is only defined <em>within</em> a single array
+object, including the special "one past the last element" address, which you may compute and compare
+against but must <em>not</em> dereference (C standard §6.5.6, additive operators). Forming or dereferencing
+a pointer further out than one-past-the-end is undefined behavior — not "wraps around," not "reads the next
+variable," but genuinely undefined. Second, the scaling is by the <em>static</em> type of the pointer, so a
+mismatched type computes the wrong address silently. The takeaway is mechanical and exact: <em>to find
+where <code>p + n</code> points, multiply <code>n</code> by <code>sizeof(*p)</code> and add that many bytes
+to <code>p</code>.</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: pointer arithmetic scales by the pointee size</span>
+<p><strong>1. In words.</strong> Adding <em>n</em> to a pointer moves it by <em>n</em> elements, i.e.
+<em>n</em> &times; <code>sizeof(*p)</code> bytes — so the byte step is the element size, and
+<code>arr[i]</code> is exactly <code>*(arr + i)</code>.</p>
+<p><strong>2. As a picture.</strong> Figure 7.1: two rulers over the same bytes. On the <code>int*</code>
+ruler each tick is 4 bytes apart; on the <code>double*</code> ruler each tick is 8 bytes apart. "+1" means
+"next tick," and the tick spacing is <code>sizeof(*p)</code>.</p>
+<p><strong>3. As a trace.</strong> <code>double *q</code> at address 1000: <code>q+1</code> &rarr; 1000 +
+1&times;8 = 1008; <code>q+3</code> &rarr; 1000 + 3&times;8 = 1024. An <code>int *p</code> at 1000:
+<code>p+3</code> &rarr; 1000 + 3&times;4 = 1012. Same "+3", different bytes, because the element size
+differs.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A pointer holds an address; "+1" moves by one <tspan font-style="italic">element</tspan>, not one byte.</text>
+<text x="20" y="44" fill="#14406b">int* (element = 4 bytes)</text>
+<g>
+<rect x="20" y="52" width="60" height="24" fill="#dbe7f3" stroke="#14406b"/><text x="42" y="68" font-size="9">arr[0]</text>
+<rect x="80" y="52" width="60" height="24" fill="#dbe7f3" stroke="#14406b"/><text x="102" y="68" font-size="9">arr[1]</text>
+<rect x="140" y="52" width="60" height="24" fill="#dbe7f3" stroke="#14406b"/><text x="162" y="68" font-size="9">arr[2]</text>
+<rect x="200" y="52" width="60" height="24" fill="#dbe7f3" stroke="#14406b"/><text x="222" y="68" font-size="9">arr[3]</text>
+<text x="30" y="90" font-size="8" fill="#555">1000</text><text x="90" y="90" font-size="8" fill="#555">1004</text>
+<text x="150" y="90" font-size="8" fill="#555">1008</text><text x="210" y="90" font-size="8" fill="#555">1012</text>
+<text x="270" y="68" font-size="9" fill="#8c3a1d">p+1 &rarr; +4 bytes</text>
+</g>
+<text x="20" y="122" fill="#2e6b34">double* (element = 8 bytes)</text>
+<g>
+<rect x="20" y="130" width="110" height="24" fill="#d8efd8" stroke="#2e6b34"/><text x="58" y="146" font-size="9">darr[0]</text>
+<rect x="130" y="130" width="110" height="24" fill="#d8efd8" stroke="#2e6b34"/><text x="168" y="146" font-size="9">darr[1]</text>
+<rect x="240" y="130" width="110" height="24" fill="#d8efd8" stroke="#2e6b34"/><text x="278" y="146" font-size="9">darr[2]</text>
+<text x="30" y="168" font-size="8" fill="#555">1000</text><text x="140" y="168" font-size="8" fill="#555">1008</text>
+<text x="250" y="168" font-size="8" fill="#555">1016</text>
+<text x="360" y="146" font-size="9" fill="#8c3a1d">q+1 &rarr; +8 bytes</text>
+</g>
+<text x="20" y="192" font-size="9" fill="#555">Verified on this machine: int step = 4 bytes, double step = 8 bytes. Sizes are implementation-defined.</text>
+</svg>
+<figcaption>Figure 7.1: Pointer arithmetic scales by the pointee's size. "+1" advances one element —
+4 bytes for <code>int*</code>, 8 for <code>double*</code> on this x86-64 machine.</figcaption>
+</figure>
+
+<p><em>(Answer to the §7.1 quick check: <code>p</code> holds the address of <code>x</code>; <code>*p</code>
+goes to that address and reads/writes the object there. The type <code>int *</code> matters because it
+tells the compiler <em>how many bytes</em> to read at that address and <em>how to interpret</em> them — four
+bytes as an <code>int</code> here — and it sets the scale for pointer arithmetic.)</em></p>
+
+<h2>7.3 Arrays vs. pointers, and array-to-pointer decay</h2>
+
+<p>Arrays and pointers feel interchangeable in C, and beginners often conclude they are the same. They are
+not, and the difference is a frequent source of bugs. An <strong>array</strong> is a block of contiguous
+elements; the array's name refers to that whole block, and the block <em>is</em> the storage. A
+<strong>pointer</strong> is a separate variable that holds an address, which may point at an array's first
+element but is its own object. The two behave alike in expressions only because of a specific rule:
+<strong>array-to-pointer decay.</strong> In most expression contexts, an array name is automatically
+converted ("decays") to a pointer to its first element (C standard §6.3.2.1). That is why you can write
+<code>int *p = arr;</code> and <code>arr[i]</code> and pass <code>arr</code> to a function expecting
+<code>int *</code> — the array decayed to <code>&amp;arr[0]</code>.</p>
+
+<p>The decay does <em>not</em> happen in three contexts, and those exceptions expose the difference. The
+sharpest is <code>sizeof</code>. Applied to an array, <code>sizeof</code> yields the <em>whole array's</em>
+size in bytes; applied to a pointer, it yields the <em>pointer's</em> size. Verified on this machine:</p>
+
+<pre><code>int  a10[10];
+int *p = a10;
+sizeof(a10);  /* == 40 : 10 ints &times; 4 bytes each, the whole array */
+sizeof(p);    /* == 8  : just the pointer, regardless of what it points to */</code></pre>
+
+<p>On the book's machine those printed <strong>40</strong> and <strong>8</strong>. This is the origin of a
+notorious trap: passing an array to a function makes it decay to a pointer, so <em>inside</em> the function
+<code>sizeof(param)</code> is the pointer size (8), not the array size — the length information is lost at
+the call boundary, which is why C array-handling functions take an explicit length parameter. (The other
+two non-decay contexts: the operand of unary <code>&amp;</code>, where <code>&amp;arr</code> has type
+"pointer to array"; and a string literal used to initialize a <code>char</code> array, where it initializes
+the array rather than setting a pointer.) The mental model: an array is the land; a pointer is a signpost
+that can point at it. Usually the signpost is what travels around your program, but the two are not the
+same object — and <code>sizeof</code> is where the difference becomes visible.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: <code>sizeof</code> on a decayed array (measuring the signpost, not the land)</span>
+<p>The classic bug: <code>void f(int a[]) { size_t n = sizeof(a) / sizeof(a[0]); … }</code> intending to
+recover the element count. It cannot work: the parameter <code>a</code> is a <em>pointer</em> (the array
+decayed at the call), so <code>sizeof(a)</code> is the pointer size — 8 on this machine — and the "count"
+comes out as <code>8 / sizeof(int)</code> = 2 regardless of the real length. The <code>sizeof(array)/
+sizeof(array[0])</code> idiom is valid <em>only</em> where the true array type is in scope (same function
+it was declared in, not a decayed parameter). The tell: computing a length from <code>sizeof</code> on a
+function parameter, or on anything you received as a pointer. The fix is the one the standard library uses
+everywhere — pass the length explicitly alongside the pointer. Confirm your assumption by printing
+<code>sizeof</code> at the point of use if you are ever unsure; on this machine the decayed case prints 8,
+the in-scope array prints its full byte size (40 for <code>int[10]</code>).</p>
+</aside>
+
+<h2>7.4 The address-space layout: text, data, bss, heap, stack</h2>
+
+<p>Where do all these addresses live? A running process's virtual address space (the illusion of
+<a href="#ch04">Chapter 4</a>) is conventionally divided into regions, each holding a different kind of
+data, described in CS:APP (Chapter 9) and OSTEP's address-space chapters. From low addresses upward, the
+classic picture is:</p>
+
+<ul>
+<li><strong>Text</strong> (a.k.a. code): your compiled machine instructions, plus read-only constants like
+string literals (often a separate <code>.rodata</code>). Typically mapped read-only and executable.</li>
+<li><strong>Data</strong> (<code>.data</code>): global and <code>static</code> variables that have a
+non-zero initial value — the initial bytes are stored in the executable and loaded here.</li>
+<li><strong>BSS</strong> (<code>.bss</code>): global and <code>static</code> variables that are
+zero-initialized. They take <em>no</em> space in the executable file (only a size is recorded); the OS
+provides zeroed pages at load. (The name is a historical assembler mnemonic.)</li>
+<li><strong>Heap</strong>: the region for <em>dynamic</em> allocation (<code>malloc</code>), which grows
+upward (toward higher addresses) as you request more. This is <a href="#ch09">Chapter 9</a>'s subject.</li>
+<li><strong>Stack</strong>: automatic storage for function calls — local variables, saved return
+addresses, arguments — which grows <em>downward</em> (toward lower addresses) as calls nest. This is
+<a href="#ch08">Chapter 8</a>'s subject.</li>
+</ul>
+
+<p>You can see the ordering directly. A small program that prints the address of a function (text), an
+initialized global (data), a zero global (bss), a <code>malloc</code>'d block (heap), and a local (stack),
+built <code>-no-pie</code> so the classic fixed layout is visible, printed on this machine:</p>
+
+<pre><code>text  (&amp;function)      = 0x401196
+.data (&amp;global_init)   = 0x404048
+.bss  (&amp;global_bss)    = 0x40405c
+heap  (malloc'd block)  = 0x351b2a0
+stack (&amp;local)         = 0x7fffa35e9a3c</code></pre>
+
+<p>The ordering is exactly the textbook one: text &lt; data &lt; bss &lt; heap, all low, and the stack far
+up near the top of the space — with the heap growing up and the stack growing down toward each other, which
+is why the address space leaves a large gap between them. <strong>These specific numbers are machine-,
+OS-, and build-dependent, not universal.</strong> A default position-independent-executable (PIE) build on
+the same machine printed entirely different, higher base addresses, because <strong>address-space layout
+randomization (ASLR)</strong> relocates the segments each run as a security measure — the <em>relative</em>
+structure holds, the absolute numbers do not. What to carry: your program's memory is not one undifferentiated
+pool; it is regions with different purposes, permissions, and growth directions, and knowing which region a
+pointer points into tells you a lot about its lifetime — the through-line into the next two chapters.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Which region holds each of these: a <code>malloc</code>'d buffer, a function's local <code>int</code>,
+a <code>static int counter = 5;</code>, and the machine code of <code>main</code>? Which two regions grow
+<em>toward</em> each other, and in which directions? (Answer after the next section.)</p>
+</aside>
+
+<h2>7.5 <code>sizeof</code>, alignment, and struct padding — computed and verified</h2>
+
+<p>Now the exact byte layout. Three rules from the C object model (CS:APP Chapter 3; C standard §6.7.2.1)
+govern how a struct is laid out, and together they let you compute a struct's size by hand — which we will
+then check against the compiler.</p>
+
+<ol>
+<li><strong>Each type has a size and an alignment.</strong> <code>sizeof(T)</code> is how many bytes an
+object of type <code>T</code> occupies; its alignment is an address requirement — an object of type
+<code>T</code> must be placed at an address that is a multiple of <code>_Alignof(T)</code>. On x86-64 the
+alignment of the scalar types equals their size. Verified on this machine (gcc, x86-64 LP64):</li>
+</ol>
+
+<table>
+<tr><th>type</th><th>char</th><th>short</th><th>int</th><th>long</th><th>long&nbsp;long</th><th>float</th><th>double</th><th>void*</th></tr>
+<tr><th>sizeof (bytes)</th><td>1</td><td>2</td><td>4</td><td>8</td><td>8</td><td>4</td><td>8</td><td>8</td></tr>
+<tr><th>_Alignof</th><td>1</td><td>2</td><td>4</td><td>8</td><td>8</td><td>4</td><td>8</td><td>8</td></tr>
+</table>
+
+<p><strong>These sizes are implementation-/ABI-defined, not guaranteed by the language.</strong> The C
+standard fixes only <code>sizeof(char) == 1</code> and minimum ranges (an <code>int</code> is <em>at
+least</em> 16 bits, a <code>long</code> at least 32); it does not promise <code>int</code> is 4 bytes. These
+are the values for this machine's ABI, measured — on a 16-bit or ILP64 platform they would differ, which is
+precisely why you print them rather than hard-code them.</p>
+
+<ol start="2">
+<li><strong>Members are laid out in declaration order, at increasing offsets, with the first member at
+offset 0.</strong> Before each member the compiler inserts as much <strong>padding</strong> as needed to
+put that member at an offset that is a multiple of <em>its</em> alignment.</li>
+<li><strong>The struct's own alignment is the largest alignment among its members, and its size is rounded
+up to a multiple of that alignment</strong> (tail padding), so that in an array of the struct every element
+stays aligned.</li>
+</ol>
+
+<p>Let us apply this to a concrete struct and predict its size before measuring:</p>
+
+<pre><code>struct Mix { char a; int b; char c; double d; };</code></pre>
+
+<p>Hand computation, using the verified alignments (char 1, int 4, double 8):</p>
+
+<table>
+<tr><th>member</th><th>align</th><th>size</th><th>offset</th><th>note</th></tr>
+<tr><td><code>a</code> (char)</td><td>1</td><td>1</td><td>0</td><td>first member at 0; occupies byte 0</td></tr>
+<tr><td>— padding —</td><td></td><td>3</td><td>1–3</td><td>to reach the next multiple of 4 for <code>b</code></td></tr>
+<tr><td><code>b</code> (int)</td><td>4</td><td>4</td><td>4</td><td>4 is a multiple of 4; occupies 4–7</td></tr>
+<tr><td><code>c</code> (char)</td><td>1</td><td>1</td><td>8</td><td>occupies byte 8</td></tr>
+<tr><td>— padding —</td><td></td><td>7</td><td>9–15</td><td>to reach the next multiple of 8 for <code>d</code></td></tr>
+<tr><td><code>d</code> (double)</td><td>8</td><td>8</td><td>16</td><td>16 is a multiple of 8; occupies 16–23</td></tr>
+</table>
+
+<p>Struct alignment = max(1, 4, 1, 8) = <strong>8</strong>; the running size is 24, already a multiple of 8,
+so no tail padding is needed. Predicted <code>sizeof(struct Mix)</code> = <strong>24</strong>, of which only
+1 + 4 + 1 + 8 = 14 bytes are real data and <strong>10 bytes are padding.</strong> Now the check — running
+<code>offsetof</code> and <code>sizeof</code> on this machine printed <em>exactly</em>:</p>
+
+<pre><code>offsetof(a)=0  offsetof(b)=4  offsetof(c)=8  offsetof(d)=16
+sizeof(struct Mix)=24   _Alignof(struct Mix)=8</code></pre>
+
+<p>The hand computation matches the compiler byte for byte. And it exposes the layout lever from
+<a href="#ch05">Chapter 5</a>: field <em>order</em> changes size. Reorder the same fields largest-alignment
+first —</p>
+
+<pre><code>struct Packed { double d; int b; char a; char c; };</code></pre>
+
+<p>— and the layout becomes <code>d</code> at 0, <code>b</code> at 8, <code>a</code> at 12, <code>c</code>
+at 13, needing only 2 bytes of tail padding to round 14 up to the next multiple of 8. Verified:
+<code>sizeof(struct Packed) = 16</code> on this machine. Same four fields, same data, <strong>24 vs. 16
+bytes</strong> — a third smaller — purely from ordering, which (as Chapter 5 argued) means more records per
+cache line and per page for free. The point of this section is method as much as result: <em>you can
+compute a struct's size from the alignment rules, and you should verify it, because the underlying sizes
+are implementation-defined.</em></p>
+
+<p><em>(Answer to the §7.4 quick check: <code>malloc</code>'d buffer &rarr; heap; local <code>int</code>
+&rarr; stack; <code>static int counter = 5;</code> &rarr; data (non-zero initializer); machine code of
+<code>main</code> &rarr; text. The heap (growing up) and the stack (growing down) grow toward each
+other.)</em></p>
+
+<h2>7.6 Endianness: which byte comes first</h2>
+
+<p>One more layout fact, invisible until you look at individual bytes. When a multi-byte integer sits in
+memory, in what order are its bytes stored? <strong>Little-endian</strong> stores the least-significant byte
+at the lowest address; <strong>big-endian</strong> stores the most-significant byte first. The C standard
+does <em>not</em> mandate either — byte order is part of the implementation-defined representation of integer
+types (C standard §6.2.6) — so portable code must not assume one. x86-64 is <strong>little-endian</strong>,
+and rather than assert it, we verify it: store the 32-bit value <code>0x01020304</code> and read its bytes
+one at a time.</p>
+
+<pre><code>uint32_t x = 0x01020304u;
+unsigned char *b = (unsigned char*)&amp;x;
+/* print b[0] b[1] b[2] b[3] */</code></pre>
+
+<p>On this machine that printed the bytes <strong><code>04 03 02 01</code></strong> — the least-significant
+byte (<code>0x04</code>) first, at the lowest address — confirming <strong>little-endian</strong>, as
+expected for x86-64. On a big-endian machine the same program would print <code>01 02 03 04</code>.
+Endianness matters the moment bytes cross a boundary the CPU does not control: reading a binary file or
+network packet written by a different machine, or reinterpreting memory through a different-width pointer.
+Within a single program on one machine you rarely notice it — arithmetic and printing hide it — but at the
+byte level it is real and, like the sizes above, something you <em>check</em> rather than assume. (Network
+protocols standardize on big-endian, "network byte order," precisely so machines of either kind can
+interoperate; Beej's Guide covers the <code>htons</code>/<code>ntohl</code> conversions the sockets Part
+will use.)</p>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate is debugging and says: "I have a <code>struct { char a; int b; char c;
+double d; }</code>, that's 14 bytes of data, but <code>sizeof</code> says 24 — is the compiler broken?"
+Cover the paragraph and answer in two or three sentences, using <em>alignment</em>, <em>padding</em>, and
+<em>field order</em>.</p>
+<p><em>Model answer.</em> "It's not broken — the compiler inserts padding so each field lands on an address
+that's a multiple of its alignment: the <code>int</code> needs a 4-aligned offset and the <code>double</code>
+an 8-aligned one, so there are 3 bytes of padding after <code>a</code> and 7 after <code>c</code>, and the
+whole struct rounds up to a multiple of 8 — 24 bytes, 10 of them padding. If you reorder the fields
+largest-alignment-first (<code>double, int, char, char</code>) it packs to 16, same data, because you stop
+paying to re-align. You can confirm any layout with <code>offsetof</code> and <code>sizeof</code> rather
+than guessing." Naming alignment and offsets — and showing you can recompute the size — is the senior
+register, and it turns "the compiler is weird" into a controllable layout decision.</p>
+</aside>
+
+<h2>7.7 What to carry forward</h2>
+
+<p>A pointer is an address in a variable; dereferencing it reads or writes the object there, using the
+pointer's type to know how many bytes and how to interpret them. Arithmetic on a pointer scales by the
+pointee's size, so <code>p + n</code> lands <code>n * sizeof(*p)</code> bytes along and <code>arr[i]</code>
+is just <code>*(arr + i)</code> — and stepping outside an array's bounds is undefined, not merely
+adventurous. Arrays and pointers are close but distinct: an array decays to a pointer to its first element
+in most contexts, but <code>sizeof</code> (and unary <code>&amp;</code>) sees the real array, which is why
+length is lost at a function boundary. Your program's memory is regioned — text, data, bss, heap, stack —
+with different lifetimes and growth directions, verified here by printing addresses (and remembering ASLR
+moves the absolute numbers). And a struct's exact size follows from alignment and padding, which you can
+compute by hand and <em>must</em> verify, because the scalar sizes and byte order underneath are
+implementation-defined — measured here as <code>sizeof(struct Mix) = 24</code> and little-endian on this
+x86-64 machine.</p>
+
+<p>That is the layer of control Part 1 was pointing at. <a href="#ch08">Chapter 8</a> takes the two regions
+with the most interesting lifetimes — the <strong>stack</strong> and the <strong>heap</strong> — and asks
+where a given object should live, why stack allocation is nearly free while the heap is managed, and how a
+pointer to a stack local becomes a dangling bug the instant its function returns. <a href="#ch09">Chapter
+9</a> then hands you the heap's controls, <code>malloc</code> and <code>free</code>, and the precise ways
+manual memory management goes wrong. Everything in those chapters is pointers into these regions — which is
+why "a pointer is an address, and addresses live in regions with lifetimes" is the model to keep.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State what a <strong>pointer</strong> holds, what <strong>dereferencing</strong> does, and why the
+pointer's <strong>type</strong> matters even though the stored value is "just an address."</li>
+<li>Compute where <code>p + n</code> points for a given pointer type (multiply <em>n</em> by
+<code>sizeof(*p)</code>), and say why stepping past one-past-the-end of an array is undefined.</li>
+<li>Explain <strong>array-to-pointer decay</strong>, and why <code>sizeof</code> on a function's array
+<em>parameter</em> gives the pointer size, not the array size.</li>
+<li>Name the address-space regions — <strong>text, data, bss, heap, stack</strong> — say what each holds,
+and which two grow toward each other and in which directions.</li>
+<li>Compute a struct's size by hand from <strong>alignment and padding</strong>, and explain why field
+<em>order</em> changes it — and why you <em>verify</em> sizes rather than assume them.</li>
+<li>Define <strong>little- vs. big-endian</strong>, state which x86-64 is, and describe the one-line
+experiment that checks it.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does a pointer hold, and what two things does its <em>type</em> tell the
+compiler? (§7.1–7.2)</li>
+<li><strong>R2.</strong> How many bytes does <code>p + 3</code> advance for an <code>int *p</code> vs. a
+<code>double *p</code> on this machine, and what general rule gives the answer? (§7.2)</li>
+<li><strong>R3.</strong> What is array-to-pointer decay, and what does <code>sizeof</code> report for an
+array vs. for a pointer (or a decayed parameter)? (§7.3)</li>
+<li><strong>R4.</strong> Name the five address-space regions low-to-high and say what each holds; which two
+grow toward each other? (§7.4)</li>
+<li><strong>R5.</strong> Give the three struct-layout rules and use them to explain why
+<code>{ char; int; char; double; }</code> is 24 bytes on this machine. (§7.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP)</strong>, Chapter 3 (machine-level data, pointers, arrays, struct alignment) and Chapter 9 (the
+process address space and its regions). The reference for this chapter's layout and padding rules; the free
+CMU 15-213 materials cover them.</li>
+<li><strong>cppreference.com</strong> and the <strong>C standard</strong> — the <code>sizeof</code>
+operator, pointer arithmetic (§6.5.6), array-to-pointer conversion (§6.3.2.1), and object representation
+(§6.2.6). The authority for what the language <em>guarantees</em> vs. leaves implementation-defined; consult
+these before assuming any size or byte order.</li>
+<li><strong>Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP)</strong>, the
+address-space chapters (free full text). The OS view of how text/data/heap/stack are arranged and why the
+stack and heap grow toward each other.</li>
+<li><strong>Beej's Guide to C</strong> (free). Practical, readable coverage of pointers, arrays, and byte
+order, including the network-byte-order conversions used in the low-level I/O Part.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex7.1"><span class="ex-label">7.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: (a) what does a pointer variable store? (b) what does <code>*p</code> do? (c) what
+does <code>&amp;x</code> produce?</div>
+
+<div class="exercise" id="ex7.2"><span class="ex-label">7.2</span> <span class="ex-tag warm">warm-up</span>
+A <code>double *q</code> holds address 2000 (<code>sizeof(double)==8</code> here). What address is
+<code>q + 4</code>? What address is <code>q + 4</code> if <code>q</code> is instead an <code>int *</code>
+(<code>sizeof(int)==4</code>)? Show the arithmetic.</div>
+
+<div class="exercise" id="ex7.3"><span class="ex-label">7.3</span> <span class="ex-tag warm">warm-up</span>
+<code>int a[10]; int *p = a;</code> on this machine. State the value of <code>sizeof(a)</code> and of
+<code>sizeof(p)</code>, and explain the difference in one sentence.</div>
+
+<div class="exercise" id="ex7.4"><span class="ex-label">7.4</span> <span class="ex-tag core">core</span>
+Explain array-to-pointer decay. Then explain precisely why <code>size_t len(int a[]) { return sizeof(a) /
+sizeof(a[0]); }</code> does <em>not</em> return the element count, and what the returned value actually is
+on this machine.</div>
+
+<div class="exercise" id="ex7.5"><span class="ex-label">7.5</span> <span class="ex-tag core">core</span>
+For <code>struct S { char a; short b; char c; int d; };</code>, compute by hand (using char 1, short 2, int
+4, with alignment = size for each) the offset of every member, the total <code>sizeof</code>, and how many
+bytes are padding. Then state how you would verify your answer with the compiler.</div>
+
+<div class="exercise" id="ex7.6"><span class="ex-label">7.6</span> <span class="ex-tag core">core</span>
+Reorder the fields of <code>struct S</code> from 7.5 to minimize its size, give the new
+<code>sizeof</code>, and explain the ordering rule you applied and why it works.</div>
+
+<div class="exercise" id="ex7.7"><span class="ex-label">7.7</span> <span class="ex-tag complexity">cost</span>
+You have an array of <em>N</em> = 10 million records, and a hot loop that scans them. (a) If the record is
+<code>struct Mix</code> (24 bytes here), how many bytes does the array occupy? (b) If reordering shrinks it
+to 16 bytes, how many bytes now, and roughly how many <em>more</em> records fit in a 64-byte cache line
+(§3.1) and a 4&nbsp;KiB page (§4.2)? (c) In one sentence, tie the size reduction to the memory-system cost
+model of Part 1.</div>
+
+<div class="exercise" id="ex7.8"><span class="ex-label">7.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Compute <code>sizeof(struct T { double d; char a; int b; };)</code>
+on this machine's ABI. Steps 1–3 given; complete step 4.
+<br><strong>Step 1 (given):</strong> <code>d</code> (double, align 8) at offset 0, occupies 0–7.
+<br><strong>Step 2 (given):</strong> <code>a</code> (char, align 1) at offset 8, occupies byte 8.
+<br><strong>Step 3 (given):</strong> <code>b</code> (int, align 4) needs an offset that is a multiple of
+4; the next such offset after byte 8 is 12, so 3 bytes of padding go at 9–11 and <code>b</code> occupies
+12–15.
+<br><strong>Step 4 (you):</strong> State the struct's alignment, whether any tail padding is needed to
+round the size up to a multiple of that alignment, the final <code>sizeof</code>, and the total padding
+bytes. Then name the one function you would call to confirm each member's offset.</div>
+
+<div class="exercise" id="ex7.9"><span class="ex-label">7.9</span> <span class="ex-tag mixed">mixed</span>
+For each symptom, decide which chapter's mechanism is the primary cause and justify in a line: (a)
+<code>sizeof(param)</code> inside a function returns 8 no matter how large the caller's array was; (b) a
+random-access loop over an 800&nbsp;MiB table is far slower than ~100&nbsp;ns/access predicts, and huge
+pages speed it up; (c) a struct is unexpectedly 24 bytes when its fields sum to 14; (d) reading a binary
+file written on a different architecture yields byte-swapped integers.</div>
+
+<div class="exercise" id="ex7.10"><span class="ex-label">7.10</span> <span class="ex-tag mixed">mixed</span>
+Without running code, decide for each what value (or category of value) is produced and why, drawing on
+Chapters 4–7: (a) the number stored in a pointer — is it a physical or virtual address? (b)
+<code>&amp;arr[5] - &amp;arr[2]</code> for an <code>int arr[10]</code>; (c) whether the absolute address
+printed by a PIE build is stable across runs, and what causes the answer; (d) whether
+<code>sizeof(int)</code> is guaranteed by the C standard to be 4.</div>
+
+<div class="exercise" id="ex7.11"><span class="ex-label">7.11</span> <span class="ex-tag stretch">stretch</span>
+The chapter says pointer arithmetic is only defined within a single array object (plus one-past-the-end).
+(a) Explain why <code>&amp;arr[10]</code> for <code>int arr[10]</code> is legal to <em>form</em> but not to
+<em>dereference</em>. (b) Give a plausible reason the standard makes going further undefined rather than
+defining it as "wraps" or "reads adjacent memory" (think about the optimizer and about
+<a href="#ch04">Chapter 4</a>'s segmented address space). (c) Connect this to the out-of-bounds bug you
+will meet in <a href="#ch09">Chapter 9</a>.</div>
+
+<div class="exercise" id="ex7.12"><span class="ex-label">7.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, write and run a program that prints: (a) <code>sizeof</code> and <code>_Alignof</code>
+for <code>char, short, int, long, double, void*</code>; (b) the <code>offsetof</code> of every member and
+the <code>sizeof</code> of a struct of your choice with at least three differently-aligned fields, and
+verify it against your hand computation; (c) the byte order of a known 32-bit value to determine your
+machine's endianness. Report <em>your</em> measured numbers and label the machine/ABI; note any that differ
+from this chapter's x86-64 values and why they might.</div>
+
+</section>
+</section>

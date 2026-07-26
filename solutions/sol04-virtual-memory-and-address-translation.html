@@ -1,0 +1,118 @@
+<section class="solutions" id="sol04">
+<h1>Chapter 4 — Solutions</h1>
+
+<div class="solution" id="sol4.1"><span class="sol-label">4.1</span>
+(a) <strong>12 bits</strong> (2<sup>12</sup>&nbsp;=&nbsp;4096&nbsp;=&nbsp;4&nbsp;KiB). (b)
+<strong>One translation</strong>: <code>a[0]</code> and <code>a[1]</code> sit on the same 4&nbsp;KiB page
+(unless <code>a[0]</code> happens to be the last element of a page), so the same page number translates
+both. (c) A 4&nbsp;KiB page holds 4096/8&nbsp;=&nbsp;<strong>512 <code>long</code>s</strong>, so up to
+~512 consecutive elements share one translation before you cross into the next page. This is the TLB
+analogue of the cache-line reuse from §3.1 — one translation amortized over many accesses.</div>
+
+<div class="solution" id="sol4.2"><span class="sol-label">4.2</span>
+<strong>Isolation</strong> — each process names only its own frames, so it cannot read or corrupt
+another's memory (this is the security/isolation boundary). <strong>A simple, uniform programming/layout
+model</strong> — every process sees the same clean virtual layout regardless of where it lands in
+physical RAM. <strong>OS flexibility</strong> — a virtual page can map to a frame, a file, nothing yet
+(lazy allocation), or be shared read-only. The isolation one is the protection boundary.</div>
+
+<div class="solution" id="sol4.3"><span class="sol-label">4.3</span>
+A data cache stores recently used <strong>cache lines</strong> so a repeated data access is a cheap hit;
+the TLB stores recently used <strong>translations (virtual-page&rarr;physical-frame mappings)</strong> so
+a repeated access to the same <strong>page</strong> skips the <strong>page-table walk</strong>. Same
+hit/miss/eviction logic (§3.3), different key and value: address&rarr;line for the data cache,
+page&rarr;frame for the TLB.</div>
+
+<div class="solution" id="sol4.4"><span class="sol-label">4.4</span>
+A multi-level walk reads one table to learn the address of the next table, reads that to learn the next,
+and so on — <strong>each read's address depends on the value returned by the previous read</strong>, so
+the reads cannot be issued in parallel or overlapped; they are strictly serial. That matters because a
+dependency chain defeats the CPU's latency-hiding (Chapter 2 §2.3): there is no independent work to run
+during each memory access, so the walk pays the full latency of every step in sequence. This is exactly
+the <strong>pointer-chasing</strong> structure of a linked-list traversal (§3.5): in both, you cannot
+compute the next address until the current access completes, so both are serial-latency-bound rather than
+bandwidth-bound. <em>Method note:</em> recognizing "the next address depends on this read" is the general
+tell for a latency-bound pattern. <strong>Feed-forward:</strong> §3.5, Chapter 2 §2.3.</div>
+
+<div class="solution" id="sol4.5"><span class="sol-label">4.5</span>
+(a) A random probe pays (i) a <strong>data-cache miss</strong> to fetch the line holding the bucket
+(~100&nbsp;ns to DRAM) and (ii) a <strong>TLB miss / page-table walk</strong> to translate the bucket's
+address before the fetch — several dependent memory accesses. (b) With 4&nbsp;KiB pages, TLB reach is
+(entries &times; 4&nbsp;KiB), typically only a few megabytes; a 400&nbsp;MiB table spans far more pages
+than the TLB can hold, so random probes keep landing on pages whose translations were evicted — heavy TLB
+misses (a capacity miss at the translation level, §4.4). (c) To cut translation cost: map the table with
+<strong>huge pages</strong> (raises TLB reach ~512&times;), assuming a profiler confirms page-walk cost.
+To cut the data-miss cost: improve <strong>locality</strong> of the buckets (e.g. keys and values stored
+together, open addressing with good probe locality, or a more cache-friendly layout) so more probes hit.
+<em>Tempting wrong answer:</em> "it's all just DRAM latency, nothing to do" — the §4.4 trap; the surplus
+over ~100&nbsp;ns is the translation cost. <strong>Feed-forward:</strong> §4.4&ndash;4.5.</div>
+
+<div class="solution" id="sol4.6"><span class="sol-label">4.6</span>
+(a) <strong>reach = E &times; 4&nbsp;KiB</strong>. (b) Expect heavy thrashing when the randomly-touched
+footprint exceeds reach: <strong>W &gt; E &times; 4&nbsp;KiB</strong> (more precisely, when the number of
+distinct pages touched, W / 4&nbsp;KiB, far exceeds E), so translations are evicted before reuse. (c)
+Switching to 2&nbsp;MiB pages multiplies reach by <strong>2&nbsp;MiB / 4&nbsp;KiB = 512&times;</strong>,
+so the threshold in (b) becomes W &gt; E &times; 2&nbsp;MiB — a working set 512&times; larger now fits
+within reach, which is exactly why huge pages relieve TLB thrashing. <em>No-fabrication note:</em> the
+512&times; is arithmetic from real, documented page sizes; the actual E is a chip-specific number this
+book does not invent. <strong>Feed-forward:</strong> §4.5.</div>
+
+<div class="solution" id="sol4.7"><span class="sol-label">4.7</span>
+<strong>Step 4:</strong> The random-by-page walker needs a <em>new</em> translation on essentially
+<strong>every jump</strong>, because each jump targets a different page and it does not stay on any page
+long enough to reuse a translation. Since the TLB's reach (a few MiB) is far smaller than the 512&nbsp;MiB
+footprint, the translation for a page it jumps to was almost certainly evicted since the last visit — so
+nearly every random access <strong>misses the TLB and pays a page-table walk</strong>, on top of the
+data-cache miss. The sequential walker, by contrast, amortizes one translation over ~512 accesses (Step
+3), so its TLB-miss <em>rate</em> is ~1 per 512 accesses versus ~1 per access for the random walker. To
+confirm the TLB — not just the data cache — is the culprit, measure the <strong>dTLB-load-miss (or
+page-walk) count/rate</strong> for both runs (e.g. <code>perf stat -e dTLB-load-misses</code>): the
+random run should show dramatically more, isolating translation cost from data-fetch cost.
+<strong>Feed-forward:</strong> §4.4, and the Chapter 6 capstone.</div>
+
+<div class="solution" id="sol4.8"><span class="sol-label">4.8</span>
+(a) <strong>TLB miss / page-walk</strong> — huge pages helping is the signature; they raise reach, not
+data-cache capacity. (b) <strong>Data-cache capacity miss</strong> — 64&nbsp;MiB exceeds the 24&nbsp;MiB
+L3 so it lives in DRAM, while 1&nbsp;MiB fits in L2; same accesses, different tier (Ch 3 §3.3). (c)
+<strong>Dependency chain / low ILP</strong> combined with poor locality — pointer-chasing a list is
+serial and scattered (§3.5); the standout distinguishing feature here is the serial dependency. (d)
+<strong>Branch misprediction</strong> — sorting makes the data-dependent branch predictable (Ch 2 §2.4).
+<em>Method-selection cue:</em> "huge pages helped" &rarr; TLB; "bigger set, re-read" &rarr; capacity;
+"linked list" &rarr; dependency/locality; "sorting fixed a branch" &rarr; prediction.</div>
+
+<div class="solution" id="sol4.9"><span class="sol-label">4.9</span>
+(a) Huge pages help specifically when <strong>TLB misses / page-walk cost are a measured bottleneck</strong>
+— i.e. a large, scattered working set whose page footprint exceeds TLB reach. (b) Downsides: internal
+<strong>fragmentation</strong> / wasted memory (a 2&nbsp;MiB page backing a few live KiB); difficulty
+<strong>finding contiguous physical memory</strong> once RAM is fragmented (allocation can fail or stall);
+and no benefit — pure overhead — for workloads that were never TLB-bound. (c) First measurement: the
+<strong>TLB-miss / page-walk rate</strong> (e.g. <code>perf stat -e dTLB-load-misses</code>); if it is
+low, huge pages will not help. <em>Discipline:</em> this is the "measure before you optimize" rule of
+Part 1 — don't flip huge pages on faith. <strong>Feed-forward:</strong> §4.5 and the Chapter 6 lab.</div>
+
+<div class="solution" id="sol4.10"><span class="sol-label">4.10</span>
+(a) <strong>Compulsory</strong>: yes — the first access to a page's translation always misses the TLB
+(it was never cached), just as the first touch of a line is a cold miss. <strong>Capacity</strong>: yes —
+when the page footprint exceeds TLB reach, translations are evicted before reuse; this is TLB thrashing
+(§4.4). <strong>Conflict</strong>: an analogue exists for set-associative TLBs (translations colliding on
+the same TLB set), though it is secondary and hardware-specific; the dominant effect for large working
+sets is capacity. (b) Huge pages attack the <em>capacity</em> analogue: they do not add TLB entries but
+make each entry cover far more memory, so the same footprint needs fewer translations and fits within
+reach. (c) Larger base pages are not a free system-wide win because programs with small, sparse footprints
+would waste memory to internal fragmentation (rounding every allocation up to a huge page) and the OS
+would find it harder to place them; the 4&nbsp;KiB default is a compromise, and huge pages are opt-in for
+the workloads that benefit. <em>Tempting wrong answer:</em> "just make all pages 2&nbsp;MiB" — ignores
+fragmentation and allocation cost. <strong>Feed-forward:</strong> §4.5.</div>
+
+<div class="solution" id="sol4.11"><span class="sol-label">4.11</span>
+Machine-specific by design. A correct write-up records the real page size (commonly 4&nbsp;KiB) and cites
+the architecture's documented page-table depth and huge-page sizes (do not guess — for x86-64, a four-
+level table with 2&nbsp;MiB and 1&nbsp;GiB huge pages); confirms both loops touch the same data the same
+number of times; and reports two measured ns-per-access figures showing the random-by-page run slower.
+Where TLB counters are available, the random run should show far more dTLB-load-misses / page-walks than
+the sequential run, isolating translation cost. The essential discipline: report only measured numbers,
+attribute the architecture facts to real documentation, and if the compiler elides a loop, consume the
+result (a <code>volatile</code> sink) and say so. <strong>Feed-forward:</strong> §4.4, and the Chapter 6
+capstone which measures exactly this latency-bound gap.</div>
+
+</section>

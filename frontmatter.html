@@ -1,0 +1,59 @@
+<div class="cover">
+  <h1>The Systems Engineer's Path</h1>
+  <div class="subtitle">A Five-Volume Book &mdash; from senior engineer to systems architect: distributed
+  systems, database internals, and platform design from first principles</div>
+  <div class="meta">A training book &middot; with worked examples, build-alongs, exercises, and full
+  solutions</div>
+</div>
+
+<section class="chapter" id="preface">
+  <h1>Preface</h1>
+  <p>This is the second volume. The first, <em>The Data Engineer's Path</em>, took a computer-science
+  graduate and trained them into a <strong>senior data engineer</strong> &mdash; someone who can hold
+  a company's data platform and reason about the systems they operate. This volume takes that engineer
+  the next step: to a <strong>data architect and staff-level systems engineer</strong> who understands
+  those systems <em>from the inside</em>, can <em>build</em> them, not just use them, and can
+  <em>design platforms</em> and defend the trade-offs at scale. Where Volume 1 taught "the shuffle is
+  expensive," A Five-Volume Book shows you the exchange-operator machinery underneath it, has you build a query
+  engine that shuffles, and teaches you to architect the platform it runs on.</p>
+
+  <p>It assumes Volume 1 (or an equivalent senior data engineer) and cross-references it generously,
+  so it is usable on its own. It is denser and goes deeper &mdash; but it is written for someone
+  senior, so it respects your time: no re-teaching, heavy signposting, and every abstraction motivated
+  by the problem that forced it into existence.</p>
+
+  <p>Four threads run through the whole volume.</p>
+  <ul>
+    <li><strong>Think from first principles.</strong> Derive a system's behavior from its underlying
+    model &mdash; the failure model, the storage model, the consistency model &mdash; not from a tool's
+    documentation. You will see a <em>first-principles</em> callout that traces each mechanism to the
+    constraint that produced it.</li>
+    <li><strong>Reason about cost, complexity, and scale.</strong> Now with formal tools &mdash;
+    amplification and the RUM conjecture, queueing theory and Little's law, the Universal Scalability
+    Law &mdash; and back-of-the-envelope estimation at architect scale. A <em>cost &amp; scale</em>
+    callout runs throughout.</li>
+    <li><strong>Design under trade-offs.</strong> Every architecture is a deliberate set of trade-offs
+    against constraints and non-functional requirements; naming and defending them <em>is</em> the job.
+    A <em>design trade-off</em> callout makes each one explicit, and recurring "design review"
+    exercises have you critique and defend real architectures.</li>
+    <li><strong>Communicate the design.</strong> Architecture decision records, diagrams, and the
+    ability to make a skeptical room trust a design &mdash; the third thread of Volume 1, elevated. (The
+    leadership and technical-strategy half of the architect role is the subject of Volume 5; this
+    volume stays technical.)</li>
+  </ul>
+
+  <p><strong>Correctness is non-negotiable</strong>, as in Volume 1. Every citation names a real
+  paper, specification, book with free-legal access, or documented system, with the correct author and
+  venue; numbers are dated because hardware and pricing age; fast-moving claims carry their date; and
+  where the field is genuinely unsettled the text says so. The sources are the canon of systems: the
+  distributed-systems and database papers, <em>Designing Data-Intensive Applications</em>, Petrov's
+  <em>Database Internals</em>, the CMU and MIT graduate courses, and the official specs.</p>
+
+  <p><strong>How to use this book.</strong> Read it front to back and do the work. Each chapter
+  motivates its topic, develops it with worked examples and traces, and closes with a <em>key ideas</em>
+  box, <em>exercises</em> with full solutions, and pointers into the primary literature. Several parts
+  end with a <strong>build-along</strong> &mdash; a mini Raft module, an LSM store, a query engine, a
+  Kubernetes operator &mdash; because at this level, reading is not enough: you understand a system
+  when you have built a small one. The build-alongs are in Python for approachability, with pointers to
+  how production engines differ in Rust and C++.</p>
+</section>

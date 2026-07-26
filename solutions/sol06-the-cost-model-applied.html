@@ -1,0 +1,121 @@
+<section class="solutions" id="sol06">
+<h1>Chapter 6 — Solutions</h1>
+
+<div class="solution" id="sol6.1"><span class="sol-label">6.1</span>
+<strong>Latency</strong> is the time to complete <em>one</em> access you must wait for; <strong>bandwidth</strong>
+is the throughput when streaming <em>many</em> contiguous items. Use <strong>latency</strong> for (a)
+fetching one random element (a single wait) and <strong>bandwidth</strong> for (b) streaming a huge array
+in order (the prefetcher keeps many accesses in flight).</div>
+
+<div class="solution" id="sol6.2"><span class="sol-label">6.2</span>
+(a) <strong>Memory-bound</strong> — <code>memcpy</code> does no arithmetic per byte; it is pure data
+movement at memory bandwidth. (b) <strong>Compute-bound</strong> — SHA-256 does much arithmetic per byte
+and the data is already in L1, so the execution units are the limit. (c) <strong>I/O-bound</strong> — the
+time is dominated by per-row network/SSD latency, not CPU or memory. <em>Method-selection cue:</em>
+"work per byte" — near zero &rarr; memory; high &rarr; compute; waiting on storage/network &rarr; I/O.</div>
+
+<div class="solution" id="sol6.3"><span class="sol-label">6.3</span>
+<strong>Estimate</strong> (predict the class and rough cost from the cost model), <strong>measure</strong>
+(run it and observe the real time / counters), <strong>reconcile</strong> (explain any gap and update the
+model). A gap is useful because it usually reveals a wrong assumption — most often using latency where
+bandwidth applies (or vice versa) — so the discrepancy points directly at the true bottleneck.</div>
+
+<div class="solution" id="sol6.4"><span class="sol-label">6.4</span>
+(a) 512&nbsp;MiB of <code>long</code> is 2<sup>26</sup> = ~67&nbsp;million elements. Latency estimate: 67M
+&times; 100&nbsp;ns &approx; <strong>~6.7&nbsp;s</strong>. Bandwidth estimate: 512&nbsp;MiB / 6&nbsp;GB/s
+&approx; <strong>~0.09&nbsp;s</strong>. (b) The <strong>bandwidth</strong> estimate is right for a
+sequential sum: the prefetcher streams the data, so accesses overlap rather than each incurring the full
+latency (this matches the ~0.08&ndash;0.09&nbsp;s measured in §6.3). (c) They differ by roughly
+<strong>~70&ndash;100&times;</strong> — the cost of using the latency model for a bandwidth-bound
+workload is being wrong by about two orders of magnitude, exactly the §6.3 surprise. <em>Tempting wrong
+answer:</em> the ~6.7&nbsp;s latency figure — tempting because ~100&nbsp;ns is the "known" DRAM number,
+but it is the wrong number for streaming. <strong>Feed-forward:</strong> §6.3.</div>
+
+<div class="solution" id="sol6.5"><span class="sol-label">6.5</span>
+(a) The sum is stride-1, so the hardware prefetcher recognizes the pattern and fetches lines ahead of the
+loop, keeping many independent accesses in flight; the loop is then limited by how fast memory can
+<em>stream</em> (bandwidth), not by any single access's latency. (b) Even the L2 sum is capped by the
+<strong>single-accumulator dependency chain</strong> (§2.3): each <code>sum +=</code> depends on the
+previous, so the additions serialize at roughly one add-latency apart, limiting throughput below what the
+cache could supply. (c) Sum into <strong>several independent accumulators</strong> (or let the compiler
+vectorize), breaking the dependency chain so more values are consumed per cycle and the loop can approach
+memory bandwidth. <em>Method note:</em> the two limiters — prefetchable bandwidth and the add dependency
+— are distinct; naming both is the full explanation. <strong>Feed-forward:</strong> §6.3 and Chapter 2
+§2.3.</div>
+
+<div class="solution" id="sol6.6"><span class="sol-label">6.6</span>
+(a) <strong>compute-time &approx; F / 10<sup>10</sup> s</strong>; <strong>memory-time &approx; B /
+10<sup>10</sup> s</strong>; the runtime floor is the larger of the two. (b) Compute-bound when compute-time
+&gt; memory-time, i.e. <strong>F / B &gt; 1</strong> op per byte for these rates (more generally, when work
+per byte exceeds the machine's ops-per-byte balance point). (c) A sum does 1 add per 8 bytes, so F/B =
+1/8 &lt; 1 &rarr; <strong>memory-bound</strong> by this test. §6.3 agrees: the sum's speed tracked memory
+(GB/s), not the add rate — though the single-accumulator dependency kept it from reaching full bandwidth,
+which is why the measured GB/s was modest. <em>No-fabrication note:</em> the 10<sup>10</sup> rates are
+round orders of magnitude for estimation, not a spec of any particular chip. <strong>Feed-forward:</strong>
+§6.2&ndash;6.3.</div>
+
+<div class="solution" id="sol6.7"><span class="sol-label">6.7</span>
+<strong>Step 4:</strong> ~150&nbsp;ns/step exceeds the ~100&nbsp;ns bare DRAM latency because the random
+chase over 512&nbsp;MiB also <strong>thrashes the TLB</strong> (Chapter 4): each jump lands on a new page
+whose translation has been evicted, so most steps pay a <strong>page-table walk</strong> — extra
+dependent memory accesses to translate the address — <em>on top of</em> the data miss. So the ~150&nbsp;ns
+is roughly the DRAM data latency plus the translation cost. To confirm the surplus is translation and not
+data, measure the <strong>dTLB-load-miss / page-walk rate</strong> (e.g. <code>perf stat -e
+dTLB-load-misses</code>) and check it is high for the random run and negligible for the sequential one.
+The pair teaches the rule: estimate with <strong>bandwidth</strong> for prefetchable sequential access
+(§6.3's ~1.7&times;) and with <strong>latency</strong> — plus translation cost — for scattered, dependent
+access (this ~25&times;); the access pattern, not just the data's tier, chooses the model.
+<strong>Feed-forward:</strong> §6.3&ndash;6.4, Chapter 4 §4.4.</div>
+
+<div class="solution" id="sol6.8"><span class="sol-label">6.8</span>
+(a) <strong>Memory-bound</strong>, memory bandwidth saturated — a single core's sequential scan already
+uses much of the available bandwidth, so more threads add little (the bottleneck is the memory pipe, not
+cores). (b) <strong>Compute-bound-ish / control</strong>, branch misprediction — sorting made the
+data-dependent branch predictable (Ch 2 §2.4), cutting flushes. (c) <strong>Memory-bound</strong>, TLB
+miss / page-walk — the ~160&nbsp;ns over ~100&nbsp;ns and the huge-page fix are the TLB signature (Ch 4).
+(d) <strong>Compute-bound</strong>, execution throughput — the multiply-add issue rate limits an in-cache
+matmul (Ch 2). <em>Method-selection cue:</em> "adding threads doesn't help a scan" &rarr; bandwidth-bound;
+"sorting fixed it" &rarr; branch; "huge pages fixed it" &rarr; TLB; "issue rate limited" &rarr; compute.</div>
+
+<div class="solution" id="sol6.9"><span class="sol-label">6.9</span>
+(a) The 100&times; is a <em>latency</em> ratio, but a sequential scan is prefetchable and therefore
+<strong>bandwidth-bound</strong>, so latency is the wrong model — the actual slowdown vs. cache is a
+small factor, not 100&times; (§6.3). (b) Rough class: <strong>memory-bound (streaming)</strong>; rough
+slowdown vs. an in-cache version: on the order of a <strong>~2&times;</strong>, since DRAM streaming
+bandwidth is within a small factor of cache (and it may be further gated by the file/I-O layer for a
+file-backed array). (c) Confirm by measuring (i) the scan's <strong>effective GB/s</strong> (is it near
+memory bandwidth?) and (ii) its <strong>cache-miss / prefetch behavior</strong> (or simply compare to the
+same scan on an in-cache slice) before optimizing. <em>Tempting wrong answer:</em> accept the 100&times;
+and build a cache — that optimizes a bottleneck that isn't there. <strong>Feed-forward:</strong> §6.3 and
+the warning box.</div>
+
+<div class="solution" id="sol6.10"><span class="sol-label">6.10</span>
+(a) The <strong>random</strong> ratio is more portable because it is bounded by DRAM <em>latency</em>
+(plus translation), which is set by physics and the memory subsystem and varies modestly across machines;
+the <strong>sequential</strong> ratio is bounded by the <em>bandwidth</em> gap between L2 and DRAM and by
+loop details (accumulators, vectorization, prefetcher quality), which vary a lot — so the sequential
+number is the fragile one. (b) Raise the sequential ratio: a stronger prefetcher / higher L2 bandwidth
+relative to DRAM (widens the streaming gap), or removing the accumulator dependency so the L2 loop speeds
+up more than the DRAM loop. Lower the random ns/step: faster DRAM / lower memory latency, a larger TLB or
+huge pages (cuts page-walk cost), or a bigger last-level cache that keeps more of the footprint on-chip.
+(c) Reporting both ratios with their access patterns is honest because there is no single "DRAM is
+N&times; slower" — the answer depends entirely on whether access is streaming or scattered; a lone
+headline number invites readers to apply it to the wrong pattern and mis-estimate by orders of magnitude,
+which is exactly the §6.3 trap. <em>Tempting wrong answer:</em> "just quote the bigger, scarier ratio" —
+that mispredicts every bandwidth-bound workload. <strong>Feed-forward:</strong> §6.3&ndash;6.4.</div>
+
+<div class="solution" id="sol6.11"><span class="sol-label">6.11</span>
+Machine-specific by design, and the write-up matters as much as the numbers. A correct submission (1)
+records real L2/L3 and cache-line sizes; (2) states a <em>written-first</em> prediction with the expected
+bound (sequential &rarr; bandwidth-bound, small ratio; DRAM chase &rarr; latency-bound, large ratio); (3)
+reports measured ns/element and GB/s for both sums (identical sums verified); (4) reports ns/step for both
+pointer-chases; and (5) reconciles each measurement against the prediction — expecting a modest sequential
+ratio (bandwidth) and a large random one (latency plus TLB), ideally backed by <code>perf</code>
+cache-miss and dTLB-miss counters showing the random DRAM run dominated by misses and page-walks. The
+essential discipline: predict before measuring, report only observed numbers, explain surprises with
+latency-vs-bandwidth and the TLB rather than hand-waving, and if a loop is elided, consume the result and
+say so. <em>Tempting wrong answer:</em> skipping the written prediction and only reporting measurements —
+you lose the reconciliation that is the whole point. <strong>Feed-forward:</strong> §6.3&ndash;6.4 and
+the performance-engineering Part.</div>
+
+</section>

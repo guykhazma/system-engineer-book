@@ -1,0 +1,116 @@
+<section class="solutions" id="sol07">
+<h1>Chapter 7 — Solutions</h1>
+
+<div class="solution" id="sol7.1"><span class="sol-label">7.1</span>
+(a) A pointer variable stores a <strong>memory address</strong> (a virtual address, per Ch 4). (b)
+<code>*p</code> <strong>dereferences</strong> — goes to the address in <code>p</code> and reads or writes
+the object there, using <code>p</code>'s type to know how many bytes and how to interpret them. (c)
+<code>&amp;x</code> produces the <strong>address of</strong> <code>x</code> (a pointer to <code>x</code>).</div>
+
+<div class="solution" id="sol7.2"><span class="sol-label">7.2</span>
+As a <code>double *</code>: <code>q + 4</code> = 2000 + 4&times;<code>sizeof(double)</code> = 2000 + 4&times;8
+= <strong>2032</strong>. As an <code>int *</code>: 2000 + 4&times;<code>sizeof(int)</code> = 2000 + 4&times;4
+= <strong>2016</strong>. The rule: <code>p + n</code> advances by <code>n &times; sizeof(*p)</code> bytes, so
+the byte step is the element size. <em>Method note:</em> always multiply the integer by the pointee's
+<code>sizeof</code>, never treat it as a byte offset. <strong>Feed-forward:</strong> §7.2.</div>
+
+<div class="solution" id="sol7.3"><span class="sol-label">7.3</span>
+<code>sizeof(a)</code> = <strong>40</strong> (10 ints &times; 4 bytes — the whole array);
+<code>sizeof(p)</code> = <strong>8</strong> (just the pointer, on this x86-64 machine). Difference:
+<code>a</code> names the array object, so <code>sizeof</code> measures all its storage;
+<code>p</code> is a separate pointer variable, so <code>sizeof</code> measures the pointer, not what it
+points at. <em>Tempting wrong answer:</em> "both are 40 because <code>p</code> points at the array" — no,
+<code>sizeof</code> looks at the operand's <em>type</em>, and <code>p</code>'s type is <code>int *</code>.
+<strong>Feed-forward:</strong> §7.3.</div>
+
+<div class="solution" id="sol7.4"><span class="sol-label">7.4</span>
+<strong>Array-to-pointer decay:</strong> in most expression contexts an array name is automatically
+converted to a pointer to its first element (C §6.3.2.1), which is why <code>arr</code> can be assigned to an
+<code>int *</code>, indexed, or passed to a function taking <code>int *</code>. In
+<code>size_t len(int a[]) { return sizeof(a)/sizeof(a[0]); }</code> the parameter <code>a</code> is
+<em>already a pointer</em> (a function parameter of "array" type is adjusted to pointer type; the array
+decayed at the call), so <code>sizeof(a)</code> is the <strong>pointer size</strong> (8 here), not the
+array size. The returned value is <code>8 / sizeof(int)</code> = <strong>2</strong> on this machine,
+regardless of the caller's real length. Correct approach: pass the length explicitly.
+<em>Tempting wrong answer:</em> "it returns the element count" — it cannot; the length was lost at the call
+boundary. <strong>Feed-forward:</strong> §7.3.</div>
+
+<div class="solution" id="sol7.5"><span class="sol-label">7.5</span>
+<code>struct S { char a; short b; char c; int d; };</code> with align = size (char 1, short 2, int 4):
+<code>a</code> at offset 0 (byte 0); <code>b</code> (align 2) needs an even offset, next is 2, so 1 byte
+padding at 1, <code>b</code> occupies 2–3; <code>c</code> at offset 4 (byte 4); <code>d</code> (align 4)
+needs a multiple of 4, next after byte 4 is 8, so 3 bytes padding at 5–7, <code>d</code> occupies 8–11.
+Struct alignment = max(1,2,1,4) = 4; running size 12 is already a multiple of 4, so no tail padding.
+<strong><code>sizeof(struct S) = 12</code></strong>; real data = 1+2+1+4 = 8, so <strong>4 bytes padding</strong>.
+Verify with <code>offsetof(struct S, member)</code> for each member and <code>sizeof(struct S)</code>.
+<em>Tempting wrong answer:</em> "1+2+1+4 = 8" — ignores alignment padding. <strong>Feed-forward:</strong> §7.5.</div>
+
+<div class="solution" id="sol7.6"><span class="sol-label">7.6</span>
+Order largest-alignment first: <code>struct S { int d; short b; char a; char c; };</code> — <code>d</code>
+at 0 (0–3), <code>b</code> at 4 (4–5), <code>a</code> at 6, <code>c</code> at 7; running size 8, alignment 4,
+8 is a multiple of 4, so no tail padding. <strong><code>sizeof = 8</code></strong> — the size of the real
+data, zero padding. Rule applied: placing members in decreasing alignment order minimizes the internal gaps
+needed to re-align each successive member (and packs the small fields into what would otherwise be padding).
+<em>Tempting wrong answer:</em> "field order can't matter in C" — it does, via alignment padding.
+<strong>Feed-forward:</strong> §7.5, and §5.4.</div>
+
+<div class="solution" id="sol7.7"><span class="sol-label">7.7</span>
+(a) 10&nbsp;M &times; 24 bytes = <strong>240&nbsp;MB</strong>. (b) 10&nbsp;M &times; 16 = <strong>160&nbsp;MB</strong>.
+A 64-byte line holds <code>64/24</code> = 2 whole 24-byte records vs. <code>64/16</code> = 4 whole 16-byte
+records — <strong>2 more per line</strong>; a 4&nbsp;KiB page holds 4096/24 = 170 vs. 4096/16 = 256 —
+<strong>86 more per page</strong>. (c) The smaller record raises useful-bytes-per-line and records-per-page,
+so a scan fetches fewer cache lines and touches fewer pages — better spatial locality and less TLB pressure
+(Ch 3–5), for free, from field ordering. <em>Tempting wrong answer:</em> ignoring that a line/page holds a
+<em>whole</em> number of records (partial records straddle boundaries), which is why we floor. <strong>Feed-forward:</strong>
+§7.5, §5.4.</div>
+
+<div class="solution" id="sol7.8"><span class="sol-label">7.8</span>
+<strong>Step 4:</strong> The struct's alignment is max(8,1,4) = <strong>8</strong>. After <code>b</code> the
+running size is 16, which <em>is</em> a multiple of 8, so <strong>no tail padding</strong> is needed. Final
+<strong><code>sizeof(struct T) = 16</code></strong>; real data = 8+1+4 = 13, so <strong>3 padding bytes</strong>
+(the ones at offsets 9–11). Confirm each member's offset with <code>offsetof(struct T, member)</code> (and
+<code>sizeof</code> for the total). <em>Method note:</em> always finish by rounding the size up to the
+struct's alignment — here it happened to already be aligned. <strong>Feed-forward:</strong> §7.5.</div>
+
+<div class="solution" id="sol7.9"><span class="sol-label">7.9</span>
+(a) <strong>Array-to-pointer decay</strong> (Ch 7) — the parameter is a pointer, so <code>sizeof</code> is
+8; length was lost at the call. (b) <strong>TLB miss / page-walk</strong> (Ch 4) — huge pages helping is the
+signature; they raise TLB reach. (c) <strong>Struct padding/alignment</strong> (Ch 7/5) — the compiler
+inserts padding to align members. (d) <strong>Endianness</strong> (Ch 7) — the other machine's byte order
+differs, so integers appear byte-swapped. <em>Method-selection cue:</em> "sizeof of a parameter is 8" &rarr;
+decay; "huge pages helped" &rarr; TLB; "bigger than the fields" &rarr; padding; "byte-swapped across
+machines" &rarr; endianness. <strong>Feed-forward:</strong> §7.3–7.6.</div>
+
+<div class="solution" id="sol7.10"><span class="sol-label">7.10</span>
+(a) A <strong>virtual</strong> address (Ch 4) — the hardware translates it to physical on access. (b)
+<code>&amp;arr[5] - &amp;arr[2]</code> = <strong>3</strong> (an element count of type <code>ptrdiff_t</code>;
+pointer subtraction divides out the element size). (c) <strong>Not stable</strong> — a PIE build is relocated
+by ASLR each run, so absolute addresses change; the relative layout is stable. (d) <strong>No</strong> — the
+C standard guarantees only <code>sizeof(char)==1</code> and minimum ranges (<code>int</code> ≥ 16 bits);
+4 bytes is this ABI's implementation-defined value, verified, not guaranteed. <em>Tempting wrong answer:</em>
+on (b), answering "12 bytes" — subtraction yields elements, not bytes. <strong>Feed-forward:</strong> §7.2,
+§7.4–7.5, and Ch 4.</div>
+
+<div class="solution" id="sol7.11"><span class="sol-label">7.11</span>
+(a) For <code>int arr[10]</code>, <code>&amp;arr[10]</code> is the special "one past the last element"
+address, which the standard explicitly permits you to <em>form</em> and compare against (useful as a loop
+end), but the object there does not exist, so <em>dereferencing</em> it is undefined (C §6.5.6). (b) Making
+it undefined (rather than "wraps" or "reads adjacent memory") lets the optimizer assume in-bounds access —
+enabling optimizations and diagnostics — and reflects that beyond the array there may be padding, another
+object, an unmapped page, or a segment boundary (Ch 4), so no single "reasonable" behavior exists to define.
+(c) This is exactly the <strong>buffer overflow</strong> bug of Ch 9: an out-of-bounds access is UB, and an
+out-of-bounds write is the classic memory-corruption vulnerability. <em>Tempting wrong answer:</em>
+"one-past-the-end is illegal to compute" — it is legal to compute and compare, only illegal to dereference.
+<strong>Feed-forward:</strong> §7.2 and §9.3.</div>
+
+<div class="solution" id="sol7.12"><span class="sol-label">7.12</span>
+Machine-specific by design. A correct write-up reports measured <code>sizeof</code>/<code>_Alignof</code>
+for the scalar types (on x86-64 LP64: char 1, short 2, int 4, long 8, double 8, pointer 8, alignment = size),
+a struct whose hand-computed offsets and total <code>sizeof</code> match <code>offsetof</code>/<code>sizeof</code>
+exactly, and an endianness check (x86-64 prints the low byte first — little-endian). The essential
+discipline: label the machine/ABI, report only measured numbers, and note that a different platform (16-bit,
+or big-endian, or a different ABI) would legitimately differ — which is the whole reason to measure rather
+than assume. <em>Tempting wrong answer:</em> hard-coding "int is 4 bytes" as universal — it is
+implementation-defined. <strong>Feed-forward:</strong> §7.5–7.6.</div>
+
+</section>

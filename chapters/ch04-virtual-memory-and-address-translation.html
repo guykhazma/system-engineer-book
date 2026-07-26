@@ -1,0 +1,425 @@
+<section class="chapter" id="ch04">
+<h1>Chapter 4 — Virtual Memory &amp; Address Translation</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch03">Chapter 3</a> (caches; memory
+moves in lines; a miss to DRAM costs ~100&nbsp;ns), <a href="#ch01">Chapter 1</a> (the latency
+hierarchy). &nbsp;·&nbsp; <strong>Pairs with:</strong> <a href="#ch05">Chapter 5</a> (data layout) and
+the operating-system Part, which builds the page tables this chapter only describes. This chapter adds
+one more cache to the picture — a cache for <em>address translations</em> — and shows why a huge,
+scattered working set can be slow for a reason the last chapter did not cover.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch03">Chapter 3</a> said the CPU keeps recently used cache
+lines so a repeated access is a cheap hit — what is the general trick there, in one word? (2)
+<a href="#ch01">Chapter 1</a> put a DRAM access at ~100&nbsp;ns and an L1 hit at ~1&nbsp;ns — about how
+many orders of magnitude apart? (3) <em>Predict:</em> the pointer <code>p</code> in your C program holds
+an address like <code>0x7ffd3a08</code>. When the CPU reads <code>*p</code>, do you think that number is
+the actual electrical address of a cell in your DRAM chips — the physical location — or something the
+hardware has to <em>translate</em> first? By the end of the chapter you will know which, and what the
+translation costs.</p>
+</aside>
+
+<p>Every address your program has ever used is a lie — a convenient, deliberate, hardware-enforced lie.
+When your code holds a pointer and dereferences it, the number in that pointer is a <strong>virtual
+address</strong>: a name in a private, per-process address space that the operating system and CPU
+maintain, not the <strong>physical address</strong> of a byte in the DRAM chips. Before the load can
+touch memory, the hardware must <em>translate</em> virtual to physical. That translation is invisible,
+automatic, and — this is the point for a performance book — <em>not free</em>. This chapter explains the
+mechanism (why virtual memory exists, how pages and page tables implement it) and then, in the register
+of Part 1, isolates its cost: the translation itself is cached, in a structure called the TLB, and when
+that cache misses, the machine pays a price that scales with how scattered your data is. The through-line
+from <a href="#ch03">Chapter 3</a> is exact — <strong>the TLB is a cache for the page table</strong>, and
+everything you learned about hits, misses, and working sets applies to it too.</p>
+
+<h2>4.1 Virtual vs. physical addresses: why the lie exists</h2>
+
+<p>On a modern system, each process runs as if it owns a large, contiguous block of memory starting near
+address zero, all to itself. It does not. Physical DRAM is shared among every process and the kernel, is
+smaller than the address space the program is allowed to name, and is handed out in scattered fragments.
+The <strong>virtual address space</strong> is the illusion that papers over this reality: the hardware's
+memory-management unit (MMU), configured by the OS, maps each process's virtual addresses onto whatever
+physical frames happen to be free, and keeps different processes' identical-looking virtual addresses
+pointing at different physical memory. Bryant and O'Hallaron develop this fully in <em>Computer Systems:
+A Programmer's Perspective</em> (CS:APP, Chapter 9, "Virtual Memory"); Arpaci-Dusseau's <em>Operating
+Systems: Three Easy Pieces</em> (OSTEP) devotes its whole virtualization part to it.</p>
+
+<p>The illusion buys three things at once, which is why every general-purpose OS pays for it. First,
+<strong>isolation</strong>: process A literally cannot name a byte belonging to process B, because A's
+page tables contain no mapping to B's frames — a security and stability boundary enforced in hardware.
+Second, <strong>a simple programming model</strong>: your linker can lay out code and data at fixed
+virtual addresses without knowing where in physical RAM the program will actually land, and every process
+gets the same clean layout. Third, <strong>flexibility the OS exploits</strong>: a virtual page can be
+mapped to a physical frame, or to a page of a file on disk, or to nothing yet (allocated lazily on first
+touch), or shared read-only between processes (as with a common library) — all invisibly to your code.
+For this chapter, hold onto the first fact and the cost it implies: because the mapping is per-process and
+arbitrary, <em>the hardware must consult a translation on essentially every memory access</em>, and that
+lookup is what we now follow.</p>
+
+<h2>4.2 Pages and page tables</h2>
+
+<p>Translating every individual byte address would need a map with one entry per byte — absurd. Instead
+memory is divided into fixed-size <strong>pages</strong>: the address space is chopped into aligned
+blocks, and translation happens one page at a time. The near-universal base page size on x86-64 (and
+many other architectures) is <strong>4&nbsp;KiB</strong>; CS:APP uses this standard size, and it is what
+<code>getconf PAGE_SIZE</code> reports on such systems. A virtual address then splits cleanly into two
+parts: the high bits are the <strong>virtual page number</strong> (which page), and the low bits — 12 of
+them for a 4&nbsp;KiB page, since 2<sup>12</sup>&nbsp;=&nbsp;4096 — are the <strong>offset</strong> within
+the page. Only the page number needs translating; the offset is the same in virtual and physical
+addresses, because a page maps to a physical <strong>frame</strong> of the same size and a byte's
+position within the page does not move.</p>
+
+<p>The <strong>page table</strong> is the data structure, held in memory and owned by the OS per process,
+that maps virtual page numbers to physical frame numbers (plus permission and status bits: present or
+not, readable/writable/executable, accessed, dirty). Conceptually it is one big array indexed by virtual
+page number. But a flat array is impractical: a 48-bit virtual address space with 4&nbsp;KiB pages has
+2<sup>36</sup> pages, and a flat table with an entry per page would be enormous <em>per process</em>, the
+overwhelming majority of it empty because most programs use a tiny, sparse fraction of their address
+space. The standard fix is a <strong>multi-level (hierarchical) page table</strong>: a tree of tables
+where the virtual page number is split into several fields, each indexing one level. x86-64 uses a
+four-level page table (a documented architectural fact, described in CS:APP). Only the branches that
+correspond to actually-used regions of memory need to exist, so a sparse address space costs a sparse
+tree instead of a giant flat array.</p>
+
+<p>The cost that matters shows up right here. To translate one virtual page number through a four-level
+table, the hardware must read <em>each level in turn</em>: read the top-level table to find the address
+of the next-level table, read that to find the next, and so on — up to <strong>four dependent memory
+accesses</strong> to complete one translation on x86-64. This descent is called a <strong>page-table
+walk</strong>. And notice it is a dependency chain of the exact kind <a href="#ch03">Chapter 3</a>
+warned about: each read's address comes from the previous read, so the walk cannot be parallelized, and
+if the table levels are not in cache, each step is its own trip toward DRAM. Doing four dependent memory
+accesses <em>for every</em> load and store would erase all the performance we have been chasing — so, as
+always, the machine caches the result.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A 4&nbsp;KiB page needs how many offset bits, and why exactly that many? If a virtual address is split
+into a page number and an offset, which part does the page table translate, and which part is copied
+unchanged into the physical address? (Answer after the next section.)</p>
+</aside>
+
+<h2>4.3 The TLB: a cache for translations</h2>
+
+<p>The <strong>translation lookaside buffer (TLB)</strong> is a small, fast, on-CPU cache that stores
+recent virtual-page-to-physical-frame translations. It is a cache in exactly the sense of
+<a href="#ch03">Chapter 3</a> — same idea, different contents. Chapter 3's data caches store recently
+used <em>cache lines</em> so a repeated data access is a cheap hit; the TLB stores recently used
+<em>translations</em> so a repeated access to the same page skips the page-table walk. On each memory
+access the MMU first checks the TLB with the virtual page number:</p>
+
+<ul>
+<li>A <strong>TLB hit</strong> — the translation is present — returns the physical frame in roughly a
+cycle, effectively free, and the access proceeds. This is the common case, because programs have
+locality: consecutive accesses usually fall on the same few pages (a 4&nbsp;KiB page holds a lot of
+data), so one page's translation, cached once, serves thousands of accesses.</li>
+<li>A <strong>TLB miss</strong> — the translation is not cached — triggers the <strong>page-table
+walk</strong> of §4.2: the several dependent memory accesses to descend the table, after which the
+freshly found translation is installed in the TLB (evicting an older one) so nearby future accesses hit.
+On modern x86-64 this walk is done by hardware; on some architectures the OS handles it in software,
+which is costlier still.</li>
+</ul>
+
+<p>So the cost of a TLB miss is the cost of the walk: on the order of a handful of dependent memory
+accesses. If those accesses hit in the data caches (the upper page-table levels are hot and small, and
+are cached), a miss is cheap — a few cycles. If they miss to DRAM, each is a ~100&nbsp;ns trip
+(<a href="#ch01">Chapter 1</a>), and a walk can cost on the order of tens to hundreds of nanoseconds. The
+exact penalty and the exact TLB capacity are hardware parameters that vary by CPU, and this book will not
+quote a specific chip's numbers as if they were universal — CS:APP (Chapter 9) gives a worked example TLB
+and walk, and Drepper's memory paper covers TLB behavior in depth. What you must carry is the
+<em>shape</em>: a TLB hit is ~free, a TLB miss costs a page-table walk whose price is one to a few memory
+accesses and, in the bad case, is a DRAM-latency event stacked <em>on top of</em> whatever the data
+access itself will cost.</p>
+
+<p><em>(Answer to the quick check: 12 offset bits, because 2<sup>12</sup>&nbsp;=&nbsp;4096&nbsp;=&nbsp;4&nbsp;KiB,
+so 12 bits address every byte within a page. The page table translates the page-number bits; the offset
+is copied unchanged into the physical address, since a page and its frame are the same size and a byte
+keeps its position within the page.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: the TLB is a cache for the page table</span>
+<p><strong>1. In words.</strong> Translating an address needs a multi-step page-table walk. Rather than
+walk on every access, the CPU caches recent translations in the TLB; a hit skips the walk, a miss pays
+for it and caches the result — identical logic to a data cache, applied to translations instead of data.</p>
+<p><strong>2. As a picture.</strong> Figure 4.1: two parallel lookups. The data cache maps <em>address
+&rarr; line</em>; the TLB maps <em>virtual page &rarr; physical frame</em>. Same hit/miss structure,
+different key and value.</p>
+<p><strong>3. As a trace.</strong> Access page P: TLB miss &rarr; walk the 4-level table (up to 4 memory
+reads) &rarr; install P&rarr;frame in the TLB. Next 1000 accesses to page P: TLB hits, ~free. The walk's
+cost is amortized over every access that stays on the page — which is why sequential code barely notices
+the TLB and scattered code does.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="18" fill="#14406b">Virtual address</text>
+<rect x="20" y="26" width="150" height="26" fill="#dbe7f3" stroke="#14406b"/>
+<text x="30" y="43" font-size="10" fill="#14406b">virtual page # | offset</text>
+<line x1="170" y1="39" x2="230" y2="39" stroke="#333" marker-end="url(#a)"/>
+<rect x="230" y="20" width="120" height="40" fill="#efe9f7" stroke="#5a3a8c"/>
+<text x="290" y="37" text-anchor="middle" font-size="10" fill="#5a3a8c">TLB</text>
+<text x="290" y="51" text-anchor="middle" font-size="9" fill="#5a3a8c">page# &rarr; frame#</text>
+<text x="360" y="30" font-size="9" fill="#2e6b34">hit: ~free</text>
+<line x1="350" y1="34" x2="470" y2="34" stroke="#2e6b34"/>
+<text x="360" y="55" font-size="9" fill="#8c3a1d">miss &darr;</text>
+<rect x="230" y="80" width="270" height="70" fill="#fbf5f2" stroke="#8c3a1d"/>
+<text x="240" y="96" font-size="10" fill="#8c3a1d">page-table walk (up to 4 dependent reads on x86-64)</text>
+<rect x="240" y="104" width="50" height="18" fill="#f0c9bd" stroke="#8c3a1d"/><text x="248" y="117" font-size="8">L4</text>
+<rect x="300" y="104" width="50" height="18" fill="#f0c9bd" stroke="#8c3a1d"/><text x="308" y="117" font-size="8">L3</text>
+<rect x="360" y="104" width="50" height="18" fill="#f0c9bd" stroke="#8c3a1d"/><text x="368" y="117" font-size="8">L2</text>
+<rect x="420" y="104" width="50" height="18" fill="#f0c9bd" stroke="#8c3a1d"/><text x="428" y="117" font-size="8">L1</text>
+<text x="240" y="140" font-size="9" fill="#8c3a1d">each read's address depends on the previous &rarr; a dependency chain</text>
+<rect x="470" y="20" width="150" height="26" fill="#d8efd8" stroke="#2e6b34"/>
+<text x="480" y="37" font-size="10" fill="#2e6b34">physical frame # | offset</text>
+<text x="20" y="185" font-size="10" fill="#555">A TLB hit skips the whole lower box. A miss pays for the walk, then caches the result.</text>
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#333"/></marker></defs>
+</svg>
+<figcaption>Figure 4.1: Address translation. The TLB caches virtual-page&rarr;physical-frame mappings;
+a hit is near-free, a miss triggers a multi-level page-table walk (a dependency chain of memory reads)
+whose result is then cached.</figcaption>
+</figure>
+
+<h2>4.4 Why huge, scattered working sets thrash the TLB</h2>
+
+<p>Here is the performance consequence, and it is a new failure mode not covered by Chapter 3's data
+caches. The TLB holds only a limited number of translations — a hardware-fixed count, small relative to
+the number of pages a large program can touch. The total span of memory the TLB can map at once is its
+<strong>reach</strong>: roughly (number of entries) &times; (page size). With 4&nbsp;KiB pages, even a
+few thousand TLB entries reach only a few megabytes of address space at a time. So a program whose hot
+data spans <em>hundreds</em> of megabytes, accessed in a scattered pattern that jumps from page to page,
+will keep missing the TLB: each jump lands on a page whose translation was long since evicted, forcing a
+fresh page-table walk. This is <strong>TLB thrashing</strong>, and it is precisely a <em>capacity miss</em>
+(Chapter 3's taxonomy) at the translation level — the working set of <em>pages</em> exceeds what the TLB
+can hold, just as a data working set can exceed the L2.</p>
+
+<p>Notice the two costs now stack. A scattered access over a huge array can miss the <em>data</em> cache
+(pay ~100&nbsp;ns to fetch the line) <em>and</em> miss the <em>TLB</em> (pay a page-table walk to even
+learn where the line is), and in the worst case the walk itself misses cache and goes to DRAM. This is a
+large part of why truly random access over a multi-hundred-megabyte structure is so much slower than the
+raw ~100&nbsp;ns DRAM figure alone would predict — a fact the <a href="#ch06">Chapter 6</a> capstone lab
+measures directly, where a random pointer-chase over 512&nbsp;MiB costs well above the bare DRAM latency,
+with the surplus owing partly to exactly this page-walk cost. By contrast, <em>sequential</em> access
+barely touches the TLB: a 4&nbsp;KiB page holds ~512 <code>long</code>s, so one translation serves
+hundreds of consecutive accesses before you cross into the next page — the same "use the whole thing you
+paid to bring in" principle as the cache line, one level up.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Two loops touch the same 512&nbsp;MiB array the same number of times: one walks it sequentially, one
+jumps to random pages. Which one thrashes the TLB, and why does the other one hardly use it at all?
+(Answer below the huge-pages section.)</p>
+</aside>
+
+<h2>4.5 Huge pages, conceptually</h2>
+
+<p>If TLB reach is (entries) &times; (page size) and you cannot easily add TLB entries (that is fixed
+hardware), the other lever is the page size. <strong>Huge pages</strong> do exactly that: instead of
+mapping memory in 4&nbsp;KiB units, the OS can map it in much larger units — on x86-64, commonly
+<strong>2&nbsp;MiB</strong>, and <strong>1&nbsp;GiB</strong> where supported (both are real, documented
+x86-64 page sizes; the <code>pdpe1gb</code> CPU flag advertises 1&nbsp;GiB support). One huge-page
+translation covers 2&nbsp;MiB instead of 4&nbsp;KiB, so the <em>same</em> number of TLB entries now
+reaches roughly 512&times; more memory. A working set that thrashed the TLB with 4&nbsp;KiB pages may fit
+entirely within the TLB's reach once mapped with 2&nbsp;MiB pages, turning a storm of page-table walks
+into TLB hits. A second, smaller benefit: a huge page's walk descends fewer levels (the translation
+stops at a higher level of the tree), so even the misses are a bit cheaper.</p>
+
+<p>Huge pages are a real mitigation for real workloads — large in-memory databases, big hash tables,
+scientific arrays — where TLB misses are a measured bottleneck. They are not free lunch: they can waste
+memory to internal fragmentation (a 2&nbsp;MiB page allocated for a few live kilobytes), can be harder
+for the OS to find contiguously once memory is fragmented, and help <em>only</em> when TLB misses were
+actually a problem. That last clause is the discipline of this whole Part: huge pages are something you
+reach for <em>after</em> a profiler shows page-walk cost is significant, not a switch you flip on faith.
+This book keeps the treatment conceptual — the mechanics of enabling them (explicit <code>mmap</code>
+flags vs. transparent huge pages) belong to the operating-system Part — but the model is what matters
+here: <em>bigger pages, fewer translations, more TLB reach.</em></p>
+
+<p><em>(Answer to the §4.4 quick check: the random-page jumper thrashes the TLB — each jump lands on a
+different page whose translation has been evicted, forcing a walk. The sequential walker hardly uses the
+TLB because each 4&nbsp;KiB page's single translation serves the hundreds of consecutive accesses that
+fall on that page before it crosses to the next one.)</em></p>
+
+<aside class="warning">
+<span class="box-title">Trap: ignoring TLB cost (the "it's all just DRAM latency" fallacy)</span>
+<p>Having learned Chapter 3, it is tempting to model every scattered access as a single ~100&nbsp;ns DRAM
+miss and stop there. That undercounts. A random access over a large working set can pay <em>two</em>
+independent penalties: the data-cache miss to fetch the line, <em>and</em> a TLB miss whose page-table
+walk is itself one to several memory accesses. When your measured cost per random access sits well above
+the raw DRAM latency you expected, suspect the TLB — especially if the working set spans far more memory
+than TLB reach (a few thousand pages &times; 4&nbsp;KiB). The tell is a hot, random-access structure of
+hundreds of megabytes or more. The fixes are the ones this chapter and the last give: prefer sequential
+or blocked access so one translation serves many accesses (the sequential-vs-random gap is partly a TLB
+gap); shrink the working set; and, where a profiler confirms page-walk cost, consider huge pages. As
+always: confirm by measuring page-walk and TLB-miss counters, not by guessing.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our random lookup into the big in-memory index costs about
+160&nbsp;ns per access, but you told me DRAM is only ~100&nbsp;ns — where does the extra time come from?"
+Cover the paragraph below and answer in two or three sentences, using <em>TLB</em>, <em>page-table
+walk</em>, and <em>reach</em>.</p>
+<p><em>Model answer.</em> "The ~100&nbsp;ns is just the data fetch. Each random lookup also needs an
+address translation, and because the index spans far more memory than the TLB can map at once (its reach
+is only a few megabytes with 4&nbsp;KiB pages), most lookups miss the TLB and trigger a page-table walk —
+several dependent memory accesses — <em>before</em> the data access even starts. That walk cost stacks on
+top of the DRAM latency, which is where the surplus comes from. If a profiler confirms it, mapping the
+index with huge pages would raise TLB reach enough to turn most of those walks back into hits." Naming
+the TLB and page walk — rather than "memory is just slow" — is the senior register, and it points at a
+concrete, measurable fix.</p>
+</aside>
+
+<h2>4.6 What to carry forward</h2>
+
+<p>This chapter added the last piece of the machine's cost model that Part 1 needs. The addresses your
+program uses are virtual, translated to physical one page at a time through a multi-level page table; the
+translation is cached in the TLB, so it is near-free when your accesses have page-level locality and
+expensive — a page-table walk of several dependent memory accesses — when they do not. A huge, scattered
+working set thrashes the TLB the same way a large data working set overflows the L2, and huge pages widen
+TLB reach as a conceptual mitigation. The unifying idea, straight from <a href="#ch03">Chapter 3</a>, is
+that <em>the TLB is one more cache</em>, subject to the same hit/miss/working-set logic as every other
+level — which is why the single habit of accessing memory sequentially or in blocks pays off twice: once
+in the data cache, once in the TLB.</p>
+
+<p>Part 1 now has the whole machine in view: the CPU that runs your instructions
+(<a href="#ch02">Chapter 2</a>), the cache hierarchy that feeds it data (<a href="#ch03">Chapter 3</a>),
+and the translation layer that turns your addresses into real memory (this chapter). <a href="#ch05">Chapter
+5</a> spends that knowledge: it is where you deliberately <em>design</em> your data's layout — array-of-
+structs versus struct-of-arrays, hot/cold splitting, alignment — so that both the cache and the TLB work
+<em>for</em> you. Then <a href="#ch06">Chapter 6</a> puts numbers on all of it in a capstone lab. The
+posture to keep: when memory is slow, ask not only "did the data miss the cache?" but also "did the
+<em>address</em> miss the TLB?"</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain the difference between a <strong>virtual</strong> and a <strong>physical</strong> address,
+and name the three things virtual memory buys (isolation, a simple layout, OS flexibility).</li>
+<li>Split a virtual address into <strong>page number</strong> and <strong>offset</strong>, say why a
+4&nbsp;KiB page has a 12-bit offset, and explain why page tables are <strong>multi-level</strong>.</li>
+<li>State what a <strong>page-table walk</strong> is, why it is a dependency chain, and roughly how many
+memory accesses it can take on x86-64 (up to four).</li>
+<li>Explain why the <strong>TLB is a cache for the page table</strong>, what a hit and a miss each cost
+(in shape, not a specific chip's numbers), and how it maps onto Chapter 3's hit/miss model.</li>
+<li>Define <strong>TLB reach</strong> and explain why a huge, scattered working set <strong>thrashes</strong>
+the TLB while sequential access barely uses it.</li>
+<li>Explain how <strong>huge pages</strong> raise TLB reach, and name a cost of using them.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is the difference between a virtual and a physical address, and why does a
+general-purpose OS use virtual memory at all? (§4.1)</li>
+<li><strong>R2.</strong> Why are page tables multi-level rather than a single flat array, and what is a
+page-table walk? (§4.2)</li>
+<li><strong>R3.</strong> In what precise sense is the TLB "a cache for the page table"? What does a hit
+cost and what does a miss cost, in shape? (§4.3)</li>
+<li><strong>R4.</strong> Define TLB reach and explain TLB thrashing using Chapter 3's miss taxonomy.
+Which of the three C's is it? (§4.4)</li>
+<li><strong>R5.</strong> How do huge pages reduce TLB misses, and when are they <em>not</em> worth it?
+(§4.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>
+(CS:APP)</strong>, Chapter 9 ("Virtual Memory"). The source for this chapter's address-translation
+mechanism, multi-level page tables, TLB, and a worked example of a walk. The free CMU 15-213 materials
+cover it.</li>
+<li><strong>Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP)</strong>, the
+virtualization part (free full text). Paging, TLBs, and page-table structures from the OS side — the
+complement to CS:APP's hardware view, and where the operating-system Part of this book will pick up.</li>
+<li><strong>Drepper, "What Every Programmer Should Know About Memory"</strong> (2007, free). Includes
+TLB behavior, the cost of misses, and huge pages. Absolute numbers are dated — read it for mechanism.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex4.1"><span class="ex-label">4.1</span> <span class="ex-tag warm">warm-up</span>
+A system uses 4&nbsp;KiB pages. (a) How many bits of a virtual address are the page offset? (b) If you
+access <code>a[0]</code> then <code>a[1]</code> (adjacent <code>long</code>s), do they need one
+translation or two? (c) Roughly how many consecutive <code>long</code>s can you touch before you cross a
+page boundary and (possibly) need a new translation?</div>
+
+<div class="exercise" id="ex4.2"><span class="ex-label">4.2</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, name the three benefits virtual memory provides, and state which one is the
+security/isolation boundary between processes.</div>
+
+<div class="exercise" id="ex4.3"><span class="ex-label">4.3</span> <span class="ex-tag warm">warm-up</span>
+Complete the analogy and justify it in a sentence: a data cache stores recently used ____ so a repeated
+data access is a cheap hit; the TLB stores recently used ____ so a repeated access to the same ____ skips
+the ____.</div>
+
+<div class="exercise" id="ex4.4"><span class="ex-label">4.4</span> <span class="ex-tag core">core</span>
+Explain why a page-table walk is a <em>dependency chain</em> and why that matters for its cost. Tie it
+explicitly to the pointer-chasing argument from <a href="#ch03">Chapter 3</a>: what do a page-table walk
+and a linked-list traversal have in common?</div>
+
+<div class="exercise" id="ex4.5"><span class="ex-label">4.5</span> <span class="ex-tag core">core</span>
+A hot in-memory hash table of 400&nbsp;MiB is probed at random keys. Measurements show ~150&nbsp;ns per
+probe, noticeably more than the ~100&nbsp;ns you expected for a single DRAM miss. (a) Give two independent
+memory-system costs a random probe pays. (b) Explain, using <em>TLB reach</em>, why this structure is
+prone to TLB misses. (c) Name one change that would reduce the translation cost specifically, and one
+that would reduce the data-miss cost.</div>
+
+<div class="exercise" id="ex4.6"><span class="ex-label">4.6</span> <span class="ex-tag complexity">cost</span>
+A TLB has <em>E</em> entries and the system uses 4&nbsp;KiB pages. (a) Write the TLB reach as a formula.
+(b) For a working set of <em>W</em> bytes accessed randomly by page, under what condition (in terms of
+<em>W</em>, <em>E</em>, and page size) do you expect heavy TLB thrashing? (c) If you switch to 2&nbsp;MiB
+pages without changing <em>E</em>, by what factor does reach change, and how does that move the threshold
+in (b)?</div>
+
+<div class="exercise" id="ex4.7"><span class="ex-label">4.7</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Explain why sequential access over a 512&nbsp;MiB array
+barely stresses the TLB while random-by-page access over the same array thrashes it. Steps 1&ndash;3
+given; complete step 4.
+<br><strong>Step 1 (given):</strong> Translation happens per page (4&nbsp;KiB); a page of
+<code>long</code>s holds ~512 elements.
+<br><strong>Step 2 (given):</strong> The TLB reaches only (entries &times; 4&nbsp;KiB) of address space
+at once — a few megabytes, far less than 512&nbsp;MiB.
+<br><strong>Step 3 (given):</strong> Sequential access stays on one page for ~512 consecutive accesses
+before crossing to the next, so one translation is amortized over many accesses.
+<br><strong>Step 4 (you):</strong> Complete the argument for the random case: state how often the random
+walker needs a <em>new, uncached</em> translation, why the TLB's small reach means those translations are
+usually missing, and therefore why nearly every random access pays a page-table walk. Then state the one
+number you would measure to confirm the TLB — not just the data cache — is the culprit.</div>
+
+<div class="exercise" id="ex4.8"><span class="ex-label">4.8</span> <span class="ex-tag mixed">mixed</span>
+For each symptom, decide whether the primary cause is most likely a <em>data-cache capacity miss</em>
+(Ch 3), a <em>TLB miss / page-walk</em> (Ch 4), a <em>branch misprediction</em> (Ch 2), or a
+<em>dependency chain / low ILP</em> (Ch 2), and justify in a line: (a) a random-access loop over
+800&nbsp;MiB is slower than ~100&nbsp;ns/access predicts, and enabling 2&nbsp;MiB pages speeds it up; (b)
+a loop over 64&nbsp;MiB re-read many times is much slower than one over 1&nbsp;MiB re-read the same total
+number of times; (c) a sum over a linked list is far slower than over an array of the same length; (d) a
+tight loop with a data-dependent <code>if</code> speeds up sharply after the input is sorted.</div>
+
+<div class="exercise" id="ex4.9"><span class="ex-label">4.9</span> <span class="ex-tag mixed">mixed</span>
+A colleague proposes enabling huge pages everywhere "to make memory faster." Without running anything,
+give (a) the specific condition under which huge pages actually help, (b) two costs or downsides of huge
+pages, and (c) the one measurement you would take first to decide whether they are worth it for a given
+workload. Note which chapter's discipline this reflects.</div>
+
+<div class="exercise" id="ex4.10"><span class="ex-label">4.10</span> <span class="ex-tag stretch">stretch</span>
+The chapter says the TLB "is a capacity miss at the translation level." (a) Map each of Chapter 3's three
+C's onto a translation-level analogue if one exists (compulsory, capacity, conflict), or say why it does
+not. (b) Explain why huge pages address the <em>capacity</em> analogue specifically. (c) Argue why
+increasing the base page size is not a free win at the system level (think of programs with small,
+sparse memory footprints).</div>
+
+<div class="exercise" id="ex4.11"><span class="ex-label">4.11</span> <span class="ex-tag lab">lab</span>
+On your own machine, record the base page size (<code>getconf PAGE_SIZE</code>) and confirm your
+architecture's page-table depth and huge-page sizes from its documentation (do <em>not</em> guess — cite
+what you find). Then write a program that sums the same large array (comfortably larger than your last-
+level cache, e.g. 512&nbsp;MiB) two ways: strictly sequentially, and in a random-by-page order (jump to a
+random page, read a few values, jump again). Time both and report <em>your</em> ns-per-access for each.
+If your platform exposes TLB-miss or page-walk counters (e.g. <code>perf stat -e dTLB-load-misses</code>
+on Linux), record them for both runs and check that the random run has far more. Report only numbers you
+actually measured, and note anything that surprised you.</div>
+
+</section>
+</section>

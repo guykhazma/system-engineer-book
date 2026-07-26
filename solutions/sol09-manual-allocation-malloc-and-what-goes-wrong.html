@@ -1,0 +1,123 @@
+<section class="solutions" id="sol09">
+<h1>Chapter 9 — Solutions</h1>
+
+<div class="solution" id="sol9.1"><span class="sol-label">9.1</span>
+(a) <strong>No</strong> — <code>malloc</code> returns uninitialized (indeterminate) bytes. (b)
+<strong>Yes</strong> — <code>calloc</code> returns all-zero bytes. (c) <strong>Yes</strong> —
+<code>free(NULL)</code> is an explicit no-op, always safe.</div>
+
+<div class="solution" id="sol9.2"><span class="sol-label">9.2</span>
+Safe idiom: <code>void *tmp = realloc(p, n); if (tmp) p = tmp; else { /* handle failure; p still valid */ }</code>.
+With <code>p = realloc(p, n);</code>, if <code>realloc</code> fails it returns <code>NULL</code> and leaves
+the original block <em>valid but unreferenced</em> — you have overwritten your only pointer to it, so it is
+<strong>leaked</strong> (and you have lost the data). <em>Tempting wrong answer:</em> "assign directly, it's
+cleaner" — cleaner and leaky. <strong>Feed-forward:</strong> §9.1.</div>
+
+<div class="solution" id="sol9.3"><span class="sol-label">9.3</span>
+<strong>Use-after-free:</strong> accessing a block after <code>free</code> — <em>UB</em>.
+<strong>Double-free:</strong> freeing the same block twice — <em>UB</em>.
+<strong>Memory leak:</strong> losing the last pointer without freeing — <em>not UB</em> (a defined defect).
+<strong>Buffer overflow:</strong> accessing outside an allocation's bounds — <em>UB</em>.
+<strong>Uninitialized read:</strong> using memory before writing it — <em>indeterminate value; unreliable,
+UB in general</em>. Four of five are undefined behavior; the leak is the exception.
+<strong>Feed-forward:</strong> §9.3.</div>
+
+<div class="solution" id="sol9.4"><span class="sol-label">9.4</span>
+"Returns the old value, so it's harmless" is wrong because use-after-free is <strong>undefined behavior</strong>
+(C §3.4.3): the standard imposes <em>no requirements</em>, so there is no guaranteed value and no guarantee it
+is harmless. Two realistic other outcomes: (1) the freed slot has been handed to another allocation, so you
+read (or clobber) <strong>unrelated live data</strong> — a correctness and security hole; (2) the access
+<strong>corrupts allocator metadata or crashes</strong>, possibly far from the buggy line. It can also differ
+by build or run, and be exploitable. <em>Tempting wrong answer:</em> the premise itself — treating UB as
+having a defined outcome. <strong>Feed-forward:</strong> §9.3.</div>
+
+<div class="solution" id="sol9.5"><span class="sol-label">9.5</span>
+(a) <strong>Use-after-free</strong> — reading <code>p[0]</code> after <code>free(p)</code>; UB. (b)
+<strong>Buffer overflow</strong> — <code>p[4]</code> on a 4-element (indices 0–3) block; UB. (c)
+<strong>Double-free</strong> — freeing the same block twice; UB. (d) <strong>Uninitialized read</strong> —
+reading a <code>malloc</code>'d <code>int</code> before writing it; indeterminate value, unreliable
+(UB in general). (e) <strong>Memory leak</strong> — overwriting the only pointer to a 1024-byte block
+without freeing; a defect, but <em>not</em> UB. <em>Method-selection cue:</em> "touched after free" &rarr;
+UAF; "index past the end" &rarr; overflow; "freed twice" &rarr; double-free; "read before write" &rarr;
+uninitialized; "pointer lost, not freed" &rarr; leak. <strong>Feed-forward:</strong> §9.3.</div>
+
+<div class="solution" id="sol9.6"><span class="sol-label">9.6</span>
+A <strong>leak</strong> frees <em>too late</em> — never; the block stays allocated but unreachable, so memory
+is wasted but no invalid access occurs, hence <strong>not undefined behavior</strong> (the program stays
+well-defined, just wasteful). A <strong>use-after-free</strong> frees <em>too early</em> — while a pointer
+still needs the block; the later access touches storage whose lifetime has ended, which <strong>is undefined
+behavior</strong>. The asymmetry: accessing outside a lifetime is undefined; merely retaining allocated
+memory forever is defined (if undesirable). <em>Tempting wrong answer:</em> "both are UB because both are
+memory bugs" — a leak is a defect but not UB. <strong>Feed-forward:</strong> §9.3.</div>
+
+<div class="solution" id="sol9.7"><span class="sol-label">9.7</span>
+(a) A heap allocation may search a free list, split a block, update bookkeeping, and sometimes call the OS
+for more memory — real work — whereas a stack allocation is a single stack-pointer adjustment (Ch 8). (b)
+<strong>External fragmentation</strong> is free space chopped into many small, non-adjacent pieces by
+interleaved allocate/free of varying sizes; a large request can fail because <em>no single free block</em> is
+big enough, even though the <em>total</em> free memory exceeds the request. (c) <strong>Not undefined
+behavior</strong> — fragmentation is a <em>performance/capacity</em> problem, not a language-rule violation.
+<em>Tempting wrong answer:</em> "fragmentation corrupts memory" — it does not; it just wastes/scatters it.
+<strong>Feed-forward:</strong> §9.2.</div>
+
+<div class="solution" id="sol9.8"><span class="sol-label">9.8</span>
+<strong>Step 4:</strong> Correct allocation size: <code>malloc(strlen(s) + 1)</code> — room for the string
+<em>and</em> its terminating <code>'\0'</code>. Missing check: after <code>malloc</code>, verify it did not
+return <code>NULL</code> before writing (<code>if (!r) return NULL;</code>). Corrected function:
+<code>char *dup(const char *s){ char *r = malloc(strlen(s)+1); if(!r) return NULL; strcpy(r,s); return r; }</code>.
+The tool from §9.4 that catches the original one-byte overflow is <strong>AddressSanitizer</strong>
+(<code>-fsanitize=address</code>), which would report a <code>heap-buffer-overflow</code> on the
+<code>strcpy</code> line (Valgrind would too). <em>Tempting wrong answer:</em> "<code>strlen</code> already
+counts the null terminator" — it does not; it counts the characters before it. <strong>Feed-forward:</strong>
+§9.3–9.4.</div>
+
+<div class="solution" id="sol9.9"><span class="sol-label">9.9</span>
+(a) <strong>Leak</strong> — steadily growing memory until the OOM killer acts is the leak signature. (b)
+<strong>Uninitialized read</strong> — a different value each run, only in release builds, is the classic
+"garbage bytes" symptom (build-dependent). (c) <strong>Buffer overflow</strong> — an out-of-bounds write
+corrupting an adjacent variable. (d) <strong>Use-after-free / double-free</strong> — crashing inside
+<code>free</code> with heap corruption after releasing the same pointer twice is a double-free. (e)
+<strong>Non-memory performance issue</strong> (a TLB/huge-page effect, Ch 4) — <em>not</em> a memory
+<em>bug</em>; the trap in this item. <em>Method-selection cue:</em> "unbounded growth" &rarr; leak; "differs
+per run/release" &rarr; uninitialized; "adjacent corruption" &rarr; overflow; "crash in free after two
+frees" &rarr; double-free; "huge pages help" &rarr; TLB, not a bug. <strong>Feed-forward:</strong> §9.3, Ch 4.</div>
+
+<div class="solution" id="sol9.10"><span class="sol-label">9.10</span>
+(a) <strong>Well-defined and fine</strong> — <code>free(NULL)</code> is a guaranteed no-op. (b) <strong>A
+defined-but-real defect</strong> — a memory leak; wasteful but not UB. (c) <strong>Undefined behavior</strong>
+— <code>a[n]</code> on an <code>n</code>-element array is one past the last valid index (valid indices 0..n-1);
+dereferencing it is out of bounds. (d) <strong>Well-defined and fine</strong> — a <code>calloc</code>'d block
+is zeroed, so reading it yields 0, a defined value. (e) <strong>Reads an indeterminate value (at best unspecified, in general undefined behavior)</strong>
+— a <code>malloc</code>'d block is uninitialized, so reading before writing uses an <em>indeterminate value</em>: on this
+ABI an <code>int</code> has no trap representation, so you get an unspecified (garbage) value rather than a crash, but
+the standard permits it to be full UB in general (matching &sect;9.3), so never rely on it.
+<em>Tempting wrong answer:</em> conflating (d) and (e) — <code>calloc</code> zeroes, <code>malloc</code> does
+not. <strong>Feed-forward:</strong> §9.1, §9.3.</div>
+
+<div class="solution" id="sol9.11"><span class="sol-label">9.11</span>
+(a) The three obligations: use a pointer only within its target's <strong>lifetime</strong>; access only
+within the allocation's <strong>bounds</strong>; and <strong>free each block exactly once</strong> (not zero,
+not twice). (b) <strong>Use-after-free</strong> violates <em>lifetime</em>; <strong>double-free</strong>
+violates <em>free-exactly-once</em>; a <strong>leak</strong> also violates <em>free-exactly-once</em> (frees
+zero times) — while use-after-free additionally implies the free happened too early. (c) A compiler that
+checks these before the program runs would <strong>reject</strong>, at compile time, any program that could
+use a pointer past its target's lifetime, index out of bounds, or mismanage a free — turning a whole class of
+runtime UB into type errors. That is more reliable than a runtime sanitizer because a sanitizer only catches
+a bug on <em>inputs/paths you actually execute</em> during testing, whereas a static guarantee holds for
+<em>all</em> executions — which is exactly Rust's ownership/borrowing promise. <em>Tempting wrong answer:</em>
+"a sanitizer is just as good" — it is path-dependent, not a proof. <strong>Feed-forward:</strong> §9.5 and
+Part 5 (Rust).</div>
+
+<div class="solution" id="sol9.12"><span class="sol-label">9.12</span>
+Machine-specific by design. A correct write-up reports, for each of the four bugs, ASan's exact error type
+and the source line — on the book's machine (gcc 11, x86-64): <code>heap-use-after-free</code> (a READ on the
+line reading the freed block), <code>heap-buffer-overflow</code> (a WRITE "0 bytes to the right of" the
+allocated region), <code>attempting double-free</code>, and (via LeakSanitizer) <code>Direct leak of N
+byte(s)</code> pinned to the allocation line. The fifth program (uninitialized read) should show that ASan
+does <strong>not</strong> flag it — reach for Valgrind or MemorySanitizer, or catch the simple case with
+<code>gcc -Wall</code> (<code>-Wuninitialized</code>). Essential discipline: label compiler/tool versions,
+report only observed output (addresses and wording vary), and note that ASan detects addressability bugs, not
+uninitialized-value bugs. <em>Tempting wrong answer:</em> "ASan catches everything" — it misses uninitialized
+reads. <strong>Feed-forward:</strong> §9.4.</div>
+
+</section>

@@ -1,0 +1,367 @@
+<section class="chapter" id="ch36">
+<h1>Chapter 36 — SIMD and Vectorization</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch02">Chapter 2</a> (the CPU up close — the vector unit is another
+execution resource on the same core), <a href="#ch35">Chapter 35</a> (struct-of-arrays — the contiguous layout the vectorizer needs),
+<a href="#ch34">Chapter 34</a> (locality and memory bandwidth — the ceiling that decides whether SIMD helps), <a href="#ch10">Chapter
+10</a> (the optimizing compiler — the auto-vectorizer is one of its transforms), <a href="#ch33">Chapter 33</a> (measure first).
+&nbsp;·&nbsp; Chapters 34 and 35 got the data close to the core and contiguous; this chapter turns that data into wide, parallel
+arithmetic — when the memory system can keep up.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch35">Chapter 35</a> — why does a struct-of-arrays layout stream one field faster than an
+array-of-structs? (2) <a href="#ch34">Chapter 34</a> — what does it mean for a loop to be &ldquo;memory-bandwidth bound&rdquo; rather
+than compute bound? (3) <em>Predict:</em> a modern vector register holds 8 <code>float</code>s (256-bit AVX), so one vector
+instruction does 8 multiplies at once. If you take a scalar arithmetic-heavy loop over an array that fits in L1 and let the compiler
+vectorize it, what speedup do you expect: about 8&times;, less, or possibly more? And would a loop that streams a 64&nbsp;MiB array
+instead see the same? Write your guesses; &sect;36.2 and &sect;36.3 answer them.</p>
+</aside>
+
+<p>A scalar instruction operates on one pair of operands: one add, one result. A <strong>SIMD</strong> instruction — Single
+Instruction, Multiple Data — operates on a whole vector of them at once: with 256-bit AVX registers, eight <code>float</code>s added
+to eight <code>float</code>s in one instruction, on the same core, in about the same time as the scalar add. This is
+<strong>data-level parallelism</strong> (Hennessy &amp; Patterson, ch.4): not more cores, but wider instructions on one core, and it is
+free throughput <em>if</em> your data is laid out so the CPU can load a vector's worth at once and your loop has no dependency forcing
+the elements to be done one at a time. Both conditions point back: contiguity is Chapter 35's struct-of-arrays, and independence is a
+property of the loop. This chapter proceeds in five steps: what SIMD is and where the lanes come from (&sect;36.1); letting the
+compiler vectorize for you, measured here from 3.4 to 45 Gflop/s (&sect;36.2); what blocks the vectorizer — dependencies, reductions
+and floating-point associativity, aliasing (&sect;36.3); intrinsics, and the memory-bandwidth ceiling that decides whether any of this
+helps (&sect;36.4); and what to carry forward as the performance part closes (&sect;36.5).</p>
+
+<p><strong>On the code in this chapter.</strong> As before the programs are C, compiled with gcc 11.4.0 and run in this environment on
+an Intel Core i7-12700H (which supports AVX2, i.e. 256-bit / 8-wide <code>float</code> vectors, not AVX-512), timed with
+<code>clock_gettime(CLOCK_MONOTONIC)</code> and reported as the minimum of several trials (Chapter 33). Throughputs are in Gflop/s
+(billions of floating-point operations per second) and are illustrative of the effect, not a benchmark of the machine. Where a
+compiler decision is claimed — that a loop did or did not vectorize — it is confirmed with gcc's own
+<code>-fopt-info-vec</code> report, quoted inline, not asserted. A hardware-counter profiler (<code>perf</code>) is not installed
+here, so the evidence is wall-clock throughput plus the compiler's vectorization report.</p>
+
+<h2>36.1 One instruction, many lanes</h2>
+
+<p>The vector unit is extra width on the ordinary core, not a separate processor. A modern x86 core has vector registers — 128-bit
+(SSE), 256-bit (AVX/AVX2), and on some parts 512-bit (AVX-512) — each holding several elements: a 256-bit register holds 8
+<code>float</code>s or 4 <code>double</code>s, and a single AVX instruction like <code>vmulps</code> multiplies all 8 lanes at once.
+The elements travel through the pipeline (Chapter 2) together, so eight multiplies retire in roughly the time of one, giving up to an
+8&times; throughput gain on 32-bit data for arithmetic that can be done in parallel across the lanes. Two requirements make that gain
+real, and both were set up by the previous chapters. First, <strong>contiguity</strong>: to fill a vector register in one load, the 8
+elements must be adjacent in memory — precisely the struct-of-arrays layout of Chapter 35; a strided array-of-structs field forces the
+CPU to gather elements one at a time and throws the advantage away. Second, <strong>independence</strong>: the 8 lanes are computed
+simultaneously, so no lane may depend on another's result within the vector — a loop where each iteration needs the previous one's
+output cannot be vectorized as written. When both hold, the same loop that issued one scalar operation per element now issues one
+vector operation per 8 elements, and the arithmetic throughput multiplies. The next section shows how little you often have to do to
+get this, and how much it is worth.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>How many <code>float</code>s fit in a 256-bit AVX register, and how many does one AVX arithmetic instruction process at once? Name
+the two properties a loop's data and computation must have for the vector unit to deliver its throughput. (Answer after the next
+section.)</p>
+</aside>
+
+<h2>36.2 Auto-vectorization: let the compiler do it</h2>
+
+<p>You rarely write vector instructions by hand first. The compiler's <strong>auto-vectorizer</strong> (Chapter 10's optimizer, with
+the loop transforms of &sect;36.3) recognizes a vectorizable loop and emits vector instructions for it — but only when you ask for the
+right optimization level and target. gcc does not vectorize at <code>-O2</code> in this version; <code>-O3</code> enables it against
+the conservative baseline instruction set (SSE2, 128-bit), and <code>-march=native</code> lets it use the widest vectors the actual
+CPU supports (AVX2, 256-bit here). Here is one compute-heavy, per-element-independent kernel — a Horner-form polynomial over an
+L1-resident 32&nbsp;KiB array — compiled three ways and run here (gcc 11.4.0, minimum of 7 trials):</p>
+
+<pre><code>for (i) y[i] += ((((v*0.11f+0.22f)*v+0.33f)*v+0.44f)*v+0.55f)*v+0.66f;   // v = x[i], ~11 flops/elem
+
+$ gcc -O2 -fno-tree-vectorize simd.c ...   scalar (no vectors) :  3.43 Gflop/s   (1.049 s)
+$ gcc -O3 simd.c ...                       -O3 (SSE2, 4-wide)  : 24.89 Gflop/s   (0.145 s)
+$ gcc -O3 -march=native simd.c ...         -O3 native (AVX2)   : 45.14 Gflop/s   (0.080 s)
+
+$ gcc -O3 -march=native -fopt-info-vec-optimized simd.c
+simd.c:10: optimized: loop vectorized using 32 byte vectors      # AVX2: 8 floats/vector</code></pre>
+
+<p>The measured jump is <strong>13&times;</strong> from scalar to AVX2 (3.43 to 45.14 Gflop/s), and the compiler's own report
+confirms it vectorized &ldquo;using 32 byte vectors&rdquo; — 256-bit AVX2, 8 <code>float</code>s per instruction. Two things deserve
+care in reading this. First, the speedup <em>exceeds</em> the 8-lane width, and honestly so: vectorizing also lets the compiler use
+fused multiply-add (one instruction for <code>a*b+c</code>), unroll the loop, and cut per-iteration overhead, so the win is
+lanes-times-other-improvements, not lanes alone — which is exactly why you <em>measure</em> the speedup rather than assume it equals
+the vector width. Second, the flags matter enormously: the identical source ran at 3.4, 25, or 45 Gflop/s depending only on
+<code>-O2</code> versus <code>-O3</code> versus <code>-O3 -march=native</code>, so &ldquo;did it vectorize?&rdquo; is a question about
+the build, and Chapter 33's rule to benchmark the build you ship is what keeps you honest. The practical lesson: reach for
+auto-vectorization first — right flags, contiguous data, an independent loop — and confirm it happened with
+<code>-fopt-info-vec</code> rather than hoping.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why did the same source run at 3.4, 25, and 45 Gflop/s? Why is the 13&times; scalar-to-AVX2 speedup <em>more</em> than the 8&times;
+you would get from lane count alone? How would you confirm a loop actually vectorized rather than assume it did? (Answer below the
+communicate box.)</p>
+</aside>
+
+<h2>36.3 What blocks the vectorizer</h2>
+
+<p>Auto-vectorization is not magic; a few common properties defeat it, and knowing them lets you either fix the loop or understand why
+the report says &ldquo;not vectorized.&rdquo; The first is a <strong>loop-carried dependency</strong>: if iteration <code>i</code> reads
+a value iteration <code>i-1</code> wrote (<code>a[i] = a[i-1] + x[i]</code>, a running prefix), the lanes cannot be computed in
+parallel because each needs the one before, and the loop is inherently serial as written. The second is subtle and important — a
+<strong>reduction under floating-point non-associativity</strong>. Summing an array into one accumulator (<code>s += a[i]</code>) is a
+reduction, and vectorizing it means adding the elements in a different grouping (8 partial sums, combined at the end), which under
+floating-point rounding can give a <em>different result</em> than the strict left-to-right order the source specifies. Because the
+standard forbids the compiler from silently changing your numerical result, gcc will <em>not</em> vectorize a floating-point reduction
+at <code>-O3</code> unless you permit reassociation with <code>-ffast-math</code> (or <code>-funsafe-math-optimizations</code>). You
+can see this in a dot product streamed over a 64&nbsp;MiB array pair here (gcc 11.4.0):</p>
+
+<pre><code>float dot = 0; for (i) dot += a[i]*b[i];      // a reduction: reassociating changes FP rounding
+
+$ gcc -O2 -fno-tree-vectorize dot.c ...   scalar              : 0.96 Gflop/s
+$ gcc -O3 -march=native dot.c ...         -O3 native, no fast : 1.12 Gflop/s   # reduction NOT vectorized
+$ gcc -O3 -march=native -ffast-math ...   with -ffast-math    : 2.30 Gflop/s   # now vectorized</code></pre>
+
+<p>Without <code>-ffast-math</code> the reduction stays essentially scalar (1.12 vs 0.96 Gflop/s — the small gain is other
+optimization, not vectorization); allowing reassociation unlocks the vector reduction and roughly doubles throughput. Two lessons
+follow. One, <strong>a floating-point reduction needs your explicit permission to vectorize</strong>, because the vector version is not
+bit-identical — so decide deliberately whether your problem tolerates the rounding difference rather than sprinkling
+<code>-ffast-math</code> blindly (it also enables other unsafe assumptions). Two, the dot-product speedup here is only ~2.4&times;, far
+short of the 13&times; of &sect;36.2 on the same machine, and the reason is the whole point of the next section: this loop is limited
+by memory bandwidth, not arithmetic. Other blockers worth naming: <strong>pointer aliasing</strong> (the compiler must assume two
+pointers might overlap and serialize to be safe — <code>restrict</code>, used in the &sect;36.2 kernel, promises they do not),
+data-dependent branches inside the loop, and non-contiguous (strided or gathered) access — the array-of-structs pattern of Chapter 35,
+which is why layout came first.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: SIMD multiplies arithmetic, not memory</span>
+<p><strong>1. In words.</strong> A vector instruction does 8 (or 4, or 16) operations at once on contiguous, independent data, so an
+arithmetic-bound loop can speed up by roughly the lane count (often more, with FMA and unrolling). But if the loop is limited by how
+fast memory can feed it, widening the arithmetic does little — you were waiting on bytes, not on the adder.</p>
+<p><strong>2. As a picture.</strong> Figure 36.1: on the left, a scalar lane doing one multiply per step; on the right, 8 lanes doing 8
+at once from one contiguous load. Below, two bars: a compute-bound kernel rising from 3.4 to 45 Gflop/s (13&times;), and a
+bandwidth-bound dot product barely moving (0.96 to 2.3), capped by a &ldquo;memory bandwidth&rdquo; line.</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, same compiler: an L1-resident compute kernel went 3.43 &rarr; 24.89 &rarr;
+45.14 Gflop/s across scalar, SSE2, and AVX2 — <strong>13&times;</strong> (&sect;36.2); a 64&nbsp;MiB-streaming dot product went 0.96
+&rarr; 2.30 Gflop/s even vectorized — <strong>2.4&times;</strong>, and only after <code>-ffast-math</code> let the reduction vectorize
+at all (&sect;36.3). Vector width is a throughput ceiling on arithmetic; memory bandwidth is a different ceiling entirely.</p>
+</aside>
+
+<p><em>(Answer to the &sect;36.1 quick check: a 256-bit AVX register holds 8 <code>float</code>s (or 4 <code>double</code>s), and one
+AVX arithmetic instruction processes all 8 lanes at once. The two required properties are contiguity — the 8 elements must be adjacent
+so one load fills the register, i.e. Chapter 35's struct-of-arrays — and independence — no lane may depend on another's result within
+the vector, so a loop-carried dependency defeats it.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Scalar vs SIMD lanes, and the two ceilings: vector width vs memory bandwidth.</text>
+<text x="12" y="38" font-size="9" fill="#14406b">scalar: 1 multiply/step</text>
+<rect x="12" y="44" width="26" height="20" fill="#f5f8fb" stroke="#14406b"/><text x="20" y="58" font-size="9">a&times;b</text>
+<text x="150" y="38" font-size="9" fill="#2f7d32">SIMD (AVX2): 8 multiplies/step from one contiguous load</text>
+<g>
+<rect x="150" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="174" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="198" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="222" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="246" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="270" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="294" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="318" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/>
+</g>
+<text x="12" y="96" font-size="9" fill="#14406b">throughput (Gflop/s), same machine and compiler:</text>
+<text x="12" y="118" font-size="8" fill="#14406b">compute-bound kernel (L1-resident):</text>
+<rect x="200" y="110" width="24" height="10" fill="#eef1f4" stroke="#14406b"/><text x="228" y="118" font-size="8">scalar 3.4</text>
+<rect x="200" y="122" width="120" height="10" fill="#cfe0ef" stroke="#14406b"/><text x="324" y="130" font-size="8">SSE2 24.9</text>
+<rect x="200" y="134" width="216" height="10" fill="#9cc2e0" stroke="#14406b"/><text x="420" y="142" font-size="8">AVX2 45.1  (13&times;)</text>
+<text x="12" y="164" font-size="8" fill="#8c3a1d">bandwidth-bound dot (64 MiB stream):</text>
+<rect x="200" y="156" width="7" height="10" fill="#f6dcd2" stroke="#8c3a1d"/><text x="210" y="164" font-size="8">scalar 0.96</text>
+<rect x="200" y="168" width="16" height="10" fill="#efb9a5" stroke="#8c3a1d"/><text x="220" y="176" font-size="8">AVX2+fast-math 2.3  (2.4&times;, capped by memory bandwidth)</text>
+<line x1="200" y1="150" x2="200" y2="182" stroke="#8c3a1d" stroke-dasharray="2,2"/>
+</svg>
+<figcaption>Figure 36.1: SIMD does many operations per instruction on contiguous, independent lanes. On an L1-resident, arithmetic-heavy
+kernel this multiplied throughput 13&times; (scalar &rarr; AVX2); on a 64&nbsp;MiB-streaming dot product it gained only ~2.4&times;,
+because that loop is limited by memory bandwidth, not by the width of the adder (&sect;36.2&ndash;&sect;36.4).</figcaption>
+</figure>
+
+<h2>36.4 Intrinsics, and the memory-bandwidth ceiling</h2>
+
+<p>When the auto-vectorizer cannot see the parallelism — an awkward data layout, a shuffle it will not synthesize, an algorithm that
+needs hand-mapping to lanes — you can write the vector instructions yourself with <strong>intrinsics</strong>: C functions like
+<code>_mm256_mul_ps</code> that map one-to-one to AVX instructions, giving you the lanes explicitly at the cost of portability and
+readability (Intel Intrinsics Guide; Agner Fog's optimization manuals). Intrinsics are the right tool when the payoff is proven and the
+compiler will not deliver it, but they are a last resort after auto-vectorization, because they are verbose, CPU-specific, and easy to
+get wrong — and, crucially, they cannot beat the ceiling the previous section exposed. That ceiling is <strong>memory bandwidth</strong>.
+The dot product of &sect;36.3 gained only 2.4&times; from vectorization not because the vector unit was idle but because the loop
+streams 64&nbsp;MiB pair of arrays that do not fit in any cache, so it is limited by how fast DRAM can deliver bytes, not by how fast
+the core can multiply them. This is the <strong>roofline</strong> idea (Williams, Waterman &amp; Patterson, 2009): a loop's achievable
+performance is capped by the lower of two ceilings — peak compute (raised by SIMD) and peak memory bandwidth (raised only by better
+locality) — and which one binds depends on the loop's <em>arithmetic intensity</em>, its ratio of flops to bytes moved. A dot product
+does ~2 flops per 8 bytes read: low intensity, bandwidth-bound, so SIMD barely helps and the real lever is Chapters 34&ndash;35
+(locality and layout, to move fewer bytes). The L1 kernel of &sect;36.2 does ~11 flops per element already in cache: high intensity,
+compute-bound, so SIMD delivered 13&times;. The discipline: <strong>vectorize the compute-bound loops; for the bandwidth-bound ones,
+fix locality first</strong> — and let a measurement, not the lane count, tell you which kind you have.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: counting lanes instead of measuring &mdash; the SIMD that memory bandwidth eats</span>
+<p>The seductive arithmetic is &ldquo;8 lanes, so 8&times; faster,&rdquo; and it fails in both directions. It <em>over</em>-predicts on
+bandwidth-bound loops: the dot product of &sect;36.3 has 8 lanes available and gained only 2.4&times;, because it waits on DRAM, not on
+the adder — hand-writing AVX intrinsics for it would add complexity and CPU-specific code for a win the memory system has already
+capped. And it <em>under</em>-predicts on compute-bound loops: the &sect;36.2 kernel gained 13&times;, <em>more</em> than 8&times;,
+because vectorization also unlocked FMA and unrolling. Both errors come from reasoning about the hardware instead of measuring it. Two
+defenses. First, decide whether the loop is compute- or bandwidth-bound before reaching for SIMD — a rough arithmetic-intensity
+estimate (flops per byte moved) or, decisively, the Chapter 33 experiment of timing scalar versus vectorized; if widening the
+arithmetic does not move the number, you are bandwidth-bound and the fix is locality and layout (Chapters 34&ndash;35), not more lanes.
+Second, if you do vectorize, confirm it happened (<code>-fopt-info-vec</code>) and measure the actual speedup rather than assuming the
+lane count — because the true number, high or low, is the only one you can ship a decision on. A hand-written SIMD kernel that ignores
+the bandwidth ceiling is effort spent past the point where it can pay, the vector-unit version of optimizing the 5% part.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I hand-wrote AVX2 intrinsics for our vector-add loop <code>c[i] = a[i] + b[i]</code>
+over big arrays — 8 lanes, so it should be 8&times; faster — but my benchmark only shows about 1.2&times;. The intrinsics must be
+wrong; help me debug them.&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;36.1&ndash;&sect;36.4.</p>
+<p><em>Model answer.</em> &ldquo;The intrinsics are probably fine — 1.2&times; is what I'd expect, because that loop is
+bandwidth-bound, not compute-bound. Vector-add does one add per two loads and a store, so its arithmetic intensity is tiny: you're
+limited by how fast DRAM can stream the arrays, not by how fast the core adds, and widening the add from 1 lane to 8 doesn't help when
+the bottleneck is the memory bus. The 8&times; rule only applies to loops that are actually compute-bound and cache-resident — a
+math-heavy kernel on data that fits in L1 can hit or exceed 8&times;, which we've measured. So before debugging the intrinsics, let's
+confirm the diagnosis: time the plain <code>-O3 -march=native</code> auto-vectorized version and check <code>-fopt-info-vec</code> —
+I bet it matches your 1.2&times;, which means the memory system is the ceiling and the real win is in layout and locality (fewer bytes
+moved), not more lanes. If we truly need this faster, the lever is Chapters 34&ndash;35, not more SIMD.&rdquo; Diagnosing the ceiling
+before optimizing against it — and preferring the auto-vectorizer plus a measurement to hand intrinsics — is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;36.2 quick check: the same source ran at 3.4/25/45 Gflop/s because vectorization depends on the build —
+<code>-O2</code> did not vectorize, <code>-O3</code> used 128-bit SSE2, and <code>-O3 -march=native</code> used 256-bit AVX2. The
+scalar-to-AVX2 gain exceeds 8&times; because vectorization also enabled fused multiply-add, loop unrolling, and lower per-iteration
+overhead, so the win is lane count times those other improvements. You confirm a loop vectorized with the compiler's own report,
+<code>-fopt-info-vec-optimized</code>, which named &ldquo;32 byte vectors,&rdquo; rather than assuming it did.)</em></p>
+
+<h2>36.5 What to carry forward</h2>
+
+<p><strong>SIMD</strong> is data-level parallelism on a single core: one instruction operating on a whole vector — 8 <code>float</code>s
+in 256-bit AVX2 — for up to lane-count throughput, and often more once vectorization unlocks fused multiply-add and unrolling
+(13&times; on the compute-bound kernel of &sect;36.2). It is not something you usually write by hand: reach for
+<strong>auto-vectorization</strong> first, with the right flags (<code>-O3 -march=native</code>), contiguous data (Chapter 35's
+struct-of-arrays), and an independent loop, and <em>confirm</em> it with <code>-fopt-info-vec</code>. Know what blocks it —
+loop-carried dependencies, floating-point reductions that need <code>-ffast-math</code> to reassociate, pointer aliasing that
+<code>restrict</code> resolves, strided or branchy access — and drop to <strong>intrinsics</strong> only when the payoff is proven and
+the compiler will not deliver it. Above all, respect the ceiling: SIMD raises the <em>compute</em> roof, so it multiplies
+arithmetic-bound loops but does almost nothing for bandwidth-bound ones (2.4&times; on the streaming dot product, &sect;36.4). Which
+ceiling binds is a question of arithmetic intensity, and the honest way to answer it is a measurement, not a lane count.</p>
+
+<p>This chapter closes the arc the part has been building. Chapter 33 said measure first and let a profile find the dominant cost.
+Chapter 34 opened the most common cause of that cost — the memory hierarchy — and got the access order right. Chapter 35 got the data
+layout right, contiguous and dense. And this chapter turned that well-placed, well-laid-out data into wide parallel arithmetic, while
+insisting that the memory system, not the vector unit, often sets the limit — which is why locality and layout came first, and why the
+whole part keeps returning to a timed run to tell truth from hope. That is the through-line to carry out of Performance Engineering:
+the machine has several ceilings — instruction count, cache, bandwidth, vector width — and engineering performance is finding, by
+measurement, which one you are actually under, and then raising <em>that</em> one. The next part turns from the CPU and its memory to
+the boundary where programs meet the outside world — <strong>I/O and networking</strong> — where a new set of costs, and a new set of
+&ldquo;where does the time go&rdquo; questions, take over.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain what SIMD is and where the lanes come from (register width), with the count for 256-bit AVX2.</li>
+<li>Name the two properties a loop needs to auto-vectorize, and the flags that enable and confirm it.</li>
+<li>Explain why a floating-point reduction will not vectorize without <code>-ffast-math</code>, and the risk of that flag.</li>
+<li>Explain why the scalar-to-AVX2 speedup can exceed the lane count.</li>
+<li>Distinguish a compute-bound from a bandwidth-bound loop, and say which SIMD helps.</li>
+<li>State when you would drop to intrinsics, and why it is a last resort.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is SIMD, how many <code>float</code>s does a 256-bit AVX2 instruction process, and what two loop properties does it require? (&sect;36.1)</li>
+<li><strong>R2.</strong> What flags enable and confirm auto-vectorization in gcc, and why did the same source run at 3.4/25/45 Gflop/s? (&sect;36.2)</li>
+<li><strong>R3.</strong> Why won't gcc vectorize a floating-point reduction without <code>-ffast-math</code>, and what does that flag risk? (&sect;36.3)</li>
+<li><strong>R4.</strong> Why did the dot product gain only ~2.4&times; from SIMD while the L1 kernel gained 13&times;? Use arithmetic intensity. (&sect;36.4)</li>
+<li><strong>R5.</strong> When do you reach for intrinsics rather than the auto-vectorizer, and why is it a last resort? (&sect;36.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>John L. Hennessy &amp; David A. Patterson, <em>Computer Architecture: A Quantitative Approach</em>, 6th ed. (Morgan
+Kaufmann, 2017), ISBN 978-0-12-811905-1.</strong> Chapter 4 (&ldquo;Data-Level Parallelism in Vector, SIMD, and GPU Architectures&rdquo;)
+is the architectural source for &sect;36.1 — vector registers, lanes, and why width is throughput. First author John Hennessy; edition
+and ISBN verified via the publisher.</li>
+<li><strong>Samuel Williams, Andrew Waterman &amp; David Patterson, &ldquo;Roofline: An Insightful Visual Performance Model for
+Multicore Architectures,&rdquo; <em>Communications of the ACM</em> 52(4), 65&ndash;76 (2009), DOI 10.1145/1498765.1498785.</strong> The
+roofline model of &sect;36.4 — arithmetic intensity, the compute and bandwidth ceilings, and why a low-intensity loop like the dot
+product is bandwidth-bound. First author Samuel Williams; DOI verified via the ACM Digital Library.</li>
+<li><strong>Agner Fog, optimization manuals, <em>Optimizing software in C++</em> and <em>Instruction tables</em>
+(<code>agner.org/optimize</code>, continuously updated).</strong> The practical reference for vectorization, intrinsics, and
+per-instruction latencies/throughputs behind &sect;36.3&ndash;&sect;36.4. Author Agner Fog; living documents, not a dated publication,
+so cited as such — consult the current versions.</li>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 5 covers program optimization including vectorization, loop-carried dependencies, and the
+reduction/associativity issue of &sect;36.3 from the programmer's side. First author Randal Bryant; edition and ISBN verified via the
+publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex36.1"><span class="ex-label">36.1</span> <span class="ex-tag warm">warm-up</span>
+Define SIMD in one sentence. How many <code>float</code>s and how many <code>double</code>s fit in a 256-bit AVX register, and how
+many does one such arithmetic instruction process at once?</div>
+
+<div class="exercise" id="ex36.2"><span class="ex-label">36.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two properties a loop's data and computation must have for the vector unit to deliver its throughput, and say which chapter's
+layout supplies the first.</div>
+
+<div class="exercise" id="ex36.3"><span class="ex-label">36.3</span> <span class="ex-tag warm">warm-up</span>
+Which gcc flags (a) enable vectorization at all, (b) let it use the widest vectors your CPU supports, and (c) let you confirm that a
+given loop was vectorized?</div>
+
+<div class="exercise" id="ex36.4"><span class="ex-label">36.4</span> <span class="ex-tag core">core</span>
+The &sect;36.2 kernel went 3.43 &rarr; 24.89 &rarr; 45.14 Gflop/s across scalar, <code>-O3</code> (SSE2), and
+<code>-O3 -march=native</code> (AVX2). (a) Why does the same source produce three different throughputs? (b) The scalar-to-AVX2 gain is
+13&times;, more than the 8-lane width — give two reasons vectorization can beat the raw lane count. (c) Why is &ldquo;confirm with
+<code>-fopt-info-vec</code>&rdquo; better engineering than assuming the loop vectorized?</div>
+
+<div class="exercise" id="ex36.5"><span class="ex-label">36.5</span> <span class="ex-tag core">core</span>
+Floating-point reductions. (a) Why does vectorizing <code>s += a[i]</code> change the numerical result, and why does that stop gcc
+from doing it at <code>-O3</code>? (b) What flag permits it, and what else does that flag allow that might be unsafe? (c) The dot
+product gained only ~2.4&times; even after vectorizing — name the reason, and say why it is <em>not</em> the reduction issue.</div>
+
+<div class="exercise" id="ex36.6"><span class="ex-label">36.6</span> <span class="ex-tag core">core</span>
+For each loop, say whether it can be auto-vectorized as written, and if not, why: (a) <code>c[i] = a[i] * b[i];</code> (b)
+<code>a[i] = a[i-1] + x[i];</code> (c) <code>if (x[i] &gt; 0) y[i] = f(x[i]);</code> with a heavy data-dependent branch; (d)
+<code>s += a[i];</code> summed into one <code>float</code> at plain <code>-O3</code>.</div>
+
+<div class="exercise" id="ex36.7"><span class="ex-label">36.7</span> <span class="ex-tag complexity">cost</span>
+Arithmetic intensity and the roofline. (a) Define arithmetic intensity in one sentence. (b) Estimate it (flops per byte moved) for the
+dot product (2 flops per two 4-byte loads) and argue why it is bandwidth-bound. (c) For the &sect;36.2 kernel (~11 flops per 4-byte
+element, data in L1), argue why it is compute-bound. (d) State the rule for which loops SIMD helps.</div>
+
+<div class="exercise" id="ex36.8"><span class="ex-label">36.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague reports that hand-written AVX2 intrinsics for <code>c[i]=a[i]+b[i]</code> over
+100&nbsp;MiB arrays give only 1.2&times; over scalar, and concludes the intrinsics are buggy.
+<br><strong>Step 1 (given):</strong> vector-add does 1 add per 2 loads + 1 store — very few flops per byte moved (low arithmetic intensity).
+<br><strong>Step 2 (given):</strong> 100&nbsp;MiB arrays do not fit in any cache, so the loop streams from DRAM every pass.
+<br><strong>Step 3 (given):</strong> therefore the loop is bandwidth-bound; the memory bus, not the adder, sets the ceiling.
+<br><strong>Step 4 (you):</strong> Explain why 1.2&times; is expected (not a bug), how you would confirm the diagnosis with the
+auto-vectorizer and a measurement, and where the real speedup would have to come from instead.</div>
+
+<div class="exercise" id="ex36.9"><span class="ex-label">36.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether SIMD is likely to give a large speedup, a small one, or none, and why: (a) a math-heavy per-pixel shader on an
+image tile that fits in L1; (b) copying a 1&nbsp;GiB buffer; (c) summing a cache-resident array of 10,000 <code>float</code>s in a
+tight loop; (d) a loop with a loop-carried dependency computing a running total sequentially.</div>
+
+<div class="exercise" id="ex36.10"><span class="ex-label">36.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;8 vector lanes always means 8&times; faster.&rdquo;
+(b) &ldquo;gcc auto-vectorizes floating-point reductions at <code>-O3</code> by default.&rdquo; (c) &ldquo;<code>-march=native</code>
+lets the compiler use the widest vectors the build machine supports.&rdquo; (d) &ldquo;SIMD helps a memory-bandwidth-bound loop as much
+as a compute-bound one.&rdquo; (e) &ldquo;An array-of-structs field is as easy to vectorize as a packed struct-of-arrays field.&rdquo;</div>
+
+<div class="exercise" id="ex36.11"><span class="ex-label">36.11</span> <span class="ex-tag stretch">stretch</span>
+Tie the whole part together. (a) Explain why Chapters 34 and 35 (locality and layout) are prerequisites for Chapter 36 (SIMD), not
+independent tricks. (b) A profile (Chapter 33) shows one kernel at 80% of runtime; describe the sequence of questions — bound by what?
+fixable how? — you would ask, in order, drawing on all four chapters. (c) Argue why &ldquo;the machine has several ceilings; find the
+one you're under and raise that one&rdquo; is a better mental model than &ldquo;make the code do fewer instructions.&rdquo;</div>
+
+<div class="exercise" id="ex36.12"><span class="ex-label">36.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain with a vectorizing compiler): (a) Write a compute-heavy, per-element-independent kernel over an
+array that fits in L1; compile it at <code>-O2 -fno-tree-vectorize</code>, <code>-O3</code>, and <code>-O3 -march=native</code>, time
+each as the minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials, and report the throughputs and the speedup; confirm
+vectorization with <code>-fopt-info-vec-optimized</code>. (b) Write a dot product over arrays far larger than your last-level cache;
+show it barely vectorizes without <code>-ffast-math</code> and gains little even with it, and explain via arithmetic intensity. (c)
+State your toolchain version, CPU, and widest vector width, and note that these are wall-clock throughputs (no hardware counters) if
+you lack <code>perf</code>.</div>
+
+</section>
+</section>

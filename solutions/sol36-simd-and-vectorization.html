@@ -1,0 +1,104 @@
+<section class="solutions" id="sol36">
+<h1>Chapter 36 — Solutions</h1>
+
+<div class="solution" id="sol36.1"><span class="sol-label">36.1</span>
+SIMD (Single Instruction, Multiple Data): one instruction operates on a whole vector of elements at once, on a single core. A 256-bit
+AVX register holds 8 <code>float</code>s (32 bits each) or 4 <code>double</code>s (64 bits each), and one AVX arithmetic instruction
+processes all of them — 8 or 4 — in one step. <em>Tempting wrong answer:</em> &ldquo;SIMD means multiple cores&rdquo; — it is width on
+one core, not more cores. <strong>Feed-forward:</strong> &sect;36.1.</div>
+
+<div class="solution" id="sol36.2"><span class="sol-label">36.2</span>
+<strong>Contiguity</strong> (the elements adjacent in memory so one load fills a vector register) and <strong>independence</strong> (no
+lane depends on another's result within the vector, so no loop-carried dependency). Contiguity is supplied by Chapter 35's
+struct-of-arrays layout. <em>Tempting wrong answer:</em> &ldquo;the loop just has to be short&rdquo; — length is irrelevant; layout and
+independence are what matter. <strong>Feed-forward:</strong> &sect;36.1, &sect;36.3.</div>
+
+<div class="solution" id="sol36.3"><span class="sol-label">36.3</span>
+(a) <code>-O3</code> (gcc does not vectorize at <code>-O2</code> in this version); more generally <code>-ftree-vectorize</code>. (b)
+<code>-march=native</code>, letting it use the widest vectors the build CPU supports (AVX2 here). (c) <code>-fopt-info-vec-optimized</code>
+(or <code>-fopt-info-vec-missed</code> to see why a loop did <em>not</em> vectorize). <em>Tempting wrong answer:</em> &ldquo;-O2 is
+enough&rdquo; — it is not, in this gcc; you need <code>-O3</code>. <strong>Feed-forward:</strong> &sect;36.2.</div>
+
+<div class="solution" id="sol36.4"><span class="sol-label">36.4</span>
+(a) Because vectorization depends on the build: <code>-O2</code> emitted scalar code, <code>-O3</code> used 128-bit SSE2 (4-wide),
+<code>-O3 -march=native</code> used 256-bit AVX2 (8-wide) — same source, three code generations. (b) Vectorizing also let the compiler
+use fused multiply-add (one instruction for <code>a*b+c</code>) and unroll the loop, cutting per-iteration overhead, so the gain is lane
+count times these extra wins. (c) Confirming with <code>-fopt-info-vec</code> gives evidence the loop vectorized (and how wide),
+whereas assuming it did risks shipping a &ldquo;vectorized&rdquo; loop the compiler actually left scalar. <em>Tempting wrong answer:</em>
+&ldquo;13&times; proves a bug in the model&rdquo; — no; FMA and unrolling legitimately push it past raw lane count.
+<strong>Feed-forward:</strong> &sect;36.2.</div>
+
+<div class="solution" id="sol36.5"><span class="sol-label">36.5</span>
+(a) Vectorizing a sum groups the additions differently (e.g. 8 partial sums combined at the end), and floating-point addition is not
+associative, so the rounded result can differ from the strict left-to-right order the source specifies; the standard forbids the
+compiler from changing your result, so it declines. (b) <code>-ffast-math</code> (or <code>-funsafe-math-optimizations</code>) permits
+reassociation; it also allows other unsafe assumptions (no NaNs/infinities, reordering that changes rounding), which can break code
+that relies on strict IEEE behavior. (c) The dot product is <strong>memory-bandwidth-bound</strong> — it streams arrays far larger than
+cache, so it waits on DRAM, not the adder; that is a bandwidth ceiling, unrelated to the reduction/associativity issue.
+<em>Tempting wrong answer:</em> &ldquo;the small gain is the reduction still being scalar&rdquo; — once <code>-ffast-math</code>
+vectorizes it, bandwidth still caps it. <strong>Feed-forward:</strong> &sect;36.3, &sect;36.4.</div>
+
+<div class="solution" id="sol36.6"><span class="sol-label">36.6</span>
+(a) <strong>Yes</strong> — elementwise, contiguous, independent lanes. (b) <strong>No</strong> — loop-carried dependency:
+<code>a[i]</code> needs <code>a[i-1]</code>, so lanes cannot be computed in parallel. (c) <strong>No (or poorly)</strong> — a heavy
+data-dependent branch per element breaks the uniform lane operation (though light branches can sometimes be masked/predicated). (d)
+<strong>No</strong> at plain <code>-O3</code> — a floating-point reduction needs <code>-ffast-math</code> to reassociate.
+<em>Tempting wrong answer:</em> marking (b) yes because &ldquo;it's a simple loop&rdquo; — simplicity is irrelevant; the dependency is
+fatal. <strong>Feed-forward:</strong> &sect;36.3.</div>
+
+<div class="solution" id="sol36.7"><span class="sol-label">36.7</span>
+(a) Arithmetic intensity = floating-point operations performed per byte moved to/from memory. (b) Dot product: ~2 flops (a multiply and
+an add) per two 4-byte loads = 8 bytes, so ~0.25 flop/byte — very low, so once the arrays exceed cache it is limited by how fast DRAM
+delivers bytes: bandwidth-bound. (c) The &sect;36.2 kernel: ~11 flops per 4-byte element already resident in L1, so ~2.75 flops/byte
+and almost no DRAM traffic — the core's arithmetic throughput binds: compute-bound. (d) SIMD helps loops that are compute-bound (high
+intensity); for bandwidth-bound (low intensity) loops the fix is locality/layout, not more lanes. <em>Tempting wrong answer:</em>
+&ldquo;more flops per element always means SIMD helps&rdquo; — it also depends on whether the bytes are in cache (intensity counts bytes
+<em>moved</em>). <strong>Feed-forward:</strong> &sect;36.4.</div>
+
+<div class="solution" id="sol36.8"><span class="sol-label">36.8</span>
+<strong>Step 4:</strong> 1.2&times; is expected, not a bug: the loop is bandwidth-bound (tiny arithmetic intensity, 100&nbsp;MiB arrays
+streamed from DRAM), so the memory bus caps it and widening the add from 1 lane to 8 cannot help — the adder was never the bottleneck.
+Confirm the diagnosis by timing the plain <code>-O3 -march=native</code> auto-vectorized version (checking <code>-fopt-info-vec</code>
+that it vectorized): it should match ~1.2&times;, showing the intrinsics are fine and memory is the ceiling. The real speedup must come
+from moving fewer bytes — better locality and layout (Chapters 34&ndash;35), e.g. fusing this with adjacent passes so the data is
+touched once, or shrinking the element type — not from more lanes. <em>Tempting wrong answer:</em> &ldquo;keep debugging the
+intrinsics&rdquo; — they are correct; the model, not the code, was wrong. <strong>Feed-forward:</strong> &sect;36.4.</div>
+
+<div class="solution" id="sol36.9"><span class="sol-label">36.9</span>
+(a) <strong>Large</strong> — compute-bound, cache-resident, independent lanes: SIMD's ideal case. (b) <strong>None (to speak of)</strong>
+— a 1&nbsp;GiB copy is pure bandwidth, so wide loads/stores are already bandwidth-limited; lanes do not add throughput. (c)
+<strong>Large</strong> — cache-resident and arithmetic-heavy, so the vector unit binds, not memory (a reduction needs
+<code>-ffast-math</code> to vectorize). (d) <strong>None</strong> — a loop-carried dependency is inherently serial; it cannot vectorize
+as written. <em>Tempting wrong answer:</em> calling (b) large &ldquo;because wider loads move more&rdquo; — the bus, not the load width,
+is already the cap. <strong>Feed-forward:</strong> &sect;36.3, &sect;36.4.</div>
+
+<div class="solution" id="sol36.10"><span class="sol-label">36.10</span>
+(a) <strong>False</strong> — 8 lanes bound arithmetic throughput at up to 8&times;, but bandwidth-bound loops gain far less and
+compute-bound ones can exceed 8&times; via FMA/unrolling. (b) <strong>False</strong> — gcc will not vectorize a floating-point
+reduction at <code>-O3</code> without <code>-ffast-math</code> (associativity). (c) <strong>True</strong> —
+<code>-march=native</code> targets the build machine's widest supported vectors. (d) <strong>False</strong> — SIMD helps compute-bound
+loops, not bandwidth-bound ones. (e) <strong>False</strong> — an AoS field is strided, so it cannot be loaded into a vector in one go;
+packed SoA can. <em>Tempting wrong answer:</em> marking (a) true from the lane-count intuition — the ceiling, not the lane count, sets
+the gain. <strong>Feed-forward:</strong> &sect;36.1&ndash;&sect;36.4.</div>
+
+<div class="solution" id="sol36.11"><span class="sol-label">36.11</span>
+(a) SIMD needs contiguous data (one wide load fills a register) and data that reaches the core fast (or the vector unit starves), which
+are exactly the layout of Chapter 35 and the locality of Chapter 34 — without them the vectorizer either cannot fire or gains nothing.
+(b) Ask in order: what is this kernel bound by — arithmetic, cache misses, or bandwidth (measure scalar vs vectorized, vary input size
+to find cache cliffs)? If cache/bandwidth-bound, fix locality (Chapter 34) and layout (Chapter 35) first; if compute-bound, vectorize
+(Chapter 36) and confirm with <code>-fopt-info-vec</code>; re-measure after each change (Chapter 33). (c) Because the true limit is
+usually a specific resource (cache, bandwidth, vector width), and raising a ceiling you are not under does nothing — &ldquo;fewer
+instructions&rdquo; ignores that a memory-bound loop is idle waiting on bytes regardless of instruction count. <em>Tempting wrong
+answer:</em> &ldquo;always vectorize the hot loop&rdquo; — pointless if it is bandwidth-bound; find the binding ceiling first.
+<strong>Feed-forward:</strong> Chapters 33&ndash;36.</div>
+
+<div class="solution" id="sol36.12"><span class="sol-label">36.12</span>
+Platform-specific. A correct write-up reports: (a) an L1-resident compute kernel at scalar / <code>-O3</code> / <code>-O3
+-march=native</code>, with throughputs rising and a speedup at or above the lane count, and the <code>-fopt-info-vec-optimized</code>
+line naming the vector width. (b) a cache-overflowing dot product that barely vectorizes without <code>-ffast-math</code> and gains
+little even with it, explained by low arithmetic intensity (bandwidth-bound). (c) the toolchain version, CPU, and widest vector width,
+noting these are wall-clock throughputs (no hardware counters) if <code>perf</code> is unavailable. <em>Tempting wrong answer:</em>
+&ldquo;report the first run&rdquo; — cold-start noise; report the minimum of several trials (Chapter 33). <strong>Feed-forward:</strong>
+&sect;36.2&ndash;&sect;36.4.</div>
+
+</section>

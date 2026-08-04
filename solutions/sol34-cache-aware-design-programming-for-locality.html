@@ -1,0 +1,103 @@
+<section class="solutions" id="sol34">
+<h1>Chapter 34 — Solutions</h1>
+
+<div class="solution" id="sol34.1"><span class="sol-label">34.1</span>
+<strong>Spatial locality:</strong> if you access one memory address, you are likely to access nearby addresses soon (so contiguous,
+small-stride access is cheap). <strong>Temporal locality:</strong> if you access an address, you are likely to access the <em>same</em>
+address again soon (so recently-used data should still be cached). Good spatial locality: <code>for (i) s += a[i];</code> (stride 1).
+Poor spatial locality: <code>for (i) s += a[i*1024];</code> (each access a new line). <em>Tempting wrong answer:</em> swapping the two
+definitions — &ldquo;spatial&rdquo; is about neighbors in space (address), &ldquo;temporal&rdquo; about revisiting over time.
+<strong>Feed-forward:</strong> &sect;34.2, &sect;34.4.</div>
+
+<div class="solution" id="sol34.2"><span class="sol-label">34.2</span>
+One fetch, in the best case: the first <code>double</code> pulls in its whole 64-byte line, and the next 7 <code>double</code>s (7&times;8
+= 56 bytes) live in that same line, so they hit cache with no new fetch — 8 <code>double</code>s fill exactly one 64-byte line.
+<em>Tempting wrong answer:</em> &ldquo;8 fetches, one per <code>double</code>&rdquo; — the hardware moves a whole line, not a single
+element. <strong>Feed-forward:</strong> &sect;34.2.</div>
+
+<div class="solution" id="sol34.3"><span class="sol-label">34.3</span>
+Because if a DRAM access costs ~100&times; an L1 hit, a loop that misses cache is stalled waiting on memory for most of its time, so
+its speed is set by <em>how it touches memory</em>, not by how many instructions it runs — two loops with identical instruction counts
+can differ by an order of magnitude in time. <em>Tempting wrong answer:</em> &ldquo;instruction count still decides it&rdquo; — the CPU
+idles through the miss regardless of how few instructions remain. <strong>Feed-forward:</strong> &sect;34.1, &sect;34.3.</div>
+
+<div class="solution" id="sol34.4"><span class="sol-label">34.4</span>
+(a) Only the <em>order</em> of memory access differs: row-major strides by one element (each 64-byte line serves 8 <code>double</code>
+accesses), column-major strides by a full row (each access lands in a fresh line and, since the matrix is 512&nbsp;MiB, that line is
+evicted long before its 8 elements are revisited). (b) 1 of 8 — the column walk uses one <code>double</code> per fetched line and
+discards the other 7, and does not return to them before eviction. (c) Swap the loop nesting so the inner loop strides by one, or
+transpose the matrix so the column access becomes contiguous. <em>Tempting wrong answer:</em> &ldquo;the column version does more
+arithmetic&rdquo; — it does exactly the same 67M additions; only locality differs. <strong>Feed-forward:</strong> &sect;34.3.</div>
+
+<div class="solution" id="sol34.5"><span class="sol-label">34.5</span>
+(a) At stride 1 each 64-byte line serves 16 <code>int</code> accesses, amortizing the fetch 16 ways; as the stride grows the accesses
+served per line fall (8, 4, 2), so each access carries more of the line-fetch cost and the per-access time climbs. (b) At a 64-byte
+stride each access lands in a distinct line and shares none with its neighbors — spatial locality is fully defeated, the first stride
+at which no two accesses reuse a line. (c) Larger strides also defeat the hardware prefetcher (it can no longer predict the next line)
+and stress the TLB (Chapter 4), each access touching a new page more often. <em>Tempting wrong answer:</em> &ldquo;the array got
+bigger&rdquo; — the array and the access count are fixed; only the stride changed. <strong>Feed-forward:</strong> &sect;34.2.</div>
+
+<div class="solution" id="sol34.6"><span class="sol-label">34.6</span>
+(a) Separately <code>malloc</code>'d nodes are scattered across the heap, so <code>next</code> jumps to an unpredictable, distant
+address — each node likely a fresh cache line (and page), with no spatial locality between consecutive nodes. (b) Store the nodes in a
+contiguous array (or a pool/arena allocator) so traversal strides through adjacent memory, restoring spatial locality and letting the
+prefetcher work. (c) Both turn a logically simple traversal into one that lands in a new cache line on nearly every step — the pointer
+chase and the column walk are the same &ldquo;stride across lines&rdquo; pathology. <em>Tempting wrong answer:</em> &ldquo;small nodes
+mean good locality&rdquo; — small but scattered is still one line per node. <strong>Feed-forward:</strong> &sect;34.2, &sect;34.3; the
+layout chapter ahead.</div>
+
+<div class="solution" id="sol34.7"><span class="sol-label">34.7</span>
+(a) While S &lt; C the array fits in cache, so after the first pass later passes mostly hit and the miss rate is low; as S grows past C,
+each pass evicts what the next pass needs, so the miss rate jumps toward one-miss-per-line. (b) Blocking processes a chunk of size &le;C
+completely — doing all the work that touches it — before moving on, so each loaded line is reused many times while still cached, keeping
+the working set within a cache level. (c) The arithmetic operation count is unchanged, but blocking removes the memory stalls that
+dominated the time, so the loop stops waiting on DRAM and becomes limited by the arithmetic it was always doing — memory-bound to
+compute-bound with no fewer operations. <em>Tempting wrong answer:</em> &ldquo;blocking does fewer operations&rdquo; — it does the same
+operations in a cache-friendlier order. <strong>Feed-forward:</strong> &sect;34.4.</div>
+
+<div class="solution" id="sol34.8"><span class="sol-label">34.8</span>
+<strong>Step 4:</strong> Ship <code>for (i) for (j) sum += A[i][j]</code> — the inner loop strides by one element along the contiguous
+(row-major) dimension, so each 64-byte line serves 16 <code>float</code> accesses and spatial locality is perfect, while the other
+nesting strides a full 16&nbsp;KiB row per access and misses almost every time. To measure: compile both at the shipping optimization
+level (<code>-O2</code>), time each as the minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials, hold everything else
+constant (same matrix, same machine, same harness), make the sum observable so neither loop is deleted (Chapter 33), warm up once, and
+report the minimum and spread for each; the row-order loop should be several times faster. <em>Tempting wrong answer:</em> &ldquo;time
+each once and compare&rdquo; — a single run is noisy; run several and report the minimum. <strong>Feed-forward:</strong> &sect;34.3;
+Chapter 33.</div>
+
+<div class="solution" id="sol34.9"><span class="sol-label">34.9</span>
+(a) <strong>Spatial</strong> — column order strides across lines, wasting most of each fetched line. (b) <strong>Temporal</strong> — the
+data is reused every scan but a 100&nbsp;MiB set overflows the 24&nbsp;MiB L3, so it is evicted before reuse. (c) <strong>Neither (both
+good)</strong> — a 1&nbsp;KiB array fits in L1 and is reused, so spatial and temporal locality are both excellent. (d)
+<strong>Spatial</strong> — scattered nodes give one line per node with no neighbor reuse. <em>Tempting wrong answer:</em> calling (b)
+&ldquo;spatial&rdquo; — the scan is contiguous (good spatial); the problem is the set does not stay cached (temporal).
+<strong>Feed-forward:</strong> &sect;34.2, &sect;34.4.</div>
+
+<div class="solution" id="sol34.10"><span class="sol-label">34.10</span>
+(a) <strong>False</strong> — reading one byte fetches its whole 64-byte cache line. (b) <strong>False</strong> — identical instruction
+counts can differ by an order of magnitude if locality differs (the &sect;34.3 19.5&times;). (c) <strong>False</strong> — the compiler
+often may <em>not</em> reorder loops (it can change results or be illegal), so the traversal order is your responsibility. (d)
+<strong>True</strong> — a working set that fits in L2 is hit by repeated passes. (e) <strong>False</strong> — blocking reorders access
+to improve reuse; it does not reduce the arithmetic operation count. <em>Tempting wrong answer:</em> marking (c) true because
+&ldquo;the optimizer handles everything&rdquo; — loop interchange is limited and not guaranteed. <strong>Feed-forward:</strong>
+&sect;34.2&ndash;&sect;34.4.</div>
+
+<div class="solution" id="sol34.11"><span class="sol-label">34.11</span>
+(a) Hypothesis: the loop is memory-bound because of poor locality (striding across lines or a working set larger than cache); test it
+by improving locality (transpose/reorder, or shrink the working set) and re-measuring, or with a cache-miss counter where available.
+(b) Wall-clock experiment: run the loop over inputs of growing size and watch for a sharp per-element slowdown as the working set
+crosses a cache size (a memory-bound signature), or compare the loop against a locality-fixed version; if the fixed version is much
+faster, it was memory-bound, if not, compute-bound. (c) Transposing/reordering is a one-line, low-risk change that attacks the actual
+cause (locality) and is easy to re-measure, whereas rewriting in assembly is high-effort, high-risk, and does nothing about a memory
+stall the arithmetic was never causing. <em>Tempting wrong answer:</em> &ldquo;assembly is always faster&rdquo; — assembly cannot beat
+the memory ceiling that poor locality created; fix locality first. <strong>Feed-forward:</strong> &sect;34.4; Chapter 33.</div>
+
+<div class="solution" id="sol34.12"><span class="sol-label">34.12</span>
+Platform-specific. A correct write-up reports: (a) the machine's real L1/L2/L3 sizes and line size from <code>/sys</code> (e.g. 64-byte
+lines). (b) The row-major sum timed several times and the column-major sum timed several times, both as minima, with a ratio of a few&times;
+to &gt;10&times; depending on hardware, explained by the column walk using one element per fetched line. (c) A stride sweep whose
+per-access cost has a knee at the line size (contiguous cheap, one-line-stride expensive). <em>Tempting wrong answer:</em> &ldquo;report
+the first, cold run&rdquo; — the first run pays cold-cache costs; report the minimum of several (Chapter 33). <strong>Feed-forward:</strong>
+&sect;34.2&ndash;&sect;34.3.</div>
+
+</section>

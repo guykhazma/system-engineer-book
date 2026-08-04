@@ -1,0 +1,101 @@
+<section class="solutions" id="sol35">
+<h1>Chapter 35 — Solutions</h1>
+
+<div class="solution" id="sol35.1"><span class="sol-label">35.1</span>
+<strong>AoS (array-of-structs):</strong> one array whose elements each hold all a record's fields together — <code>struct P{float x,y,vx,vy;}
+p[N];</code>. <strong>SoA (struct-of-arrays):</strong> a separate contiguous array per field — <code>float x[N],y[N],vx[N],vy[N];</code>.
+<em>Tempting wrong answer:</em> &ldquo;SoA is just an array of structs each holding arrays&rdquo; — no; each <em>field</em> gets its own
+flat array, so one field's values are contiguous. <strong>Feed-forward:</strong> &sect;35.2.</div>
+
+<div class="solution" id="sol35.2"><span class="sol-label">35.2</span>
+Useful bytes per fetched line = of every 64-byte line the hardware pulls in, how many bytes the loop actually reads. Summing one field
+of a 64-byte AoS struct reads 8 bytes (one <code>double</code>) of each fetched line and ignores the other 56, so 7 of every 8 bytes of
+memory traffic are wasted. <em>Tempting wrong answer:</em> &ldquo;it uses the whole line because it fetched it&rdquo; — fetching is not
+using; the other fields are dragged in and discarded. <strong>Feed-forward:</strong> &sect;35.2, &sect;35.3.</div>
+
+<div class="solution" id="sol35.3"><span class="sol-label">35.3</span>
+False sharing: two threads write two <em>different</em> variables that happen to sit in the <em>same</em> cache line, so the coherence
+protocol bounces that line between cores on every write even though no data is truly shared. Fix: <strong>padding</strong> (or
+alignment) so each thread's hot data sits on its own cache line. <em>Tempting wrong answer:</em> &ldquo;add a lock&rdquo; — a lock
+addresses real contention; false sharing has none, and a lock would make it worse. <strong>Feed-forward:</strong> &sect;35.4.</div>
+
+<div class="solution" id="sol35.4"><span class="sol-label">35.4</span>
+(a) AoS uses 8 of 64 bytes per line; SoA uses 64 of 64 — an 8&times; better useful-bytes ratio, and since the loop is limited by memory
+traffic, ~8&times; less wasted traffic predicts a large speedup. (b) The measured 4.08&times; is below 8&times; because the hardware
+prefetcher partly hides AoS's waste (it streams ahead), and other fixed costs (the add, loop overhead) do not shrink — so the memory
+saving does not translate one-for-one. (c) A loop that reads <em>all</em> fields of one element before moving on: then AoS puts the
+whole record in one fetched line and uses all of it, while SoA would touch several arrays (several lines) per element.
+<em>Tempting wrong answer:</em> &ldquo;SoA must give exactly 8&times;&rdquo; — byte ratio is an upper bound, not a guarantee.
+<strong>Feed-forward:</strong> &sect;35.2.</div>
+
+<div class="solution" id="sol35.5"><span class="sol-label">35.5</span>
+(a) Split into hot <code>struct{float x,y;} hot[N];</code> and cold <code>struct{char name[..]; Inv inventory; Ach achievements;}
+cold[N];</code>, indexed in parallel. (b) The per-frame loop now streams the dense <code>hot[]</code> array — every fetched line is
+full of <code>x,y</code> — instead of striding a fat struct and wasting the line on cold fields, even though no field was deleted. (c)
+Cost: touching a player's full state now means two arrays (worse locality for the rare all-fields access), and the code is more complex
+and easy to desynchronize; not worth it when the hot loop reads most fields anyway, or when the struct is already small.
+<em>Tempting wrong answer:</em> &ldquo;always hot/cold split&rdquo; — it hurts loops that need all fields of one element.
+<strong>Feed-forward:</strong> &sect;35.3.</div>
+
+<div class="solution" id="sol35.6"><span class="sol-label">35.6</span>
+(a) Alignment: <code>double b</code> must sit on an 8-byte boundary, so the compiler pads after <code>char a</code> (7 bytes) and
+after <code>char c</code> (7 bytes) to keep the struct's size a multiple of its alignment — about 24 bytes, not 10. (b) Reorder
+largest-to-smallest: <code>{ double b; char a; char c; }</code> — <code>b</code> takes 8, <code>a</code> and <code>c</code> pack into
+the next 2 bytes, then 6 bytes of tail padding to a multiple of 8: 16 bytes. (c) At 16 vs 24 bytes, 50% more elements fit per 64-byte
+line, so a sweep over a million of them fetches fewer lines and runs faster. <em>Tempting wrong answer:</em> &ldquo;the struct is 10
+bytes, the size of its fields&rdquo; — alignment padding makes it larger. <strong>Feed-forward:</strong> &sect;35.3.</div>
+
+<div class="solution" id="sol35.7"><span class="sol-label">35.7</span>
+(a) From the cache-coherence protocol: the four counters share one line, so each thread's write invalidates the line in the other three
+cores' caches, forcing the line to bounce (ping-pong) between cores — pure coherence traffic, not data sharing. (b) Padding puts each
+counter on its own line, so a thread's writes never invalidate another's line; it trades ~56 wasted bytes per counter (harmless here)
+for eliminating the bounce, an 8&times; win. (c) It would shrink to nothing: with one thread there is no other core to bounce the line
+to, so packed and padded run the same — false sharing is a purely concurrent cost. <em>Tempting wrong answer:</em> &ldquo;the writes
+themselves are slow&rdquo; — the increment is trivial; the cost is the line moving between cores. <strong>Feed-forward:</strong>
+&sect;35.4.</div>
+
+<div class="solution" id="sol35.8"><span class="sol-label">35.8</span>
+<strong>Step 4:</strong> Choose the <strong>hot/cold split</strong> (a packed <code>{cx,cy,cz,r}</code> array plus a parallel cold
+array): the intersection loop reads exactly those four fields together per sphere, so a 32-byte hot record gives it two spheres per
+64-byte line with everything it needs, while full SoA would make it touch four separate arrays (four lines) per sphere — worse for a
+loop that uses all four hot fields at once. (Full SoA would win only if the loop swept a single field.) Measure it the Chapter 33 way:
+compile original and split at the shipping level (<code>-O2</code>), same scene, same machine, make the result observable, warm up, and
+report the minimum and spread of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials for each; the split should be several times
+faster. <em>Tempting wrong answer:</em> &ldquo;full SoA is always best&rdquo; — here the loop reads four fields together, so a packed
+hot record beats four separate arrays. <strong>Feed-forward:</strong> &sect;35.2, &sect;35.3; Chapter 33.</div>
+
+<div class="solution" id="sol35.9"><span class="sol-label">35.9</span>
+(a) <strong>SoA</strong> — one field swept across many records is pure spatial locality when that field is its own array. (b)
+<strong>AoS</strong> — processing one record's full state at a time wants the whole record in one line. (c) <strong>Hot/cold split</strong>
+— 3 hot fields streamed every frame go in a dense array, the 30 cold ones elsewhere. (d) <strong>Pad to a cache line</strong> (a layout
+change, not AoS/SoA) — per-thread counters must not share a line, or false sharing bites. <em>Tempting wrong answer:</em> calling (d)
+&ldquo;SoA&rdquo; — the issue is cross-thread line sharing, fixed by padding. <strong>Feed-forward:</strong> &sect;35.2&ndash;&sect;35.4.</div>
+
+<div class="solution" id="sol35.10"><span class="sol-label">35.10</span>
+(a) <strong>False</strong> — SoA wins for one-field sweeps but AoS wins when a loop uses all fields of one element. (b)
+<strong>True</strong> — reordering fields to reduce alignment padding shrinks the struct without removing a field. (c)
+<strong>False</strong> — false sharing is two threads writing <em>different</em> variables that share a cache line, not the same
+variable. (d) <strong>False</strong> — padding wastes bytes single-threaded but prevents false sharing across threads, an 8&times; win
+in &sect;35.4. (e) <strong>False</strong> — same operation count, different layout, can change runtime by several&times; (the AoS/SoA
+4&times;). <em>Tempting wrong answer:</em> marking (e) true from RAM-model intuition — locality, not operation count, sets the time.
+<strong>Feed-forward:</strong> &sect;35.2&ndash;&sect;35.4.</div>
+
+<div class="solution" id="sol35.11"><span class="sol-label">35.11</span>
+(a) Chapter 34 (reorder accesses over a fixed layout) fits when you cannot change the data structure — e.g. iterating a given matrix in
+the right order; this chapter (change the layout) fits when you own the types — e.g. AoS&rarr;SoA for a hot field sweep; use both when
+you both pick the layout and choose the loop order over it (SoA arrays, swept contiguously). (b) A vectorizer loads 8 contiguous
+elements into one register; SoA makes a field's values contiguous, so one wide load fills a vector, while AoS scatters them across
+struct-sized gaps and cannot. (c) Converting everything before profiling optimizes code that may be nowhere near the dominant cost
+(Chapter 33/Amdahl), risks pessimizing loops that wanted AoS, and spends effort with no measured payoff — profile first, convert the
+hot path, re-measure. <em>Tempting wrong answer:</em> &ldquo;SoA everywhere is strictly better&rdquo; — it hurts all-fields-per-element
+loops and ignores Amdahl. <strong>Feed-forward:</strong> &sect;35.2; Chapters 33, 36.</div>
+
+<div class="solution" id="sol35.12"><span class="sol-label">35.12</span>
+Platform-specific. A correct write-up reports: (a) an AoS field sum and an SoA field sum timed as minima of several trials, with a
+ratio of a few&times; explained by the useful-bytes-per-line difference (struct size vs field size). (b) the ratio growing as the struct
+grows (16&rarr;128 bytes), because a bigger struct wastes more of each line in AoS while SoA is unchanged. (c) if threads are available,
+a packed-counters vs padded-counters run with a several&times; slowdown from false sharing, vanishing at one thread.
+<em>Tempting wrong answer:</em> &ldquo;time each layout once&rdquo; — single runs are noisy; report minima of several (Chapter 33).
+<strong>Feed-forward:</strong> &sect;35.2, &sect;35.4.</div>
+
+</section>

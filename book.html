@@ -276,6 +276,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch32">Chapter 32 — Fearless Concurrency</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VI &mdash; Performance Engineering</li>
 <li class="toc-ch"><a href="#ch33">Chapter 33 — Measure First: Profiling and Benchmarking</a></li>
+<li class="toc-ch"><a href="#ch34">Chapter 34 — Cache-Aware Design: Programming for Locality</a></li>
+<li class="toc-ch"><a href="#ch35">Chapter 35 — Data-Oriented Design: Laying Out Data for the Cache</a></li>
+<li class="toc-ch"><a href="#ch36">Chapter 36 — SIMD and Vectorization</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VII &mdash; I/O & Networking, Low-Level</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part VIII &mdash; Storage & the Disk</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part IX &mdash; Storage Engines</li>
@@ -13764,6 +13767,1083 @@ dominates; if not, do the hand timing and state which tool you would use and wha
 </section>
 </section>
 
+<section class="chapter" id="ch34">
+<h1>Chapter 34 — Cache-Aware Design: Programming for Locality</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch03">Chapter 3</a> (the memory hierarchy and caches — this chapter
+turns that model into code you can time), <a href="#ch05">Chapter 5</a> (mechanical sympathy — writing with the grain of the machine),
+<a href="#ch04">Chapter 4</a> (virtual memory and the TLB — the other table a strided access thrashes), <a href="#ch33">Chapter 33</a>
+(measure first — every number here is measured, and you should distrust the ones that are not). &nbsp;·&nbsp; The profiler of Chapter 33
+tells you <em>where</em> the time goes; this chapter opens the most common answer — the loop is waiting on memory — and shows the code
+changes that make it wait less.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch03">Chapter 3</a> — roughly how many times slower is a main-memory access than an
+L1 cache hit, order of magnitude? (2) <a href="#ch03">Chapter 3</a> — what is a <em>cache line</em>, and what is the unit the hardware
+moves between memory and cache? (3) <em>Predict:</em> you have an 8192&times;8192 matrix of <code>double</code> stored row by row, and
+you sum every element two ways — walking along each row, then walking down each column. Same arithmetic, same element count. How many
+times slower do you expect the column walk to be: about the same, 2&times;, or something far larger? Write your guess; &sect;34.2 and
+&sect;34.3 answer all three.</p>
+</aside>
+
+<p>Chapter 3 gave you the memory hierarchy as a set of facts: registers, then L1, L2, L3 caches, then DRAM, each larger and an order
+of magnitude slower than the last. This chapter makes those facts <em>actionable</em>. The RAM model of Chapter 1 says every memory
+access costs the same; the real machine says an access that hits L1 is perhaps a hundred times cheaper than one that goes to DRAM, and
+which one you get is decided by <strong>locality</strong> — whether your accesses reuse recent data (temporal) and touch neighbors of
+recent data (spatial). The striking consequence is that two loops doing the <em>identical</em> arithmetic on the <em>identical</em>
+data can differ in wall-clock time by more than an order of magnitude, decided entirely by the order in which they touch memory. We
+build this up in five steps: the hierarchy as a cost model, with this machine's real cache sizes (&sect;34.1); spatial locality and
+why the <em>cache line</em>, not the byte, is the unit you pay for (&sect;34.2); the canonical demonstration — row-major versus
+column-major traversal, measured at 19&times; here (&sect;34.3); temporal locality, working sets, and blocking to keep reuse in cache
+(&sect;34.4); and what to carry into the layout and vectorization chapters that follow (&sect;34.5).</p>
+
+<p><strong>On the code in this chapter.</strong> As in Chapter 33 the programs are C, compiled with gcc 11.4.0 and run in this
+environment on an Intel Core i7-12700H, timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> and reported as the minimum of several
+trials (Chapter 33's method). The cache sizes quoted are read from this machine's <code>/sys/devices/system/cpu/.../cache</code>, so
+they are real for this CPU; the <em>times</em> are illustrative of the effect and hardware-specific — your machine will differ. A
+hardware-counter profiler (<code>perf</code>) is <em>not</em> installed here, so cache-miss counts are not quoted; the effects below
+are shown through wall-clock timing, which is enough to see an order-of-magnitude gap, and this is stated wherever it matters.</p>
+
+<h2>34.1 The hierarchy as a cost model, in real numbers</h2>
+
+<p>The reason locality governs performance is that the levels of the hierarchy differ not by a little but by orders of magnitude, and
+the fast levels are small. On the machine these programs run on — an Intel Core i7-12700H, values read from <code>/sys</code> — each
+core has a 48&nbsp;KiB L1 data cache and a 1.25&nbsp;MiB L2, and all cores share a 24&nbsp;MiB L3; the line size at every level is
+64&nbsp;bytes. Representative published access latencies (order-of-magnitude teaching figures, not measured here; see Drepper 2007 and
+CS:APP) run about 4 cycles to hit L1, ~12 to L2, ~40 to L3, and <em>hundreds</em> of cycles — often quoted near 100&nbsp;ns — to reach
+DRAM. Two facts follow that decide everything else. First, the gap is enormous: a DRAM access can cost more than a hundred L1 hits, so
+a loop that misses cache on most accesses is not a little slower, it is <em>stalled</em>, the CPU idling while data crawls in. Second,
+the fast memory is <em>small</em> — 48&nbsp;KiB of L1, not megabytes — so you cannot keep everything hot; you must arrange for the data
+you are about to use to already be near the core. That arrangement is what &ldquo;cache-aware&rdquo; means, and the hardware gives you
+two levers, spatial and temporal locality, which the next sections make concrete.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the levels of the hierarchy from fastest to slowest and say, to an order of magnitude, how much slower a DRAM access is than
+an L1 hit. Why does the smallness of L1 (tens of KiB) mean you cannot simply &ldquo;keep the data in cache&rdquo; and must instead
+control locality? (Answer after the next section.)</p>
+</aside>
+
+<h2>34.2 Spatial locality: you pay by the cache line, not the byte</h2>
+
+<p>The hardware never fetches a single byte or a single <code>int</code> from memory. It fetches a whole <strong>cache line</strong> —
+64&nbsp;bytes on this machine — and caches that. So when you read one <code>int</code>, the fifteen <code>int</code>s next to it in
+the same line come along for free; if your next access is one of them, it hits cache. This is <strong>spatial locality</strong>: code
+that touches memory in contiguous, small strides gets many accesses per line fetched, while code that jumps far between accesses pays a
+full line fetch to use just one element and throws the other 60 bytes away. You can see the line size directly by sweeping the stride
+of a walk over an array far larger than L3 and measuring time per access — compiled and run here (gcc 11.4.0, <code>-O2</code>, a
+256&nbsp;MiB <code>int</code> array, a fixed 2<sup>24</sup> accesses at each stride):</p>
+
+<pre><code>for (long k=0, idx=0; k &lt; touches; k++) { s += a[idx]; idx += stride; if (idx &gt;= N) idx = 0; }
+
+$ gcc -O2 stride.c -o stride &amp;&amp; ./stride
+stride  1 ints (  4 B):  2.93 ns/access
+stride  2 ints (  8 B):  2.71 ns/access
+stride  4 ints ( 16 B):  3.53 ns/access
+stride  8 ints ( 32 B):  5.82 ns/access
+stride 16 ints ( 64 B): 10.61 ns/access   &lt;- one access per 64-byte line
+stride 32 ints (128 B): 18.03 ns/access
+stride 64 ints (256 B): 20.91 ns/access</code></pre>
+
+<p>Read the shape, not the exact figures. At stride 1 each 64-byte line serves 16 accesses, so the line-fetch cost is amortized 16
+ways and each access is cheap (~2.9&nbsp;ns here, with the hardware prefetcher helping). As the stride grows the number of useful
+accesses per line falls — 8, then 4, then 2 — and the per-access cost climbs, because the same line fetch now serves fewer of them.
+At a stride of 16 <code>int</code>s — exactly 64&nbsp;bytes, one cache line — <em>every</em> access lands in a fresh line and uses only
+4 of its 64 bytes; the cost has jumped to ~10.6&nbsp;ns, roughly 3.6&times; the stride-1 cost. The knee at 64&nbsp;bytes is the cache
+line making itself visible in wall-clock time. Beyond it the cost keeps rising as larger strides also defeat the prefetcher and
+stress the TLB (Chapter 4), but the lesson is already fixed: <strong>the cache line is the unit you pay for</strong>, so packing the
+data a loop uses into as few lines as possible — contiguous, small-stride, no wasted bytes per line — is the first and cheapest
+performance lever you have.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does a stride-1 walk cost far less per access than a stride-16-<code>int</code> walk over the same array, when both read the
+same number of elements? What is special about a stride of 64&nbsp;bytes on this machine? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>34.3 The canonical case: row-major versus column-major</h2>
+
+<p>Now the demonstration that every performance course reaches for, because it isolates spatial locality with nothing else changed.
+C stores a two-dimensional array in <strong>row-major</strong> order: <code>A[i][j]</code> and <code>A[i][j+1]</code> are adjacent in
+memory, while <code>A[i][j]</code> and <code>A[i+1][j]</code> are a full row apart. Summing the matrix by walking along rows therefore
+strides by one element (stay in the line, spatial locality is perfect); walking down columns strides by a whole row — 8192
+<code>double</code>s, 64&nbsp;KiB — so every single access lands in a new line, uses 8 of its 64 bytes, and evicts a line you will
+need again later. Same elements, same additions, opposite locality. Compiled and run here (gcc 11.4.0, <code>-O2</code>, an
+8192&times;8192 <code>double</code> matrix, 512&nbsp;MiB, minimum of 5 trials):</p>
+
+<pre><code>for (i) for (j) s += A[i*N + j];   // row-major: stride 1 element
+for (j) for (i) s += A[i*N + j];   // col-major: stride N elements (one row apart)
+
+$ gcc -O2 rowcol.c -o rowcol &amp;&amp; ./rowcol
+row-major (stride 1): 0.1269 s
+col-major (stride N): 2.4744 s
+ratio col/row       : 19.50x</code></pre>
+
+<p>The column walk is <strong>19.5&times; slower</strong> for arithmetic that is byte-for-byte identical. Nothing about the computation
+changed — the same 67 million additions run in both — only the order of memory access, and that order alone cost a factor of nineteen.
+This is the whole chapter in one measurement: at the RAM-model level (Chapter 1) the two loops are the same program, and a beginner
+reasoning from instruction counts predicts they run in the same time; the real machine charges an order of magnitude for the
+difference in locality, exactly the &ldquo;where does the time go&rdquo; question Chapter 33 said the instruction count cannot answer.
+The fix is almost always to reorder the loops or transpose the data so the innermost loop strides by one — and note that the compiler
+generally may <em>not</em> do this for you, because swapping loop nesting can change results under floating-point rounding and is not
+always legal, so the choice of traversal order is yours to make and to measure.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: locality decides the cost of identical work</span>
+<p><strong>1. In words.</strong> Memory is a hierarchy whose levels differ by orders of magnitude, and the hardware moves whole cache
+lines. Touch memory contiguously (spatial locality) and reuse it before it is evicted (temporal locality) and most accesses hit a fast
+level; stride far or revisit after eviction and most accesses stall on DRAM. The arithmetic is the same either way; the access order
+sets the price.</p>
+<p><strong>2. As a picture.</strong> Figure 34.1: the hierarchy as a pyramid (registers &rarr; L1 48&nbsp;KiB &rarr; L2 1.25&nbsp;MiB
+&rarr; L3 24&nbsp;MiB &rarr; DRAM), each level wider and slower; beside it, a 64-byte cache line with a row-major walk using all of it
+and a column-major walk using one element and discarding the rest.</p>
+<p><strong>3. As numbers/contrast.</strong> Same array, cost per access rose from ~2.9&nbsp;ns at stride 1 to ~10.6&nbsp;ns at a
+64-byte stride as line utilization fell (&sect;34.2); the same 8192&times;8192 sum ran in 0.1269&nbsp;s row-major and 2.4744&nbsp;s
+column-major — <strong>19.5&times;</strong> — for byte-identical arithmetic (&sect;34.3). Identical work, an order-of-magnitude spread,
+decided only by access order.</p>
+</aside>
+
+<p><em>(Answer to the &sect;34.1 quick check: fastest to slowest — registers, L1, L2, L3, DRAM — and a DRAM access is roughly two
+orders of magnitude slower than an L1 hit (tens of nanoseconds versus a fraction of one). L1 is only tens of KiB, far too small to
+hold a working set of any size, so you cannot &ldquo;just keep it in cache&rdquo;; you must arrange your accesses so the small hot data
+you need next is already near the core — that arrangement is locality, spatial and temporal.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The hierarchy (left) and the cache line as the unit of transfer (right).</text>
+<polygon points="20,40 120,40 90,58 50,58" fill="#dfeee0" stroke="#2f7d32"/><text x="128" y="53" font-size="9">registers &mdash; ~1 cycle</text>
+<polygon points="50,58 90,58 100,78 40,78" fill="#eaf3e9" stroke="#2f7d32"/><text x="128" y="72" font-size="9">L1 48 KiB &mdash; ~4 cyc</text>
+<polygon points="40,78 100,78 112,100 28,100" fill="#f5f8fb" stroke="#14406b"/><text x="128" y="92" font-size="9">L2 1.25 MiB &mdash; ~12 cyc</text>
+<polygon points="28,100 112,100 126,124 14,124" fill="#f5f8fb" stroke="#14406b"/><text x="132" y="115" font-size="9">L3 24 MiB &mdash; ~40 cyc</text>
+<polygon points="14,124 126,124 140,150 0,150" fill="#eef1f4" stroke="#14406b"/><text x="146" y="139" font-size="9">DRAM &mdash; ~100 ns</text>
+<text x="12" y="176" font-size="9" fill="#14406b">faster, smaller  &uarr;    &darr;  slower, larger</text>
+<text x="360" y="40" font-size="9" fill="#14406b">one 64-byte cache line (8 doubles):</text>
+<g>
+<rect x="360" y="48" width="30" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="390" y="48" width="30" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="420" y="48" width="30" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="450" y="48" width="30" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="480" y="48" width="30" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="510" y="48" width="30" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="540" y="48" width="30" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="570" y="48" width="30" height="20" fill="#dfeee0" stroke="#2f7d32"/>
+</g>
+<text x="360" y="84" font-size="8" fill="#2f7d32">row-major walk: all 8 used before the line is evicted (spatial locality)</text>
+<g>
+<rect x="360" y="100" width="30" height="20" fill="#f6dcd2" stroke="#8c3a1d"/><rect x="390" y="100" width="30" height="20" fill="#eef1f4" stroke="#8c3a1d"/><rect x="420" y="100" width="30" height="20" fill="#eef1f4" stroke="#8c3a1d"/><rect x="450" y="100" width="30" height="20" fill="#eef1f4" stroke="#8c3a1d"/><rect x="480" y="100" width="30" height="20" fill="#eef1f4" stroke="#8c3a1d"/><rect x="510" y="100" width="30" height="20" fill="#eef1f4" stroke="#8c3a1d"/><rect x="540" y="100" width="30" height="20" fill="#eef1f4" stroke="#8c3a1d"/><rect x="570" y="100" width="30" height="20" fill="#eef1f4" stroke="#8c3a1d"/>
+</g>
+<text x="360" y="136" font-size="8" fill="#8c3a1d">column-major walk: 1 used, 7 discarded, line evicted before reuse</text>
+<text x="360" y="170" font-size="9" fill="#14406b">row-major 0.1269 s  vs  column-major 2.4744 s  =  19.5&times;</text>
+</svg>
+<figcaption>Figure 34.1: The memory hierarchy (left) charges orders of magnitude more for a DRAM access than an L1 hit, and the
+hardware moves whole 64-byte lines (right). A row-major walk uses every element of each line it fetches; a column-major walk uses one
+and discards the rest, evicting lines before their reuse — measured here at a 19.5&times; gap for identical arithmetic (&sect;34.3).</figcaption>
+</figure>
+
+<h2>34.4 Temporal locality, working sets, and blocking</h2>
+
+<p>Spatial locality is about the <em>neighbors</em> of what you touch; <strong>temporal locality</strong> is about revisiting the
+<em>same</em> data soon enough that it is still cached. The governing quantity is the <strong>working set</strong> — the amount of data
+a phase of the program touches repeatedly. If the working set fits in a cache level, the second and later passes over it hit that
+level; if it overflows, each pass evicts what the next pass needs, and you pay DRAM latency on every access even though you are reusing
+data. The classic example is dense matrix multiplication: the naive triple loop streams an entire N&times;N matrix for each output
+element, so once N is large enough that a row plus a column no longer fit in cache, nearly every access misses. The standard cure is
+<strong>blocking</strong> (tiling): restructure the loops to work on small sub-blocks that <em>do</em> fit in cache, compute everything
+that block contributes before moving on, so each loaded line is reused many times before eviction (CS:APP, ch.6; Hennessy &amp;
+Patterson, ch.2). The block size is chosen so the active tiles fit a target cache level, turning a memory-bound computation into a
+compute-bound one. The general principle generalizes far past matrices: <strong>size your hot working set to a cache level and reuse
+each loaded line as much as possible before it is evicted</strong>. When a profile (Chapter 33) shows a loop stalled on memory, the two
+questions are always the same — am I striding contiguously (spatial), and does my reused data fit in cache (temporal) — and the fixes
+are reorder the accesses, or shrink the working set until it does.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the innocent transpose &mdash; striding across cache lines by accident</span>
+<p>The column-major sum of &sect;34.3 was 19&times; slower than the row-major one, and nobody wrote a &ldquo;slow&rdquo; loop — they
+wrote <code>for (j) for (i) A[i][j]</code>, which looks as reasonable as the other order and is a one-token difference. This is the
+trap: <strong>an access pattern that strides across cache lines instead of along them is invisible in the source</strong>. It hides in
+iterating a row-major array in column order; in an array of large structs where you touch one field per element (Chapter 35); in
+chasing pointers through a linked list or tree whose nodes were allocated all over the heap; in a hash table walked in key order. Each
+looks like ordinary code and each turns a fast level into DRAM latency on nearly every access. Two defenses. First, <em>know your data's
+memory layout</em> and make the innermost, most frequent loop stride by one along it — transpose the data, or swap the loops, so the
+hot access is contiguous. Second, <em>measure</em>: the gap does not show up in a code review or an instruction count, only in a timed
+run (Chapter 33) or a cache-miss counter (<code>perf</code>, where available). The order-of-magnitude cost of getting this wrong is
+precisely why it is worth a deliberate look at any hot loop's access pattern.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our image filter is too slow. The inner loop is just <code>out[x][y] =
+f(in[x][y])</code> over a big 2-D array — it's the simplest possible code, so I don't think we can do better without rewriting it in
+assembly.&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;34.1&ndash;&sect;34.4.</p>
+<p><em>Model answer.</em> &ldquo;Before assembly, let's check the access pattern, because &lsquo;simplest code&rsquo; and &lsquo;fastest
+code&rsquo; aren't the same thing here. If the arrays are stored row-major and the loops are nested <code>for x { for y }</code> with
+<code>x</code> the row index, then <code>[x][y]</code> is striding by a whole row on the inner loop — every access lands in a new
+cache line and uses a fraction of it, which on the matrix case cost us about 19&times;. Swapping the loop nesting so the inner index
+runs along the contiguous dimension, or transposing one array, could give most of that back for a one-line change, no assembly. Let's
+measure it the Chapter 33 way — same input, <code>-O2</code>, many trials, minimum — with the loops each way and compare; if the
+profile then still shows us memory-bound, we look at blocking the working set to fit L2, and only after that consider vectorizing the
+kernel.&rdquo; Reaching for the access pattern and a measurement before reaching for assembly is the senior register: the cheap,
+high-leverage fix first.</p>
+</aside>
+
+<p><em>(Answer to the &sect;34.2 quick check: a stride-1 walk reuses each fetched 64-byte line for all 16 <code>int</code>s in it, so
+the line-fetch cost is amortized across many accesses and each is cheap; a stride-16-<code>int</code> walk strides exactly one 64-byte
+line per access, so every access triggers a fresh line fetch and uses only 4 of its 64 bytes, and the cost climbs to the per-line
+fetch cost. A 64-byte stride is special because it equals the cache line: it is the smallest stride at which no two consecutive
+accesses ever share a line, so spatial locality is completely defeated.)</em></p>
+
+<h2>34.5 What to carry forward</h2>
+
+<p>The memory hierarchy is not a detail under the RAM model; on real hardware it is often <em>the</em> cost. Its levels differ by
+orders of magnitude and the fast ones are small (48&nbsp;KiB of L1 on this machine, 24&nbsp;MiB of shared L3), so performance is
+decided by <strong>locality</strong>: touch memory contiguously so each 64-byte line you fetch serves many accesses (<strong>spatial
+locality</strong>, &sect;34.2), and reuse data while it is still cached by sizing your hot working set to a cache level
+(<strong>temporal locality</strong> and <strong>blocking</strong>, &sect;34.4). The cost of ignoring this is not marginal: identical
+arithmetic ran <strong>19.5&times;</strong> slower in column-major than row-major order (&sect;34.3), a factor that no instruction-count
+reasoning predicts and that a profile (Chapter 33) surfaces only as &ldquo;stalled on memory.&rdquo; The cardinal rule of the chapter:
+the cache line, not the byte, is the unit you pay for, so pack what a loop uses into as few lines as possible and stride along them,
+not across them.</p>
+
+<p>This chapter took the data layout as given — a matrix, an array — and controlled the <em>order</em> of access. The next chapter,
+<a href="#ch35">Chapter 35</a>, takes the complementary lever: controlling the <em>layout itself</em>, so that the bytes a loop needs
+are contiguous by construction. That is <strong>data-oriented design</strong> — array-of-structs versus struct-of-arrays, hot/cold
+splitting, packing — the operational form of the mechanical sympathy Chapter 5 introduced, and it turns the &ldquo;stride along, not
+across&rdquo; rule from something you arrange at the loop into something guaranteed by the data structure. After that,
+<a href="#ch36">Chapter 36</a> shows how a cache-friendly, contiguous layout is also the precondition for the CPU's other lever of
+throughput, <strong>SIMD</strong>: the vector unit can only stream data it can reach quickly. Locality first, because a vector unit
+starved for memory is no faster than a scalar one.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the levels of the memory hierarchy and, to an order of magnitude, the L1-to-DRAM latency gap.</li>
+<li>Define spatial and temporal locality, and say why the cache line (not the byte) is the unit you pay for.</li>
+<li>Explain why row-major and column-major traversal of the same matrix can differ by an order of magnitude.</li>
+<li>Explain what a working set is and how blocking keeps reuse in cache.</li>
+<li>Name three ordinary-looking code patterns that secretly stride across cache lines.</li>
+<li>Describe how you would measure whether a proposed locality fix actually helped.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why do the orders-of-magnitude latency gaps between cache levels make locality, not instruction count, the thing to optimize? (&sect;34.1)</li>
+<li><strong>R2.</strong> What is a cache line, and why does striding by exactly one line size defeat spatial locality? (&sect;34.2)</li>
+<li><strong>R3.</strong> Why is column-major traversal of a row-major matrix an order of magnitude slower than row-major, for identical arithmetic? (&sect;34.3)</li>
+<li><strong>R4.</strong> What is a working set, and how does blocking (tiling) turn a memory-bound loop into a compute-bound one? (&sect;34.4)</li>
+<li><strong>R5.</strong> A profile says a loop is stalled on memory. What two locality questions do you ask, and what are the corresponding fixes? (&sect;34.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Ulrich Drepper, &ldquo;What Every Programmer Should Know About Memory&rdquo; (Red Hat, Inc., 2007).</strong> The definitive
+long-form treatment of caches, cache lines, prefetching, and the locality techniques of this chapter, published as a Red Hat
+whitepaper and as an LWN.net series (<code>lwn.net/Articles/250967</code>). Author Ulrich Drepper; a whitepaper, not a journal
+article, so no DOI — cited as such. The 19&times; effect of &sect;34.3 is exactly what its cache chapters predict.</li>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 6 (the memory hierarchy) is the source for the working-set and blocking discussion of
+&sect;34.4 and for the representative latency figures of &sect;34.1. First author Randal Bryant; edition, publisher, and ISBN verified
+via the publisher.</li>
+<li><strong>John L. Hennessy &amp; David A. Patterson, <em>Computer Architecture: A Quantitative Approach</em>, 6th ed. (Morgan
+Kaufmann, 2017), ISBN 978-0-12-811905-1.</strong> Chapter 2 develops the memory hierarchy quantitatively — cache organization, miss
+penalties, and the arithmetic behind the cost model of &sect;34.1. First author John Hennessy; edition and ISBN verified via the
+publisher.</li>
+<li><strong>Linux kernel sysfs cache topology (<code>/sys/devices/system/cpu/cpu*/cache/</code>).</strong> The source of the real
+cache sizes and 64-byte line size quoted for this machine in &sect;34.1&ndash;&sect;34.2 (<code>size</code>,
+<code>coherency_line_size</code>, <code>level</code>). Read directly from this environment; your machine's values will differ, so read
+your own before quoting them.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex34.1"><span class="ex-label">34.1</span> <span class="ex-tag warm">warm-up</span>
+Define spatial locality and temporal locality in one sentence each, and give a small code example that has good spatial locality and
+one that has poor spatial locality.</div>
+
+<div class="exercise" id="ex34.2"><span class="ex-label">34.2</span> <span class="ex-tag warm">warm-up</span>
+The cache line on this machine is 64 bytes. If you read one <code>double</code> (8 bytes) and then read the next 7
+<code>double</code>s in memory, how many cache-line fetches does that cost in the best case, and why?</div>
+
+<div class="exercise" id="ex34.3"><span class="ex-label">34.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, why is a DRAM access being ~100&times; slower than an L1 hit the reason we care about locality at all, rather than
+just counting instructions?</div>
+
+<div class="exercise" id="ex34.4"><span class="ex-label">34.4</span> <span class="ex-tag core">core</span>
+The &sect;34.3 measurement: row-major 0.1269&nbsp;s, column-major 2.4744&nbsp;s, on an 8192&times;8192 <code>double</code> matrix.
+(a) Both loops do the same number of additions — so what, precisely, differs between them to produce a 19.5&times; gap? (b) A
+<code>double</code> is 8 bytes and the line is 64 bytes; how many elements of each fetched line does the column-major walk actually
+use before the line is (much later) needed again? (c) Name two ways to fix the column-major loop.</div>
+
+<div class="exercise" id="ex34.5"><span class="ex-label">34.5</span> <span class="ex-tag core">core</span>
+The stride sweep of &sect;34.2 rose from ~2.9&nbsp;ns/access at stride 1 to ~10.6&nbsp;ns at a 64-byte stride. (a) Explain the
+climb in terms of accesses-served-per-line. (b) Why is there a recognizable knee at 64 bytes specifically? (c) Costs kept rising past
+64 bytes; name two mechanisms other than the L1 line that explain the further increase.</div>
+
+<div class="exercise" id="ex34.6"><span class="ex-label">34.6</span> <span class="ex-tag core">core</span>
+A colleague's hot loop chases a linked list: each node is <code>malloc</code>'d separately and holds one <code>int</code> plus a
+<code>next</code> pointer. Profiling shows it stalled on memory. (a) Why does this pattern have poor spatial locality even though each
+node is small? (b) What layout change would improve it, and why? (c) What does this share with the column-major case of &sect;34.3?</div>
+
+<div class="exercise" id="ex34.7"><span class="ex-label">34.7</span> <span class="ex-tag complexity">cost</span>
+Reason about working sets and blocking. A program makes repeated passes over an array of size S, and the last-level cache holds C
+bytes. (a) Qualitatively, what happens to the miss rate as S grows from below C to well above C? (b) Explain how blocking the
+computation into chunks of size &le;C changes the picture. (c) Why can blocking turn a &ldquo;memory-bound&rdquo; loop into a
+&ldquo;compute-bound&rdquo; one without reducing the number of arithmetic operations at all?</div>
+
+<div class="exercise" id="ex34.8"><span class="ex-label">34.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> You must sum a 4096&times;4096 <code>float</code> matrix stored row-major.
+<br><strong>Step 1 (given):</strong> row-major storage means <code>A[i][j]</code> and <code>A[i][j+1]</code> are adjacent; <code>A[i][j]</code> and <code>A[i+1][j]</code> are one row (16&nbsp;KiB) apart.
+<br><strong>Step 2 (given):</strong> the loop <code>for (j) for (i) sum += A[i][j]</code> strides by a full row on its inner loop, so nearly every access misses.
+<br><strong>Step 3 (given):</strong> the loop <code>for (i) for (j) sum += A[i][j]</code> strides by one element on its inner loop, so each 64-byte line serves 16 accesses.
+<br><strong>Step 4 (you):</strong> State which loop to ship and why, and describe exactly how you would measure that the reordered loop is faster on this matrix (clock, optimization level, trials, what to hold constant).</div>
+
+<div class="exercise" id="ex34.9"><span class="ex-label">34.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether the problem is primarily <em>spatial</em> locality, <em>temporal</em> locality, or <em>neither</em>, and why:
+(a) iterating a row-major 2-D array in column order; (b) repeatedly scanning a 100&nbsp;MiB table that does not fit in a 24&nbsp;MiB
+L3; (c) a tight loop summing a 1&nbsp;KiB array a million times; (d) chasing pointers through a tree whose nodes are scattered across
+the heap.</div>
+
+<div class="exercise" id="ex34.10"><span class="ex-label">34.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Reading one byte from memory fetches exactly one
+byte into cache.&rdquo; (b) &ldquo;Two loops with the same instruction count always take the same time.&rdquo; (c) &ldquo;The compiler
+will always reorder loops to fix a bad traversal order for you.&rdquo; (d) &ldquo;If the working set fits in L2, repeated passes over
+it mostly hit L2.&rdquo; (e) &ldquo;Blocking reduces the number of arithmetic operations.&rdquo;</div>
+
+<div class="exercise" id="ex34.11"><span class="ex-label">34.11</span> <span class="ex-tag stretch">stretch</span>
+Tie locality back to the profiler. (a) A profile (Chapter 33) shows one loop at 85% of runtime but a low instruction count per
+iteration; give the locality hypothesis and how you would test it. (b) Without <code>perf</code> or a cache-miss counter, describe a
+purely wall-clock experiment that distinguishes &ldquo;memory-bound because of poor locality&rdquo; from &ldquo;genuinely
+compute-bound.&rdquo; (c) Why is &ldquo;transpose the data / swap the loops, then re-measure&rdquo; a stronger move than
+&ldquo;rewrite the loop in assembly&rdquo; as a first response to a memory-bound loop?</div>
+
+<div class="exercise" id="ex34.12"><span class="ex-label">34.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices): (a) Read your real cache sizes and line size from
+<code>/sys/devices/system/cpu/cpu0/cache/index*/</code> (or your platform's equivalent) and record them. (b) Reproduce &sect;34.3 —
+sum a large row-major matrix both ways at <code>-O2</code>, time each as the minimum of several
+<code>clock_gettime(CLOCK_MONOTONIC)</code> trials, and report the ratio; explain it using your line size. (c) Reproduce the stride
+sweep of &sect;34.2 over an array larger than your L3 and find the knee; check that it falls at your line size. Note your toolchain
+version and CPU, and state that these are wall-clock measurements (no hardware counters) if you lack <code>perf</code>.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch35">
+<h1>Chapter 35 — Data-Oriented Design: Laying Out Data for the Cache</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch05">Chapter 5</a> (mechanical sympathy and data-oriented design —
+this chapter is that idea made operational and measured), <a href="#ch34">Chapter 34</a> (locality and the cache line — here we control
+the layout, not just the access order), <a href="#ch26">Chapter 26</a> (false sharing — its cause is cache-line layout, and we measure
+it here), <a href="#ch33">Chapter 33</a> (measure first). &nbsp;·&nbsp; Chapter 34 took the data layout as given and reordered the
+accesses; this chapter changes the <em>layout itself</em>, so the bytes a loop needs are contiguous by construction.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch34">Chapter 34</a> — what is the unit the hardware moves between memory and cache, and
+how big is it on typical hardware? (2) <a href="#ch26">Chapter 26</a> — what is <em>false sharing</em>, in one line? (3)
+<em>Predict:</em> you have 16 million particles, each a struct of eight <code>double</code>s (position, velocity, mass, charge), and
+a loop that sums just the <code>x</code> field. Compare that to storing all the <code>x</code>s in their own separate array and
+summing those. Same 16 million additions. How much faster do you expect the separate-array version to be: the same, a little, or
+several times? Write your guess; &sect;35.2 answers it.</p>
+</aside>
+
+<p>Object-oriented habit says: model a thing as a struct with all its attributes, make an array of those structs, and write loops over
+them. <strong>Data-oriented design</strong> inverts the priority. It asks first what <em>transformations</em> the hot loops perform on
+the data — which fields they read, in what order, how often — and then lays the data out so those loops touch memory contiguously, with
+no wasted bytes per cache line. The object is a convenience for the programmer; the layout is a contract with the cache, and Chapter 34
+showed that contract can be worth an order of magnitude. Mike Acton put the discipline bluntly in his 2014 keynote: the purpose of the
+program is to transform data, so &ldquo;if you don't understand the data, you don't understand the problem,&rdquo; and the hardware you
+run on has one overriding cost — memory (Acton, 2014; Fabian, 2018). This chapter makes that concrete in four steps: the core idea and
+why the object is not the natural unit (&sect;35.1); array-of-structs versus struct-of-arrays, measured at 4&times; here (&sect;35.2);
+hot/cold splitting, field ordering, and packing to fit more useful data per line (&sect;35.3); and the place where layout collides with
+concurrency — <strong>false sharing</strong>, measured at nearly 8&times; (&sect;35.4). Then what to carry into the vectorization chapter,
+which needs exactly the layout this one produces (&sect;35.5).</p>
+
+<p><strong>On the code in this chapter.</strong> As before the programs are C, compiled with gcc 11.4.0 and run in this environment on
+an Intel Core i7-12700H, timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> and reported as the minimum of several trials
+(Chapter 33). The times are illustrative of the effect and hardware-specific; a hardware-counter profiler (<code>perf</code>) is not
+installed here, so the effects are shown through wall-clock timing rather than cache-miss counts, and this is stated where it matters.</p>
+
+<h2>35.1 The object is not the natural unit</h2>
+
+<p>Start from the mismatch. A natural object-oriented model of a particle bundles everything about it — position, velocity, mass,
+charge — into one struct, and a simulation holds an array of them. But a physics update loop that only needs the <code>x</code>
+coordinate now strides through memory in jumps the size of the <em>whole struct</em>, dragging velocity, mass, and charge into cache on
+every step only to ignore them. The cache line is spent on bytes the loop never reads. Data-oriented design starts from the loop, not
+the object: it asks which fields the hot transformation actually touches, and arranges memory so <em>those</em> bytes are contiguous
+and the rest are elsewhere. The design question flips from &ldquo;what is a particle?&rdquo; to &ldquo;what does the update loop read,
+and how do I give it that with no wasted line?&rdquo; This is the same &ldquo;stride along, not across&rdquo; rule as Chapter 34, but
+achieved by <em>choosing the layout</em> rather than by reordering accesses over a fixed one — and because you own the layout, you can
+guarantee the good pattern instead of hoping the access order preserves it. The rest of the chapter is the concrete moves this
+principle licenses: splitting one array of fat structs into several arrays of fields (&sect;35.2), separating hot fields from cold
+(&sect;35.3), and being deliberate about which fields share a cache line when threads are involved (&sect;35.4).</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does a loop that reads only the <code>x</code> field of an array of large structs waste most of every cache line it fetches?
+State the data-oriented reframing: which question replaces &ldquo;what is a particle?&rdquo; (Answer after the next section.)</p>
+</aside>
+
+<h2>35.2 Array-of-structs versus struct-of-arrays</h2>
+
+<p>The canonical data-oriented transform has a name. <strong>Array-of-structs (AoS)</strong> is the object-oriented default:
+<code>Particle a[N]</code>, each element holding all its fields together. <strong>Struct-of-arrays (SoA)</strong> stores each field
+in its own contiguous array: <code>double x[N], y[N], vx[N], ...</code>. For a loop that reads one field across all elements, SoA is
+pure spatial locality — every fetched line is full of the field you want — while AoS strides by the struct size and wastes the rest of
+each line. Here is the exact case from the opener: 16 million particles, an 8-field struct that happens to be 64 bytes (one whole cache
+line), summing only <code>x</code>. Compiled and run here (gcc 11.4.0, <code>-O2</code>, minimum of 7 trials):</p>
+
+<pre><code>struct Particle { double x,y,z,vx,vy,vz,mass,charge; };  // 64 bytes = one cache line
+for (i) s += aos[i].x;    // AoS: stride 64 B, uses 8 of every 64 bytes fetched
+for (i) s += soa_x[i];    // SoA: stride 8 B, every line full of x's
+
+$ gcc -O2 aossoa.c -o aossoa &amp;&amp; ./aossoa
+AoS  sum of .x (64 B stride): 0.1514 s
+SoA  sum of x  ( 8 B packed): 0.0371 s
+ratio AoS/SoA               : 4.08x</code></pre>
+
+<p>SoA is <strong>4.08&times; faster</strong> for the same 16 million additions. The reason is the same accounting as Chapter 34's
+cache line: the AoS loop fetches a 64-byte line and uses 8 bytes of it — one <code>double</code> — before moving on, so 7 of every 8
+bytes it pulls from memory are thrown away; the SoA loop uses all 64 bytes of every line, and the ratio of useful-to-fetched bytes
+(8&times; better) is most of the speedup. Notice this is not a made-up struct: 64 bytes is an entirely ordinary object size, and the
+&ldquo;sum one field&rdquo; loop is what half of data processing looks like. The tradeoff is real and worth stating plainly: SoA wins
+decisively when loops sweep <em>one or a few fields across many elements</em>; AoS can win when a loop touches <em>all</em> fields of
+<em>one</em> element at a time (then the whole struct in one line is exactly what you want). Data-oriented design is choosing per the
+dominant access pattern the profile shows — and when the hot loop reads a column, you store a column.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define AoS and SoA. For a loop summing one field across all elements, why is SoA faster, and roughly by what factor did the byte
+accounting predict here? When would AoS be the better layout instead? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>35.3 Hot/cold splitting, field order, and packing</h2>
+
+<p>SoA is the extreme; between it and AoS lies a spectrum of cheaper wins from the same principle: <em>get more useful bytes into each
+fetched line</em>. Three moves recur. First, <strong>hot/cold splitting</strong>: if a struct has a few fields the hot loop reads every
+time (hot) and many it touches rarely (cold), split them into two structs — a dense array of hot fields the loop streams efficiently,
+and a parallel array of cold fields it visits only when needed. This keeps AoS convenience for the cold data while giving the hot loop
+SoA-like density. Second, <strong>field ordering and padding</strong>: the compiler inserts padding to satisfy each field's alignment,
+so a careless field order can bloat a struct with holes — ordering fields large-to-small typically minimizes that padding and shrinks
+the struct, so more elements fit per line (CS:APP, ch.3). A 24-byte struct that packs to 16 bytes with reordered fields is 50% more
+elements per line for free. Third, <strong>shrinking the data itself</strong>: using a 32-bit index instead of a 64-bit pointer, or a
+<code>float</code> instead of a <code>double</code> where precision allows, or a smaller enum, all raise the number of useful elements
+per cache line and so the effective bandwidth. None of these change the algorithm or the operation count; they change how many of the
+bytes you drag through the cache are ones you actually use. The unifying question, again, is the one Chapter 34 posed at the loop and
+this chapter poses at the type: <strong>of every 64-byte line this code fetches, how many bytes does it use?</strong> Every layout move
+here raises that fraction.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: raise the useful bytes per fetched line</span>
+<p><strong>1. In words.</strong> The hardware fetches whole cache lines; design the data so the bytes a hot loop reads are packed into
+as few lines as possible and the bytes it ignores are elsewhere. Store the column the loop sweeps (SoA), split hot fields from cold,
+order and shrink fields to cut padding. The operation count is unchanged; the wasted-bytes-per-line falls.</p>
+<p><strong>2. As a picture.</strong> Figure 35.1: AoS as an array of fat boxes with one thin stripe (the read field) per box, the rest
+shaded &ldquo;fetched but unused&rdquo;; SoA as one tight array of just those stripes, every line full. A cache line drawn over each
+shows AoS using 1 slot of 8, SoA using 8 of 8.</p>
+<p><strong>3. As numbers/contrast.</strong> Summing one field of 16M 64-byte structs: AoS 0.1514&nbsp;s, SoA 0.0371&nbsp;s —
+<strong>4.08&times;</strong>, tracking the 8&times; better useful-bytes-per-line (&sect;35.2). And the same layout lever, mishandled
+across threads, produced a <strong>7.9&times;</strong> <em>slowdown</em> from false sharing (&sect;35.4). Layout gives and layout takes
+away.</p>
+</aside>
+
+<p><em>(Answer to the &sect;35.1 quick check: a loop reading only <code>x</code> from an array of large structs fetches a full 64-byte
+line per element but uses only the few bytes of <code>x</code> in it, so most of every line — and most of the memory bandwidth it
+consumes — is wasted on fields it never reads. The data-oriented reframing replaces &ldquo;what is a particle (and what are all its
+attributes)?&rdquo; with &ldquo;what does the hot loop read, and how do I lay memory out so it reads only that, contiguously?&rdquo;)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Array-of-structs vs struct-of-arrays: summing one field (x) of many records.</text>
+<text x="12" y="40" font-size="9" fill="#8c3a1d">AoS: one fetched line (64 B) holds one whole record; the loop uses only x (1 of 8 fields).</text>
+<g>
+<rect x="12" y="48" width="18" height="22" fill="#f6dcd2" stroke="#8c3a1d"/><rect x="30" y="48" width="98" height="22" fill="#eef1f4" stroke="#8c3a1d"/>
+<rect x="140" y="48" width="18" height="22" fill="#f6dcd2" stroke="#8c3a1d"/><rect x="158" y="48" width="98" height="22" fill="#eef1f4" stroke="#8c3a1d"/>
+<rect x="268" y="48" width="18" height="22" fill="#f6dcd2" stroke="#8c3a1d"/><rect x="286" y="48" width="98" height="22" fill="#eef1f4" stroke="#8c3a1d"/>
+</g>
+<text x="34" y="63" font-size="8" fill="#8c3a1d">y z vx vy vz mass charge  (fetched, unused)</text>
+<text x="14" y="86" font-size="8" fill="#8c3a1d">x</text>
+<text x="12" y="118" font-size="9" fill="#2f7d32">SoA: the x's are their own contiguous array; every fetched line is full of x (8 of 8 used).</text>
+<g>
+<rect x="12" y="126" width="24" height="22" fill="#dfeee0" stroke="#2f7d32"/><rect x="36" y="126" width="24" height="22" fill="#dfeee0" stroke="#2f7d32"/><rect x="60" y="126" width="24" height="22" fill="#dfeee0" stroke="#2f7d32"/><rect x="84" y="126" width="24" height="22" fill="#dfeee0" stroke="#2f7d32"/><rect x="108" y="126" width="24" height="22" fill="#dfeee0" stroke="#2f7d32"/><rect x="132" y="126" width="24" height="22" fill="#dfeee0" stroke="#2f7d32"/><rect x="156" y="126" width="24" height="22" fill="#dfeee0" stroke="#2f7d32"/><rect x="180" y="126" width="24" height="22" fill="#dfeee0" stroke="#2f7d32"/>
+</g>
+<text x="16" y="141" font-size="8" fill="#2f7d32">x0 x1 x2 x3 x4 x5 x6 x7</text>
+<text x="12" y="184" font-size="10" fill="#14406b">Same 16M additions:  AoS 0.1514 s   vs   SoA 0.0371 s   =   4.08&times; faster</text>
+</svg>
+<figcaption>Figure 35.1: Summing one field across many records. In AoS each fetched 64-byte line holds one whole record and the loop
+uses a single field, discarding the rest; in SoA the field has its own contiguous array and every fetched line is fully used. Measured
+here at 4.08&times; for identical arithmetic (&sect;35.2).</figcaption>
+</figure>
+
+<h2>35.4 When layout meets concurrency: false sharing</h2>
+
+<p>Layout can also cost you a factor when threads are involved, and the mechanism is again the 64-byte line. Chapter 26 named
+<strong>false sharing</strong>: two threads write to two <em>different</em> variables that happen to sit in the <em>same</em> cache
+line, and the cache-coherence protocol, which tracks ownership at line granularity, ping-pongs that line between the cores' caches on
+every write — even though the threads never touch each other's data. The variables are logically independent; the hardware sees one
+shared line and serializes access to it. This is a pure layout bug: nothing is logically contended, yet the line is. The fix is layout
+too — <strong>pad or align each thread's data to its own cache line</strong> so no two threads' hot variables share one. Here are four
+threads each incrementing their own counter 200 million times, first with the counters packed into one line, then padded to a line
+each. Compiled and run here (gcc 11.4.0, <code>-O2</code>, four threads on this machine, minimum of 3 trials):</p>
+
+<pre><code>struct { volatile long v; } shared[4];                    // 4 counters in ONE 64-byte line
+struct { volatile long v; char pad[56]; } padded[4];      // each counter on its OWN line
+
+$ gcc -O2 falseshare.c -o falseshare -lpthread &amp;&amp; ./falseshare
+false-shared (one line) : 1.3925 s
+padded (one line each)  : 0.1757 s
+slowdown from sharing    : 7.92x</code></pre>
+
+<p>Packing the counters into one line made the program <strong>7.9&times; slower</strong>, and not one byte of data was actually
+shared between threads — each thread only ever touched its own counter. All 7.9&times; is the coherence protocol bouncing the single
+contested line between four cores. The 56 bytes of padding that fixed it look like waste, and in single-threaded terms they are; across
+threads they buy back a factor of eight, because they guarantee each thread's line is its own. This is the same lesson as SoA from the
+other direction: in &sect;35.2 <em>packing</em> data together helped a single loop; here <em>separating</em> data onto distinct lines
+helped concurrent threads. Both are the same principle — control which bytes share a cache line — applied to opposite access patterns.
+The general rule for concurrent code: <strong>per-thread hot data should live on its own cache line</strong>, achieved by padding or by
+<code>alignas(64)</code>, and you confirm it the Chapter 33 way, by measuring the padded and unpadded versions.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the array of fat objects (and its mirror, the shared counter line)</span>
+<p>The default reflex — model a thing as a struct, make an array of them, loop over the array — is invisible as a performance bug
+because it is <em>good object-oriented style</em>. Yet a hot loop that reads one field of a 64-byte struct wastes 7 of every 8 bytes it
+fetches, which cost <strong>4&times;</strong> in &sect;35.2, and no code review flags &ldquo;array of structs&rdquo; as slow because it
+is textbook design. The mirror-image trap is its concurrent form: put each thread's counter in an adjacent array slot — the obvious,
+tidy layout — and false sharing costs <strong>8&times;</strong> (&sect;35.4), again with nothing in the source that looks wrong. Both
+are layout bugs hiding behind reasonable-looking code, and both are invisible to instruction counting; they show up only in a timed run
+(Chapter 33) or a cache/coherence counter. Two defenses. First, at any hot loop, ask the useful-bytes-per-line question of &sect;35.3
+— is this loop reading a column out of an array of rows? If so, store the column (SoA), or split hot from cold. Second, for per-thread
+hot data, pad or align to a cache line and measure both ways. The connecting insight is that <em>the layout is a performance decision
+the type system lets you make silently</em> — so make it deliberately, and measure it, rather than inheriting whatever the object model
+happened to produce.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our entity system has an <code>Entity</code> struct with 20 fields, and we store
+them in one big <code>Entity[]</code> array. The movement system, which runs every frame over all entities, only reads position and
+velocity, and it's our hottest loop. It's clean OOP — should we leave it?&rdquo; Cover the paragraph and respond in four or five
+sentences, drawing on &sect;35.1&ndash;&sect;35.4.</p>
+<p><em>Model answer.</em> &ldquo;The clean-OOP layout is probably costing us several times on that loop, and it won't show up in a
+review. The movement system reads maybe 4 of 20 fields, so every cache line it fetches is mostly the other 16 fields it never touches —
+in a comparable case, summing one field of a 64-byte struct, storing it as its own array was about 4&times; faster. I'd hot/cold split:
+put position and velocity in their own tightly packed arrays (struct-of-arrays for the hot fields) that the movement system streams,
+and leave the cold fields in a parallel array visited only when needed. Let's measure it the Chapter 33 way — same entity count,
+<code>-O2</code>, many trials, minimum — with the current layout and the split, and confirm the frame time actually dropped. And while
+we're at it, if any per-entity data is written by multiple worker threads, we should pad it to a cache line so we don't add false
+sharing on top.&rdquo; Choosing the layout from the hot loop's access pattern, and proving it with a measurement, is the senior register
+— not defending a layout because it is tidy.</p>
+</aside>
+
+<p><em>(Answer to the &sect;35.2 quick check: AoS is <code>Particle a[N]</code> with all fields of each element together; SoA is a
+separate contiguous array per field. For a loop summing one field across all elements, SoA is faster because every fetched 64-byte line
+is full of that field while AoS wastes the bytes of the other fields — here the useful-bytes-per-line was 8&times; better and the
+measured speedup 4.08&times;. AoS is better when a loop touches all fields of one element at a time, since then the whole struct in one
+line is exactly what it uses.)</em></p>
+
+<h2>35.5 What to carry forward</h2>
+
+<p>Data-oriented design is the operational form of the mechanical sympathy Chapter 5 named: decide the memory layout from what the hot
+loops actually read, not from what makes a tidy object. Because the hardware fetches whole 64-byte lines (Chapter 34), the governing
+metric is <strong>useful bytes per fetched line</strong>, and every move in this chapter raises it — <strong>struct-of-arrays</strong>
+to store the column a loop sweeps (4.08&times; here, &sect;35.2), <strong>hot/cold splitting</strong> and <strong>field ordering and
+packing</strong> to cut wasted bytes and padding (&sect;35.3), and, across threads, cache-line <strong>padding to avoid false
+sharing</strong> (7.9&times; here, &sect;35.4). None of these change the algorithm or the operation count; they change how much of the
+memory traffic is useful. And all of them are invisible to instruction counting and to code review — an array of fat structs and a row
+of adjacent counters both look like good code — so they are found and fixed only by measurement (Chapter 33).</p>
+
+<p>The layout this chapter produces is not only cache-friendly; it is the precondition for the next lever of throughput. A vector unit
+(<a href="#ch36">Chapter 36</a>, <strong>SIMD</strong>) processes 4, 8, or 16 elements per instruction, but only if those elements are
+contiguous in memory and identically laid out — which is exactly what struct-of-arrays gives it and what array-of-structs denies it.
+The auto-vectorizer that Chapter 36 leans on typically cannot vectorize a strided AoS field access but happily vectorizes a packed SoA
+array. So the two chapters compose: Chapter 34 got the access order right, this chapter got the layout right, and Chapter 36 turns that
+contiguous, well-laid-out data into vector throughput. Lay the data out for the cache first, because the vector unit, like the cache,
+rewards contiguity and punishes strides.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the data-oriented reframing: which question about the data replaces &ldquo;what is this object?&rdquo;</li>
+<li>Define AoS and SoA, and say for which access pattern each wins.</li>
+<li>Explain the &ldquo;useful bytes per fetched line&rdquo; metric and how SoA, hot/cold splitting, and packing each raise it.</li>
+<li>Explain false sharing as a layout bug and give its fix.</li>
+<li>Say why an array of fat structs and a row of adjacent per-thread counters are both invisible performance bugs.</li>
+<li>Describe how you would measure whether a layout change actually helped.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What question does data-oriented design ask first, and why is the object not the natural unit of layout? (&sect;35.1)</li>
+<li><strong>R2.</strong> What are AoS and SoA, why is SoA faster for a one-field sweep, and when does AoS win? (&sect;35.2)</li>
+<li><strong>R3.</strong> Name three layout moves that raise useful-bytes-per-line without changing the algorithm. (&sect;35.3)</li>
+<li><strong>R4.</strong> What is false sharing, why did it cost ~8&times; here, and what is the fix? (&sect;35.4)</li>
+<li><strong>R5.</strong> Why are these layout issues invisible to code review and instruction counting, and what makes them visible? (&sect;35.3, &sect;35.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Richard Fabian, <em>Data-Oriented Design: Software Engineering for Limited Resources and Short Schedules</em> (2018), ISBN
+978-1-916478-70-1.</strong> The book-length treatment of the discipline of this chapter — designing around data transformations and
+cache-friendly layout, with SoA, hot/cold splitting, and existence-based processing. Author Richard Fabian; year and ISBN verified via
+the publisher listing. Also available online at <code>dataorienteddesign.com/dodbook</code>.</li>
+<li><strong>Mike Acton, &ldquo;Data-Oriented Design and C++,&rdquo; keynote, CppCon 2014.</strong> The influential talk (Acton was then
+engine director at Insomniac Games) that popularized the &ldquo;understand the data, then design the code&rdquo; framing of &sect;35.1
+and the AoS-vs-SoA argument of &sect;35.2. A recorded conference talk, not a paper, so cited as such; slides in the CppCon2014 GitHub
+archive.</li>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 3 covers struct layout, alignment, and padding — the basis for the field-ordering and packing
+of &sect;35.3. First author Randal Bryant; edition and ISBN verified via the publisher.</li>
+<li><strong>Ulrich Drepper, &ldquo;What Every Programmer Should Know About Memory&rdquo; (Red Hat, Inc., 2007).</strong> Its cache-
+coherency sections explain the line-granularity ownership that makes false sharing (&sect;35.4) cost what it does, and the layout
+techniques that avoid it. A Red Hat whitepaper / LWN.net series (<code>lwn.net/Articles/250967</code>), so no DOI — cited as such.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex35.1"><span class="ex-label">35.1</span> <span class="ex-tag warm">warm-up</span>
+Define array-of-structs (AoS) and struct-of-arrays (SoA) in one sentence each, with a small code sketch of each for a particle with
+fields <code>x, y, vx, vy</code>.</div>
+
+<div class="exercise" id="ex35.2"><span class="ex-label">35.2</span> <span class="ex-tag warm">warm-up</span>
+State the &ldquo;useful bytes per fetched line&rdquo; metric in one sentence, and use it to explain why summing one field of a 64-byte
+AoS struct wastes most of each cache line.</div>
+
+<div class="exercise" id="ex35.3"><span class="ex-label">35.3</span> <span class="ex-tag warm">warm-up</span>
+What is false sharing, in one or two sentences, and what one-word layout change fixes it?</div>
+
+<div class="exercise" id="ex35.4"><span class="ex-label">35.4</span> <span class="ex-tag core">core</span>
+The &sect;35.2 measurement: AoS 0.1514&nbsp;s, SoA 0.0371&nbsp;s (4.08&times;) summing one field of 16M 64-byte structs. (a) Compute
+the useful-bytes-per-line ratio between the two layouts and explain why it roughly predicts the speedup. (b) Why is the measured
+4.08&times; a little less than the 8&times; byte ratio? Give one plausible reason. (c) Describe a loop for which AoS would be the
+<em>faster</em> layout, and why.</div>
+
+<div class="exercise" id="ex35.5"><span class="ex-label">35.5</span> <span class="ex-tag core">core</span>
+Hot/cold splitting. A <code>Player</code> struct has <code>x, y</code> (read every frame) and <code>name, inventory,
+achievements</code> (read rarely). (a) Sketch the hot/cold split. (b) Why does this help the per-frame loop even though you did not
+remove any fields? (c) What is the cost of the split — what becomes slower or more awkward, and when is it not worth it?</div>
+
+<div class="exercise" id="ex35.6"><span class="ex-label">35.6</span> <span class="ex-tag core">core</span>
+Field ordering and packing. A struct is declared <code>{ char a; double b; char c; }</code>. (a) Explain why alignment makes this
+larger than the 10 bytes of its fields, and estimate its actual size on a typical 64-bit target. (b) Reorder the fields to minimize
+padding and give the new size. (c) In an array of a million of these, why does the smaller struct improve a loop that sweeps them?</div>
+
+<div class="exercise" id="ex35.7"><span class="ex-label">35.7</span> <span class="ex-tag complexity">cost</span>
+Reason about the false-sharing measurement (&sect;35.4): packed 1.3925&nbsp;s, padded 0.1757&nbsp;s, 7.92&times;. (a) Given no bytes are
+logically shared between threads, where does the entire 7.9&times; come from? (b) Why does the padding (56 wasted bytes per counter)
+buy back the factor, and what is it trading? (c) Would the gap grow or shrink if you ran <em>one</em> thread instead of four, and why?</div>
+
+<div class="exercise" id="ex35.8"><span class="ex-label">35.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A ray tracer stores scene objects as <code>Sphere{ double cx,cy,cz,r; Material m;
+char name[48]; }</code> in a <code>Sphere[]</code>, and its hottest loop is an intersection test that reads only <code>cx,cy,cz,r</code>.
+<br><strong>Step 1 (given):</strong> the loop reads 32 bytes (four <code>double</code>s) of a struct that is well over 100 bytes, so it wastes most of every fetched line.
+<br><strong>Step 2 (given):</strong> the profile (Chapter 33) confirms the intersection loop dominates runtime and is stalled on memory.
+<br><strong>Step 3 (given):</strong> two candidate layouts — full SoA (separate <code>cx[],cy[],cz[],r[]</code> arrays) and hot/cold split (a packed <code>{cx,cy,cz,r}</code> array plus a parallel array of the cold fields).
+<br><strong>Step 4 (you):</strong> Choose a layout, justify it from the access pattern, and describe exactly how you would measure that it beats the original (clock, optimization level, trials, what to hold constant).</div>
+
+<div class="exercise" id="ex35.9"><span class="ex-label">35.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether the better layout is <em>AoS</em>, <em>SoA</em>, or <em>hot/cold split</em>, and why: (a) a loop that sweeps one
+field across millions of records; (b) a loop that processes one record fully (all its fields) then moves to the next; (c) a struct
+with 3 hot fields and 30 cold ones, swept every frame on the hot fields; (d) two threads each updating their own per-thread counter in
+a tight loop.</div>
+
+<div class="exercise" id="ex35.10"><span class="ex-label">35.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;SoA is always faster than AoS.&rdquo; (b)
+&ldquo;Reordering struct fields can shrink the struct without removing any field.&rdquo; (c) &ldquo;False sharing means two threads are
+writing the same variable.&rdquo; (d) &ldquo;Padding a struct to a cache line is pure waste with no benefit.&rdquo; (e) &ldquo;A layout
+change that keeps the same operation count cannot change runtime.&rdquo;</div>
+
+<div class="exercise" id="ex35.11"><span class="ex-label">35.11</span> <span class="ex-tag stretch">stretch</span>
+Tie layout to the whole part. (a) Chapter 34 reordered accesses over a fixed layout; this chapter changed the layout. Give one problem
+each is the right tool for, and one where you would use both together. (b) Explain why SoA is also the layout a vectorizer (Chapter 36)
+wants, referencing contiguity. (c) A colleague proposes converting the entire codebase from AoS to SoA up front, before profiling.
+Argue, from Chapters 33&ndash;35, why that is the wrong order.</div>
+
+<div class="exercise" id="ex35.12"><span class="ex-label">35.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a threads library for part c): (a) Reproduce &sect;35.2 — a struct of several
+<code>double</code>s in an array, versus a separate array of one field; sum that field both ways at <code>-O2</code>, time each as the
+minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials, and report the ratio, explaining it from your struct size and
+line size. (b) Vary the struct size (16, 32, 64, 128 bytes) and observe how the AoS/SoA ratio changes; explain the trend. (c) If you
+have threads, reproduce the false-sharing experiment — counters packed into one line versus padded to a line each — and report the
+slowdown. State that these are wall-clock measurements (no hardware counters) if you lack <code>perf</code>, and note your toolchain
+and CPU.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch36">
+<h1>Chapter 36 — SIMD and Vectorization</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch02">Chapter 2</a> (the CPU up close — the vector unit is another
+execution resource on the same core), <a href="#ch35">Chapter 35</a> (struct-of-arrays — the contiguous layout the vectorizer needs),
+<a href="#ch34">Chapter 34</a> (locality and memory bandwidth — the ceiling that decides whether SIMD helps), <a href="#ch10">Chapter
+10</a> (the optimizing compiler — the auto-vectorizer is one of its transforms), <a href="#ch33">Chapter 33</a> (measure first).
+&nbsp;·&nbsp; Chapters 34 and 35 got the data close to the core and contiguous; this chapter turns that data into wide, parallel
+arithmetic — when the memory system can keep up.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch35">Chapter 35</a> — why does a struct-of-arrays layout stream one field faster than an
+array-of-structs? (2) <a href="#ch34">Chapter 34</a> — what does it mean for a loop to be &ldquo;memory-bandwidth bound&rdquo; rather
+than compute bound? (3) <em>Predict:</em> a modern vector register holds 8 <code>float</code>s (256-bit AVX), so one vector
+instruction does 8 multiplies at once. If you take a scalar arithmetic-heavy loop over an array that fits in L1 and let the compiler
+vectorize it, what speedup do you expect: about 8&times;, less, or possibly more? And would a loop that streams a 64&nbsp;MiB array
+instead see the same? Write your guesses; &sect;36.2 and &sect;36.3 answer them.</p>
+</aside>
+
+<p>A scalar instruction operates on one pair of operands: one add, one result. A <strong>SIMD</strong> instruction — Single
+Instruction, Multiple Data — operates on a whole vector of them at once: with 256-bit AVX registers, eight <code>float</code>s added
+to eight <code>float</code>s in one instruction, on the same core, in about the same time as the scalar add. This is
+<strong>data-level parallelism</strong> (Hennessy &amp; Patterson, ch.4): not more cores, but wider instructions on one core, and it is
+free throughput <em>if</em> your data is laid out so the CPU can load a vector's worth at once and your loop has no dependency forcing
+the elements to be done one at a time. Both conditions point back: contiguity is Chapter 35's struct-of-arrays, and independence is a
+property of the loop. This chapter proceeds in five steps: what SIMD is and where the lanes come from (&sect;36.1); letting the
+compiler vectorize for you, measured here from 3.4 to 45 Gflop/s (&sect;36.2); what blocks the vectorizer — dependencies, reductions
+and floating-point associativity, aliasing (&sect;36.3); intrinsics, and the memory-bandwidth ceiling that decides whether any of this
+helps (&sect;36.4); and what to carry forward as the performance part closes (&sect;36.5).</p>
+
+<p><strong>On the code in this chapter.</strong> As before the programs are C, compiled with gcc 11.4.0 and run in this environment on
+an Intel Core i7-12700H (which supports AVX2, i.e. 256-bit / 8-wide <code>float</code> vectors, not AVX-512), timed with
+<code>clock_gettime(CLOCK_MONOTONIC)</code> and reported as the minimum of several trials (Chapter 33). Throughputs are in Gflop/s
+(billions of floating-point operations per second) and are illustrative of the effect, not a benchmark of the machine. Where a
+compiler decision is claimed — that a loop did or did not vectorize — it is confirmed with gcc's own
+<code>-fopt-info-vec</code> report, quoted inline, not asserted. A hardware-counter profiler (<code>perf</code>) is not installed
+here, so the evidence is wall-clock throughput plus the compiler's vectorization report.</p>
+
+<h2>36.1 One instruction, many lanes</h2>
+
+<p>The vector unit is extra width on the ordinary core, not a separate processor. A modern x86 core has vector registers — 128-bit
+(SSE), 256-bit (AVX/AVX2), and on some parts 512-bit (AVX-512) — each holding several elements: a 256-bit register holds 8
+<code>float</code>s or 4 <code>double</code>s, and a single AVX instruction like <code>vmulps</code> multiplies all 8 lanes at once.
+The elements travel through the pipeline (Chapter 2) together, so eight multiplies retire in roughly the time of one, giving up to an
+8&times; throughput gain on 32-bit data for arithmetic that can be done in parallel across the lanes. Two requirements make that gain
+real, and both were set up by the previous chapters. First, <strong>contiguity</strong>: to fill a vector register in one load, the 8
+elements must be adjacent in memory — precisely the struct-of-arrays layout of Chapter 35; a strided array-of-structs field forces the
+CPU to gather elements one at a time and throws the advantage away. Second, <strong>independence</strong>: the 8 lanes are computed
+simultaneously, so no lane may depend on another's result within the vector — a loop where each iteration needs the previous one's
+output cannot be vectorized as written. When both hold, the same loop that issued one scalar operation per element now issues one
+vector operation per 8 elements, and the arithmetic throughput multiplies. The next section shows how little you often have to do to
+get this, and how much it is worth.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>How many <code>float</code>s fit in a 256-bit AVX register, and how many does one AVX arithmetic instruction process at once? Name
+the two properties a loop's data and computation must have for the vector unit to deliver its throughput. (Answer after the next
+section.)</p>
+</aside>
+
+<h2>36.2 Auto-vectorization: let the compiler do it</h2>
+
+<p>You rarely write vector instructions by hand first. The compiler's <strong>auto-vectorizer</strong> (Chapter 10's optimizer, with
+the loop transforms of &sect;36.3) recognizes a vectorizable loop and emits vector instructions for it — but only when you ask for the
+right optimization level and target. gcc does not vectorize at <code>-O2</code> in this version; <code>-O3</code> enables it against
+the conservative baseline instruction set (SSE2, 128-bit), and <code>-march=native</code> lets it use the widest vectors the actual
+CPU supports (AVX2, 256-bit here). Here is one compute-heavy, per-element-independent kernel — a Horner-form polynomial over an
+L1-resident 32&nbsp;KiB array — compiled three ways and run here (gcc 11.4.0, minimum of 7 trials):</p>
+
+<pre><code>for (i) y[i] += ((((v*0.11f+0.22f)*v+0.33f)*v+0.44f)*v+0.55f)*v+0.66f;   // v = x[i], ~11 flops/elem
+
+$ gcc -O2 -fno-tree-vectorize simd.c ...   scalar (no vectors) :  3.43 Gflop/s   (1.049 s)
+$ gcc -O3 simd.c ...                       -O3 (SSE2, 4-wide)  : 24.89 Gflop/s   (0.145 s)
+$ gcc -O3 -march=native simd.c ...         -O3 native (AVX2)   : 45.14 Gflop/s   (0.080 s)
+
+$ gcc -O3 -march=native -fopt-info-vec-optimized simd.c
+simd.c:10: optimized: loop vectorized using 32 byte vectors      # AVX2: 8 floats/vector</code></pre>
+
+<p>The measured jump is <strong>13&times;</strong> from scalar to AVX2 (3.43 to 45.14 Gflop/s), and the compiler's own report
+confirms it vectorized &ldquo;using 32 byte vectors&rdquo; — 256-bit AVX2, 8 <code>float</code>s per instruction. Two things deserve
+care in reading this. First, the speedup <em>exceeds</em> the 8-lane width, and honestly so: vectorizing also lets the compiler use
+fused multiply-add (one instruction for <code>a*b+c</code>), unroll the loop, and cut per-iteration overhead, so the win is
+lanes-times-other-improvements, not lanes alone — which is exactly why you <em>measure</em> the speedup rather than assume it equals
+the vector width. Second, the flags matter enormously: the identical source ran at 3.4, 25, or 45 Gflop/s depending only on
+<code>-O2</code> versus <code>-O3</code> versus <code>-O3 -march=native</code>, so &ldquo;did it vectorize?&rdquo; is a question about
+the build, and Chapter 33's rule to benchmark the build you ship is what keeps you honest. The practical lesson: reach for
+auto-vectorization first — right flags, contiguous data, an independent loop — and confirm it happened with
+<code>-fopt-info-vec</code> rather than hoping.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why did the same source run at 3.4, 25, and 45 Gflop/s? Why is the 13&times; scalar-to-AVX2 speedup <em>more</em> than the 8&times;
+you would get from lane count alone? How would you confirm a loop actually vectorized rather than assume it did? (Answer below the
+communicate box.)</p>
+</aside>
+
+<h2>36.3 What blocks the vectorizer</h2>
+
+<p>Auto-vectorization is not magic; a few common properties defeat it, and knowing them lets you either fix the loop or understand why
+the report says &ldquo;not vectorized.&rdquo; The first is a <strong>loop-carried dependency</strong>: if iteration <code>i</code> reads
+a value iteration <code>i-1</code> wrote (<code>a[i] = a[i-1] + x[i]</code>, a running prefix), the lanes cannot be computed in
+parallel because each needs the one before, and the loop is inherently serial as written. The second is subtle and important — a
+<strong>reduction under floating-point non-associativity</strong>. Summing an array into one accumulator (<code>s += a[i]</code>) is a
+reduction, and vectorizing it means adding the elements in a different grouping (8 partial sums, combined at the end), which under
+floating-point rounding can give a <em>different result</em> than the strict left-to-right order the source specifies. Because the
+standard forbids the compiler from silently changing your numerical result, gcc will <em>not</em> vectorize a floating-point reduction
+at <code>-O3</code> unless you permit reassociation with <code>-ffast-math</code> (or <code>-funsafe-math-optimizations</code>). You
+can see this in a dot product streamed over a 64&nbsp;MiB array pair here (gcc 11.4.0):</p>
+
+<pre><code>float dot = 0; for (i) dot += a[i]*b[i];      // a reduction: reassociating changes FP rounding
+
+$ gcc -O2 -fno-tree-vectorize dot.c ...   scalar              : 0.96 Gflop/s
+$ gcc -O3 -march=native dot.c ...         -O3 native, no fast : 1.12 Gflop/s   # reduction NOT vectorized
+$ gcc -O3 -march=native -ffast-math ...   with -ffast-math    : 2.30 Gflop/s   # now vectorized</code></pre>
+
+<p>Without <code>-ffast-math</code> the reduction stays essentially scalar (1.12 vs 0.96 Gflop/s — the small gain is other
+optimization, not vectorization); allowing reassociation unlocks the vector reduction and roughly doubles throughput. Two lessons
+follow. One, <strong>a floating-point reduction needs your explicit permission to vectorize</strong>, because the vector version is not
+bit-identical — so decide deliberately whether your problem tolerates the rounding difference rather than sprinkling
+<code>-ffast-math</code> blindly (it also enables other unsafe assumptions). Two, the dot-product speedup here is only ~2.4&times;, far
+short of the 13&times; of &sect;36.2 on the same machine, and the reason is the whole point of the next section: this loop is limited
+by memory bandwidth, not arithmetic. Other blockers worth naming: <strong>pointer aliasing</strong> (the compiler must assume two
+pointers might overlap and serialize to be safe — <code>restrict</code>, used in the &sect;36.2 kernel, promises they do not),
+data-dependent branches inside the loop, and non-contiguous (strided or gathered) access — the array-of-structs pattern of Chapter 35,
+which is why layout came first.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: SIMD multiplies arithmetic, not memory</span>
+<p><strong>1. In words.</strong> A vector instruction does 8 (or 4, or 16) operations at once on contiguous, independent data, so an
+arithmetic-bound loop can speed up by roughly the lane count (often more, with FMA and unrolling). But if the loop is limited by how
+fast memory can feed it, widening the arithmetic does little — you were waiting on bytes, not on the adder.</p>
+<p><strong>2. As a picture.</strong> Figure 36.1: on the left, a scalar lane doing one multiply per step; on the right, 8 lanes doing 8
+at once from one contiguous load. Below, two bars: a compute-bound kernel rising from 3.4 to 45 Gflop/s (13&times;), and a
+bandwidth-bound dot product barely moving (0.96 to 2.3), capped by a &ldquo;memory bandwidth&rdquo; line.</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, same compiler: an L1-resident compute kernel went 3.43 &rarr; 24.89 &rarr;
+45.14 Gflop/s across scalar, SSE2, and AVX2 — <strong>13&times;</strong> (&sect;36.2); a 64&nbsp;MiB-streaming dot product went 0.96
+&rarr; 2.30 Gflop/s even vectorized — <strong>2.4&times;</strong>, and only after <code>-ffast-math</code> let the reduction vectorize
+at all (&sect;36.3). Vector width is a throughput ceiling on arithmetic; memory bandwidth is a different ceiling entirely.</p>
+</aside>
+
+<p><em>(Answer to the &sect;36.1 quick check: a 256-bit AVX register holds 8 <code>float</code>s (or 4 <code>double</code>s), and one
+AVX arithmetic instruction processes all 8 lanes at once. The two required properties are contiguity — the 8 elements must be adjacent
+so one load fills the register, i.e. Chapter 35's struct-of-arrays — and independence — no lane may depend on another's result within
+the vector, so a loop-carried dependency defeats it.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Scalar vs SIMD lanes, and the two ceilings: vector width vs memory bandwidth.</text>
+<text x="12" y="38" font-size="9" fill="#14406b">scalar: 1 multiply/step</text>
+<rect x="12" y="44" width="26" height="20" fill="#f5f8fb" stroke="#14406b"/><text x="20" y="58" font-size="9">a&times;b</text>
+<text x="150" y="38" font-size="9" fill="#2f7d32">SIMD (AVX2): 8 multiplies/step from one contiguous load</text>
+<g>
+<rect x="150" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="174" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="198" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="222" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="246" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="270" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="294" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/><rect x="318" y="44" width="24" height="20" fill="#dfeee0" stroke="#2f7d32"/>
+</g>
+<text x="12" y="96" font-size="9" fill="#14406b">throughput (Gflop/s), same machine and compiler:</text>
+<text x="12" y="118" font-size="8" fill="#14406b">compute-bound kernel (L1-resident):</text>
+<rect x="200" y="110" width="24" height="10" fill="#eef1f4" stroke="#14406b"/><text x="228" y="118" font-size="8">scalar 3.4</text>
+<rect x="200" y="122" width="120" height="10" fill="#cfe0ef" stroke="#14406b"/><text x="324" y="130" font-size="8">SSE2 24.9</text>
+<rect x="200" y="134" width="216" height="10" fill="#9cc2e0" stroke="#14406b"/><text x="420" y="142" font-size="8">AVX2 45.1  (13&times;)</text>
+<text x="12" y="164" font-size="8" fill="#8c3a1d">bandwidth-bound dot (64 MiB stream):</text>
+<rect x="200" y="156" width="7" height="10" fill="#f6dcd2" stroke="#8c3a1d"/><text x="210" y="164" font-size="8">scalar 0.96</text>
+<rect x="200" y="168" width="16" height="10" fill="#efb9a5" stroke="#8c3a1d"/><text x="220" y="176" font-size="8">AVX2+fast-math 2.3  (2.4&times;, capped by memory bandwidth)</text>
+<line x1="200" y1="150" x2="200" y2="182" stroke="#8c3a1d" stroke-dasharray="2,2"/>
+</svg>
+<figcaption>Figure 36.1: SIMD does many operations per instruction on contiguous, independent lanes. On an L1-resident, arithmetic-heavy
+kernel this multiplied throughput 13&times; (scalar &rarr; AVX2); on a 64&nbsp;MiB-streaming dot product it gained only ~2.4&times;,
+because that loop is limited by memory bandwidth, not by the width of the adder (&sect;36.2&ndash;&sect;36.4).</figcaption>
+</figure>
+
+<h2>36.4 Intrinsics, and the memory-bandwidth ceiling</h2>
+
+<p>When the auto-vectorizer cannot see the parallelism — an awkward data layout, a shuffle it will not synthesize, an algorithm that
+needs hand-mapping to lanes — you can write the vector instructions yourself with <strong>intrinsics</strong>: C functions like
+<code>_mm256_mul_ps</code> that map one-to-one to AVX instructions, giving you the lanes explicitly at the cost of portability and
+readability (Intel Intrinsics Guide; Agner Fog's optimization manuals). Intrinsics are the right tool when the payoff is proven and the
+compiler will not deliver it, but they are a last resort after auto-vectorization, because they are verbose, CPU-specific, and easy to
+get wrong — and, crucially, they cannot beat the ceiling the previous section exposed. That ceiling is <strong>memory bandwidth</strong>.
+The dot product of &sect;36.3 gained only 2.4&times; from vectorization not because the vector unit was idle but because the loop
+streams 64&nbsp;MiB pair of arrays that do not fit in any cache, so it is limited by how fast DRAM can deliver bytes, not by how fast
+the core can multiply them. This is the <strong>roofline</strong> idea (Williams, Waterman &amp; Patterson, 2009): a loop's achievable
+performance is capped by the lower of two ceilings — peak compute (raised by SIMD) and peak memory bandwidth (raised only by better
+locality) — and which one binds depends on the loop's <em>arithmetic intensity</em>, its ratio of flops to bytes moved. A dot product
+does ~2 flops per 8 bytes read: low intensity, bandwidth-bound, so SIMD barely helps and the real lever is Chapters 34&ndash;35
+(locality and layout, to move fewer bytes). The L1 kernel of &sect;36.2 does ~11 flops per element already in cache: high intensity,
+compute-bound, so SIMD delivered 13&times;. The discipline: <strong>vectorize the compute-bound loops; for the bandwidth-bound ones,
+fix locality first</strong> — and let a measurement, not the lane count, tell you which kind you have.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: counting lanes instead of measuring &mdash; the SIMD that memory bandwidth eats</span>
+<p>The seductive arithmetic is &ldquo;8 lanes, so 8&times; faster,&rdquo; and it fails in both directions. It <em>over</em>-predicts on
+bandwidth-bound loops: the dot product of &sect;36.3 has 8 lanes available and gained only 2.4&times;, because it waits on DRAM, not on
+the adder — hand-writing AVX intrinsics for it would add complexity and CPU-specific code for a win the memory system has already
+capped. And it <em>under</em>-predicts on compute-bound loops: the &sect;36.2 kernel gained 13&times;, <em>more</em> than 8&times;,
+because vectorization also unlocked FMA and unrolling. Both errors come from reasoning about the hardware instead of measuring it. Two
+defenses. First, decide whether the loop is compute- or bandwidth-bound before reaching for SIMD — a rough arithmetic-intensity
+estimate (flops per byte moved) or, decisively, the Chapter 33 experiment of timing scalar versus vectorized; if widening the
+arithmetic does not move the number, you are bandwidth-bound and the fix is locality and layout (Chapters 34&ndash;35), not more lanes.
+Second, if you do vectorize, confirm it happened (<code>-fopt-info-vec</code>) and measure the actual speedup rather than assuming the
+lane count — because the true number, high or low, is the only one you can ship a decision on. A hand-written SIMD kernel that ignores
+the bandwidth ceiling is effort spent past the point where it can pay, the vector-unit version of optimizing the 5% part.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I hand-wrote AVX2 intrinsics for our vector-add loop <code>c[i] = a[i] + b[i]</code>
+over big arrays — 8 lanes, so it should be 8&times; faster — but my benchmark only shows about 1.2&times;. The intrinsics must be
+wrong; help me debug them.&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;36.1&ndash;&sect;36.4.</p>
+<p><em>Model answer.</em> &ldquo;The intrinsics are probably fine — 1.2&times; is what I'd expect, because that loop is
+bandwidth-bound, not compute-bound. Vector-add does one add per two loads and a store, so its arithmetic intensity is tiny: you're
+limited by how fast DRAM can stream the arrays, not by how fast the core adds, and widening the add from 1 lane to 8 doesn't help when
+the bottleneck is the memory bus. The 8&times; rule only applies to loops that are actually compute-bound and cache-resident — a
+math-heavy kernel on data that fits in L1 can hit or exceed 8&times;, which we've measured. So before debugging the intrinsics, let's
+confirm the diagnosis: time the plain <code>-O3 -march=native</code> auto-vectorized version and check <code>-fopt-info-vec</code> —
+I bet it matches your 1.2&times;, which means the memory system is the ceiling and the real win is in layout and locality (fewer bytes
+moved), not more lanes. If we truly need this faster, the lever is Chapters 34&ndash;35, not more SIMD.&rdquo; Diagnosing the ceiling
+before optimizing against it — and preferring the auto-vectorizer plus a measurement to hand intrinsics — is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;36.2 quick check: the same source ran at 3.4/25/45 Gflop/s because vectorization depends on the build —
+<code>-O2</code> did not vectorize, <code>-O3</code> used 128-bit SSE2, and <code>-O3 -march=native</code> used 256-bit AVX2. The
+scalar-to-AVX2 gain exceeds 8&times; because vectorization also enabled fused multiply-add, loop unrolling, and lower per-iteration
+overhead, so the win is lane count times those other improvements. You confirm a loop vectorized with the compiler's own report,
+<code>-fopt-info-vec-optimized</code>, which named &ldquo;32 byte vectors,&rdquo; rather than assuming it did.)</em></p>
+
+<h2>36.5 What to carry forward</h2>
+
+<p><strong>SIMD</strong> is data-level parallelism on a single core: one instruction operating on a whole vector — 8 <code>float</code>s
+in 256-bit AVX2 — for up to lane-count throughput, and often more once vectorization unlocks fused multiply-add and unrolling
+(13&times; on the compute-bound kernel of &sect;36.2). It is not something you usually write by hand: reach for
+<strong>auto-vectorization</strong> first, with the right flags (<code>-O3 -march=native</code>), contiguous data (Chapter 35's
+struct-of-arrays), and an independent loop, and <em>confirm</em> it with <code>-fopt-info-vec</code>. Know what blocks it —
+loop-carried dependencies, floating-point reductions that need <code>-ffast-math</code> to reassociate, pointer aliasing that
+<code>restrict</code> resolves, strided or branchy access — and drop to <strong>intrinsics</strong> only when the payoff is proven and
+the compiler will not deliver it. Above all, respect the ceiling: SIMD raises the <em>compute</em> roof, so it multiplies
+arithmetic-bound loops but does almost nothing for bandwidth-bound ones (2.4&times; on the streaming dot product, &sect;36.4). Which
+ceiling binds is a question of arithmetic intensity, and the honest way to answer it is a measurement, not a lane count.</p>
+
+<p>This chapter closes the arc the part has been building. Chapter 33 said measure first and let a profile find the dominant cost.
+Chapter 34 opened the most common cause of that cost — the memory hierarchy — and got the access order right. Chapter 35 got the data
+layout right, contiguous and dense. And this chapter turned that well-placed, well-laid-out data into wide parallel arithmetic, while
+insisting that the memory system, not the vector unit, often sets the limit — which is why locality and layout came first, and why the
+whole part keeps returning to a timed run to tell truth from hope. That is the through-line to carry out of Performance Engineering:
+the machine has several ceilings — instruction count, cache, bandwidth, vector width — and engineering performance is finding, by
+measurement, which one you are actually under, and then raising <em>that</em> one. The next part turns from the CPU and its memory to
+the boundary where programs meet the outside world — <strong>I/O and networking</strong> — where a new set of costs, and a new set of
+&ldquo;where does the time go&rdquo; questions, take over.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain what SIMD is and where the lanes come from (register width), with the count for 256-bit AVX2.</li>
+<li>Name the two properties a loop needs to auto-vectorize, and the flags that enable and confirm it.</li>
+<li>Explain why a floating-point reduction will not vectorize without <code>-ffast-math</code>, and the risk of that flag.</li>
+<li>Explain why the scalar-to-AVX2 speedup can exceed the lane count.</li>
+<li>Distinguish a compute-bound from a bandwidth-bound loop, and say which SIMD helps.</li>
+<li>State when you would drop to intrinsics, and why it is a last resort.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is SIMD, how many <code>float</code>s does a 256-bit AVX2 instruction process, and what two loop properties does it require? (&sect;36.1)</li>
+<li><strong>R2.</strong> What flags enable and confirm auto-vectorization in gcc, and why did the same source run at 3.4/25/45 Gflop/s? (&sect;36.2)</li>
+<li><strong>R3.</strong> Why won't gcc vectorize a floating-point reduction without <code>-ffast-math</code>, and what does that flag risk? (&sect;36.3)</li>
+<li><strong>R4.</strong> Why did the dot product gain only ~2.4&times; from SIMD while the L1 kernel gained 13&times;? Use arithmetic intensity. (&sect;36.4)</li>
+<li><strong>R5.</strong> When do you reach for intrinsics rather than the auto-vectorizer, and why is it a last resort? (&sect;36.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>John L. Hennessy &amp; David A. Patterson, <em>Computer Architecture: A Quantitative Approach</em>, 6th ed. (Morgan
+Kaufmann, 2017), ISBN 978-0-12-811905-1.</strong> Chapter 4 (&ldquo;Data-Level Parallelism in Vector, SIMD, and GPU Architectures&rdquo;)
+is the architectural source for &sect;36.1 — vector registers, lanes, and why width is throughput. First author John Hennessy; edition
+and ISBN verified via the publisher.</li>
+<li><strong>Samuel Williams, Andrew Waterman &amp; David Patterson, &ldquo;Roofline: An Insightful Visual Performance Model for
+Multicore Architectures,&rdquo; <em>Communications of the ACM</em> 52(4), 65&ndash;76 (2009), DOI 10.1145/1498765.1498785.</strong> The
+roofline model of &sect;36.4 — arithmetic intensity, the compute and bandwidth ceilings, and why a low-intensity loop like the dot
+product is bandwidth-bound. First author Samuel Williams; DOI verified via the ACM Digital Library.</li>
+<li><strong>Agner Fog, optimization manuals, <em>Optimizing software in C++</em> and <em>Instruction tables</em>
+(<code>agner.org/optimize</code>, continuously updated).</strong> The practical reference for vectorization, intrinsics, and
+per-instruction latencies/throughputs behind &sect;36.3&ndash;&sect;36.4. Author Agner Fog; living documents, not a dated publication,
+so cited as such — consult the current versions.</li>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 5 covers program optimization including vectorization, loop-carried dependencies, and the
+reduction/associativity issue of &sect;36.3 from the programmer's side. First author Randal Bryant; edition and ISBN verified via the
+publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex36.1"><span class="ex-label">36.1</span> <span class="ex-tag warm">warm-up</span>
+Define SIMD in one sentence. How many <code>float</code>s and how many <code>double</code>s fit in a 256-bit AVX register, and how
+many does one such arithmetic instruction process at once?</div>
+
+<div class="exercise" id="ex36.2"><span class="ex-label">36.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two properties a loop's data and computation must have for the vector unit to deliver its throughput, and say which chapter's
+layout supplies the first.</div>
+
+<div class="exercise" id="ex36.3"><span class="ex-label">36.3</span> <span class="ex-tag warm">warm-up</span>
+Which gcc flags (a) enable vectorization at all, (b) let it use the widest vectors your CPU supports, and (c) let you confirm that a
+given loop was vectorized?</div>
+
+<div class="exercise" id="ex36.4"><span class="ex-label">36.4</span> <span class="ex-tag core">core</span>
+The &sect;36.2 kernel went 3.43 &rarr; 24.89 &rarr; 45.14 Gflop/s across scalar, <code>-O3</code> (SSE2), and
+<code>-O3 -march=native</code> (AVX2). (a) Why does the same source produce three different throughputs? (b) The scalar-to-AVX2 gain is
+13&times;, more than the 8-lane width — give two reasons vectorization can beat the raw lane count. (c) Why is &ldquo;confirm with
+<code>-fopt-info-vec</code>&rdquo; better engineering than assuming the loop vectorized?</div>
+
+<div class="exercise" id="ex36.5"><span class="ex-label">36.5</span> <span class="ex-tag core">core</span>
+Floating-point reductions. (a) Why does vectorizing <code>s += a[i]</code> change the numerical result, and why does that stop gcc
+from doing it at <code>-O3</code>? (b) What flag permits it, and what else does that flag allow that might be unsafe? (c) The dot
+product gained only ~2.4&times; even after vectorizing — name the reason, and say why it is <em>not</em> the reduction issue.</div>
+
+<div class="exercise" id="ex36.6"><span class="ex-label">36.6</span> <span class="ex-tag core">core</span>
+For each loop, say whether it can be auto-vectorized as written, and if not, why: (a) <code>c[i] = a[i] * b[i];</code> (b)
+<code>a[i] = a[i-1] + x[i];</code> (c) <code>if (x[i] &gt; 0) y[i] = f(x[i]);</code> with a heavy data-dependent branch; (d)
+<code>s += a[i];</code> summed into one <code>float</code> at plain <code>-O3</code>.</div>
+
+<div class="exercise" id="ex36.7"><span class="ex-label">36.7</span> <span class="ex-tag complexity">cost</span>
+Arithmetic intensity and the roofline. (a) Define arithmetic intensity in one sentence. (b) Estimate it (flops per byte moved) for the
+dot product (2 flops per two 4-byte loads) and argue why it is bandwidth-bound. (c) For the &sect;36.2 kernel (~11 flops per 4-byte
+element, data in L1), argue why it is compute-bound. (d) State the rule for which loops SIMD helps.</div>
+
+<div class="exercise" id="ex36.8"><span class="ex-label">36.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague reports that hand-written AVX2 intrinsics for <code>c[i]=a[i]+b[i]</code> over
+100&nbsp;MiB arrays give only 1.2&times; over scalar, and concludes the intrinsics are buggy.
+<br><strong>Step 1 (given):</strong> vector-add does 1 add per 2 loads + 1 store — very few flops per byte moved (low arithmetic intensity).
+<br><strong>Step 2 (given):</strong> 100&nbsp;MiB arrays do not fit in any cache, so the loop streams from DRAM every pass.
+<br><strong>Step 3 (given):</strong> therefore the loop is bandwidth-bound; the memory bus, not the adder, sets the ceiling.
+<br><strong>Step 4 (you):</strong> Explain why 1.2&times; is expected (not a bug), how you would confirm the diagnosis with the
+auto-vectorizer and a measurement, and where the real speedup would have to come from instead.</div>
+
+<div class="exercise" id="ex36.9"><span class="ex-label">36.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether SIMD is likely to give a large speedup, a small one, or none, and why: (a) a math-heavy per-pixel shader on an
+image tile that fits in L1; (b) copying a 1&nbsp;GiB buffer; (c) summing a cache-resident array of 10,000 <code>float</code>s in a
+tight loop; (d) a loop with a loop-carried dependency computing a running total sequentially.</div>
+
+<div class="exercise" id="ex36.10"><span class="ex-label">36.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;8 vector lanes always means 8&times; faster.&rdquo;
+(b) &ldquo;gcc auto-vectorizes floating-point reductions at <code>-O3</code> by default.&rdquo; (c) &ldquo;<code>-march=native</code>
+lets the compiler use the widest vectors the build machine supports.&rdquo; (d) &ldquo;SIMD helps a memory-bandwidth-bound loop as much
+as a compute-bound one.&rdquo; (e) &ldquo;An array-of-structs field is as easy to vectorize as a packed struct-of-arrays field.&rdquo;</div>
+
+<div class="exercise" id="ex36.11"><span class="ex-label">36.11</span> <span class="ex-tag stretch">stretch</span>
+Tie the whole part together. (a) Explain why Chapters 34 and 35 (locality and layout) are prerequisites for Chapter 36 (SIMD), not
+independent tricks. (b) A profile (Chapter 33) shows one kernel at 80% of runtime; describe the sequence of questions — bound by what?
+fixable how? — you would ask, in order, drawing on all four chapters. (c) Argue why &ldquo;the machine has several ceilings; find the
+one you're under and raise that one&rdquo; is a better mental model than &ldquo;make the code do fewer instructions.&rdquo;</div>
+
+<div class="exercise" id="ex36.12"><span class="ex-label">36.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain with a vectorizing compiler): (a) Write a compute-heavy, per-element-independent kernel over an
+array that fits in L1; compile it at <code>-O2 -fno-tree-vectorize</code>, <code>-O3</code>, and <code>-O3 -march=native</code>, time
+each as the minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials, and report the throughputs and the speedup; confirm
+vectorization with <code>-fopt-info-vec-optimized</code>. (b) Write a dot product over arrays far larger than your last-level cache;
+show it barely vectorizes without <code>-ffast-math</code> and gains little even with it, and explain via arithmetic intensity. (c)
+State your toolchain version, CPU, and widest vector width, and note that these are wall-clock throughputs (no hardware counters) if
+you lack <code>perf</code>.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VII</div><h1>I/O & Networking, Low-Level</h1><p class='part-blurb'>Files, sockets, blocking vs async, epoll/io_uring, zero-copy — the systems substrate under every data pipeline and service.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part VIII</div><h1>Storage & the Disk</h1><p class='part-blurb'>Pages, files, the buffer pool, and the storage manager — the foundation you build a database on.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part IX</div><h1>Storage Engines</h1><p class='part-blurb'>B-trees and LSM-trees implemented and analyzed — the two families and when each wins.</p></div>
@@ -17697,6 +18777,317 @@ minimum below the others and a spread (max &minus; min) of some percent — e.g.
 split (e.g. ~94% vs ~6%) and the write-up names the sampling profiler it would use and that it adds per-line/whole-program
 attribution without recompilation. <em>Tempting wrong answer:</em> &ldquo;report the first run's time&rdquo; — the first run pays
 cold-cache/warm-up costs; report the minimum of several. <strong>Feed-forward:</strong> &sect;33.2&ndash;&sect;33.4.</div>
+
+</section>
+
+<section class="solutions" id="sol34">
+<h1>Chapter 34 — Solutions</h1>
+
+<div class="solution" id="sol34.1"><span class="sol-label">34.1</span>
+<strong>Spatial locality:</strong> if you access one memory address, you are likely to access nearby addresses soon (so contiguous,
+small-stride access is cheap). <strong>Temporal locality:</strong> if you access an address, you are likely to access the <em>same</em>
+address again soon (so recently-used data should still be cached). Good spatial locality: <code>for (i) s += a[i];</code> (stride 1).
+Poor spatial locality: <code>for (i) s += a[i*1024];</code> (each access a new line). <em>Tempting wrong answer:</em> swapping the two
+definitions — &ldquo;spatial&rdquo; is about neighbors in space (address), &ldquo;temporal&rdquo; about revisiting over time.
+<strong>Feed-forward:</strong> &sect;34.2, &sect;34.4.</div>
+
+<div class="solution" id="sol34.2"><span class="sol-label">34.2</span>
+One fetch, in the best case: the first <code>double</code> pulls in its whole 64-byte line, and the next 7 <code>double</code>s (7&times;8
+= 56 bytes) live in that same line, so they hit cache with no new fetch — 8 <code>double</code>s fill exactly one 64-byte line.
+<em>Tempting wrong answer:</em> &ldquo;8 fetches, one per <code>double</code>&rdquo; — the hardware moves a whole line, not a single
+element. <strong>Feed-forward:</strong> &sect;34.2.</div>
+
+<div class="solution" id="sol34.3"><span class="sol-label">34.3</span>
+Because if a DRAM access costs ~100&times; an L1 hit, a loop that misses cache is stalled waiting on memory for most of its time, so
+its speed is set by <em>how it touches memory</em>, not by how many instructions it runs — two loops with identical instruction counts
+can differ by an order of magnitude in time. <em>Tempting wrong answer:</em> &ldquo;instruction count still decides it&rdquo; — the CPU
+idles through the miss regardless of how few instructions remain. <strong>Feed-forward:</strong> &sect;34.1, &sect;34.3.</div>
+
+<div class="solution" id="sol34.4"><span class="sol-label">34.4</span>
+(a) Only the <em>order</em> of memory access differs: row-major strides by one element (each 64-byte line serves 8 <code>double</code>
+accesses), column-major strides by a full row (each access lands in a fresh line and, since the matrix is 512&nbsp;MiB, that line is
+evicted long before its 8 elements are revisited). (b) 1 of 8 — the column walk uses one <code>double</code> per fetched line and
+discards the other 7, and does not return to them before eviction. (c) Swap the loop nesting so the inner loop strides by one, or
+transpose the matrix so the column access becomes contiguous. <em>Tempting wrong answer:</em> &ldquo;the column version does more
+arithmetic&rdquo; — it does exactly the same 67M additions; only locality differs. <strong>Feed-forward:</strong> &sect;34.3.</div>
+
+<div class="solution" id="sol34.5"><span class="sol-label">34.5</span>
+(a) At stride 1 each 64-byte line serves 16 <code>int</code> accesses, amortizing the fetch 16 ways; as the stride grows the accesses
+served per line fall (8, 4, 2), so each access carries more of the line-fetch cost and the per-access time climbs. (b) At a 64-byte
+stride each access lands in a distinct line and shares none with its neighbors — spatial locality is fully defeated, the first stride
+at which no two accesses reuse a line. (c) Larger strides also defeat the hardware prefetcher (it can no longer predict the next line)
+and stress the TLB (Chapter 4), each access touching a new page more often. <em>Tempting wrong answer:</em> &ldquo;the array got
+bigger&rdquo; — the array and the access count are fixed; only the stride changed. <strong>Feed-forward:</strong> &sect;34.2.</div>
+
+<div class="solution" id="sol34.6"><span class="sol-label">34.6</span>
+(a) Separately <code>malloc</code>'d nodes are scattered across the heap, so <code>next</code> jumps to an unpredictable, distant
+address — each node likely a fresh cache line (and page), with no spatial locality between consecutive nodes. (b) Store the nodes in a
+contiguous array (or a pool/arena allocator) so traversal strides through adjacent memory, restoring spatial locality and letting the
+prefetcher work. (c) Both turn a logically simple traversal into one that lands in a new cache line on nearly every step — the pointer
+chase and the column walk are the same &ldquo;stride across lines&rdquo; pathology. <em>Tempting wrong answer:</em> &ldquo;small nodes
+mean good locality&rdquo; — small but scattered is still one line per node. <strong>Feed-forward:</strong> &sect;34.2, &sect;34.3; the
+layout chapter ahead.</div>
+
+<div class="solution" id="sol34.7"><span class="sol-label">34.7</span>
+(a) While S &lt; C the array fits in cache, so after the first pass later passes mostly hit and the miss rate is low; as S grows past C,
+each pass evicts what the next pass needs, so the miss rate jumps toward one-miss-per-line. (b) Blocking processes a chunk of size &le;C
+completely — doing all the work that touches it — before moving on, so each loaded line is reused many times while still cached, keeping
+the working set within a cache level. (c) The arithmetic operation count is unchanged, but blocking removes the memory stalls that
+dominated the time, so the loop stops waiting on DRAM and becomes limited by the arithmetic it was always doing — memory-bound to
+compute-bound with no fewer operations. <em>Tempting wrong answer:</em> &ldquo;blocking does fewer operations&rdquo; — it does the same
+operations in a cache-friendlier order. <strong>Feed-forward:</strong> &sect;34.4.</div>
+
+<div class="solution" id="sol34.8"><span class="sol-label">34.8</span>
+<strong>Step 4:</strong> Ship <code>for (i) for (j) sum += A[i][j]</code> — the inner loop strides by one element along the contiguous
+(row-major) dimension, so each 64-byte line serves 16 <code>float</code> accesses and spatial locality is perfect, while the other
+nesting strides a full 16&nbsp;KiB row per access and misses almost every time. To measure: compile both at the shipping optimization
+level (<code>-O2</code>), time each as the minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials, hold everything else
+constant (same matrix, same machine, same harness), make the sum observable so neither loop is deleted (Chapter 33), warm up once, and
+report the minimum and spread for each; the row-order loop should be several times faster. <em>Tempting wrong answer:</em> &ldquo;time
+each once and compare&rdquo; — a single run is noisy; run several and report the minimum. <strong>Feed-forward:</strong> &sect;34.3;
+Chapter 33.</div>
+
+<div class="solution" id="sol34.9"><span class="sol-label">34.9</span>
+(a) <strong>Spatial</strong> — column order strides across lines, wasting most of each fetched line. (b) <strong>Temporal</strong> — the
+data is reused every scan but a 100&nbsp;MiB set overflows the 24&nbsp;MiB L3, so it is evicted before reuse. (c) <strong>Neither (both
+good)</strong> — a 1&nbsp;KiB array fits in L1 and is reused, so spatial and temporal locality are both excellent. (d)
+<strong>Spatial</strong> — scattered nodes give one line per node with no neighbor reuse. <em>Tempting wrong answer:</em> calling (b)
+&ldquo;spatial&rdquo; — the scan is contiguous (good spatial); the problem is the set does not stay cached (temporal).
+<strong>Feed-forward:</strong> &sect;34.2, &sect;34.4.</div>
+
+<div class="solution" id="sol34.10"><span class="sol-label">34.10</span>
+(a) <strong>False</strong> — reading one byte fetches its whole 64-byte cache line. (b) <strong>False</strong> — identical instruction
+counts can differ by an order of magnitude if locality differs (the &sect;34.3 19.5&times;). (c) <strong>False</strong> — the compiler
+often may <em>not</em> reorder loops (it can change results or be illegal), so the traversal order is your responsibility. (d)
+<strong>True</strong> — a working set that fits in L2 is hit by repeated passes. (e) <strong>False</strong> — blocking reorders access
+to improve reuse; it does not reduce the arithmetic operation count. <em>Tempting wrong answer:</em> marking (c) true because
+&ldquo;the optimizer handles everything&rdquo; — loop interchange is limited and not guaranteed. <strong>Feed-forward:</strong>
+&sect;34.2&ndash;&sect;34.4.</div>
+
+<div class="solution" id="sol34.11"><span class="sol-label">34.11</span>
+(a) Hypothesis: the loop is memory-bound because of poor locality (striding across lines or a working set larger than cache); test it
+by improving locality (transpose/reorder, or shrink the working set) and re-measuring, or with a cache-miss counter where available.
+(b) Wall-clock experiment: run the loop over inputs of growing size and watch for a sharp per-element slowdown as the working set
+crosses a cache size (a memory-bound signature), or compare the loop against a locality-fixed version; if the fixed version is much
+faster, it was memory-bound, if not, compute-bound. (c) Transposing/reordering is a one-line, low-risk change that attacks the actual
+cause (locality) and is easy to re-measure, whereas rewriting in assembly is high-effort, high-risk, and does nothing about a memory
+stall the arithmetic was never causing. <em>Tempting wrong answer:</em> &ldquo;assembly is always faster&rdquo; — assembly cannot beat
+the memory ceiling that poor locality created; fix locality first. <strong>Feed-forward:</strong> &sect;34.4; Chapter 33.</div>
+
+<div class="solution" id="sol34.12"><span class="sol-label">34.12</span>
+Platform-specific. A correct write-up reports: (a) the machine's real L1/L2/L3 sizes and line size from <code>/sys</code> (e.g. 64-byte
+lines). (b) The row-major sum timed several times and the column-major sum timed several times, both as minima, with a ratio of a few&times;
+to &gt;10&times; depending on hardware, explained by the column walk using one element per fetched line. (c) A stride sweep whose
+per-access cost has a knee at the line size (contiguous cheap, one-line-stride expensive). <em>Tempting wrong answer:</em> &ldquo;report
+the first, cold run&rdquo; — the first run pays cold-cache costs; report the minimum of several (Chapter 33). <strong>Feed-forward:</strong>
+&sect;34.2&ndash;&sect;34.3.</div>
+
+</section>
+
+<section class="solutions" id="sol35">
+<h1>Chapter 35 — Solutions</h1>
+
+<div class="solution" id="sol35.1"><span class="sol-label">35.1</span>
+<strong>AoS (array-of-structs):</strong> one array whose elements each hold all a record's fields together — <code>struct P{float x,y,vx,vy;}
+p[N];</code>. <strong>SoA (struct-of-arrays):</strong> a separate contiguous array per field — <code>float x[N],y[N],vx[N],vy[N];</code>.
+<em>Tempting wrong answer:</em> &ldquo;SoA is just an array of structs each holding arrays&rdquo; — no; each <em>field</em> gets its own
+flat array, so one field's values are contiguous. <strong>Feed-forward:</strong> &sect;35.2.</div>
+
+<div class="solution" id="sol35.2"><span class="sol-label">35.2</span>
+Useful bytes per fetched line = of every 64-byte line the hardware pulls in, how many bytes the loop actually reads. Summing one field
+of a 64-byte AoS struct reads 8 bytes (one <code>double</code>) of each fetched line and ignores the other 56, so 7 of every 8 bytes of
+memory traffic are wasted. <em>Tempting wrong answer:</em> &ldquo;it uses the whole line because it fetched it&rdquo; — fetching is not
+using; the other fields are dragged in and discarded. <strong>Feed-forward:</strong> &sect;35.2, &sect;35.3.</div>
+
+<div class="solution" id="sol35.3"><span class="sol-label">35.3</span>
+False sharing: two threads write two <em>different</em> variables that happen to sit in the <em>same</em> cache line, so the coherence
+protocol bounces that line between cores on every write even though no data is truly shared. Fix: <strong>padding</strong> (or
+alignment) so each thread's hot data sits on its own cache line. <em>Tempting wrong answer:</em> &ldquo;add a lock&rdquo; — a lock
+addresses real contention; false sharing has none, and a lock would make it worse. <strong>Feed-forward:</strong> &sect;35.4.</div>
+
+<div class="solution" id="sol35.4"><span class="sol-label">35.4</span>
+(a) AoS uses 8 of 64 bytes per line; SoA uses 64 of 64 — an 8&times; better useful-bytes ratio, and since the loop is limited by memory
+traffic, ~8&times; less wasted traffic predicts a large speedup. (b) The measured 4.08&times; is below 8&times; because the hardware
+prefetcher partly hides AoS's waste (it streams ahead), and other fixed costs (the add, loop overhead) do not shrink — so the memory
+saving does not translate one-for-one. (c) A loop that reads <em>all</em> fields of one element before moving on: then AoS puts the
+whole record in one fetched line and uses all of it, while SoA would touch several arrays (several lines) per element.
+<em>Tempting wrong answer:</em> &ldquo;SoA must give exactly 8&times;&rdquo; — byte ratio is an upper bound, not a guarantee.
+<strong>Feed-forward:</strong> &sect;35.2.</div>
+
+<div class="solution" id="sol35.5"><span class="sol-label">35.5</span>
+(a) Split into hot <code>struct{float x,y;} hot[N];</code> and cold <code>struct{char name[..]; Inv inventory; Ach achievements;}
+cold[N];</code>, indexed in parallel. (b) The per-frame loop now streams the dense <code>hot[]</code> array — every fetched line is
+full of <code>x,y</code> — instead of striding a fat struct and wasting the line on cold fields, even though no field was deleted. (c)
+Cost: touching a player's full state now means two arrays (worse locality for the rare all-fields access), and the code is more complex
+and easy to desynchronize; not worth it when the hot loop reads most fields anyway, or when the struct is already small.
+<em>Tempting wrong answer:</em> &ldquo;always hot/cold split&rdquo; — it hurts loops that need all fields of one element.
+<strong>Feed-forward:</strong> &sect;35.3.</div>
+
+<div class="solution" id="sol35.6"><span class="sol-label">35.6</span>
+(a) Alignment: <code>double b</code> must sit on an 8-byte boundary, so the compiler pads after <code>char a</code> (7 bytes) and
+after <code>char c</code> (7 bytes) to keep the struct's size a multiple of its alignment — about 24 bytes, not 10. (b) Reorder
+largest-to-smallest: <code>{ double b; char a; char c; }</code> — <code>b</code> takes 8, <code>a</code> and <code>c</code> pack into
+the next 2 bytes, then 6 bytes of tail padding to a multiple of 8: 16 bytes. (c) At 16 vs 24 bytes, 50% more elements fit per 64-byte
+line, so a sweep over a million of them fetches fewer lines and runs faster. <em>Tempting wrong answer:</em> &ldquo;the struct is 10
+bytes, the size of its fields&rdquo; — alignment padding makes it larger. <strong>Feed-forward:</strong> &sect;35.3.</div>
+
+<div class="solution" id="sol35.7"><span class="sol-label">35.7</span>
+(a) From the cache-coherence protocol: the four counters share one line, so each thread's write invalidates the line in the other three
+cores' caches, forcing the line to bounce (ping-pong) between cores — pure coherence traffic, not data sharing. (b) Padding puts each
+counter on its own line, so a thread's writes never invalidate another's line; it trades ~56 wasted bytes per counter (harmless here)
+for eliminating the bounce, an 8&times; win. (c) It would shrink to nothing: with one thread there is no other core to bounce the line
+to, so packed and padded run the same — false sharing is a purely concurrent cost. <em>Tempting wrong answer:</em> &ldquo;the writes
+themselves are slow&rdquo; — the increment is trivial; the cost is the line moving between cores. <strong>Feed-forward:</strong>
+&sect;35.4.</div>
+
+<div class="solution" id="sol35.8"><span class="sol-label">35.8</span>
+<strong>Step 4:</strong> Choose the <strong>hot/cold split</strong> (a packed <code>{cx,cy,cz,r}</code> array plus a parallel cold
+array): the intersection loop reads exactly those four fields together per sphere, so a 32-byte hot record gives it two spheres per
+64-byte line with everything it needs, while full SoA would make it touch four separate arrays (four lines) per sphere — worse for a
+loop that uses all four hot fields at once. (Full SoA would win only if the loop swept a single field.) Measure it the Chapter 33 way:
+compile original and split at the shipping level (<code>-O2</code>), same scene, same machine, make the result observable, warm up, and
+report the minimum and spread of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials for each; the split should be several times
+faster. <em>Tempting wrong answer:</em> &ldquo;full SoA is always best&rdquo; — here the loop reads four fields together, so a packed
+hot record beats four separate arrays. <strong>Feed-forward:</strong> &sect;35.2, &sect;35.3; Chapter 33.</div>
+
+<div class="solution" id="sol35.9"><span class="sol-label">35.9</span>
+(a) <strong>SoA</strong> — one field swept across many records is pure spatial locality when that field is its own array. (b)
+<strong>AoS</strong> — processing one record's full state at a time wants the whole record in one line. (c) <strong>Hot/cold split</strong>
+— 3 hot fields streamed every frame go in a dense array, the 30 cold ones elsewhere. (d) <strong>Pad to a cache line</strong> (a layout
+change, not AoS/SoA) — per-thread counters must not share a line, or false sharing bites. <em>Tempting wrong answer:</em> calling (d)
+&ldquo;SoA&rdquo; — the issue is cross-thread line sharing, fixed by padding. <strong>Feed-forward:</strong> &sect;35.2&ndash;&sect;35.4.</div>
+
+<div class="solution" id="sol35.10"><span class="sol-label">35.10</span>
+(a) <strong>False</strong> — SoA wins for one-field sweeps but AoS wins when a loop uses all fields of one element. (b)
+<strong>True</strong> — reordering fields to reduce alignment padding shrinks the struct without removing a field. (c)
+<strong>False</strong> — false sharing is two threads writing <em>different</em> variables that share a cache line, not the same
+variable. (d) <strong>False</strong> — padding wastes bytes single-threaded but prevents false sharing across threads, an 8&times; win
+in &sect;35.4. (e) <strong>False</strong> — same operation count, different layout, can change runtime by several&times; (the AoS/SoA
+4&times;). <em>Tempting wrong answer:</em> marking (e) true from RAM-model intuition — locality, not operation count, sets the time.
+<strong>Feed-forward:</strong> &sect;35.2&ndash;&sect;35.4.</div>
+
+<div class="solution" id="sol35.11"><span class="sol-label">35.11</span>
+(a) Chapter 34 (reorder accesses over a fixed layout) fits when you cannot change the data structure — e.g. iterating a given matrix in
+the right order; this chapter (change the layout) fits when you own the types — e.g. AoS&rarr;SoA for a hot field sweep; use both when
+you both pick the layout and choose the loop order over it (SoA arrays, swept contiguously). (b) A vectorizer loads 8 contiguous
+elements into one register; SoA makes a field's values contiguous, so one wide load fills a vector, while AoS scatters them across
+struct-sized gaps and cannot. (c) Converting everything before profiling optimizes code that may be nowhere near the dominant cost
+(Chapter 33/Amdahl), risks pessimizing loops that wanted AoS, and spends effort with no measured payoff — profile first, convert the
+hot path, re-measure. <em>Tempting wrong answer:</em> &ldquo;SoA everywhere is strictly better&rdquo; — it hurts all-fields-per-element
+loops and ignores Amdahl. <strong>Feed-forward:</strong> &sect;35.2; Chapters 33, 36.</div>
+
+<div class="solution" id="sol35.12"><span class="sol-label">35.12</span>
+Platform-specific. A correct write-up reports: (a) an AoS field sum and an SoA field sum timed as minima of several trials, with a
+ratio of a few&times; explained by the useful-bytes-per-line difference (struct size vs field size). (b) the ratio growing as the struct
+grows (16&rarr;128 bytes), because a bigger struct wastes more of each line in AoS while SoA is unchanged. (c) if threads are available,
+a packed-counters vs padded-counters run with a several&times; slowdown from false sharing, vanishing at one thread.
+<em>Tempting wrong answer:</em> &ldquo;time each layout once&rdquo; — single runs are noisy; report minima of several (Chapter 33).
+<strong>Feed-forward:</strong> &sect;35.2, &sect;35.4.</div>
+
+</section>
+
+<section class="solutions" id="sol36">
+<h1>Chapter 36 — Solutions</h1>
+
+<div class="solution" id="sol36.1"><span class="sol-label">36.1</span>
+SIMD (Single Instruction, Multiple Data): one instruction operates on a whole vector of elements at once, on a single core. A 256-bit
+AVX register holds 8 <code>float</code>s (32 bits each) or 4 <code>double</code>s (64 bits each), and one AVX arithmetic instruction
+processes all of them — 8 or 4 — in one step. <em>Tempting wrong answer:</em> &ldquo;SIMD means multiple cores&rdquo; — it is width on
+one core, not more cores. <strong>Feed-forward:</strong> &sect;36.1.</div>
+
+<div class="solution" id="sol36.2"><span class="sol-label">36.2</span>
+<strong>Contiguity</strong> (the elements adjacent in memory so one load fills a vector register) and <strong>independence</strong> (no
+lane depends on another's result within the vector, so no loop-carried dependency). Contiguity is supplied by Chapter 35's
+struct-of-arrays layout. <em>Tempting wrong answer:</em> &ldquo;the loop just has to be short&rdquo; — length is irrelevant; layout and
+independence are what matter. <strong>Feed-forward:</strong> &sect;36.1, &sect;36.3.</div>
+
+<div class="solution" id="sol36.3"><span class="sol-label">36.3</span>
+(a) <code>-O3</code> (gcc does not vectorize at <code>-O2</code> in this version); more generally <code>-ftree-vectorize</code>. (b)
+<code>-march=native</code>, letting it use the widest vectors the build CPU supports (AVX2 here). (c) <code>-fopt-info-vec-optimized</code>
+(or <code>-fopt-info-vec-missed</code> to see why a loop did <em>not</em> vectorize). <em>Tempting wrong answer:</em> &ldquo;-O2 is
+enough&rdquo; — it is not, in this gcc; you need <code>-O3</code>. <strong>Feed-forward:</strong> &sect;36.2.</div>
+
+<div class="solution" id="sol36.4"><span class="sol-label">36.4</span>
+(a) Because vectorization depends on the build: <code>-O2</code> emitted scalar code, <code>-O3</code> used 128-bit SSE2 (4-wide),
+<code>-O3 -march=native</code> used 256-bit AVX2 (8-wide) — same source, three code generations. (b) Vectorizing also let the compiler
+use fused multiply-add (one instruction for <code>a*b+c</code>) and unroll the loop, cutting per-iteration overhead, so the gain is lane
+count times these extra wins. (c) Confirming with <code>-fopt-info-vec</code> gives evidence the loop vectorized (and how wide),
+whereas assuming it did risks shipping a &ldquo;vectorized&rdquo; loop the compiler actually left scalar. <em>Tempting wrong answer:</em>
+&ldquo;13&times; proves a bug in the model&rdquo; — no; FMA and unrolling legitimately push it past raw lane count.
+<strong>Feed-forward:</strong> &sect;36.2.</div>
+
+<div class="solution" id="sol36.5"><span class="sol-label">36.5</span>
+(a) Vectorizing a sum groups the additions differently (e.g. 8 partial sums combined at the end), and floating-point addition is not
+associative, so the rounded result can differ from the strict left-to-right order the source specifies; the standard forbids the
+compiler from changing your result, so it declines. (b) <code>-ffast-math</code> (or <code>-funsafe-math-optimizations</code>) permits
+reassociation; it also allows other unsafe assumptions (no NaNs/infinities, reordering that changes rounding), which can break code
+that relies on strict IEEE behavior. (c) The dot product is <strong>memory-bandwidth-bound</strong> — it streams arrays far larger than
+cache, so it waits on DRAM, not the adder; that is a bandwidth ceiling, unrelated to the reduction/associativity issue.
+<em>Tempting wrong answer:</em> &ldquo;the small gain is the reduction still being scalar&rdquo; — once <code>-ffast-math</code>
+vectorizes it, bandwidth still caps it. <strong>Feed-forward:</strong> &sect;36.3, &sect;36.4.</div>
+
+<div class="solution" id="sol36.6"><span class="sol-label">36.6</span>
+(a) <strong>Yes</strong> — elementwise, contiguous, independent lanes. (b) <strong>No</strong> — loop-carried dependency:
+<code>a[i]</code> needs <code>a[i-1]</code>, so lanes cannot be computed in parallel. (c) <strong>No (or poorly)</strong> — a heavy
+data-dependent branch per element breaks the uniform lane operation (though light branches can sometimes be masked/predicated). (d)
+<strong>No</strong> at plain <code>-O3</code> — a floating-point reduction needs <code>-ffast-math</code> to reassociate.
+<em>Tempting wrong answer:</em> marking (b) yes because &ldquo;it's a simple loop&rdquo; — simplicity is irrelevant; the dependency is
+fatal. <strong>Feed-forward:</strong> &sect;36.3.</div>
+
+<div class="solution" id="sol36.7"><span class="sol-label">36.7</span>
+(a) Arithmetic intensity = floating-point operations performed per byte moved to/from memory. (b) Dot product: ~2 flops (a multiply and
+an add) per two 4-byte loads = 8 bytes, so ~0.25 flop/byte — very low, so once the arrays exceed cache it is limited by how fast DRAM
+delivers bytes: bandwidth-bound. (c) The &sect;36.2 kernel: ~11 flops per 4-byte element already resident in L1, so ~2.75 flops/byte
+and almost no DRAM traffic — the core's arithmetic throughput binds: compute-bound. (d) SIMD helps loops that are compute-bound (high
+intensity); for bandwidth-bound (low intensity) loops the fix is locality/layout, not more lanes. <em>Tempting wrong answer:</em>
+&ldquo;more flops per element always means SIMD helps&rdquo; — it also depends on whether the bytes are in cache (intensity counts bytes
+<em>moved</em>). <strong>Feed-forward:</strong> &sect;36.4.</div>
+
+<div class="solution" id="sol36.8"><span class="sol-label">36.8</span>
+<strong>Step 4:</strong> 1.2&times; is expected, not a bug: the loop is bandwidth-bound (tiny arithmetic intensity, 100&nbsp;MiB arrays
+streamed from DRAM), so the memory bus caps it and widening the add from 1 lane to 8 cannot help — the adder was never the bottleneck.
+Confirm the diagnosis by timing the plain <code>-O3 -march=native</code> auto-vectorized version (checking <code>-fopt-info-vec</code>
+that it vectorized): it should match ~1.2&times;, showing the intrinsics are fine and memory is the ceiling. The real speedup must come
+from moving fewer bytes — better locality and layout (Chapters 34&ndash;35), e.g. fusing this with adjacent passes so the data is
+touched once, or shrinking the element type — not from more lanes. <em>Tempting wrong answer:</em> &ldquo;keep debugging the
+intrinsics&rdquo; — they are correct; the model, not the code, was wrong. <strong>Feed-forward:</strong> &sect;36.4.</div>
+
+<div class="solution" id="sol36.9"><span class="sol-label">36.9</span>
+(a) <strong>Large</strong> — compute-bound, cache-resident, independent lanes: SIMD's ideal case. (b) <strong>None (to speak of)</strong>
+— a 1&nbsp;GiB copy is pure bandwidth, so wide loads/stores are already bandwidth-limited; lanes do not add throughput. (c)
+<strong>Large</strong> — cache-resident and arithmetic-heavy, so the vector unit binds, not memory (a reduction needs
+<code>-ffast-math</code> to vectorize). (d) <strong>None</strong> — a loop-carried dependency is inherently serial; it cannot vectorize
+as written. <em>Tempting wrong answer:</em> calling (b) large &ldquo;because wider loads move more&rdquo; — the bus, not the load width,
+is already the cap. <strong>Feed-forward:</strong> &sect;36.3, &sect;36.4.</div>
+
+<div class="solution" id="sol36.10"><span class="sol-label">36.10</span>
+(a) <strong>False</strong> — 8 lanes bound arithmetic throughput at up to 8&times;, but bandwidth-bound loops gain far less and
+compute-bound ones can exceed 8&times; via FMA/unrolling. (b) <strong>False</strong> — gcc will not vectorize a floating-point
+reduction at <code>-O3</code> without <code>-ffast-math</code> (associativity). (c) <strong>True</strong> —
+<code>-march=native</code> targets the build machine's widest supported vectors. (d) <strong>False</strong> — SIMD helps compute-bound
+loops, not bandwidth-bound ones. (e) <strong>False</strong> — an AoS field is strided, so it cannot be loaded into a vector in one go;
+packed SoA can. <em>Tempting wrong answer:</em> marking (a) true from the lane-count intuition — the ceiling, not the lane count, sets
+the gain. <strong>Feed-forward:</strong> &sect;36.1&ndash;&sect;36.4.</div>
+
+<div class="solution" id="sol36.11"><span class="sol-label">36.11</span>
+(a) SIMD needs contiguous data (one wide load fills a register) and data that reaches the core fast (or the vector unit starves), which
+are exactly the layout of Chapter 35 and the locality of Chapter 34 — without them the vectorizer either cannot fire or gains nothing.
+(b) Ask in order: what is this kernel bound by — arithmetic, cache misses, or bandwidth (measure scalar vs vectorized, vary input size
+to find cache cliffs)? If cache/bandwidth-bound, fix locality (Chapter 34) and layout (Chapter 35) first; if compute-bound, vectorize
+(Chapter 36) and confirm with <code>-fopt-info-vec</code>; re-measure after each change (Chapter 33). (c) Because the true limit is
+usually a specific resource (cache, bandwidth, vector width), and raising a ceiling you are not under does nothing — &ldquo;fewer
+instructions&rdquo; ignores that a memory-bound loop is idle waiting on bytes regardless of instruction count. <em>Tempting wrong
+answer:</em> &ldquo;always vectorize the hot loop&rdquo; — pointless if it is bandwidth-bound; find the binding ceiling first.
+<strong>Feed-forward:</strong> Chapters 33&ndash;36.</div>
+
+<div class="solution" id="sol36.12"><span class="sol-label">36.12</span>
+Platform-specific. A correct write-up reports: (a) an L1-resident compute kernel at scalar / <code>-O3</code> / <code>-O3
+-march=native</code>, with throughputs rising and a speedup at or above the lane count, and the <code>-fopt-info-vec-optimized</code>
+line naming the vector width. (b) a cache-overflowing dot product that barely vectorizes without <code>-ffast-math</code> and gains
+little even with it, explained by low arithmetic intensity (bandwidth-bound). (c) the toolchain version, CPU, and widest vector width,
+noting these are wall-clock throughputs (no hardware counters) if <code>perf</code> is unavailable. <em>Tempting wrong answer:</em>
+&ldquo;report the first run&rdquo; — cold-start noise; report the minimum of several trials (Chapter 33). <strong>Feed-forward:</strong>
+&sect;36.2&ndash;&sect;36.4.</div>
 
 </section>
 </body></html>

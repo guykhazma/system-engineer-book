@@ -1,0 +1,338 @@
+<section class="chapter" id="ch52">
+<h1>Chapter 52 — The B-Tree in Practice: Deletion, Occupancy, and Concurrency</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (a random page write is as expensive as a random read, and
+concurrency contends on the device), <a href="#ch47">Chapter 47</a> (the page a node lives in), <a href="#ch48">Chapter 48</a> (nodes are latched
+and pinned in the buffer pool while in use), <a href="#ch50">Chapter 50</a> (the storage-manager free list a deleted page returns to),
+<a href="#ch51">Chapter 51</a> (the B+-tree's shape, the balance invariant, search, and insert-with-split — this chapter is its second half).
+&nbsp;·&nbsp; Chapter 51 built the B-tree and its two easy directions: it grows at the root by splitting, and it searches in <em>height</em> page
+fetches. This chapter finishes the structure with the three things a production B-tree must also do — <strong>shrink</strong> when rows are deleted,
+<strong>stay dense</strong> so its size tracks its data, and <strong>serve many threads at once</strong> — none of which the split alone gives you.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch51">Chapter 51</a> — an insert into a <em>full</em> leaf does what, and in which direction does the tree grow when
+the split reaches the root? (2) <a href="#ch51">Chapter 51</a> — the balance invariant has two parts: every non-root node is kept at least how full,
+and all leaves are at what depth? (3) <em>Predict:</em> you build a B-tree by inserting a billion keys in <em>random</em> order with the naive
+50/50 split of Chapter 51, then measure how full its nodes are on average. Is the tree about 100% full, about 85% full, or closer to 70% full — and
+what does the answer imply about how much bigger the index is than the data it holds? Write your guess; &sect;52.3 measures it.</p>
+</aside>
+
+<p>Chapter 51 left the B-tree half-built. It could grow — insert descends to a leaf and, if the leaf is full, splits, pushing a separator key up and
+growing the tree only at the root — and it could search in a handful of page fetches. But a table is not append-only: rows are deleted, and an index
+that only ever grows is a leak. A B-tree is also not built once and frozen: it is written by many transactions at once, and a structure that must be
+locked whole for every insert serves one writer at a time. And the split that keeps the tree balanced has a quiet cost Chapter 51 flagged but did not
+measure — it leaves pages <em>half-empty</em>, so a B-tree built by ordinary inserts is markedly larger than the data it indexes. This chapter closes
+those three gaps, which is the difference between the textbook B-tree and the one PostgreSQL or InnoDB actually ships: <strong>deletion</strong> with
+its borrow-or-merge rebalancing, the mirror image of the split, that shrinks the tree at the root (&sect;52.1); why real systems usually
+<strong>defer</strong> that merge and what <em>index bloat</em> that buys and costs (&sect;52.2); <strong>occupancy</strong> — the measured fact that
+random insertion settles nodes at about 69% full, and why bulk-loading reaches nearly 100% (&sect;52.3); and <strong>concurrency</strong> — latch
+coupling and the Blink-tree right-link that let many threads descend the same tree without locking it whole, with its named trap, the split race
+(&sect;52.4); then what all of this carries into the write-optimized engine that comes next (&sect;52.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's Intel Core i7-12700H), a working in-memory
+B-tree in the classic minimum-degree form — insert with split, delete with borrow and merge — used two ways. First it builds trees by
+<strong>random insertion</strong> at several node sizes and reports the <em>average node occupancy</em>, a structural ratio (keys held over keys that
+fit), to confirm the &ldquo;fills to ln&nbsp;2&rdquo; result; occupancy is a property of the shape, not a timing. Second it inserts then
+<strong>deletes</strong> most of the keys and reports that the height <em>shrinks</em> and the surviving keys are still found — again a structural
+outcome of a deterministic, seeded operation sequence, not a wall-clock measurement. Where a page fetch or a random write's cost appears it is the
+<a href="#ch46">Chapter 46</a> device and <a href="#ch48">Chapter 48</a> buffer-pool figures measured earlier in this volume, cited rather than
+re-measured (a hardware-counter profiler, <code>perf</code>, is not installed on this machine).</p>
+
+<h2>52.1 Deletion: underflow, borrow, and merge</h2>
+
+<p><strong>Deletion</strong> begins exactly as search and insert do — descend to the leaf where the key lives — and then removes the entry, which is
+trivial <em>unless</em> it drops the node below the balance invariant's floor. Chapter 51's invariant says every node except the root holds at least
+&lceil;<var>m</var>/2&rceil;&minus;1 keys (about half a full node); a leaf that falls below that has <strong>underflowed</strong>, and the tree must be
+repaired before the deletion is done, because an under-full node breaks the guarantee that gives search its uniform cost. There are two repairs, tried
+in order. First, <strong>borrow</strong> (also called redistribution): if an adjacent sibling has more than the minimum, move one of its keys across —
+rotating it <em>through the parent</em>, since the separator key in the parent must always sit between the two children — and the underflow is fixed
+with a single key movement and no structural change. Second, if no sibling can spare a key (both are exactly at the minimum), <strong>merge</strong>:
+combine the under-full node with a sibling into one node, and pull the <em>separator key down</em> from the parent to sit between them, since with the
+two children fused that separator no longer separates anything. Merging is the exact mirror of a split — a split creates a node and pushes a key up; a
+merge destroys a node and pulls a key down — and it has the same propagation: pulling the separator down removes a key from the parent, which may itself
+underflow and merge, and so on up the tree. If the merge propagates all the way to the root and the root is left with no keys and a single child, the
+<strong>root is removed</strong> and that single child becomes the new root — and this is the only way a B-tree's height ever <em>decreases</em>. So the
+tree grows at the root by splitting and shrinks at the root by merging; it is symmetric, and that symmetry is why all leaves stay at the same depth
+through any mix of inserts and deletes. Search never sees an unbalanced tree because deletion, like insertion, does the balancing work up front.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A delete leaves a leaf with fewer than the minimum keys. What are the two repairs, in the order they are tried, and which one can change the tree's
+height? When the height changes on a delete, where does the change happen? (Answer in the next section.)</p>
+</aside>
+
+<h2>52.2 Lazy deletion and index bloat: why systems defer the merge</h2>
+
+<p>The borrow-and-merge of &sect;52.1 is the <em>correct</em> deletion, and it is what a textbook implements. Most production B-trees do not do it on
+every delete. The reason is cost and concurrency: a merge touches <strong>three</strong> pages at once — the under-full node, its sibling, and the
+parent — and must lock all three against other operations, and the merge can propagate upward and lock still more; under a heavy concurrent workload
+that is a lot of contention to spend on the common case where a deleted key's slot will soon be filled by another insert. So real engines mostly use
+<strong>lazy deletion</strong>: remove the entry (or just mark it dead), let the node sit under-full, and reclaim a page to the storage manager's free
+list (Chapter 50) only when it becomes completely <em>empty</em>, rebalancing rarely or never. This is a deliberate trade of space for speed and
+simplicity, and it has a name for its cost: <strong>index bloat</strong>. Because under-full pages are tolerated rather than merged, a B-tree that has
+seen many deletes keeps its page count even as its live-key count falls — the on-disk index stays large while the data it indexes shrinks, occupancy
+drops toward the deleted fraction, and range scans still walk the mostly-empty pages, paying page fetches for keys that are gone. The bloat is not a
+bug; it is the chosen point on the space/latency curve. It is undone deliberately, not automatically: a <strong>rebuild</strong> (PostgreSQL's
+<code>REINDEX</code>, or dropping and recreating the index) reconstructs the tree densely, and background reclamation (PostgreSQL's <code>VACUUM</code>,
+InnoDB's purge) returns wholly-empty pages. Knowing that deletion is usually lazy — that the index does not shrink itself — is the difference between
+&ldquo;the delete is broken&rdquo; and &ldquo;the index needs a rebuild,&rdquo; and it is exactly the confusion the communicate box below untangles.</p>
+
+<p><em>(Answer to the &sect;52.1 quick check: the two repairs are <strong>borrow</strong> from a sibling that has a spare key, tried first, and
+<strong>merge</strong> with a sibling when neither can spare one. Only merge can change the height, and only when it propagates to the root and empties
+it: the root is removed and its single child becomes the new root, so — like growth — the height change happens <strong>at the root</strong>.)</em></p>
+
+<h2>52.3 Node occupancy: random inserts settle at ln&nbsp;2, bulk-loading fills the pages</h2>
+
+<p>How full is a B-tree's nodes, on average? The answer decides how big the index is for a given amount of data, and it is not 100%. Chapter 51's
+naive split cuts a full node in half, so a just-split node is 50% full; subsequent inserts refill it, and averaged over a long random insert sequence
+the occupancy settles at a specific constant. Yao proved in 1978 that for B-trees of reasonable order, random insertion drives the average node
+occupancy to <strong>ln&nbsp;2 &asymp; 0.693</strong> — about <strong>69%</strong> full — and the working B-tree here reproduces it. Building trees by
+inserting 200,000 keys in random order and measuring keys-held over keys-that-fit:</p>
+
+<pre><code>random-insertion B-tree, average node occupancy (Yao 1978: -> ln2 = 0.6931):
+  min-degree t= 16 (&lt;= 31 keys/node), N=200000: occupancy=0.687, height=4
+  min-degree t= 32 (&lt;= 63 keys/node), N=200000: occupancy=0.686, height=4
+  min-degree t= 64 (&lt;=127 keys/node), N=200000: occupancy=0.684, height=3
+</code></pre>
+
+<p>Every measurement lands within a hair of ln&nbsp;2. The consequence is quantitative and large: a B-tree built by ordinary row-by-row insertion is
+about <strong>1/ln&nbsp;2 &asymp; 1.44&times;</strong> the size of the same keys packed densely — it needs roughly 44% more pages than the data
+strictly requires, which is more pages in the buffer pool, more page fetches for a scan, and (because lower occupancy means lower effective fanout) the
+occasional extra level of height. This is why databases distinguish <strong>bulk-loading</strong> from insertion: given data already sorted, an engine
+builds the B-tree <em>bottom-up</em> — fill a leaf completely, emit it, start the next; when a level's worth of leaves exists, build their parent — which
+packs every node to nearly 100% and produces the smallest, shallowest possible tree. It is both faster (no per-key descent, no splits) and denser than
+inserting the same rows one at a time, which is why &ldquo;<code>CREATE INDEX</code> on an existing table&rdquo; and &ldquo;a rebuild&rdquo; use
+bulk-load, and why append-heavy inserts use the append-aware split of Chapter 51 to approach the same density. The occupancy constant is also the reason
+a healthy index is still noticeably larger than its raw data: 69%, not 100%, is normal for a live, randomly-updated tree.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: naive splitting fills nodes to ~69%, so a randomly-built index is ~1.44&times; its data</span>
+<p><strong>1. In words.</strong> A naive split halves a full node, leaving both halves 50% full; random inserts refill them and the average settles at
+ln&nbsp;2 &asymp; 69%. Sorted bulk-loading skips splitting entirely, filling each node to ~100%, so a bulk-loaded index is the densest and a
+randomly-inserted one carries ~44% more pages.</p>
+<p><strong>2. As a picture.</strong> Figure 52.1: two leaves side by side — a randomly-built leaf shaded ~69% with empty slots at the end, and a
+bulk-loaded leaf shaded solid ~100% — over a caption reading &ldquo;same keys, 1.44&times; the pages.&rdquo;</p>
+<p><strong>3. As numbers.</strong> Measured here: node occupancy 0.687, 0.686, 0.684 at node sizes 31, 63, 127 keys — all converging on the Yao
+constant ln&nbsp;2 = 0.6931. Densely packed, the same keys occupy 1/1.44 as many pages; the 44% gap is the price of building by insertion instead of
+bulk-load.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 190" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Node occupancy: random insertion settles at ln 2 (~69%); bulk-loading packs to ~100%. Same keys, ~1.44x the pages.</text>
+<text x="30" y="48" font-size="9" fill="#333">random-built leaf (~69% full):</text>
+<rect x="30" y="55" width="360" height="26" fill="#f4f4f4" stroke="#14406b"/>
+<rect x="30" y="55" width="248" height="26" fill="#dfe8f4" stroke="#14406b"/>
+<text x="284" y="72" font-size="8" fill="#8c3a1d">empty slots</text>
+<text x="30" y="112" font-size="9" fill="#333">bulk-loaded leaf (~100% full):</text>
+<rect x="30" y="119" width="360" height="26" fill="#dff0df" stroke="#2f7d32"/>
+<text x="150" y="136" font-size="8" fill="#2f7d32">packed</text>
+<text x="410" y="72" font-size="9" fill="#14406b">0.687 measured</text>
+<text x="410" y="90" font-size="8" fill="#333">(t=16, N=200k)</text>
+<text x="410" y="136" font-size="9" fill="#2f7d32">~1.00</text>
+<text x="30" y="172" font-size="8" fill="#8c3a1d">1/ln2 = 1.44: an index built by insertion needs ~44% more pages than the same keys bulk-loaded.</text>
+</svg>
+<figcaption>Figure 52.1: average node occupancy. Naive 50/50 splitting under random insertion settles nodes at ln&nbsp;2 &asymp; 69% full (measured 0.684&ndash;0.687);
+sorted bulk-loading packs them to ~100%. The 1/ln&nbsp;2 &asymp; 1.44 ratio is why a rebuilt or bulk-loaded index is markedly smaller than one grown by
+row-by-row insertion.</figcaption>
+</figure>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Random insertion settles a B-tree's nodes at what average occupancy, and what constant is that? Roughly how many more pages does an index built by
+insertion carry than the same keys bulk-loaded, and why does bulk-loading pack so much tighter? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>52.4 Concurrent access: latch coupling and the Blink-tree</h2>
+
+<p>Everything so far assumed one thread. A real B-tree is descended and modified by many transactions at once, and the pages it touches live in the
+shared buffer pool (Chapter 48), so access must be protected by <strong>latches</strong> — the short-held mutexes on in-memory pages, distinct from the
+transactional locks of a later part. The naive protection, one latch over the whole tree, allows exactly one operation at a time and wastes the
+machine. The classic improvement is <strong>latch coupling</strong>, also called <em>crabbing</em>: as a search descends, it latches a child
+<em>before</em> releasing the parent — always holding the ground under its feet, like a crab moving one leg at a time — so a concurrent modification can
+never move a node out from under it mid-descent. For a read that is enough and cheap: take a shared latch on the child, release the parent, move down,
+so only one or two latches are held at any moment. An <em>insert</em> is harder, because it might split, and a split modifies the parent — so a
+crabbing insert must keep every ancestor latched until it reaches a node that is provably <strong>safe</strong> (has room, so it cannot split and cannot
+push a change upward); only then can it release the ancestors above. When nodes are near-full, &ldquo;safe&rdquo; is rare, ancestor latches are held
+long, and concurrency collapses back toward serial. The elegant fix is the <strong>Blink-tree</strong> of Lehman and Yao (1981): give every node a
+<em>right-link</em> pointer to its right sibling and record each node's <strong>high key</strong> (the largest key it covers). A split now adds the new
+node to the <em>right</em> and links to it, and it does so as a purely local, left-to-right operation. A reader that arrives at a node just after it
+split, and finds its target key is now greater than the node's high key, simply <strong>follows the right-link</strong> to the new sibling instead of
+needing the parent to have been updated first. Because a searcher can always recover a mid-split move by moving right, it never has to hold a parent
+latch to guard against a split below it — a descent holds only <strong>one</strong> latch at a time. That single structural addition, the right-link, is
+what let B-trees scale to many concurrent threads, and it is why the Blink-tree is the concurrency design real systems (including PostgreSQL) build on.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: naive latch coupling either serializes the tree or deadlocks — the split race</span>
+<p>The tempting concurrency scheme is &ldquo;just latch-couple everything with exclusive latches, parent held until the child is latched, all the way
+down&rdquo; — and it fails two ways at once. First, <strong>it serializes writers</strong>: to be safe against a split propagating up, a naive insert
+must hold exclusive latches on the whole root-to-leaf path until it finds a node with room, so under a write-heavy load every insert latches the root
+exclusively and writers run one at a time — the tree's own root becomes the bottleneck. The over-correction is to release ancestor latches early to
+regain concurrency, which triggers the second failure, the <strong>split race</strong>: a searcher releases a parent latch, a concurrent insert splits
+the child and moves half its keys (including the searcher's target) to a new right sibling, and the searcher — now latching a node that no longer holds
+its key — reports the key <em>absent</em> though it is present. Worse, trying to fix this by re-latching upward invites <strong>deadlock</strong>:
+descents take latches top-down while a propagating split takes them bottom-up, so two operations can grab the same two nodes in opposite orders and wait
+on each other forever. &ldquo;Hold exclusive latches down the whole path&rdquo; and &ldquo;release early for concurrency&rdquo; are not both safe under
+naive coupling — one serializes, the other loses keys or deadlocks. The honest fix is not a latching tweak but the <strong>structural</strong> one: the
+Blink-tree right-link and high key, which make a split locally recoverable so a searcher moves <em>right</em> instead of holding an ancestor latch — one
+latch at a time, no path-long exclusive holds, no opposite-order deadlock.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;We archived and deleted about 90% of the rows in our biggest table last week. But the index on that
+table is barely smaller on disk than before, and the range queries didn't get faster. The delete must be broken — should I file a bug?&rdquo; Cover the
+paragraph and answer in four or five sentences, drawing on &sect;52.2 and &sect;52.3.</p>
+<p><em>Model answer.</em> &ldquo;It's almost certainly not a bug — it's how B-tree deletion normally works. Most engines delete <strong>lazily</strong>:
+they mark the entries dead and leave the pages under-full rather than merging siblings on every delete, because eager merges are expensive under
+concurrency. So the index keeps its page count even though 90% of the keys are gone — that's index bloat, and it's why the on-disk size barely moved
+and scans still walk the now-mostly-empty pages. The index doesn't shrink itself; you reclaim the space deliberately, by rebuilding it —
+<code>REINDEX</code> or drop-and-recreate, which bulk-loads it back to near-100% fill — and by letting <code>VACUUM</code>/purge reclaim the empty
+pages. One more expectation to set: even a freshly rebuilt, healthy index is only about 69% full on average under random inserts, so it will always be
+somewhat larger than the raw data — don't expect the index size to equal the live-row size.&rdquo; Naming lazy deletion, index bloat, the rebuild as the
+fix, and the ln&nbsp;2 occupancy baseline is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;52.3 quick check: random insertion settles nodes at about <strong>69%</strong> occupancy — the constant ln&nbsp;2 &asymp;
+0.693, as Yao proved and the code measured (0.684&ndash;0.687). An index built by insertion therefore carries about <strong>1/ln&nbsp;2 &asymp;
+1.44&times;</strong> — ~44% more — pages than the same keys bulk-loaded. Bulk-loading packs tighter because it builds bottom-up from sorted data,
+filling each node completely and never splitting, so no node is left half-empty.)</em></p>
+
+<h2>52.5 What to carry forward</h2>
+
+<p><strong>Deletion</strong> is the mirror of the split: descend, remove, and if the node underflows, first <strong>borrow</strong> a key from a sibling
+through the parent, or if none can spare one, <strong>merge</strong> with a sibling and pull the separator down — a merge can propagate up and, if it
+empties the root, remove it, which is the only way the tree's height shrinks, at the root, symmetric with how it grows (&sect;52.1). Real systems mostly
+defer that merge — <strong>lazy deletion</strong> — tolerating under-full pages and reclaiming only empty ones, trading space for concurrency and paying
+in <strong>index bloat</strong> that a rebuild (<code>REINDEX</code>) undoes (&sect;52.2). <strong>Occupancy</strong> under random insertion settles at
+<strong>ln&nbsp;2 &asymp; 69%</strong> (Yao 1978, reproduced at 0.684&ndash;0.687), so an inserted index is ~1.44&times; the pages of a bulk-loaded one,
+which is why databases bulk-load sorted data bottom-up to pack near 100% (&sect;52.3). <strong>Concurrency</strong> uses <strong>latch coupling</strong>
+(crabbing) to descend without locking the tree whole, and the <strong>Blink-tree</strong> right-link and high key (Lehman &amp; Yao 1981) to make a
+split locally recoverable so a searcher holds one latch at a time — the structural fix for the split-race trap that naive coupling falls into
+(&sect;52.4).</p>
+
+<p>With Chapters 51 and 52 the B-tree is complete: a wide, shallow, self-balancing tree of pages that gives selective look-up, range scan, ordered
+iteration, safe deletion, and concurrent access — the workhorse index of every relational database. But notice the shape of everything this chapter
+added. Deletion rebalances pages in place. Keeping occupancy up means splitting and packing pages in place. Concurrency exists precisely because writers
+are modifying pages in place and must be kept from colliding. The entire chapter is the machinery of <strong>updating data in place</strong> — rewriting
+the page where a key belongs — done safely and densely. That in-place discipline is exactly what makes the B-tree superb for reads and range scans and
+exactly what makes every write a random page update, paying the Chapter 46 random-write cost, and what makes concurrent writers contend on the same hot
+pages. The next chapter takes the opposite bet. Instead of finding the right page and updating it in place, it <em>never</em> updates in place: it
+buffers writes in memory and flushes them as new, immutable, sorted files, turning every random write into a sequential one — and pays the bill later,
+at read time, by having to merge those files. That is the <strong>log-structured merge-tree</strong>, the write-optimized counterpart to the
+read-optimized B-tree, and the whole rest of this part is the two families and when each wins. The B-tree updates in place; the LSM-tree appends and
+merges; and the tension between them is the central storage-engine decision.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Describe deletion's two repairs — borrow and merge — and say which can shrink the tree and where.</li>
+<li>Explain why merge is the mirror of split, including how the height decreases at the root.</li>
+<li>Explain lazy deletion and index bloat, and name the operation that reclaims the space.</li>
+<li>State the ln&nbsp;2 occupancy result and the ~1.44&times; size consequence, and why bulk-loading packs tighter.</li>
+<li>Explain latch coupling (crabbing) and why an insert must hold ancestor latches until a &ldquo;safe&rdquo; node.</li>
+<li>Describe the Blink-tree right-link and how it lets a searcher survive a split with one latch at a time.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> On a delete that underflows a node, what are the two repairs in order, and which changes the height? (&sect;52.1)</li>
+<li><strong>R2.</strong> What is lazy deletion, what is the index bloat it causes, and how is the space reclaimed? (&sect;52.2)</li>
+<li><strong>R3.</strong> What average node occupancy does random insertion produce, and how much bigger is such an index than a bulk-loaded one? (&sect;52.3)</li>
+<li><strong>R4.</strong> What is latch coupling, and why does a naive insert have to hold ancestor latches down the path? (&sect;52.4)</li>
+<li><strong>R5.</strong> What does the Blink-tree right-link add, and how does it defeat the split race? (&sect;52.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Rudolf Bayer &amp; Edward M. McCreight, &ldquo;Organization and Maintenance of Large Ordered Indexes,&rdquo; <em>Acta Informatica</em>
+1(3), 1972, pp. 173&ndash;189, DOI 10.1007/BF00288683.</strong> The original B-tree paper, which specifies the deletion, borrow, and merge of
+&sect;52.1 alongside the insertion of Chapter 51. First author Rudolf Bayer; venue, volume, pages, year, and DOI verified via SpringerLink.</li>
+<li><strong>Andrew Chi-Chih Yao, &ldquo;On Random 2&ndash;3 Trees,&rdquo; <em>Acta Informatica</em> 9(2), 1978, pp. 159&ndash;170, DOI 10.1007/BF00289075.</strong>
+The analysis behind &sect;52.3: random insertion drives average node occupancy to ln&nbsp;2 for B-trees of high order. Sole author Andrew Yao; venue,
+volume, pages, year, and DOI verified via SpringerLink.</li>
+<li><strong>Philip L. Lehman &amp; S. Bing Yao, &ldquo;Efficient Locking for Concurrent Operations on B-Trees,&rdquo; <em>ACM Transactions on Database
+Systems</em> 6(4), 1981, pp. 650&ndash;670, DOI 10.1145/319628.319663.</strong> The Blink-tree of &sect;52.4: the right-link and high key that let a
+split be locally recovered, so a search holds only one latch at a time. First author Philip Lehman; venue, volume, pages, year, and DOI verified via
+the ACM Digital Library.</li>
+<li><strong>Goetz Graefe, &ldquo;Modern B-Tree Techniques,&rdquo; <em>Foundations and Trends in Databases</em> 3(4), 2011, pp. 203&ndash;402,
+DOI 10.1561/1900000028.</strong> The modern survey covering all three of this chapter's threads: deletion and its deferral, occupancy and
+bulk-loading, and the concurrency techniques real B-trees use. Sole author Goetz Graefe; venue, volume, pages, year, and DOI verified via the
+publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex52.1"><span class="ex-label">52.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, what is the difference between <em>borrowing</em> from a sibling and <em>merging</em> with one when a delete underflows a node?</div>
+
+<div class="exercise" id="ex52.2"><span class="ex-label">52.2</span> <span class="ex-tag warm">warm-up</span>
+A B-tree grows only at the root by splitting. In one sentence, how and where does it <em>shrink</em>, and what operation causes it?</div>
+
+<div class="exercise" id="ex52.3"><span class="ex-label">52.3</span> <span class="ex-tag warm">warm-up</span>
+Random insertion leaves a B-tree's nodes about how full on average, and what constant is that? Roughly how many more pages does such an index carry
+than the same keys bulk-loaded?</div>
+
+<div class="exercise" id="ex52.4"><span class="ex-label">52.4</span> <span class="ex-tag core">core</span>
+Merge as the mirror of split. (a) In a split, a node is created and a key is pushed up; state the mirror for a merge (what is destroyed, what moves,
+and in which direction). (b) Explain why a merge can propagate up the tree. (c) Explain the single case in which a merge decreases the tree's height,
+and why that keeps all leaves at the same depth.</div>
+
+<div class="exercise" id="ex52.5"><span class="ex-label">52.5</span> <span class="ex-tag core">core</span>
+Lazy deletion. (a) Why do most engines defer the merge instead of rebalancing on every delete — what does an eager merge lock? (b) Define index
+bloat and describe how occupancy and range-scan cost change after a large delete under lazy deletion. (c) Name the operation that reclaims the space
+and explain why it produces a denser tree than the deletes left behind.</div>
+
+<div class="exercise" id="ex52.6"><span class="ex-label">52.6</span> <span class="ex-tag core">core</span>
+Occupancy arithmetic. (a) State the average occupancy random insertion produces and the size ratio 1/ln&nbsp;2 it implies. (b) A table's data would
+fit in 1,000,000 densely-packed index pages; estimate the page count of the same index built by random row-by-row insertion. (c) Explain two distinct
+costs that the extra pages impose (think buffer pool and height).</div>
+
+<div class="exercise" id="ex52.7"><span class="ex-label">52.7</span> <span class="ex-tag complexity">cost</span>
+Latch coupling cost. (a) For a <em>read</em> descending a height-4 B-tree with crabbing, how many latches are held at any one moment, and why is that
+enough? (b) For a naive <em>insert</em> that must guard against a split, how many latches might it hold on the path, and what determines when it can
+release the ancestors? (c) Explain in cost terms why near-full nodes make the naive insert scheme collapse toward serial execution.</div>
+
+<div class="exercise" id="ex52.8"><span class="ex-label">52.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A search and a concurrent insert touch the same leaf; the search released the parent latch just before the
+insert split that leaf.
+<br><strong>Step 1 (given):</strong> the insert splits the leaf, moving the upper half of its keys — including the search's target — to a new right sibling.
+<br><strong>Step 2 (given):</strong> the search is now holding a leaf that no longer contains its key.
+<br><strong>Step 3 (given):</strong> in a plain B-tree the search would wrongly report the key absent (the split race).
+<br><strong>Step 4 (you):</strong> Explain what the Blink-tree's right-link and high key let the search do instead, and why that means the search never
+needed to hold the parent latch.</div>
+
+<div class="exercise" id="ex52.9"><span class="ex-label">52.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the mechanism responsible — <em>borrow</em>, <em>merge</em>, <em>lazy deletion</em>, <em>bulk-loading</em>, or <em>the right-link</em> — and
+why: (a) an index stays large on disk after most rows are deleted; (b) a rebuilt index is ~30% smaller than the one it replaced; (c) an under-full node
+is fixed with a single key movement and no structural change; (d) the tree's height decreases; (e) a search recovers from a concurrent split by moving
+sideways.</div>
+
+<div class="exercise" id="ex52.10"><span class="ex-label">52.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A B-tree's height can decrease only when a merge empties the root.&rdquo;
+(b) &ldquo;Random insertion fills B-tree nodes to about 85% on average.&rdquo; (c) &ldquo;Bulk-loading is denser than insertion because it never
+splits.&rdquo; (d) &ldquo;Deleting rows automatically shrinks the index on disk.&rdquo; (e) &ldquo;With the Blink-tree right-link, a descending search
+must hold a latch on the parent to be safe against a split.&rdquo;</div>
+
+<div class="exercise" id="ex52.11"><span class="ex-label">52.11</span> <span class="ex-tag stretch">stretch</span>
+Symmetry and its limits. (a) Argue that insert-with-split and delete-with-merge are exact mirrors, matching each step of one to a step of the other.
+(b) Given that symmetry, explain why real systems implement the split faithfully but usually <em>defer</em> the merge — what breaks the symmetry in
+practice. (c) Explain how deferring the merge, plus the ln&nbsp;2 occupancy of insertion, together mean a long-lived B-tree drifts toward lower density
+over time, and what operational practice counters the drift.</div>
+
+<div class="exercise" id="ex52.12"><span class="ex-label">52.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Implement a working B-tree of minimum degree <var>t</var> with insert (split) and delete (borrow and merge).
+(b) Insert keys in a seeded random order and measure the average node occupancy for a few values of <var>t</var>; confirm it approaches ln&nbsp;2
+&asymp; 0.693. (c) Then delete most of the keys and report that the height shrinks and every surviving key is still found. (d) State your toolchain and
+explain why occupancy and height are <em>structural</em> outcomes of the operation sequence, not wall-clock timings.</div>
+
+</section>
+</section>

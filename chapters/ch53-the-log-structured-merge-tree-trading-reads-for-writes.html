@@ -1,0 +1,357 @@
+<section class="chapter" id="ch53">
+<h1>Chapter 53 — The Log-Structured Merge-Tree: Trading Reads for Writes</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (the device measurement that rules everything here: sequential
+streaming ~916&nbsp;MB/s versus random 4&nbsp;KiB access ~19&nbsp;MB/s, ~49&times; slower — the gap the LSM-tree exploits),
+<a href="#ch41">Chapter 41</a> (durability: an <code>fsync</code>'d append to a log is what makes an in-memory write survive a crash),
+<a href="#ch47">Chapter 47</a> (pages and the on-disk file), <a href="#ch49">Chapter 49</a> (the sequential append a heap file already showed is cheap),
+<a href="#ch51">Chapter 51</a> and <a href="#ch52">Chapter 52</a> (the B-tree — the read-optimized, update-in-place engine this one is the mirror of).
+&nbsp;·&nbsp; The B-tree finds the page a key belongs on and updates it there, in place, which makes every write a random page update. This chapter builds
+the engine that refuses to do that: it never updates in place, buffers writes in memory, and flushes them as sorted, immutable files — turning random
+writes into sequential ones, and paying the bill at read time instead.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch46">Chapter 46</a> — on this machine sequential streaming ran at ~916&nbsp;MB/s and random 4&nbsp;KiB access at
+~19&nbsp;MB/s; about how many times slower is random, and why does that gap exist on both flash and disk? (2) <a href="#ch52">Chapter 52</a> — a
+B-tree write updates the page where the key belongs; what does that make each write, in device terms? (3) <em>Predict:</em> suppose you make every
+write cheap by never seeking — just append each new key-value to the end of a file, in arrival order. Writes are now pure sequential appends. What have
+you made <em>catastrophically</em> expensive, and for which operation? Write your guess; &sect;53.1 and &sect;53.3 answer it.</p>
+</aside>
+
+<p>The B-tree of the last two chapters is the read-optimized storage engine: it keeps keys sorted in a shallow tree of pages so any key is found in a
+handful of fetches, and it maintains that order by <strong>updating pages in place</strong> — finding the leaf a key belongs on and writing it there.
+That in-place discipline is exactly what makes reads and range scans excellent, and exactly what makes every write a <em>random</em> page update, paying
+the Chapter 46 random-access cost — ~49&times; slower than sequential on the very machine we measured. For a write-heavy workload — a metrics firehose,
+an event log, a high-ingest key-value store — that random-write tax dominates, and no amount of B-tree tuning removes it, because it is inherent in
+keeping the data sorted on disk as it arrives. The <strong>log-structured merge-tree</strong> (LSM-tree), introduced by O'Neil, Cheng, Gawlick, and
+O'Neil in 1996 and made ubiquitous by Google's Bigtable and its descendants (LevelDB, RocksDB, Cassandra, HBase), takes the opposite bet: it
+<strong>never updates in place</strong>. Writes go into a sorted in-memory structure and are periodically flushed to disk as whole, immutable, sorted
+files written sequentially; reads consult memory first and then those files, newest to oldest; and the files are merged in the background to keep their
+number down. The trade is deliberate and total — the LSM-tree makes writes sequential and cheap and pays for it at read time and in space — and it is
+the write-optimized counterpart to the read-optimized B-tree. This chapter builds it in five steps: the inversion, and why appending is not enough by
+itself (&sect;53.1); the write path — the memtable, the write-ahead log that makes it durable, and the flush to an immutable SSTable (&sect;53.2); the
+read path — check memory, then the sorted files newest to oldest, with a tombstone for deletes, reproduced in a working model (&sect;53.3); the
+resulting <strong>read amplification</strong> and space cost that pile up as files accumulate, and its named trap (&sect;53.4); and what all of this hands
+to the compaction chapter that follows (&sect;53.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's Intel Core i7-12700H) implementing a faithful
+LSM write and read path: writes land in a sorted in-memory memtable; when it reaches a flush threshold it is written, in sorted order, as an immutable
+SSTable and a fresh memtable begins; a read checks the memtable and then the SSTables newest to oldest, stopping at the first hit; and a delete writes a
+tombstone. The program reports two <em>structural</em> quantities — how many SSTables accumulate, and how many of them a point read must scan (its
+<em>read amplification</em>) — and confirms that the newest write wins and a tombstone shadows older values. These are counts determined by the code's
+logic and a seeded key stream, not wall-clock timings. Where a sequential-versus-random write cost appears, it is the <a href="#ch46">Chapter 46</a>
+device figures (~916&nbsp;MB/s sequential, ~19&nbsp;MB/s random) measured earlier in this volume and cited here, not re-measured (a hardware-counter
+profiler, <code>perf</code>, is not installed on this machine).</p>
+
+<h2>53.1 The inversion: make writes sequential, pay at read time</h2>
+
+<p>Start from the cost that defines the problem. On the machine of Chapter 46 a large sequential write streams at ~916&nbsp;MB/s while random
+4&nbsp;KiB access manages ~19&nbsp;MB/s — a ~49&times; gap, and it is not an accident of one device: seeks cost on disk, and even flash pays for
+random writes through its erase-block granularity and garbage collection. A B-tree write is a random write (it updates the leaf a key belongs on), so
+the B-tree sits on the slow side of that gap for every insert. The obvious escape is to <strong>stop seeking</strong>: never place a key where it
+belongs, just <em>append</em> each new key-value to the end of a file in arrival order. Writes are now pure sequential appends at ~916&nbsp;MB/s — the
+fast side of the gap. But this naive log has made one thing catastrophic, which is the answer to the opener: a <strong>read</strong> for a key must now
+scan the <em>entire log</em>, because the log is in arrival order, not key order, and the key could be anywhere — and if the key was overwritten, the
+newest value is whichever copy is latest in the log, so you cannot even stop at the first match from the front. An append-only log is the best possible
+write structure and the worst possible read structure. The LSM-tree is the engineering that keeps the sequential-write win while making reads tractable
+again, and it does so with one idea: <strong>keep the in-memory buffer sorted, and flush it sorted</strong>. Then the on-disk files are each internally
+sorted (so a key is found in one file by binary search, not a scan), and there are few enough of them (because each flush is a whole batch, not one key)
+that a read consults a manageable handful. The LSM-tree is not &ldquo;a log&rdquo; in the naive sense; it is a log of <em>sorted runs</em>, and that word
+&ldquo;sorted&rdquo; is what turns an unreadable append log into a real index. What it cannot escape is that reads now touch <em>several</em> sorted
+files instead of one tree — the bill the write side deferred — and the rest of the chapter is about paying it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Appending every write to a log in arrival order makes writes maximally cheap. Which operation does it make catastrophically expensive, and why?
+What single property must the buffer and its flushed files have to make that operation tractable again? (Answer after the next section.)</p>
+</aside>
+
+<h2>53.2 The write path: the memtable, the WAL, and the immutable SSTable</h2>
+
+<p>A write enters the LSM-tree at the <strong>memtable</strong>: an in-memory, sorted, mutable structure — typically a balanced tree or a skip list, so
+inserts stay ordered and cheap — that accumulates recent writes. Because the memtable is in volatile memory, a crash would lose it, so every write is
+<em>first</em> appended to a <strong>write-ahead log</strong> (WAL) on disk (Chapter 41) — a sequential, <code>fsync</code>'d append, itself cheap — so
+that after a crash the memtable can be reconstructed by replaying the log. This is the crucial detail that makes the LSM-tree durable without a random
+write: the only synchronous disk write on the insert path is a <em>sequential</em> append to the WAL; the sorted placement happens in memory. When the
+memtable grows past a threshold, it is <strong>flushed</strong>: its contents, already sorted, are written out in one sequential pass as an immutable
+on-disk file — historically called an <strong>SSTable</strong> (Sorted String Table, the name from Bigtable) — and once the SSTable is safely on disk
+the corresponding WAL segment can be discarded and a fresh empty memtable takes over. Two properties of that flushed file are load-bearing for
+everything after. It is <strong>sorted</strong>, so a lookup within one SSTable is a binary search, not a scan, and two SSTables can be merged by a
+linear merge like the merge step of mergesort. And it is <strong>immutable</strong>: once written, an SSTable is never modified in place — not to update
+a key, not to delete one — which is what keeps writes sequential (no random rewrites ever happen) and also makes the files trivially safe to read
+concurrently and to cache, since nothing mutates underneath a reader. An update to an existing key does not find and change it; it simply writes the new
+value into the memtable, which will flush to a newer SSTable, and the newer value <em>shadows</em> the old one at read time. The disk fills with a stack
+of immutable sorted files, newest on top, and no random write was ever issued.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: buffer in memory and flush sorted, turning random writes into sequential ones</span>
+<p><strong>1. In words.</strong> Instead of updating the page a key belongs on (a random write), the LSM-tree collects writes in a sorted in-memory
+memtable and flushes the whole batch as one immutable sorted file in a single sequential pass. Every disk write it issues is sequential; the price is
+that a key's current value may live in memory or in any of the flushed files.</p>
+<p><strong>2. As a picture.</strong> Figure 53.1: writes flow into a memtable box; an arrow labeled &ldquo;flush (sequential)&rdquo; drops a sorted
+SSTable onto a growing stack of immutable files below, newest on top; a WAL append sits beside the memtable guarding durability.</p>
+<p><strong>3. As numbers.</strong> The write the LSM-tree avoids is the ~19&nbsp;MB/s random 4&nbsp;KiB update of Chapter 46; the writes it issues — the
+WAL append and the flush — are the ~916&nbsp;MB/s sequential stream, the same ~49&times; faster side of the gap. The cost moves to reads and space,
+quantified in &sect;53.3&ndash;&sect;53.4.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">LSM write path: writes -&gt; sorted memtable (+ WAL for durability) -&gt; flush as an immutable sorted SSTable.</text>
+<rect x="30" y="40" width="150" height="34" fill="#dfe8f4" stroke="#14406b"/><text x="42" y="61" font-size="9">memtable (sorted, in RAM)</text>
+<rect x="210" y="40" width="90" height="34" fill="#f4ecd8" stroke="#8c3a1d"/><text x="220" y="55" font-size="8">WAL append</text><text x="220" y="68" font-size="8">(fsync, seq)</text>
+<path d="M180 57 L210 57" stroke="#8c3a1d"/><text x="120" y="34" font-size="8" fill="#333">write</text><path d="M105 20 L105 40" stroke="#333"/>
+<text x="325" y="61" font-size="8" fill="#2f7d32">flush (sequential, when full)</text>
+<path d="M105 74 L105 110" stroke="#2f7d32" stroke-width="1.5"/><path d="M99 104 L105 110 L111 104" fill="none" stroke="#2f7d32"/>
+<rect x="30" y="112" width="150" height="18" fill="#dff0df" stroke="#2f7d32"/><text x="42" y="125" font-size="8">SSTable 3 (newest)</text>
+<rect x="30" y="134" width="150" height="18" fill="#e8f4e8" stroke="#2f7d32"/><text x="42" y="147" font-size="8">SSTable 2</text>
+<rect x="30" y="156" width="150" height="18" fill="#eef7ee" stroke="#2f7d32"/><text x="42" y="169" font-size="8">SSTable 1 (oldest)</text>
+<text x="200" y="128" font-size="8" fill="#14406b">each file: sorted + immutable</text>
+<text x="200" y="150" font-size="8" fill="#8c3a1d">a read checks memtable, then</text>
+<text x="200" y="163" font-size="8" fill="#8c3a1d">SSTables newest -&gt; oldest (read amp)</text>
+<text x="30" y="200" font-size="8" fill="#8c3a1d">No random write is ever issued: the WAL append and the flush are both sequential (~916 MB/s side of Ch.46).</text>
+</svg>
+<figcaption>Figure 53.1: the LSM write path. Writes update a sorted in-memory memtable and are logged sequentially to the WAL for durability; when the
+memtable fills, it is flushed in one sequential pass as an immutable sorted SSTable atop a stack of older ones. Every disk write is sequential; a read
+must consult the memtable and then the SSTables newest to oldest.</figcaption>
+</figure>
+
+<p><em>(Answer to the &sect;53.1 quick check: a naive arrival-order append log makes <strong>reads</strong> catastrophic — a lookup must scan the whole
+log, since the key could be anywhere and the newest copy is wherever it was last written. The property that makes reads tractable is
+<strong>sortedness</strong>: keep the memtable sorted and flush it sorted, so each on-disk file is internally sorted — found by binary search, mergeable
+linearly — and a read consults a handful of sorted runs instead of scanning an unordered log.)</em></p>
+
+<h2>53.3 The read path: newest wins, tombstones, and read amplification</h2>
+
+<p>Because a key's value can live in the memtable or in any flushed SSTable, and because a newer write shadows an older one, a <strong>read</strong> must
+consult the sources <em>newest first</em> and stop at the first hit. It checks the memtable; then, if not found, the SSTables from newest to oldest;
+the first source that contains the key holds its current value, and the search stops — anything older is a superseded version and must not be returned.
+This ordering is also how <strong>deletion</strong> works, and the mechanism is worth stating plainly because it surprises people: since SSTables are
+immutable, a delete cannot go back and erase the key from the older files where it still sits. Instead a delete writes a <strong>tombstone</strong> — a
+marker &ldquo;this key is deleted&rdquo; — into the memtable, which flushes to a newer SSTable like any other write. A later read finds the tombstone
+first (it is the newest entry for that key), stops, and reports the key absent, even though older SSTables still physically contain the old value. A
+delete, in an LSM-tree, is a <em>write</em>. The working model reproduces the whole path — newest-wins reads, tombstone-shadows-value deletes, and the
+count of files a read must touch:</p>
+
+<pre><code>LSM write path (100000 writes, keys drawn from a 40k-key space so keys are overwritten):
+  flush_threshold=1000: 100000 writes -> 99 SSTables on disk
+     avg SSTables scanned per point read: hit=35.9   miss=99  (a miss must touch ALL runs)
+  flush_threshold=5000: 100000 writes -> 19 SSTables on disk
+     avg SSTables scanned per point read: hit= 7.6   miss=19  (a miss must touch ALL runs)
+
+correctness: newest write wins; a tombstone shadows an older value
+  put v1, put v2, flush;  put v3, flush   -> get = v3           (newest of two SSTables)
+  delete, flush                           -> get = None         (tombstone shadows v2,v3, which still sit on disk)
+  SSTables on disk: 3  (the dead values are NOT reclaimed until compaction)
+</code></pre>
+
+<p>Two facts jump out. First, the model is <strong>correct</strong>: the newest write wins, and a tombstone hides values that physically still exist in
+older files — deletion by shadowing, not erasure. Second, and this is the whole cost of the design: a point read may have to scan <em>many</em> SSTables.
+A lookup for a key that is <em>absent</em> is the worst case — it finds the key in none of them, so it must touch <em>every</em> run before concluding
+&ldquo;not here&rdquo; (99 files at the small flush threshold, 19 at the larger). This is <strong>read amplification</strong>: the LSM-tree turned one
+logical read into many physical file probes, the exact mirror of the write amplification a B-tree pays. The flush threshold trades one against the other
+— a larger memtable means fewer, bigger SSTables (less read amplification) but more memory held and more lost on a crash before the WAL is replayed.
+And notice the deletion line: after deleting the key, three SSTables still sit on disk, two of them holding now-dead values plus a tombstone. The
+LSM-tree's write path has quietly created three problems that only grow with time — too many files to read, dead values wasting space, and tombstones
+that must be carried until every older copy they shadow is gone — and none of them is fixed by anything on the write path. Fixing them is the job of
+<em>compaction</em>, the next chapter; this chapter's job is to make you feel why compaction is not optional.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why must a read consult its sources newest-first and stop at the first hit — what would returning an older copy get wrong? And why is a point
+<em>miss</em>, not a hit, the worst case for read amplification? (Answer after the communicate box.)</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: a delete is a write — the tombstone, and the range-scan-over-tombstones cliff</span>
+<p>The intuition &ldquo;deleting frees space and speeds things up&rdquo; is exactly backwards in an LSM-tree, and it bites hard. A delete does not
+remove anything: it <strong>writes a tombstone</strong>, which <em>adds</em> data, consumes a memtable slot and eventually an SSTable entry, and leaves
+the old value physically on disk in older files until a later compaction finally drops both. So deleting a million keys makes the store temporarily
+<em>larger</em>, not smaller. Worse is the range scan. A range scan over an LSM-tree must merge the runs across the whole key range and <em>skip past
+every tombstone in it</em>, because a tombstone might be shadowing a live value in an older run and the scan cannot know without reading it. A key range
+that has been heavily deleted — say a queue table where rows are inserted and soon deleted, or a time range that was bulk-purged — can therefore hold
+thousands of tombstones with almost no live rows, and a scan of it reads all of them to return almost nothing: a query that touches &ldquo;ten live
+rows&rdquo; can physically read tens of thousands of tombstones and stall. This is a real and famous operational cliff (Cassandra operators know it as
+the &ldquo;tombstone scan&rdquo; problem, complete with warning thresholds). &ldquo;It's just a few deleted rows, the query should be fast&rdquo; and
+&ldquo;deletes clean up after themselves&rdquo; are both false on an LSM-tree: deletes are writes that linger, and reads pay for them until compaction
+removes them. The honest mental model is that in an LSM-tree <em>every</em> operation, including delete, is an append, and space and read cost are
+reclaimed only by the background merge — never by the delete itself.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;We moved our high-ingest service from Postgres to an LSM key-value store and writes got dramatically
+faster — great. But now point reads are noticeably slower than before, and the data directory is almost twice the size of the actual data. Did we
+misconfigure something?&rdquo; Cover the paragraph and answer in four or five sentences, drawing on &sect;53.1&ndash;&sect;53.4.</p>
+<p><em>Model answer.</em> &ldquo;Nothing is misconfigured — you're seeing the LSM-tree's trade working exactly as designed. It made writes fast by never
+updating in place: writes buffer in memory and flush as immutable sorted files, so every disk write is sequential instead of a random page update.
+The bill for that lands on reads and space. A point read has to check the memtable and then the sorted files newest-to-oldest, so it probes several
+files instead of one B-tree — that's read amplification, and it's why reads got slower. And the near-2&times; size is space amplification: old versions
+of updated keys and tombstones for deleted keys physically stay in older files until a background <em>compaction</em> merges the files and drops the
+dead entries. So it's the write-optimized side of a deliberate trade, not a bug. What you tune is compaction — how aggressively the files are merged —
+which buys back read speed and space at the cost of extra background write work; that's the knob, and it's the subject of the next chapter.&rdquo;
+Naming the in-place-vs-append inversion, read amplification, space amplification, and compaction as the knob is the senior register.</p>
+</aside>
+
+<h2>53.4 Why the files must be merged: read amplification and space, over time</h2>
+
+<p>The write path of &sect;53.2 has one relentless consequence: SSTables only accumulate. Every flush adds a file and none is ever removed by writing,
+so a long-running LSM-tree drifts toward a large stack of sorted runs, and the read path of &sect;53.3 pays for every one of them. Read amplification
+grows with the file count — a point miss touches all of them, and even a hit touches every file newer than the one holding the key. Space grows too, and
+for two distinct reasons the write path guarantees: <strong>obsolete versions</strong>, because updating a key writes a new copy while the old copy sits
+in an older file unremoved, so a hot key that is updated a thousand times has a thousand versions on disk with only the newest live; and
+<strong>tombstones</strong>, because a delete adds a marker and cannot remove the shadowed value, so deleted data occupies space until every copy it
+shadows is gone. Left alone, an LSM-tree becomes slower to read and larger on disk without bound, even as its <em>logical</em> contents stay the same
+size. The structure therefore has a mandatory second half that the write path implies but does not perform: <strong>compaction</strong>, a background
+process that reads several SSTables, merges their sorted contents into fewer (or one) new sorted SSTables, and along the way keeps only the newest
+version of each key and drops tombstones whose shadowed values it has now also seen and discarded. Compaction is what bounds the file count (bounding
+read amplification), reclaims the space of dead versions and tombstones (bounding space amplification), and it is the reason the &ldquo;LSM&rdquo; has
+&ldquo;merge&rdquo; in its name. It is not free — it re-reads and re-writes data that was already written, which is <em>write amplification</em>, the LSM's
+own version of the B-tree's random-write cost, only deferred and sequential — and how aggressively to run it is the central tuning decision, trading
+read amplification and space against write amplification. That three-way trade — the amount of extra reading, extra writing, and extra space you
+accept — is the subject of the next chapter, and it is why there is no single &ldquo;best&rdquo; LSM configuration: you choose which of the three to
+spend.</p>
+
+<p><em>(Answer to the &sect;53.3 quick check: a read must go newest-first and stop at the first hit because a newer write <strong>shadows</strong> an
+older one — the first source containing the key holds its current value, and any older copy is a superseded version that would be wrong to return. A
+point <strong>miss</strong> is the worst case because the key is in no source, so the read can never stop early: it must probe the memtable and every
+SSTable before it can conclude the key is absent — the full read amplification, every time.)</em></p>
+
+<h2>53.5 What to carry forward</h2>
+
+<p>The LSM-tree is the write-optimized storage engine, the mirror of the read-optimized B-tree. It exploits the Chapter 46 fact that sequential access
+is ~49&times; faster than random by <strong>never updating in place</strong>: writes go to a sorted in-memory <strong>memtable</strong>, made durable by
+a sequential <strong>WAL</strong> append, and are flushed in one sequential pass as an immutable, sorted <strong>SSTable</strong> — so every disk write is
+sequential and no random page update is ever issued (&sect;53.1&ndash;&sect;53.2). Reads pay for that: a lookup checks the memtable, then the SSTables
+<strong>newest to oldest</strong>, stopping at the first hit; a delete is a <strong>write</strong> of a tombstone that shadows older values rather than
+erasing them; and a point miss must touch every file — <strong>read amplification</strong>, reproduced at 19&ndash;99 files scanned in the working model
+(&sect;53.3). Because files only accumulate and dead versions and tombstones only pile up, the structure requires <strong>compaction</strong> to merge
+runs, drop obsolete versions and tombstones, and bound both read amplification and space — at the cost of <strong>write amplification</strong>
+(&sect;53.4).</p>
+
+<p>Step back and the two engines of this part are now both on the table, and they are exact opposites built on the same storage manager. The
+<strong>B-tree</strong> keeps data sorted on disk and updates it in place: reads and range scans are excellent (one shallow tree, one path), writes are
+random and expensive, and space is tight (~69% full). The <strong>LSM-tree</strong> keeps data sorted in memory and appends it to disk in immutable
+runs: writes are sequential and cheap, reads and range scans pay to merge many runs, and space is loose (dead versions and tombstones linger until
+compaction). Neither is better; they sit at opposite ends of a trade between the cost of reading, the cost of writing, and the cost of storage — and the
+next chapter makes that trade precise, showing how compaction strategy lets an LSM-tree slide along it, and why you cannot minimize all three at once.
+The chapter after builds the read-side rescue the LSM-tree needs — the Bloom filter that lets a point read skip files that cannot contain the key,
+cutting the read amplification &sect;53.3 measured. And the final chapter of the part puts B-tree and LSM-tree side by side and answers the question the
+whole part has been building toward: given a workload, which engine, and why. The B-tree gave you fast selective reads; the LSM-tree gives you fast
+durable writes; the art is knowing which bill you would rather pay.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>State the inversion: what the LSM-tree refuses to do, and which device fact of Chapter 46 makes that pay.</li>
+<li>Explain why a naive arrival-order append log is unreadable, and what property fixes it.</li>
+<li>Trace the write path: memtable, WAL, flush to an immutable SSTable, and why each disk write is sequential.</li>
+<li>Trace a read: which sources, in what order, and why newest wins; and explain how a tombstone deletes.</li>
+<li>Define read amplification and space amplification, and say why both grow over time without intervention.</li>
+<li>Explain why compaction is mandatory and what it costs (write amplification).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is the LSM-tree's core inversion, and which Chapter 46 measurement justifies it? (&sect;53.1)</li>
+<li><strong>R2.</strong> Describe the write path — memtable, WAL, SSTable flush — and why the flushed file must be sorted and immutable. (&sect;53.2)</li>
+<li><strong>R3.</strong> How does a read find a key's current value, and how does a tombstone delete one? (&sect;53.3)</li>
+<li><strong>R4.</strong> What is read amplification in an LSM-tree, and why is a point <em>miss</em> its worst case? (&sect;53.3&ndash;&sect;53.4)</li>
+<li><strong>R5.</strong> Why must SSTables be compacted, and what does compaction cost in return? (&sect;53.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Patrick O'Neil, Edward Cheng, Dieter Gawlick &amp; Elizabeth O'Neil, &ldquo;The Log-Structured Merge-Tree (LSM-Tree),&rdquo;
+<em>Acta Informatica</em> 33(4), 1996, pp. 351&ndash;385, DOI 10.1007/s002360050048.</strong> The paper that named and analyzed the structure: buffering
+in memory and merging sorted runs to convert random writes into sequential ones. First author Patrick O'Neil; venue, volume, pages, year, and DOI
+verified via SpringerLink and the ACM Digital Library.</li>
+<li><strong>Fay Chang et&nbsp;al., &ldquo;Bigtable: A Distributed Storage System for Structured Data,&rdquo; <em>7th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI&nbsp;'06)</em>, 2006, pp. 205&ndash;218.</strong> The system that popularized the memtable / SSTable / minor-
+and major-compaction vocabulary of &sect;53.2&ndash;&sect;53.4 and seeded LevelDB, RocksDB, HBase, and Cassandra. First author Fay Chang; venue, year,
+and pages verified via the USENIX proceedings listing.</li>
+<li><strong>Chen Luo &amp; Michael J. Carey, &ldquo;LSM-based storage techniques: a survey,&rdquo; <em>The VLDB Journal</em> 29(1), 2020, pp.
+393&ndash;418, DOI 10.1007/s00778-019-00555-y.</strong> The modern survey: the write/read paths, tombstones, and the read/write/space amplification
+framing this chapter and the next use. First author Chen Luo; venue, volume, pages, year, and DOI verified via SpringerLink and the ACM Digital
+Library.</li>
+<li><strong>Mendel Rosenblum &amp; John K. Ousterhout, &ldquo;The Design and Implementation of a Log-Structured File System,&rdquo; <em>ACM Transactions
+on Computer Systems</em> 10(1), 1992, pp. 26&ndash;52, DOI 10.1145/146941.146943.</strong> The intellectual ancestor of &sect;53.1: writing all changes
+sequentially to a log to make writes cheap, and cleaning (compacting) the log afterward. First author Mendel Rosenblum; venue, volume, pages, year, and
+DOI verified via the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex53.1"><span class="ex-label">53.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does the LSM-tree refuse to do that the B-tree does, and which Chapter 46 measurement makes that refusal pay off?</div>
+
+<div class="exercise" id="ex53.2"><span class="ex-label">53.2</span> <span class="ex-tag warm">warm-up</span>
+Name the three pieces of the write path in the order a write touches them, and say which one exists purely for durability.</div>
+
+<div class="exercise" id="ex53.3"><span class="ex-label">53.3</span> <span class="ex-tag warm">warm-up</span>
+In an LSM-tree, what does a delete actually write, and why can't it simply remove the key from disk?</div>
+
+<div class="exercise" id="ex53.4"><span class="ex-label">53.4</span> <span class="ex-tag core">core</span>
+The naive log. (a) Explain why appending every write to a file in arrival order makes writes maximally cheap. (b) Explain precisely why a point read on
+that log is catastrophic, including why you cannot stop at the first match found scanning from the front. (c) State the single property that turns the
+unreadable log into a real index, and how it helps both a single-file lookup and a two-file merge.</div>
+
+<div class="exercise" id="ex53.5"><span class="ex-label">53.5</span> <span class="ex-tag core">core</span>
+The read path. (a) List the sources a read consults and the order, and explain why newest must win. (b) Trace the model's sequence — put v2 (flush),
+put v3 (flush), delete (flush) — and give the result of a read after each flush, naming what shadows what. (c) Explain why a point <em>miss</em> is the
+worst case for read amplification.</div>
+
+<div class="exercise" id="ex53.6"><span class="ex-label">53.6</span> <span class="ex-tag core">core</span>
+Immutability. (a) Give two distinct things the &ldquo;SSTables are never modified in place&rdquo; rule buys (think writes, and think concurrent
+readers). (b) Given immutability, explain how an update to an existing key takes effect at all. (c) Explain how immutability forces deletion to use a
+tombstone rather than an in-place erase.</div>
+
+<div class="exercise" id="ex53.7"><span class="ex-label">53.7</span> <span class="ex-tag complexity">cost</span>
+Read amplification versus the flush threshold. (a) In the model, 100,000 writes produced 99 SSTables at a 1,000-key flush threshold and 19 at 5,000;
+explain the relationship. (b) A point miss scans how many files in each case, and why the miss and not the hit is the worst case? (c) What does raising
+the flush threshold cost, given the memtable is volatile and backed only by the WAL?</div>
+
+<div class="exercise" id="ex53.8"><span class="ex-label">53.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A queue table inserts rows and deletes each soon after it is processed; a monitoring query scans the
+table's key range expecting ~10 live rows and times out.
+<br><strong>Step 1 (given):</strong> each delete writes a tombstone, not an erase, so processed rows leave tombstones behind.
+<br><strong>Step 2 (given):</strong> the tombstones stay on disk until a compaction removes them and the values they shadow.
+<br><strong>Step 3 (given):</strong> a range scan must read and skip past every tombstone in the range, because each might shadow a live value in an older run.
+<br><strong>Step 4 (you):</strong> Explain why a scan expecting ~10 live rows can physically read tens of thousands of entries, and name what must
+happen for the scan to get fast again.</div>
+
+<div class="exercise" id="ex53.9"><span class="ex-label">53.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the LSM concept responsible — <em>the memtable</em>, <em>the WAL</em>, <em>SSTable immutability</em>, <em>the tombstone</em>, or
+<em>read amplification</em> — and why: (a) a crash loses no acknowledged write even though the memtable is in RAM; (b) a point miss must touch every
+file; (c) a deleted key still occupies disk space; (d) recent writes are served without touching disk at all; (e) an old SSTable can be read
+concurrently with no locking.</div>
+
+<div class="exercise" id="ex53.10"><span class="ex-label">53.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;An LSM-tree issues random writes only when the memtable is
+full.&rdquo; (b) &ldquo;A delete in an LSM-tree immediately frees the deleted key's space.&rdquo; (c) &ldquo;A read returns the value from the oldest
+SSTable that contains the key.&rdquo; (d) &ldquo;Every disk write an LSM-tree issues — WAL append and flush — is sequential.&rdquo; (e) &ldquo;Read
+amplification means one logical read may become many physical file probes.&rdquo;</div>
+
+<div class="exercise" id="ex53.11"><span class="ex-label">53.11</span> <span class="ex-tag stretch">stretch</span>
+The mirror. (a) Lay out the B-tree and LSM-tree as opposites on three axes — write cost, read cost, and space — citing the mechanism behind each
+(in-place update vs append; one tree vs many runs; ~69% fill vs lingering dead versions). (b) Argue that the LSM-tree's write amplification (from
+compaction) is the counterpart to the B-tree's random-write cost, and why one is deferred and sequential while the other is immediate and random.
+(c) From the three axes, state the kind of workload for which each engine is the right default.</div>
+
+<div class="exercise" id="ex53.12"><span class="ex-label">53.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Implement a memtable (a sorted map) that flushes to an immutable sorted SSTable at a threshold, a read that
+checks the memtable then SSTables newest-to-oldest, and a delete that writes a tombstone. (b) Drive it with a seeded stream of writes over a small key
+space and report how many SSTables accumulate and how many a point miss must scan. (c) Verify that the newest write wins and a tombstone hides an older
+value. (d) State your toolchain and explain why the file count and scan count are <em>structural</em> outcomes of the logic and the key stream, not
+wall-clock timings.</div>
+
+</section>
+</section>

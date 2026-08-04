@@ -1,0 +1,94 @@
+<section class="solutions" id="sol53">
+<h1>Chapter 53 — Solutions</h1>
+
+<div class="solution" id="sol53.1"><span class="sol-label">53.1</span>
+The LSM-tree refuses to update pages in place; instead of finding a key's page and rewriting it (a random write), it buffers writes and flushes them
+sequentially. The Chapter 46 measurement that makes this pay is that sequential access (~916&nbsp;MB/s) is about 49&times; faster than random 4&nbsp;KiB
+access (~19&nbsp;MB/s). <em>Tempting wrong answer:</em> &ldquo;it avoids writing to disk&rdquo; — it writes plenty, but only sequentially.
+<strong>Feed-forward:</strong> &sect;53.1.</div>
+
+<div class="solution" id="sol53.2"><span class="sol-label">53.2</span>
+In order: the write-ahead log (WAL), then the memtable, then — when the memtable fills — the flushed SSTable. The WAL exists purely for durability: it
+is the sequential, <code>fsync</code>'d record that lets the in-memory memtable be rebuilt after a crash. <em>Tempting wrong answer:</em> naming the
+SSTable as the durability mechanism — the SSTable is the eventual sorted file; the WAL is what makes an in-RAM write survive a crash before the flush.
+<strong>Feed-forward:</strong> &sect;53.2.</div>
+
+<div class="solution" id="sol53.3"><span class="sol-label">53.3</span>
+A delete writes a <strong>tombstone</strong> — a marker &ldquo;this key is deleted&rdquo; — into the memtable, which flushes like any other write. It
+cannot remove the key from disk because SSTables are immutable, so the old value still sits in older files; the tombstone, being newest, shadows it at
+read time. <em>Tempting wrong answer:</em> &ldquo;it erases the key from the file&rdquo; — immutability forbids that; deletion is by shadowing, not
+erasure. <strong>Feed-forward:</strong> &sect;53.3.</div>
+
+<div class="solution" id="sol53.4"><span class="sol-label">53.4</span>
+(a) Appending in arrival order never seeks — every write is a pure sequential append, the fast side of the Chapter 46 gap. (b) A point read is
+catastrophic because the log is in arrival order, not key order, so the key could be anywhere and must be scanned for; and you cannot stop at the first
+match from the front, because a later append may hold a newer value, so the newest copy is whichever is <em>last</em> in the log. (c)
+<strong>Sortedness</strong>: keep the memtable sorted and flush it sorted, so each file is internally sorted — found by binary search in one file, and
+merged linearly across two like mergesort's merge step. <em>Tempting wrong answer:</em> &ldquo;scan from the back and stop at the first match&rdquo; —
+correct for finding the newest value but still a full-file scan per read; sortedness is what removes the scan. <strong>Feed-forward:</strong>
+&sect;53.1&ndash;&sect;53.2.</div>
+
+<div class="solution" id="sol53.5"><span class="sol-label">53.5</span>
+(a) The memtable, then the SSTables newest to oldest; newest must win because a later write shadows an earlier one, so the first source holding the key
+has its current value and older copies are superseded. (b) After put v2 (flush): read = v2. After put v3 (flush): read = v3 (the newer of two
+SSTables shadows v2). After delete (flush): read = None (the tombstone, newest, shadows v3 and v2, which still sit on disk). (c) A point miss must
+touch <em>every</em> source, because only after finding the key in none of them can it conclude absence — it can never stop early.
+<em>Tempting wrong answer:</em> &ldquo;a hit is the worst case because it reads a value&rdquo; — a hit can stop at the first source that has the key; a
+miss cannot stop at all. <strong>Feed-forward:</strong> &sect;53.3.</div>
+
+<div class="solution" id="sol53.6"><span class="sol-label">53.6</span>
+(a) It keeps writes sequential (no file is ever randomly rewritten) and makes files safe to read concurrently and to cache, since nothing mutates under
+a reader. (b) An update just writes the new value into the memtable, which flushes to a newer SSTable; the newer copy shadows the old at read time. (c)
+Since the old value cannot be erased from its immutable file, deletion writes a tombstone that, being newest, shadows the old value instead. <em>Tempting
+wrong answer:</em> &ldquo;immutability only helps concurrency&rdquo; — its first purpose is keeping every write sequential. <strong>Feed-forward:</strong>
+&sect;53.2&ndash;&sect;53.3.</div>
+
+<div class="solution" id="sol53.7"><span class="sol-label">53.7</span>
+(a) The number of SSTables is the total writes divided by the flush threshold (roughly 100,000/1,000 &asymp; 99 and 100,000/5,000 &asymp; 19 in the
+model), since each threshold's worth of writes flushes one file. (b) A miss scans all of them (99, then 19); the miss is the worst case because it
+cannot stop at a first hit — the key is in none of the files, so every one must be probed. (c) A larger flush threshold means a larger memtable held in
+volatile RAM and more writes to replay from the WAL after a crash — more memory and slower recovery. <em>Tempting wrong answer:</em> &ldquo;just make
+the threshold huge&rdquo; — that trades read amplification for memory and crash-recovery time. <strong>Feed-forward:</strong> &sect;53.3&ndash;&sect;53.4.</div>
+
+<div class="solution" id="sol53.8"><span class="sol-label">53.8</span>
+<strong>Step 4:</strong> Each processed-and-deleted row left a tombstone, and every tombstone in the scanned range must be read and skipped, because
+each might be shadowing a live value in an older run — the scan cannot know without reading it. So a range that has churned through tens of thousands of
+insert/delete cycles holds tens of thousands of tombstones over its ~10 live rows, and the scan physically reads all of them to return almost nothing.
+It gets fast again only when a <strong>compaction</strong> merges the runs and drops the tombstones (and the values they shadow) from that range.
+<em>Tempting wrong answer:</em> &ldquo;add an index on the range&rdquo; — the cost is the tombstones themselves; only compaction removes them.
+<strong>Feed-forward:</strong> &sect;53.3&ndash;&sect;53.4.</div>
+
+<div class="solution" id="sol53.9"><span class="sol-label">53.9</span>
+(a) <strong>The WAL</strong> — a crash replays the log to rebuild the memtable, so no acknowledged write is lost. (b) <strong>Read amplification</strong> —
+a miss probes every file. (c) <strong>The tombstone</strong> — a deleted key's marker and its shadowed value occupy space until compaction. (d)
+<strong>The memtable</strong> — recent writes are served from RAM. (e) <strong>SSTable immutability</strong> — nothing mutates the file, so it needs no
+read lock. <em>Tempting wrong answer:</em> crediting (a) to the memtable — the memtable is volatile; it is the WAL that survives the crash.
+<strong>Feed-forward:</strong> &sect;53.2&ndash;&sect;53.4.</div>
+
+<div class="solution" id="sol53.10"><span class="sol-label">53.10</span>
+(a) <strong>False</strong> — even the flush is a sequential write; an LSM-tree issues <em>no</em> random writes. (b) <strong>False</strong> — a delete
+writes a tombstone and adds data; space is reclaimed only by compaction. (c) <strong>False</strong> — a read returns the value from the
+<em>newest</em> source that contains the key. (d) <strong>True</strong> — both the WAL append and the flush are sequential. (e) <strong>True</strong> —
+that is exactly read amplification. <em>Tempting wrong answer:</em> marking (a) true because &ldquo;the flush goes to a specific place&rdquo; — the flush
+is one large sequential write of a whole sorted file, not a random update. <strong>Feed-forward:</strong> &sect;53.1&ndash;&sect;53.4.</div>
+
+<div class="solution" id="sol53.11"><span class="sol-label">53.11</span>
+(a) Write cost: B-tree updates a leaf in place (random write, expensive) vs LSM appends sequentially (cheap). Read cost: B-tree descends one shallow
+tree (cheap) vs LSM merges many sorted runs (read amplification). Space: B-tree packs to ~69% and holds one copy vs LSM lets dead versions and
+tombstones linger until compaction (loose). (b) The LSM's write amplification comes from compaction re-reading and re-writing data that was already
+written; it is the counterpart to the B-tree's random-write cost, but it is <em>deferred</em> (paid later, in the background) and <em>sequential</em>
+(large merges), whereas the B-tree's is <em>immediate</em> and <em>random</em> (per insert). (c) B-tree is the right default for read- and range-scan-heavy
+workloads that update in place; the LSM-tree for write- and ingest-heavy workloads that can afford background merging and looser space. <em>Tempting
+wrong answer:</em> &ldquo;the LSM has no write cost&rdquo; — it defers the cost into compaction as write amplification. <strong>Feed-forward:</strong>
+&sect;53.1&ndash;&sect;53.5.</div>
+
+<div class="solution" id="sol53.12"><span class="sol-label">53.12</span>
+Open-ended and platform-specific. A correct write-up: (a) implements a sorted memtable that flushes to an immutable sorted SSTable at a threshold, a
+newest-to-oldest read, and a tombstone delete; (b) drives it with a seeded write stream over a small key space and reports the SSTable count (writes /
+threshold) and the files a point miss must scan; (c) verifies newest-write-wins and tombstone-shadows-value (this chapter's model: 99 and 19 SSTables
+at thresholds 1,000 and 5,000, a miss scanning all of them, get = v3 then None after the delete); (d) states toolchain and notes the file count and
+scan count are <em>structural</em> outcomes of the logic and the key stream — reproducible, not wall-clock timings. <em>Tempting wrong answer:</em>
+timing the reads and reporting milliseconds as the result — the reproducible quantities are the structural counts. <strong>Feed-forward:</strong>
+&sect;53.3.</div>
+
+</section>

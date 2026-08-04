@@ -1,0 +1,349 @@
+<section class="chapter" id="ch54">
+<h1>Chapter 54 — Compaction and Amplification: Tuning the LSM-Tree</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (sequential ~916&nbsp;MB/s vs random ~19&nbsp;MB/s — compaction
+is large sequential work, which is why it is affordable at all), <a href="#ch48">Chapter 48</a> (compaction competes with foreground work for the buffer
+pool and the device), <a href="#ch51">Chapter 51</a> and <a href="#ch52">Chapter 52</a> (the B-tree, whose read cost and ~69% space this chapter's
+trade is measured against), <a href="#ch53">Chapter 53</a> (the LSM write and read path this chapter completes — the memtable, the immutable SSTable,
+tombstones, and the read amplification that made compaction mandatory). &nbsp;·&nbsp; Chapter 53 left the LSM-tree with a growing stack of immutable
+files, dead versions and tombstones piling up, and reads paying for all of it. This chapter is the missing second half: <strong>compaction</strong>,
+the background merge that bounds the mess — and the three amplifications it trades among, the tuning decision at the heart of every LSM store.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch53">Chapter 53</a> — why do SSTables only accumulate, and what two kinds of dead data pile up in them over time?
+(2) <a href="#ch53">Chapter 53</a> — a point-read miss must touch how many of the files, and what is that cost called? (3) <em>Predict:</em> compaction
+merges files to cut read amplification and reclaim space — but it does so by re-reading and re-writing data already on disk. So it lowers two costs and
+raises a third. Name the three costs an LSM-tree trades among, and guess whether any single compaction strategy can make all three small at once. Write
+your guess; &sect;54.2&ndash;&sect;54.3 answer it.</p>
+</aside>
+
+<p>Chapter 53 built the LSM-tree's write and read paths and ended at an uncomfortable place: the write path only ever <em>adds</em> immutable SSTables,
+so their number grows without bound, dead versions of updated keys and tombstones of deleted ones accumulate, and the read path pays for every file —
+read amplification and space that climb forever if nothing intervenes. <strong>Compaction</strong> is what intervenes. It is a background process that
+takes several SSTables, merges their sorted contents into fewer new SSTables, and along the way keeps only the newest version of each key and drops
+tombstones once it has passed the values they shadow — bounding the file count (and thus read amplification) and reclaiming the space of dead data. But
+compaction is not free: it re-reads and re-writes data that was already written, which is <strong>write amplification</strong>, the LSM-tree's own cost
+of keeping order, deferred and sequential where the B-tree's was immediate and random. So an LSM-tree is defined by a three-way tension — how much
+extra <em>reading</em>, extra <em>writing</em>, and extra <em>space</em> it accepts — and the compaction strategy is how you pick your point in that
+space. This chapter makes the trade precise: what compaction actually does, merging runs and dropping dead data, reproduced on real runs (&sect;54.1);
+the three amplifications — write, read, space — and the impossibility, the RUM tension, that you cannot minimize all three (&sect;54.2); the two great
+compaction families, <strong>leveled</strong> and <strong>size-tiered</strong>, and an arithmetic model of where each sits on the three axes (&sect;54.3);
+the tuning that follows and its named trap, that compaction is not free background work but a source of write stalls and device wear (&sect;54.4); and
+what this completes about the two storage-engine families (&sect;54.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's Intel Core i7-12700H) in two parts. First it runs
+a <strong>concrete compaction</strong>: given a set of overlapping sorted runs with updates and tombstones, it merges them keeping the newest value per
+key and dropping tombstones, and reports how many entries and runs remain — a structural result of the merge logic, showing read amplification and dead
+space collapse. Second it computes an <strong>amplification model</strong>: closed-form arithmetic for the write, read, and space amplification of
+leveled versus size-tiered compaction as a function of the size ratio between levels — exact functions of the parameters, hardware-independent, of the
+same kind as Chapter 51's fanout arithmetic, and clearly a model of the structure rather than a measurement of any device. Where a sequential-write cost
+appears it is the <a href="#ch46">Chapter 46</a> figure cited, not re-measured (a hardware-counter profiler, <code>perf</code>, is not installed on this
+machine); the amplification numbers are analytical, and labeled as such.</p>
+
+<h2>54.1 Compaction: merging runs, dropping dead versions and tombstones</h2>
+
+<p><strong>Compaction</strong> is a <em>k</em>-way merge of sorted runs, and it is cheap for the same reason the flush was: the inputs are already
+sorted, so merging them is one linear pass (the merge step of mergesort), reading sequentially and writing sequentially — the ~916&nbsp;MB/s side of
+Chapter 46, never a random access. As it merges, compaction does the garbage collection the immutable write path could not. When several runs contain
+the same key, it keeps only the <strong>newest version</strong> and discards the rest — reclaiming the space of every superseded update. And when it
+meets a <strong>tombstone</strong>, it drops the tombstone <em>and</em> the older values it shadows, since after the merge there is no older run left for
+those values to hide in — reclaiming deleted data and, finally, the tombstone itself. The output is fewer, larger sorted runs holding only live data, so
+a subsequent read touches fewer files (lower read amplification) over less dead space (lower space amplification). The working model compacts twenty
+overlapping runs full of updates and tombstones:</p>
+
+<pre><code>concrete compaction of 20 SSTable runs (updates + tombstones, keyspace 5000):
+  entries across runs before: 25934   (a point miss scans all 20 runs)
+  entries after full compaction: 3362 (a point read scans 1 run; dead versions + tombstones dropped)
+  space reclaimed: 87.0%   read amplification: 20x -> 1x
+</code></pre>
+
+<p>The twenty runs held 25,934 entries, but most were dead — superseded updates and tombstones — so merging them to keep only the newest live value per
+key left 3,362 entries in one run: <strong>87% of the physical data was garbage</strong> that compaction reclaimed, and read amplification for the
+compacted range fell from twenty files to one. That is the entire value proposition of compaction in one measurement — it converts the write path's
+accumulated slack back into a compact, cheap-to-read form. But look at what it cost to get there: to produce the 3,362-entry output, compaction had to
+<em>read all 25,934 input entries and write 3,362 out</em>, work spent re-processing data that was already on disk. Do this repeatedly, as an LSM-tree
+must — every byte is rewritten each time its run is compacted into a larger one — and the rewriting adds up to several times the original data volume.
+That is write amplification, and it is not a flaw to be fixed but the price of order; the only question is how much of it you pay, which depends entirely
+on <em>how</em> you compact.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Compaction merges sorted runs and, doing so, reclaims two kinds of dead data — name them, and say what happens to a tombstone and the value it
+shadows. Why is the merge itself a cheap (sequential) operation, and what new cost does repeatedly rewriting data create? (Answer in &sect;54.2.)</p>
+</aside>
+
+<h2>54.2 The three amplifications, and why you cannot minimize all three</h2>
+
+<p>An LSM-tree's behavior is captured by three <strong>amplification</strong> factors, each a ratio of physical work or space to the logical minimum.
+<strong>Write amplification</strong> is the bytes actually written to the device per byte of logical data — greater than one because compaction rewrites
+data as it merges runs into larger ones. <strong>Read amplification</strong> is the number of physical accesses per logical read — greater than one
+because a lookup probes multiple runs. <strong>Space amplification</strong> is the bytes on disk per byte of live data — greater than one because dead
+versions and tombstones linger until compaction removes them. Here is the fact that makes LSM tuning an art rather than a lookup: these three are in
+<strong>tension</strong>, and lowering one tends to raise another. Compact aggressively — merge runs the moment they appear — and you keep few runs (low
+read amplification) and little dead data (low space amplification), but you rewrite constantly (high write amplification). Compact lazily — let runs pile
+up before merging — and you rewrite rarely (low write amplification) but read across many runs (high read amplification) over lots of dead data (high
+space amplification). You cannot have all three small at once. This is a specific instance of a general law of access-method design, the
+<strong>RUM conjecture</strong> of Athanassoulis and colleagues (2016): optimizing any two of read overhead, update overhead, and memory/space overhead
+comes at the expense of the third. The LSM-tree does not escape the trade the B-tree faced; it relocates it — the B-tree spent its cost as immediate
+random writes and tight space, the LSM-tree spends its as deferred sequential write amplification and looser space — but the trilemma is the same, and
+answering the opener's second question: <strong>no single compaction strategy makes all three amplifications small</strong>. You choose which to spend.</p>
+
+<p><em>(Answer to the &sect;54.1 quick check: compaction reclaims <strong>superseded update versions</strong> (keeping only the newest value per key) and
+<strong>deleted data</strong> — when it meets a tombstone it drops both the tombstone and the older values it shadowed, since no older run remains to
+hide them. The merge is cheap because the inputs are sorted, so it is one sequential pass (Chapter 46's fast side), never a random access. The new cost
+is <strong>write amplification</strong>: repeatedly rewriting data as it is merged into larger runs writes several times the logical data volume over an
+item's lifetime.)</em></p>
+
+<h2>54.3 Leveled versus size-tiered compaction: the model</h2>
+
+<p>The two dominant compaction strategies sit at opposite ends of the write-versus-read-and-space trade, and both organize SSTables into
+<strong>levels</strong>, each level holding runs some size ratio <var>T</var> larger than the one above; the number of levels is
+<var>L</var>&nbsp;&asymp;&nbsp;log-base-<var>T</var> of the data size over the memtable size, so <var>L</var> is small (single digits) for the same
+logarithmic reason the B-tree is shallow. <strong>Leveled compaction</strong> keeps exactly <em>one sorted run per level</em>: when a level overflows,
+its data is merged into the next level's single run, which — because that level is <var>T</var> times bigger — rewrites roughly <var>T</var> bytes for
+each byte promoted, so write amplification is about <var>T</var>&times;<var>L</var>; but a read finds at most one run per level (low read amplification)
+and dead data is squeezed out quickly (low space amplification, near 1). <strong>Size-tiered compaction</strong> instead lets <em>up to <var>T</var> runs
+accumulate per level</em> and merges them, all at once, only when a level is full: each byte is written just once per level, so write amplification is
+only about <var>L</var>; but a read may probe up to <var>T</var> runs at every level (high read amplification, ~<var>T</var>&times;<var>L</var>) and a
+full level's worth of dead data can linger (space amplification up to ~<var>T</var>). Same structure, two policies, opposite corners. The model computes
+all three amplifications for a billion-entry store as the size ratio <var>T</var> varies:</p>
+
+<pre><code>amplification model (N=1e9 entries, flush unit B=1e6; W=write, R=read, S=space amp):
+  T    levels | LEVELED  (W / R / S)     | SIZE-TIERED (W / R / S)
+   2     10   |   20 /  10 / 1.50        |    10 /  20 /  2.0
+   4      5   |   20 /   5 / 1.25        |     5 /  20 /  4.0
+  10      3   |   30 /   3 / 1.10        |     3 /  30 / 10.0
+  20      3   |   60 /   3 / 1.05        |     3 /  60 / 20.0
+  -> leveled trades WRITE amp for low READ and SPACE amp; size-tiered does the reverse. Same tree.
+</code></pre>
+
+<p>Read the table across and the trade is stark and symmetric. At every size ratio, leveled compaction's read and space amplification are low (a handful
+of runs, space within ~10&ndash;50% of the live data) while it pays in write amplification (20&ndash;60&times;); size-tiered's write amplification is
+low (3&ndash;10&times;) while it pays in read amplification (up to 60&times;) and space (up to 2&ndash;20&times; the live data). Raising <var>T</var> makes
+the tree shallower — fewer levels — which cuts one column and inflates the other: leveled's write amplification climbs with <var>T</var> while its read
+and space fall; size-tiered's read and space climb with <var>T</var> while its write falls. There is no row where all three are small, which is the RUM
+tension made numeric. This is why real engines expose compaction as a <em>choice</em>: RocksDB defaults to leveled for read-heavy workloads that need
+tight space, offers size-tiered (universal) compaction for write-heavy ingest that can tolerate read and space blowup, and Cassandra, HBase, and
+ScyllaDB expose the same knob — because the &ldquo;right&rdquo; answer is a property of the workload, not of the structure.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: leveled and size-tiered are opposite corners of the write/read/space trade</span>
+<p><strong>1. In words.</strong> Leveled keeps one run per level, so reads and space are tight but every promotion rewrites a full larger level — high
+write amplification. Size-tiered lets runs pile up and merges in bulk, so each byte is written about once per level — low write amplification — but
+reads probe many runs over much dead data. You pick the corner your workload can afford.</p>
+<p><strong>2. As a picture.</strong> Figure 54.1: a triangle with corners labeled <em>read</em>, <em>write</em>, and <em>space</em>; a &ldquo;leveled&rdquo;
+dot pulled toward low-read/low-space (far from write), a &ldquo;size-tiered&rdquo; dot pulled toward low-write (far from read and space) — no dot can sit
+at the center.</p>
+<p><strong>3. As numbers.</strong> Modeled here at size ratio <var>T</var>=10 over a billion entries: leveled = write&nbsp;30 / read&nbsp;3 /
+space&nbsp;1.10; size-tiered = write&nbsp;3 / read&nbsp;30 / space&nbsp;10. The write and read columns literally swap, and space swings 1.1&times; vs
+10&times; — the trilemma, quantified.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The RUM trilemma: leveled and size-tiered compaction pull to opposite corners. No policy reaches all three.</text>
+<polygon points="320,40 120,175 520,175" fill="#f7f7f7" stroke="#14406b"/>
+<text x="300" y="34" font-size="9" fill="#14406b">low READ amp</text>
+<text x="70" y="188" font-size="9" fill="#8c3a1d">low WRITE amp</text>
+<text x="470" y="188" font-size="9" fill="#2f7d32">low SPACE amp</text>
+<circle cx="380" cy="150" r="6" fill="#14406b"/><text x="392" y="154" font-size="9" fill="#14406b">leveled (W30 / R3 / S1.1)</text>
+<circle cx="200" cy="120" r="6" fill="#8c3a1d"/><text x="150" y="112" font-size="9" fill="#8c3a1d">size-tiered (W3 / R30 / S10)</text>
+<text x="150" y="205" font-size="8" fill="#333">at T=10, 1e9 entries: the write and read amplifications swap; space swings 1.1x vs 10x. No dot sits at the centroid.</text>
+</svg>
+<figcaption>Figure 54.1: the read/write/space trilemma (the RUM tension). Leveled compaction sits near low read and low space, paying high write
+amplification; size-tiered sits near low write, paying high read and space. The modeled numbers at size ratio <var>T</var>=10 (leveled 30/3/1.1,
+size-tiered 3/30/10) show the columns swapping — no compaction policy occupies the center where all three are small.</figcaption>
+</figure>
+
+<aside class="warning">
+<span class="box-title">Trap: compaction is not free background work — write stalls, write amplification, and device wear</span>
+<p>&ldquo;Compaction runs in the background, so it's free&rdquo; is the trap, and it fails at three levels. First, <strong>throughput</strong>:
+compaction competes with foreground writes and reads for the same device bandwidth and buffer pool (Chapter 48), so a store under heavy ingest can find
+its reads and writes slowed by the very merging meant to help them — the background work is real work on the same disk. Second, and sharper,
+<strong>write stalls</strong>: if the ingest rate exceeds the rate at which compaction can merge, the unmerged runs (RocksDB's level&nbsp;0, for
+instance) pile up, read amplification spikes, and the engine must <em>throttle or stall incoming writes</em> to let compaction catch up — the LSM-tree's
+&ldquo;fast writes&rdquo; turn into periodic write stalls exactly when the write load is highest, which is a classic production surprise. Third,
+<strong>device wear</strong>: write amplification means the SSD physically writes several times the logical data — a leveled store at write amplification
+30 writes thirty bytes per logical byte — which multiplies flash wear and can dominate the storage budget. The two counter-traps are equal and
+opposite: switching to size-tiered to cut write amplification (and stalls and wear) can multiply <em>read</em> amplification and double or 10&times; the
+<em>space</em>; switching to leveled for read speed and tight space can triple or sextuple the write amplification and its stalls and wear.
+&ldquo;Compaction is free&rdquo; and &ldquo;just pick the cheap-write policy&rdquo; are both false: compaction is foreground-affecting work you provision
+for, and every policy spends one amplification to save another. The honest posture is to measure the workload's read/write/space mix, choose the
+compaction family that spends the amplification you can most afford, and provision compaction throughput so it keeps up with ingest.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Our LSM stores are wearing out SSDs and I've read that size-tiered compaction has much lower write
+amplification. Let's switch every table to size-tiered to cut the writes and save the flash.&rdquo; Cover the paragraph and answer in four or five
+sentences, drawing on &sect;54.2&ndash;&sect;54.3.</p>
+<p><em>Model answer.</em> &ldquo;Size-tiered really does cut write amplification — at size ratio 10 it's about 3&times; versus leveled's ~30&times;, so
+the flash-wear worry is legitimate for write-heavy tables. But it isn't free: size-tiered raises the other two amplifications by roughly the same factor
+it saves. Read amplification can jump to ~30&times; because a lookup probes many runs per level, and space amplification can hit ~10&times; because a
+level's worth of dead versions and tombstones lingers before the bulk merge — so our read-heavy tables would get slower and our disk usage could balloon.
+The right move is per-table, not global: keep leveled where reads and tight space matter, use size-tiered only on the write-heavy ingest tables that can
+tolerate the read and space cost, and either way provision enough compaction throughput that we don't hit write stalls under peak ingest. It's a
+three-way trade — read, write, space — and we should spend the amplification each table can most afford, not minimize writes everywhere.&rdquo; Naming
+the RUM trade, the specific read/space cost of size-tiered, and the per-workload choice is the senior register.</p>
+</aside>
+
+<h2>54.4 Tuning: choosing which amplification to spend</h2>
+
+<p>Everything above resolves into a single design decision made per store, sometimes per table: <em>which amplification can this workload most afford to
+spend?</em> A read-heavy or space-constrained workload — an index served under tight latency, a store on expensive fast storage — wants <strong>leveled
+compaction</strong>, accepting high write amplification to keep reads and space tight. A write-heavy ingest workload — a metrics or event firehose, a log
+store — wants <strong>size-tiered</strong>, accepting read and space blowup to keep write amplification and device wear low. The size ratio <var>T</var>
+is the finer knob within each: larger <var>T</var> means fewer levels, which for leveled raises write amplification while lowering read and space, and for
+size-tiered does the reverse — so <var>T</var> slides you along the same trade the family already chose. And whatever the choice, compaction throughput
+must be provisioned to keep pace with ingest, or the write stalls of the trap appear regardless of family. There is no universally correct setting
+because there is no workload-independent point in a three-way trade; the competent move is to characterize the workload's read/write/space sensitivity
+and pick the corner accordingly, which is exactly why every production LSM engine ships the choice as configuration rather than baking one in. The
+tuning is not a defect of the LSM-tree; it is the LSM-tree honestly exposing the trilemma the RUM conjecture says no access method can escape.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Leveled and size-tiered compaction each minimize one amplification and pay in the other two — state, for each, which one it minimizes and which two
+it pays. What does raising the size ratio <var>T</var> do to a leveled store's three amplifications? (Answer below.)</p>
+</aside>
+
+<h2>54.5 What to carry forward</h2>
+
+<p><strong>Compaction</strong> is the background <em>k</em>-way merge that completes the LSM-tree: it merges sorted runs in one sequential pass, keeping
+only the newest version of each key and dropping tombstones with the values they shadow, which bounds read amplification and reclaims space (the model
+reclaimed 87% dead data and cut read amplification 20&times;&rarr;1&times;) — at the cost of <strong>write amplification</strong> from rewriting data as
+it merges (&sect;54.1). An LSM-tree trades among three amplifications — <strong>write</strong> (bytes written per logical byte), <strong>read</strong>
+(accesses per logical read), and <strong>space</strong> (bytes stored per live byte) — and the <strong>RUM</strong> tension (Athanassoulis et&nbsp;al.
+2016) says no strategy makes all three small (&sect;54.2). <strong>Leveled</strong> compaction (one run per level) minimizes read and space at high
+write amplification ~<var>T</var>&times;<var>L</var>; <strong>size-tiered</strong> (many runs per level, bulk-merged) minimizes write at high read
+~<var>T</var>&times;<var>L</var> and space ~<var>T</var> — opposite corners, quantified by the model (&sect;54.3). The choice is per-workload, the size
+ratio <var>T</var> is the finer knob, and compaction throughput must keep pace with ingest or <strong>write stalls</strong> and device wear appear —
+compaction is provisioned work, not free (&sect;54.4).</p>
+
+<p>With this chapter the two storage-engine families are complete and fully drawn. The <strong>B-tree</strong> keeps data sorted on disk and updates it
+in place: excellent reads and range scans, random and immediate write cost, tight ~69% space, and a single point on the trade. The
+<strong>LSM-tree</strong> keeps data sorted in memory and appends immutable sorted runs, using compaction to bound the accumulation: cheap sequential
+writes, read and space costs paid through amplification, and — through the compaction strategy — a whole <em>curve</em> of points on the RUM trade you
+can slide along. That last difference is the deep one: the B-tree offers one balance of read, write, and space, while the LSM-tree offers a tunable
+family of balances, which is why write-optimized engines dominate high-ingest systems that need to place their cost deliberately. Two threads remain
+open for the rest of the part. The read amplification this chapter <em>bounds</em> but does not eliminate — a point read still probes several runs — is
+attacked next by the Bloom filter, a tiny in-memory structure that lets a read skip runs that provably cannot contain the key, cutting the probes toward
+one. And the whole question the part has been building toward — given a concrete workload, B-tree or LSM-tree, and at what settings — is answered in the
+part's final chapter, now that both engines and the amplification vocabulary to compare them are in hand. The B-tree optimizes reads; the LSM-tree
+optimizes writes and hands you the dial; and knowing which cost your workload can afford to spend is the whole of storage-engine judgment.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Describe what compaction does to updates and tombstones, and why the merge itself is cheap.</li>
+<li>Name the three amplifications and give the one-line reason each exceeds one.</li>
+<li>State the RUM tension and why no compaction strategy makes all three amplifications small.</li>
+<li>Contrast leveled and size-tiered compaction on all three axes, with the reason for each.</li>
+<li>Explain what raising the size ratio <var>T</var> does to a leveled and to a size-tiered store.</li>
+<li>Explain why compaction is not free — throughput contention, write stalls, and device wear.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What two kinds of dead data does compaction reclaim, and what happens to a tombstone during a merge? (&sect;54.1)</li>
+<li><strong>R2.</strong> Define write, read, and space amplification, and state the tension among them. (&sect;54.2)</li>
+<li><strong>R3.</strong> What is the RUM conjecture, and how does it apply to LSM compaction? (&sect;54.2)</li>
+<li><strong>R4.</strong> Contrast leveled and size-tiered compaction on write, read, and space amplification. (&sect;54.3)</li>
+<li><strong>R5.</strong> What is a write stall, and how does it arise from treating compaction as free? (&sect;54.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Chen Luo &amp; Michael J. Carey, &ldquo;LSM-based storage techniques: a survey,&rdquo; <em>The VLDB Journal</em> 29(1), 2020, pp.
+393&ndash;418, DOI 10.1007/s00778-019-00555-y.</strong> The definitive modern survey: leveled versus tiered compaction and the write/read/space
+amplification framing this chapter uses. First author Chen Luo; venue, volume, pages, year, and DOI verified via SpringerLink and the ACM Digital
+Library.</li>
+<li><strong>Manos Athanassoulis, Michael S. Kester, Lukas M. Maas, Radu Stoica, Stratos Idreos, Anastasia Ailamaki &amp; Mark Callaghan,
+&ldquo;Designing Access Methods: The RUM Conjecture,&rdquo; <em>19th International Conference on Extending Database Technology (EDBT&nbsp;2016)</em>,
+pp. 461&ndash;466, DOI 10.5441/002/edbt.2016.42.</strong> The read/update/memory trilemma of &sect;54.2: optimizing any two overheads costs the third.
+First author Manos Athanassoulis; venue, year, pages, and DOI verified via the EDBT proceedings and DBLP.</li>
+<li><strong>Siying Dong, Mark Callaghan, Leonidas Galanis, Dhruba Borthakur, Tony Savor &amp; Michael Strum, &ldquo;Optimizing Space Amplification in
+RocksDB,&rdquo; <em>8th Biennial Conference on Innovative Data Systems Research (CIDR&nbsp;2017)</em>.</strong> A production LSM engine's account of the
+space/write amplification trade and how leveled compaction and tuning manage it. First author Siying Dong; venue, year, and authorship verified via the
+CIDR 2017 proceedings (open access, no DOI).</li>
+<li><strong>Patrick O'Neil, Edward Cheng, Dieter Gawlick &amp; Elizabeth O'Neil, &ldquo;The Log-Structured Merge-Tree (LSM-Tree),&rdquo;
+<em>Acta Informatica</em> 33(4), 1996, pp. 351&ndash;385, DOI 10.1007/s002360050048.</strong> The original analysis of merging sorted runs across
+levels and the write-amplification cost that compaction strategy manages. First author Patrick O'Neil; venue, volume, pages, year, and DOI verified via
+SpringerLink.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex54.1"><span class="ex-label">54.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what two kinds of dead data does compaction reclaim, and what does it do with a tombstone it encounters?</div>
+
+<div class="exercise" id="ex54.2"><span class="ex-label">54.2</span> <span class="ex-tag warm">warm-up</span>
+Name the three amplifications an LSM-tree trades among, and give the one-phrase reason each is greater than one.</div>
+
+<div class="exercise" id="ex54.3"><span class="ex-label">54.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: which single amplification does leveled compaction minimize, and which does size-tiered minimize?</div>
+
+<div class="exercise" id="ex54.4"><span class="ex-label">54.4</span> <span class="ex-tag core">core</span>
+The merge, concretely. (a) The model compacted 20 runs of 25,934 entries down to 3,362; explain in terms of updates and tombstones why so much was
+dropped. (b) What did read amplification for that range become, and why? (c) Explain why, despite reclaiming 87% of the data, the compaction still
+<em>wrote</em> — and where that write shows up as an amplification.</div>
+
+<div class="exercise" id="ex54.5"><span class="ex-label">54.5</span> <span class="ex-tag core">core</span>
+The RUM tension. (a) State the RUM conjecture in terms of read, update, and memory/space. (b) Explain, using aggressive versus lazy compaction, why
+lowering read and space amplification raises write amplification. (c) Argue that the B-tree and LSM-tree face the same trilemma and differ only in where
+they spend it.</div>
+
+<div class="exercise" id="ex54.6"><span class="ex-label">54.6</span> <span class="ex-tag core">core</span>
+Leveled versus size-tiered. (a) Describe how each organizes runs within a level (one run vs up to <var>T</var>). (b) From that organization, derive why
+leveled's write amplification is ~<var>T</var>&times;<var>L</var> while size-tiered's is ~<var>L</var>. (c) From the same organization, derive why
+size-tiered's read amplification is ~<var>T</var>&times;<var>L</var> while leveled's is ~<var>L</var>.</div>
+
+<div class="exercise" id="ex54.7"><span class="ex-label">54.7</span> <span class="ex-tag complexity">cost</span>
+Reading the model. Using the table at size ratio <var>T</var>=10 over a billion entries (leveled 30/3/1.10, size-tiered 3/30/10): (a) which policy would
+you pick for a read-latency-critical index on expensive storage, and why? (b) which for a metrics firehose on cheap disk, and why? (c) A store writes
+1&nbsp;TB of logical data under leveled compaction at write amplification 30 — roughly how many bytes hit the device, and why does that matter for an
+SSD?</div>
+
+<div class="exercise" id="ex54.8"><span class="ex-label">54.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team runs a high-ingest LSM store with leveled compaction; during traffic spikes, write latency
+periodically jumps and then recovers.
+<br><strong>Step 1 (given):</strong> during a spike, incoming writes arrive faster than compaction can merge the newest level's runs.
+<br><strong>Step 2 (given):</strong> unmerged runs pile up at the top level, and read amplification there climbs.
+<br><strong>Step 3 (given):</strong> to keep read amplification bounded, the engine throttles incoming writes until compaction catches up.
+<br><strong>Step 4 (you):</strong> Name this phenomenon, explain why it appears precisely when write load is highest, and give two levers that reduce
+it (one about provisioning, one about compaction strategy).</div>
+
+<div class="exercise" id="ex54.9"><span class="ex-label">54.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>write amplification</em>, <em>read amplification</em>, <em>space amplification</em>, <em>leveled
+compaction</em>, or <em>size-tiered compaction</em> — and why: (a) an SSD wears out faster than the logical write volume suggests; (b) a store's disk
+usage is 10&times; its live data; (c) a point read probes many runs at every level; (d) the policy that keeps one run per level; (e) the policy that
+merges a level's runs only when it fills.</div>
+
+<div class="exercise" id="ex54.10"><span class="ex-label">54.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A good compaction strategy makes all three amplifications
+small.&rdquo; (b) &ldquo;Compaction is a random-access operation.&rdquo; (c) &ldquo;Size-tiered compaction has lower write amplification but higher read
+and space amplification than leveled.&rdquo; (d) &ldquo;Compaction runs in the background, so it never affects foreground latency.&rdquo; (e)
+&ldquo;Raising the size ratio <var>T</var> lowers the number of levels.&rdquo;</div>
+
+<div class="exercise" id="ex54.11"><span class="ex-label">54.11</span> <span class="ex-tag stretch">stretch</span>
+The whole trade. (a) Place B-tree, leveled-LSM, and size-tiered-LSM as three points in the read/write/space space, justifying each coordinate.
+(b) Argue that the LSM-tree offers a <em>curve</em> of points (via <var>T</var> and the compaction family) while the B-tree offers essentially one,
+and why that flexibility is the LSM-tree's structural advantage for high-ingest systems. (c) Explain why &ldquo;which engine and which settings&rdquo;
+cannot be answered without the workload, tying it to the RUM conjecture.</div>
+
+<div class="exercise" id="ex54.12"><span class="ex-label">54.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Implement a <em>k</em>-way merge of several sorted runs that keeps the newest value per key and drops
+tombstones, and report the input and output entry counts (the reclaimed fraction). (b) Compute, from closed-form arithmetic, the write, read, and space
+amplification of leveled and size-tiered compaction as functions of the size ratio <var>T</var> and level count <var>L</var>, and tabulate them for a
+few <var>T</var>. (c) State your toolchain and explain why the reclaimed fraction is a structural outcome of the merge logic and the amplification
+figures are exact arithmetic of a model — neither a wall-clock timing.</div>
+
+</section>
+</section>

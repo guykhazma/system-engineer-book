@@ -1,0 +1,92 @@
+<section class="solutions" id="sol54">
+<h1>Chapter 54 — Solutions</h1>
+
+<div class="solution" id="sol54.1"><span class="sol-label">54.1</span>
+It reclaims superseded update versions (keeping only the newest value per key) and deleted data; a tombstone it meets is dropped along with the older
+values it was shadowing, since after the merge no older run remains to hide them. <em>Tempting wrong answer:</em> &ldquo;it keeps the tombstone
+forever&rdquo; — the tombstone is dropped once compaction has merged past every value it shadowed. <strong>Feed-forward:</strong> &sect;54.1.</div>
+
+<div class="solution" id="sol54.2"><span class="sol-label">54.2</span>
+Write amplification (compaction rewrites data as it merges into larger runs), read amplification (a lookup probes several runs), and space
+amplification (dead versions and tombstones linger until compaction removes them). <em>Tempting wrong answer:</em> naming only write and read — space
+amplification is the third and the one size-tiered blows up most. <strong>Feed-forward:</strong> &sect;54.2.</div>
+
+<div class="solution" id="sol54.3"><span class="sol-label">54.3</span>
+Leveled compaction minimizes read (and space) amplification by keeping one run per level; size-tiered minimizes write amplification by writing each
+byte about once per level. <em>Tempting wrong answer:</em> &ldquo;leveled minimizes write amplification&rdquo; — it is the opposite; leveled pays the
+most in writes. <strong>Feed-forward:</strong> &sect;54.3.</div>
+
+<div class="solution" id="sol54.4"><span class="sol-label">54.4</span>
+(a) The keyspace was small (5,000) and the runs overlapped, so most of the 25,934 entries were superseded updates or tombstones of the same keys; only
+the newest live value of each surviving key remained — 3,362 entries. (b) It became 1&times; for that range: the merged output is a single run, so a
+read touches one file instead of twenty. (c) Compaction still read all 25,934 inputs and wrote 3,362 outputs; that rewriting of already-stored data is
+<strong>write amplification</strong>, the cost paid to lower read and space amplification. <em>Tempting wrong answer:</em> &ldquo;compaction is free
+because it shrinks the data&rdquo; — it shrinks stored data but spends write bandwidth to do it. <strong>Feed-forward:</strong> &sect;54.1&ndash;&sect;54.2.</div>
+
+<div class="solution" id="sol54.5"><span class="sol-label">54.5</span>
+(a) The RUM conjecture: optimizing any two of read overhead, update overhead, and memory/space overhead comes at the expense of the third. (b)
+Aggressive compaction merges runs promptly, so few runs and little dead data (low read and space) but constant rewriting (high write); lazy compaction
+merges rarely, so little rewriting (low write) but many runs and much dead data (high read and space). (c) Both engines face read/update/space; the
+B-tree spends it as immediate random writes and tight space, the LSM-tree as deferred sequential write amplification and looser space — same trilemma,
+different corner. <em>Tempting wrong answer:</em> &ldquo;the LSM-tree escapes the trade the B-tree faced&rdquo; — it relocates the trade, it does not
+escape it. <strong>Feed-forward:</strong> &sect;54.2.</div>
+
+<div class="solution" id="sol54.6"><span class="sol-label">54.6</span>
+(a) Leveled keeps exactly one sorted run per level; size-tiered lets up to <var>T</var> runs accumulate per level and merges them together when the
+level fills. (b) Leveled: promoting data into a level that is <var>T</var>&times; bigger rewrites ~<var>T</var> bytes per byte, across <var>L</var> levels
+&rarr; ~<var>T</var>&times;<var>L</var>; size-tiered: each byte is written once per level (in the bulk merge) &rarr; ~<var>L</var>. (c) Leveled: at most
+one run per level, so a read checks ~<var>L</var> runs; size-tiered: up to <var>T</var> runs per level, so a read checks ~<var>T</var>&times;<var>L</var>.
+<em>Tempting wrong answer:</em> assuming both read and write scale the same way — they scale oppositely, which is the whole trade.
+<strong>Feed-forward:</strong> &sect;54.3.</div>
+
+<div class="solution" id="sol54.7"><span class="sol-label">54.7</span>
+(a) Leveled — read amplification 3 and space 1.10 keep latency low and waste little of the expensive storage, at the cost of write amplification 30,
+which a read-critical index can afford. (b) Size-tiered — write amplification 3 spares the cheap disk's write bandwidth and wear, and the firehose can
+tolerate read amplification 30 and 10&times; space on cheap storage. (c) About 30&nbsp;TB hit the device (30&times;1&nbsp;TB); it matters because an
+SSD's endurance is finite writes, so 30&times; amplification burns through its rated lifetime ~30&times; faster. <em>Tempting wrong answer:</em>
+&ldquo;pick leveled everywhere because low read amp is always best&rdquo; — for the firehose its 30&times; write amplification is the dominant cost.
+<strong>Feed-forward:</strong> &sect;54.3&ndash;&sect;54.4.</div>
+
+<div class="solution" id="sol54.8"><span class="sol-label">54.8</span>
+<strong>Step 4:</strong> This is a <strong>write stall</strong> (write throttling). It appears exactly at peak write load because that is when ingest
+most outruns compaction: the top-level runs pile up faster than they can be merged, read amplification there climbs, and the engine throttles writes to
+keep it bounded — so the &ldquo;fast writes&rdquo; degrade precisely when they are busiest. Two levers: provision more compaction throughput (I/O
+bandwidth and threads) so merging keeps pace, and/or move to a compaction family with lower write amplification (size-tiered) so less merging is needed
+per byte — accepting its higher read and space cost. <em>Tempting wrong answer:</em> &ldquo;add more memory to the memtable&rdquo; — a bigger memtable
+delays but does not remove the stall; the bottleneck is compaction throughput versus ingest. <strong>Feed-forward:</strong> &sect;54.4.</div>
+
+<div class="solution" id="sol54.9"><span class="sol-label">54.9</span>
+(a) <strong>Write amplification</strong> — the device physically writes several times the logical volume. (b) <strong>Space amplification</strong> —
+dead versions and tombstones inflate on-disk size well past live data. (c) <strong>Read amplification</strong> — many runs probed per level. (d)
+<strong>Leveled compaction</strong> — one run per level. (e) <strong>Size-tiered compaction</strong> — merges a level's runs when it fills.
+<em>Tempting wrong answer:</em> crediting (a) to read amplification — reads do not wear the device; writes do. <strong>Feed-forward:</strong>
+&sect;54.2&ndash;&sect;54.3.</div>
+
+<div class="solution" id="sol54.10"><span class="sol-label">54.10</span>
+(a) <strong>False</strong> — the RUM tension means no strategy makes all three small; you spend one to save another. (b) <strong>False</strong> —
+compaction merges sorted runs in one sequential pass, reading and writing sequentially. (c) <strong>True</strong> — size-tiered trades higher read and
+space for lower write amplification. (d) <strong>False</strong> — compaction contends for device bandwidth and buffer pool and can cause write stalls,
+affecting foreground latency. (e) <strong>True</strong> — levels &asymp; log-base-<var>T</var>, so larger <var>T</var> means fewer levels.
+<em>Tempting wrong answer:</em> marking (d) true because &ldquo;background&rdquo; sounds free — it is real work on the same device.
+<strong>Feed-forward:</strong> &sect;54.1&ndash;&sect;54.4.</div>
+
+<div class="solution" id="sol54.11"><span class="sol-label">54.11</span>
+(a) B-tree: low read, high (random) write, low space (~69% fill) — one point. Leveled-LSM: low read, high write, low space — but write is deferred and
+sequential. Size-tiered-LSM: high read, low write, high space. Each coordinate follows from the mechanism (in-place update; one-run-per-level;
+many-runs-per-level). (b) By varying <var>T</var> and choosing the compaction family, the LSM-tree reaches many points along the read/write/space
+surface, whereas the B-tree's in-place discipline fixes it near one; that tunability lets high-ingest systems place their cost where they can afford it.
+(c) The best point depends on the workload's read/write/space sensitivity, and the RUM conjecture says no point is best on all three — so the answer is a
+function of the workload, not of the engine. <em>Tempting wrong answer:</em> &ldquo;the LSM-tree is strictly better because it's tunable&rdquo; — tunable
+means it can be set badly too; it is better only when the workload wants a corner the B-tree can't reach. <strong>Feed-forward:</strong>
+&sect;54.2&ndash;&sect;54.5.</div>
+
+<div class="solution" id="sol54.12"><span class="sol-label">54.12</span>
+Open-ended and platform-specific. A correct write-up: (a) implements a <em>k</em>-way merge keeping the newest value per key and dropping tombstones,
+reporting input and output counts and the reclaimed fraction (this chapter: 25,934 &rarr; 3,362, 87% reclaimed); (b) computes write/read/space
+amplification for leveled (~<var>T</var>&times;<var>L</var> / ~<var>L</var> / ~1) and size-tiered (~<var>L</var> / ~<var>T</var>&times;<var>L</var> /
+~<var>T</var>) across a few <var>T</var>; (c) states toolchain and notes the reclaimed fraction is a structural outcome of the merge logic and the
+amplification figures are exact model arithmetic — reproducible and hardware-independent, neither a wall-clock timing. <em>Tempting wrong answer:</em>
+reporting the amplification numbers as measured device throughput — they are a model of the structure, not a benchmark. <strong>Feed-forward:</strong>
+&sect;54.3.</div>
+
+</section>

@@ -297,6 +297,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch50">Chapter 50 — The Storage Manager: The Interface Under Everything</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part IX &mdash; Storage Engines</li>
 <li class="toc-ch"><a href="#ch51">Chapter 51 — The B-Tree: A Search Tree on Disk</a></li>
+<li class="toc-ch"><a href="#ch52">Chapter 52 — The B-Tree in Practice: Deletion, Occupancy, and Concurrency</a></li>
+<li class="toc-ch"><a href="#ch53">Chapter 53 — The Log-Structured Merge-Tree: Trading Reads for Writes</a></li>
+<li class="toc-ch"><a href="#ch54">Chapter 54 — Compaction and Amplification: Tuning the LSM-Tree</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part X &mdash; Durability & Recovery</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XI &mdash; Transactions & Concurrency Control</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XII &mdash; Query Processing & Execution</li>
@@ -20473,6 +20476,1053 @@ structural outcomes of a deterministic insert order — and why neither is a wal
 </section>
 </section>
 
+<section class="chapter" id="ch52">
+<h1>Chapter 52 — The B-Tree in Practice: Deletion, Occupancy, and Concurrency</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (a random page write is as expensive as a random read, and
+concurrency contends on the device), <a href="#ch47">Chapter 47</a> (the page a node lives in), <a href="#ch48">Chapter 48</a> (nodes are latched
+and pinned in the buffer pool while in use), <a href="#ch50">Chapter 50</a> (the storage-manager free list a deleted page returns to),
+<a href="#ch51">Chapter 51</a> (the B+-tree's shape, the balance invariant, search, and insert-with-split — this chapter is its second half).
+&nbsp;·&nbsp; Chapter 51 built the B-tree and its two easy directions: it grows at the root by splitting, and it searches in <em>height</em> page
+fetches. This chapter finishes the structure with the three things a production B-tree must also do — <strong>shrink</strong> when rows are deleted,
+<strong>stay dense</strong> so its size tracks its data, and <strong>serve many threads at once</strong> — none of which the split alone gives you.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch51">Chapter 51</a> — an insert into a <em>full</em> leaf does what, and in which direction does the tree grow when
+the split reaches the root? (2) <a href="#ch51">Chapter 51</a> — the balance invariant has two parts: every non-root node is kept at least how full,
+and all leaves are at what depth? (3) <em>Predict:</em> you build a B-tree by inserting a billion keys in <em>random</em> order with the naive
+50/50 split of Chapter 51, then measure how full its nodes are on average. Is the tree about 100% full, about 85% full, or closer to 70% full — and
+what does the answer imply about how much bigger the index is than the data it holds? Write your guess; &sect;52.3 measures it.</p>
+</aside>
+
+<p>Chapter 51 left the B-tree half-built. It could grow — insert descends to a leaf and, if the leaf is full, splits, pushing a separator key up and
+growing the tree only at the root — and it could search in a handful of page fetches. But a table is not append-only: rows are deleted, and an index
+that only ever grows is a leak. A B-tree is also not built once and frozen: it is written by many transactions at once, and a structure that must be
+locked whole for every insert serves one writer at a time. And the split that keeps the tree balanced has a quiet cost Chapter 51 flagged but did not
+measure — it leaves pages <em>half-empty</em>, so a B-tree built by ordinary inserts is markedly larger than the data it indexes. This chapter closes
+those three gaps, which is the difference between the textbook B-tree and the one PostgreSQL or InnoDB actually ships: <strong>deletion</strong> with
+its borrow-or-merge rebalancing, the mirror image of the split, that shrinks the tree at the root (&sect;52.1); why real systems usually
+<strong>defer</strong> that merge and what <em>index bloat</em> that buys and costs (&sect;52.2); <strong>occupancy</strong> — the measured fact that
+random insertion settles nodes at about 69% full, and why bulk-loading reaches nearly 100% (&sect;52.3); and <strong>concurrency</strong> — latch
+coupling and the Blink-tree right-link that let many threads descend the same tree without locking it whole, with its named trap, the split race
+(&sect;52.4); then what all of this carries into the write-optimized engine that comes next (&sect;52.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's Intel Core i7-12700H), a working in-memory
+B-tree in the classic minimum-degree form — insert with split, delete with borrow and merge — used two ways. First it builds trees by
+<strong>random insertion</strong> at several node sizes and reports the <em>average node occupancy</em>, a structural ratio (keys held over keys that
+fit), to confirm the &ldquo;fills to ln&nbsp;2&rdquo; result; occupancy is a property of the shape, not a timing. Second it inserts then
+<strong>deletes</strong> most of the keys and reports that the height <em>shrinks</em> and the surviving keys are still found — again a structural
+outcome of a deterministic, seeded operation sequence, not a wall-clock measurement. Where a page fetch or a random write's cost appears it is the
+<a href="#ch46">Chapter 46</a> device and <a href="#ch48">Chapter 48</a> buffer-pool figures measured earlier in this volume, cited rather than
+re-measured (a hardware-counter profiler, <code>perf</code>, is not installed on this machine).</p>
+
+<h2>52.1 Deletion: underflow, borrow, and merge</h2>
+
+<p><strong>Deletion</strong> begins exactly as search and insert do — descend to the leaf where the key lives — and then removes the entry, which is
+trivial <em>unless</em> it drops the node below the balance invariant's floor. Chapter 51's invariant says every node except the root holds at least
+&lceil;<var>m</var>/2&rceil;&minus;1 keys (about half a full node); a leaf that falls below that has <strong>underflowed</strong>, and the tree must be
+repaired before the deletion is done, because an under-full node breaks the guarantee that gives search its uniform cost. There are two repairs, tried
+in order. First, <strong>borrow</strong> (also called redistribution): if an adjacent sibling has more than the minimum, move one of its keys across —
+rotating it <em>through the parent</em>, since the separator key in the parent must always sit between the two children — and the underflow is fixed
+with a single key movement and no structural change. Second, if no sibling can spare a key (both are exactly at the minimum), <strong>merge</strong>:
+combine the under-full node with a sibling into one node, and pull the <em>separator key down</em> from the parent to sit between them, since with the
+two children fused that separator no longer separates anything. Merging is the exact mirror of a split — a split creates a node and pushes a key up; a
+merge destroys a node and pulls a key down — and it has the same propagation: pulling the separator down removes a key from the parent, which may itself
+underflow and merge, and so on up the tree. If the merge propagates all the way to the root and the root is left with no keys and a single child, the
+<strong>root is removed</strong> and that single child becomes the new root — and this is the only way a B-tree's height ever <em>decreases</em>. So the
+tree grows at the root by splitting and shrinks at the root by merging; it is symmetric, and that symmetry is why all leaves stay at the same depth
+through any mix of inserts and deletes. Search never sees an unbalanced tree because deletion, like insertion, does the balancing work up front.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A delete leaves a leaf with fewer than the minimum keys. What are the two repairs, in the order they are tried, and which one can change the tree's
+height? When the height changes on a delete, where does the change happen? (Answer in the next section.)</p>
+</aside>
+
+<h2>52.2 Lazy deletion and index bloat: why systems defer the merge</h2>
+
+<p>The borrow-and-merge of &sect;52.1 is the <em>correct</em> deletion, and it is what a textbook implements. Most production B-trees do not do it on
+every delete. The reason is cost and concurrency: a merge touches <strong>three</strong> pages at once — the under-full node, its sibling, and the
+parent — and must lock all three against other operations, and the merge can propagate upward and lock still more; under a heavy concurrent workload
+that is a lot of contention to spend on the common case where a deleted key's slot will soon be filled by another insert. So real engines mostly use
+<strong>lazy deletion</strong>: remove the entry (or just mark it dead), let the node sit under-full, and reclaim a page to the storage manager's free
+list (Chapter 50) only when it becomes completely <em>empty</em>, rebalancing rarely or never. This is a deliberate trade of space for speed and
+simplicity, and it has a name for its cost: <strong>index bloat</strong>. Because under-full pages are tolerated rather than merged, a B-tree that has
+seen many deletes keeps its page count even as its live-key count falls — the on-disk index stays large while the data it indexes shrinks, occupancy
+drops toward the deleted fraction, and range scans still walk the mostly-empty pages, paying page fetches for keys that are gone. The bloat is not a
+bug; it is the chosen point on the space/latency curve. It is undone deliberately, not automatically: a <strong>rebuild</strong> (PostgreSQL's
+<code>REINDEX</code>, or dropping and recreating the index) reconstructs the tree densely, and background reclamation (PostgreSQL's <code>VACUUM</code>,
+InnoDB's purge) returns wholly-empty pages. Knowing that deletion is usually lazy — that the index does not shrink itself — is the difference between
+&ldquo;the delete is broken&rdquo; and &ldquo;the index needs a rebuild,&rdquo; and it is exactly the confusion the communicate box below untangles.</p>
+
+<p><em>(Answer to the &sect;52.1 quick check: the two repairs are <strong>borrow</strong> from a sibling that has a spare key, tried first, and
+<strong>merge</strong> with a sibling when neither can spare one. Only merge can change the height, and only when it propagates to the root and empties
+it: the root is removed and its single child becomes the new root, so — like growth — the height change happens <strong>at the root</strong>.)</em></p>
+
+<h2>52.3 Node occupancy: random inserts settle at ln&nbsp;2, bulk-loading fills the pages</h2>
+
+<p>How full is a B-tree's nodes, on average? The answer decides how big the index is for a given amount of data, and it is not 100%. Chapter 51's
+naive split cuts a full node in half, so a just-split node is 50% full; subsequent inserts refill it, and averaged over a long random insert sequence
+the occupancy settles at a specific constant. Yao proved in 1978 that for B-trees of reasonable order, random insertion drives the average node
+occupancy to <strong>ln&nbsp;2 &asymp; 0.693</strong> — about <strong>69%</strong> full — and the working B-tree here reproduces it. Building trees by
+inserting 200,000 keys in random order and measuring keys-held over keys-that-fit:</p>
+
+<pre><code>random-insertion B-tree, average node occupancy (Yao 1978: -> ln2 = 0.6931):
+  min-degree t= 16 (&lt;= 31 keys/node), N=200000: occupancy=0.687, height=4
+  min-degree t= 32 (&lt;= 63 keys/node), N=200000: occupancy=0.686, height=4
+  min-degree t= 64 (&lt;=127 keys/node), N=200000: occupancy=0.684, height=3
+</code></pre>
+
+<p>Every measurement lands within a hair of ln&nbsp;2. The consequence is quantitative and large: a B-tree built by ordinary row-by-row insertion is
+about <strong>1/ln&nbsp;2 &asymp; 1.44&times;</strong> the size of the same keys packed densely — it needs roughly 44% more pages than the data
+strictly requires, which is more pages in the buffer pool, more page fetches for a scan, and (because lower occupancy means lower effective fanout) the
+occasional extra level of height. This is why databases distinguish <strong>bulk-loading</strong> from insertion: given data already sorted, an engine
+builds the B-tree <em>bottom-up</em> — fill a leaf completely, emit it, start the next; when a level's worth of leaves exists, build their parent — which
+packs every node to nearly 100% and produces the smallest, shallowest possible tree. It is both faster (no per-key descent, no splits) and denser than
+inserting the same rows one at a time, which is why &ldquo;<code>CREATE INDEX</code> on an existing table&rdquo; and &ldquo;a rebuild&rdquo; use
+bulk-load, and why append-heavy inserts use the append-aware split of Chapter 51 to approach the same density. The occupancy constant is also the reason
+a healthy index is still noticeably larger than its raw data: 69%, not 100%, is normal for a live, randomly-updated tree.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: naive splitting fills nodes to ~69%, so a randomly-built index is ~1.44&times; its data</span>
+<p><strong>1. In words.</strong> A naive split halves a full node, leaving both halves 50% full; random inserts refill them and the average settles at
+ln&nbsp;2 &asymp; 69%. Sorted bulk-loading skips splitting entirely, filling each node to ~100%, so a bulk-loaded index is the densest and a
+randomly-inserted one carries ~44% more pages.</p>
+<p><strong>2. As a picture.</strong> Figure 52.1: two leaves side by side — a randomly-built leaf shaded ~69% with empty slots at the end, and a
+bulk-loaded leaf shaded solid ~100% — over a caption reading &ldquo;same keys, 1.44&times; the pages.&rdquo;</p>
+<p><strong>3. As numbers.</strong> Measured here: node occupancy 0.687, 0.686, 0.684 at node sizes 31, 63, 127 keys — all converging on the Yao
+constant ln&nbsp;2 = 0.6931. Densely packed, the same keys occupy 1/1.44 as many pages; the 44% gap is the price of building by insertion instead of
+bulk-load.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 190" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Node occupancy: random insertion settles at ln 2 (~69%); bulk-loading packs to ~100%. Same keys, ~1.44x the pages.</text>
+<text x="30" y="48" font-size="9" fill="#333">random-built leaf (~69% full):</text>
+<rect x="30" y="55" width="360" height="26" fill="#f4f4f4" stroke="#14406b"/>
+<rect x="30" y="55" width="248" height="26" fill="#dfe8f4" stroke="#14406b"/>
+<text x="284" y="72" font-size="8" fill="#8c3a1d">empty slots</text>
+<text x="30" y="112" font-size="9" fill="#333">bulk-loaded leaf (~100% full):</text>
+<rect x="30" y="119" width="360" height="26" fill="#dff0df" stroke="#2f7d32"/>
+<text x="150" y="136" font-size="8" fill="#2f7d32">packed</text>
+<text x="410" y="72" font-size="9" fill="#14406b">0.687 measured</text>
+<text x="410" y="90" font-size="8" fill="#333">(t=16, N=200k)</text>
+<text x="410" y="136" font-size="9" fill="#2f7d32">~1.00</text>
+<text x="30" y="172" font-size="8" fill="#8c3a1d">1/ln2 = 1.44: an index built by insertion needs ~44% more pages than the same keys bulk-loaded.</text>
+</svg>
+<figcaption>Figure 52.1: average node occupancy. Naive 50/50 splitting under random insertion settles nodes at ln&nbsp;2 &asymp; 69% full (measured 0.684&ndash;0.687);
+sorted bulk-loading packs them to ~100%. The 1/ln&nbsp;2 &asymp; 1.44 ratio is why a rebuilt or bulk-loaded index is markedly smaller than one grown by
+row-by-row insertion.</figcaption>
+</figure>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Random insertion settles a B-tree's nodes at what average occupancy, and what constant is that? Roughly how many more pages does an index built by
+insertion carry than the same keys bulk-loaded, and why does bulk-loading pack so much tighter? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>52.4 Concurrent access: latch coupling and the Blink-tree</h2>
+
+<p>Everything so far assumed one thread. A real B-tree is descended and modified by many transactions at once, and the pages it touches live in the
+shared buffer pool (Chapter 48), so access must be protected by <strong>latches</strong> — the short-held mutexes on in-memory pages, distinct from the
+transactional locks of a later part. The naive protection, one latch over the whole tree, allows exactly one operation at a time and wastes the
+machine. The classic improvement is <strong>latch coupling</strong>, also called <em>crabbing</em>: as a search descends, it latches a child
+<em>before</em> releasing the parent — always holding the ground under its feet, like a crab moving one leg at a time — so a concurrent modification can
+never move a node out from under it mid-descent. For a read that is enough and cheap: take a shared latch on the child, release the parent, move down,
+so only one or two latches are held at any moment. An <em>insert</em> is harder, because it might split, and a split modifies the parent — so a
+crabbing insert must keep every ancestor latched until it reaches a node that is provably <strong>safe</strong> (has room, so it cannot split and cannot
+push a change upward); only then can it release the ancestors above. When nodes are near-full, &ldquo;safe&rdquo; is rare, ancestor latches are held
+long, and concurrency collapses back toward serial. The elegant fix is the <strong>Blink-tree</strong> of Lehman and Yao (1981): give every node a
+<em>right-link</em> pointer to its right sibling and record each node's <strong>high key</strong> (the largest key it covers). A split now adds the new
+node to the <em>right</em> and links to it, and it does so as a purely local, left-to-right operation. A reader that arrives at a node just after it
+split, and finds its target key is now greater than the node's high key, simply <strong>follows the right-link</strong> to the new sibling instead of
+needing the parent to have been updated first. Because a searcher can always recover a mid-split move by moving right, it never has to hold a parent
+latch to guard against a split below it — a descent holds only <strong>one</strong> latch at a time. That single structural addition, the right-link, is
+what let B-trees scale to many concurrent threads, and it is why the Blink-tree is the concurrency design real systems (including PostgreSQL) build on.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: naive latch coupling either serializes the tree or deadlocks — the split race</span>
+<p>The tempting concurrency scheme is &ldquo;just latch-couple everything with exclusive latches, parent held until the child is latched, all the way
+down&rdquo; — and it fails two ways at once. First, <strong>it serializes writers</strong>: to be safe against a split propagating up, a naive insert
+must hold exclusive latches on the whole root-to-leaf path until it finds a node with room, so under a write-heavy load every insert latches the root
+exclusively and writers run one at a time — the tree's own root becomes the bottleneck. The over-correction is to release ancestor latches early to
+regain concurrency, which triggers the second failure, the <strong>split race</strong>: a searcher releases a parent latch, a concurrent insert splits
+the child and moves half its keys (including the searcher's target) to a new right sibling, and the searcher — now latching a node that no longer holds
+its key — reports the key <em>absent</em> though it is present. Worse, trying to fix this by re-latching upward invites <strong>deadlock</strong>:
+descents take latches top-down while a propagating split takes them bottom-up, so two operations can grab the same two nodes in opposite orders and wait
+on each other forever. &ldquo;Hold exclusive latches down the whole path&rdquo; and &ldquo;release early for concurrency&rdquo; are not both safe under
+naive coupling — one serializes, the other loses keys or deadlocks. The honest fix is not a latching tweak but the <strong>structural</strong> one: the
+Blink-tree right-link and high key, which make a split locally recoverable so a searcher moves <em>right</em> instead of holding an ancestor latch — one
+latch at a time, no path-long exclusive holds, no opposite-order deadlock.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;We archived and deleted about 90% of the rows in our biggest table last week. But the index on that
+table is barely smaller on disk than before, and the range queries didn't get faster. The delete must be broken — should I file a bug?&rdquo; Cover the
+paragraph and answer in four or five sentences, drawing on &sect;52.2 and &sect;52.3.</p>
+<p><em>Model answer.</em> &ldquo;It's almost certainly not a bug — it's how B-tree deletion normally works. Most engines delete <strong>lazily</strong>:
+they mark the entries dead and leave the pages under-full rather than merging siblings on every delete, because eager merges are expensive under
+concurrency. So the index keeps its page count even though 90% of the keys are gone — that's index bloat, and it's why the on-disk size barely moved
+and scans still walk the now-mostly-empty pages. The index doesn't shrink itself; you reclaim the space deliberately, by rebuilding it —
+<code>REINDEX</code> or drop-and-recreate, which bulk-loads it back to near-100% fill — and by letting <code>VACUUM</code>/purge reclaim the empty
+pages. One more expectation to set: even a freshly rebuilt, healthy index is only about 69% full on average under random inserts, so it will always be
+somewhat larger than the raw data — don't expect the index size to equal the live-row size.&rdquo; Naming lazy deletion, index bloat, the rebuild as the
+fix, and the ln&nbsp;2 occupancy baseline is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;52.3 quick check: random insertion settles nodes at about <strong>69%</strong> occupancy — the constant ln&nbsp;2 &asymp;
+0.693, as Yao proved and the code measured (0.684&ndash;0.687). An index built by insertion therefore carries about <strong>1/ln&nbsp;2 &asymp;
+1.44&times;</strong> — ~44% more — pages than the same keys bulk-loaded. Bulk-loading packs tighter because it builds bottom-up from sorted data,
+filling each node completely and never splitting, so no node is left half-empty.)</em></p>
+
+<h2>52.5 What to carry forward</h2>
+
+<p><strong>Deletion</strong> is the mirror of the split: descend, remove, and if the node underflows, first <strong>borrow</strong> a key from a sibling
+through the parent, or if none can spare one, <strong>merge</strong> with a sibling and pull the separator down — a merge can propagate up and, if it
+empties the root, remove it, which is the only way the tree's height shrinks, at the root, symmetric with how it grows (&sect;52.1). Real systems mostly
+defer that merge — <strong>lazy deletion</strong> — tolerating under-full pages and reclaiming only empty ones, trading space for concurrency and paying
+in <strong>index bloat</strong> that a rebuild (<code>REINDEX</code>) undoes (&sect;52.2). <strong>Occupancy</strong> under random insertion settles at
+<strong>ln&nbsp;2 &asymp; 69%</strong> (Yao 1978, reproduced at 0.684&ndash;0.687), so an inserted index is ~1.44&times; the pages of a bulk-loaded one,
+which is why databases bulk-load sorted data bottom-up to pack near 100% (&sect;52.3). <strong>Concurrency</strong> uses <strong>latch coupling</strong>
+(crabbing) to descend without locking the tree whole, and the <strong>Blink-tree</strong> right-link and high key (Lehman &amp; Yao 1981) to make a
+split locally recoverable so a searcher holds one latch at a time — the structural fix for the split-race trap that naive coupling falls into
+(&sect;52.4).</p>
+
+<p>With Chapters 51 and 52 the B-tree is complete: a wide, shallow, self-balancing tree of pages that gives selective look-up, range scan, ordered
+iteration, safe deletion, and concurrent access — the workhorse index of every relational database. But notice the shape of everything this chapter
+added. Deletion rebalances pages in place. Keeping occupancy up means splitting and packing pages in place. Concurrency exists precisely because writers
+are modifying pages in place and must be kept from colliding. The entire chapter is the machinery of <strong>updating data in place</strong> — rewriting
+the page where a key belongs — done safely and densely. That in-place discipline is exactly what makes the B-tree superb for reads and range scans and
+exactly what makes every write a random page update, paying the Chapter 46 random-write cost, and what makes concurrent writers contend on the same hot
+pages. The next chapter takes the opposite bet. Instead of finding the right page and updating it in place, it <em>never</em> updates in place: it
+buffers writes in memory and flushes them as new, immutable, sorted files, turning every random write into a sequential one — and pays the bill later,
+at read time, by having to merge those files. That is the <strong>log-structured merge-tree</strong>, the write-optimized counterpart to the
+read-optimized B-tree, and the whole rest of this part is the two families and when each wins. The B-tree updates in place; the LSM-tree appends and
+merges; and the tension between them is the central storage-engine decision.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Describe deletion's two repairs — borrow and merge — and say which can shrink the tree and where.</li>
+<li>Explain why merge is the mirror of split, including how the height decreases at the root.</li>
+<li>Explain lazy deletion and index bloat, and name the operation that reclaims the space.</li>
+<li>State the ln&nbsp;2 occupancy result and the ~1.44&times; size consequence, and why bulk-loading packs tighter.</li>
+<li>Explain latch coupling (crabbing) and why an insert must hold ancestor latches until a &ldquo;safe&rdquo; node.</li>
+<li>Describe the Blink-tree right-link and how it lets a searcher survive a split with one latch at a time.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> On a delete that underflows a node, what are the two repairs in order, and which changes the height? (&sect;52.1)</li>
+<li><strong>R2.</strong> What is lazy deletion, what is the index bloat it causes, and how is the space reclaimed? (&sect;52.2)</li>
+<li><strong>R3.</strong> What average node occupancy does random insertion produce, and how much bigger is such an index than a bulk-loaded one? (&sect;52.3)</li>
+<li><strong>R4.</strong> What is latch coupling, and why does a naive insert have to hold ancestor latches down the path? (&sect;52.4)</li>
+<li><strong>R5.</strong> What does the Blink-tree right-link add, and how does it defeat the split race? (&sect;52.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Rudolf Bayer &amp; Edward M. McCreight, &ldquo;Organization and Maintenance of Large Ordered Indexes,&rdquo; <em>Acta Informatica</em>
+1(3), 1972, pp. 173&ndash;189, DOI 10.1007/BF00288683.</strong> The original B-tree paper, which specifies the deletion, borrow, and merge of
+&sect;52.1 alongside the insertion of Chapter 51. First author Rudolf Bayer; venue, volume, pages, year, and DOI verified via SpringerLink.</li>
+<li><strong>Andrew Chi-Chih Yao, &ldquo;On Random 2&ndash;3 Trees,&rdquo; <em>Acta Informatica</em> 9(2), 1978, pp. 159&ndash;170, DOI 10.1007/BF00289075.</strong>
+The analysis behind &sect;52.3: random insertion drives average node occupancy to ln&nbsp;2 for B-trees of high order. Sole author Andrew Yao; venue,
+volume, pages, year, and DOI verified via SpringerLink.</li>
+<li><strong>Philip L. Lehman &amp; S. Bing Yao, &ldquo;Efficient Locking for Concurrent Operations on B-Trees,&rdquo; <em>ACM Transactions on Database
+Systems</em> 6(4), 1981, pp. 650&ndash;670, DOI 10.1145/319628.319663.</strong> The Blink-tree of &sect;52.4: the right-link and high key that let a
+split be locally recovered, so a search holds only one latch at a time. First author Philip Lehman; venue, volume, pages, year, and DOI verified via
+the ACM Digital Library.</li>
+<li><strong>Goetz Graefe, &ldquo;Modern B-Tree Techniques,&rdquo; <em>Foundations and Trends in Databases</em> 3(4), 2011, pp. 203&ndash;402,
+DOI 10.1561/1900000028.</strong> The modern survey covering all three of this chapter's threads: deletion and its deferral, occupancy and
+bulk-loading, and the concurrency techniques real B-trees use. Sole author Goetz Graefe; venue, volume, pages, year, and DOI verified via the
+publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex52.1"><span class="ex-label">52.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, what is the difference between <em>borrowing</em> from a sibling and <em>merging</em> with one when a delete underflows a node?</div>
+
+<div class="exercise" id="ex52.2"><span class="ex-label">52.2</span> <span class="ex-tag warm">warm-up</span>
+A B-tree grows only at the root by splitting. In one sentence, how and where does it <em>shrink</em>, and what operation causes it?</div>
+
+<div class="exercise" id="ex52.3"><span class="ex-label">52.3</span> <span class="ex-tag warm">warm-up</span>
+Random insertion leaves a B-tree's nodes about how full on average, and what constant is that? Roughly how many more pages does such an index carry
+than the same keys bulk-loaded?</div>
+
+<div class="exercise" id="ex52.4"><span class="ex-label">52.4</span> <span class="ex-tag core">core</span>
+Merge as the mirror of split. (a) In a split, a node is created and a key is pushed up; state the mirror for a merge (what is destroyed, what moves,
+and in which direction). (b) Explain why a merge can propagate up the tree. (c) Explain the single case in which a merge decreases the tree's height,
+and why that keeps all leaves at the same depth.</div>
+
+<div class="exercise" id="ex52.5"><span class="ex-label">52.5</span> <span class="ex-tag core">core</span>
+Lazy deletion. (a) Why do most engines defer the merge instead of rebalancing on every delete — what does an eager merge lock? (b) Define index
+bloat and describe how occupancy and range-scan cost change after a large delete under lazy deletion. (c) Name the operation that reclaims the space
+and explain why it produces a denser tree than the deletes left behind.</div>
+
+<div class="exercise" id="ex52.6"><span class="ex-label">52.6</span> <span class="ex-tag core">core</span>
+Occupancy arithmetic. (a) State the average occupancy random insertion produces and the size ratio 1/ln&nbsp;2 it implies. (b) A table's data would
+fit in 1,000,000 densely-packed index pages; estimate the page count of the same index built by random row-by-row insertion. (c) Explain two distinct
+costs that the extra pages impose (think buffer pool and height).</div>
+
+<div class="exercise" id="ex52.7"><span class="ex-label">52.7</span> <span class="ex-tag complexity">cost</span>
+Latch coupling cost. (a) For a <em>read</em> descending a height-4 B-tree with crabbing, how many latches are held at any one moment, and why is that
+enough? (b) For a naive <em>insert</em> that must guard against a split, how many latches might it hold on the path, and what determines when it can
+release the ancestors? (c) Explain in cost terms why near-full nodes make the naive insert scheme collapse toward serial execution.</div>
+
+<div class="exercise" id="ex52.8"><span class="ex-label">52.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A search and a concurrent insert touch the same leaf; the search released the parent latch just before the
+insert split that leaf.
+<br><strong>Step 1 (given):</strong> the insert splits the leaf, moving the upper half of its keys — including the search's target — to a new right sibling.
+<br><strong>Step 2 (given):</strong> the search is now holding a leaf that no longer contains its key.
+<br><strong>Step 3 (given):</strong> in a plain B-tree the search would wrongly report the key absent (the split race).
+<br><strong>Step 4 (you):</strong> Explain what the Blink-tree's right-link and high key let the search do instead, and why that means the search never
+needed to hold the parent latch.</div>
+
+<div class="exercise" id="ex52.9"><span class="ex-label">52.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the mechanism responsible — <em>borrow</em>, <em>merge</em>, <em>lazy deletion</em>, <em>bulk-loading</em>, or <em>the right-link</em> — and
+why: (a) an index stays large on disk after most rows are deleted; (b) a rebuilt index is ~30% smaller than the one it replaced; (c) an under-full node
+is fixed with a single key movement and no structural change; (d) the tree's height decreases; (e) a search recovers from a concurrent split by moving
+sideways.</div>
+
+<div class="exercise" id="ex52.10"><span class="ex-label">52.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A B-tree's height can decrease only when a merge empties the root.&rdquo;
+(b) &ldquo;Random insertion fills B-tree nodes to about 85% on average.&rdquo; (c) &ldquo;Bulk-loading is denser than insertion because it never
+splits.&rdquo; (d) &ldquo;Deleting rows automatically shrinks the index on disk.&rdquo; (e) &ldquo;With the Blink-tree right-link, a descending search
+must hold a latch on the parent to be safe against a split.&rdquo;</div>
+
+<div class="exercise" id="ex52.11"><span class="ex-label">52.11</span> <span class="ex-tag stretch">stretch</span>
+Symmetry and its limits. (a) Argue that insert-with-split and delete-with-merge are exact mirrors, matching each step of one to a step of the other.
+(b) Given that symmetry, explain why real systems implement the split faithfully but usually <em>defer</em> the merge — what breaks the symmetry in
+practice. (c) Explain how deferring the merge, plus the ln&nbsp;2 occupancy of insertion, together mean a long-lived B-tree drifts toward lower density
+over time, and what operational practice counters the drift.</div>
+
+<div class="exercise" id="ex52.12"><span class="ex-label">52.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Implement a working B-tree of minimum degree <var>t</var> with insert (split) and delete (borrow and merge).
+(b) Insert keys in a seeded random order and measure the average node occupancy for a few values of <var>t</var>; confirm it approaches ln&nbsp;2
+&asymp; 0.693. (c) Then delete most of the keys and report that the height shrinks and every surviving key is still found. (d) State your toolchain and
+explain why occupancy and height are <em>structural</em> outcomes of the operation sequence, not wall-clock timings.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch53">
+<h1>Chapter 53 — The Log-Structured Merge-Tree: Trading Reads for Writes</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (the device measurement that rules everything here: sequential
+streaming ~916&nbsp;MB/s versus random 4&nbsp;KiB access ~19&nbsp;MB/s, ~49&times; slower — the gap the LSM-tree exploits),
+<a href="#ch41">Chapter 41</a> (durability: an <code>fsync</code>'d append to a log is what makes an in-memory write survive a crash),
+<a href="#ch47">Chapter 47</a> (pages and the on-disk file), <a href="#ch49">Chapter 49</a> (the sequential append a heap file already showed is cheap),
+<a href="#ch51">Chapter 51</a> and <a href="#ch52">Chapter 52</a> (the B-tree — the read-optimized, update-in-place engine this one is the mirror of).
+&nbsp;·&nbsp; The B-tree finds the page a key belongs on and updates it there, in place, which makes every write a random page update. This chapter builds
+the engine that refuses to do that: it never updates in place, buffers writes in memory, and flushes them as sorted, immutable files — turning random
+writes into sequential ones, and paying the bill at read time instead.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch46">Chapter 46</a> — on this machine sequential streaming ran at ~916&nbsp;MB/s and random 4&nbsp;KiB access at
+~19&nbsp;MB/s; about how many times slower is random, and why does that gap exist on both flash and disk? (2) <a href="#ch52">Chapter 52</a> — a
+B-tree write updates the page where the key belongs; what does that make each write, in device terms? (3) <em>Predict:</em> suppose you make every
+write cheap by never seeking — just append each new key-value to the end of a file, in arrival order. Writes are now pure sequential appends. What have
+you made <em>catastrophically</em> expensive, and for which operation? Write your guess; &sect;53.1 and &sect;53.3 answer it.</p>
+</aside>
+
+<p>The B-tree of the last two chapters is the read-optimized storage engine: it keeps keys sorted in a shallow tree of pages so any key is found in a
+handful of fetches, and it maintains that order by <strong>updating pages in place</strong> — finding the leaf a key belongs on and writing it there.
+That in-place discipline is exactly what makes reads and range scans excellent, and exactly what makes every write a <em>random</em> page update, paying
+the Chapter 46 random-access cost — ~49&times; slower than sequential on the very machine we measured. For a write-heavy workload — a metrics firehose,
+an event log, a high-ingest key-value store — that random-write tax dominates, and no amount of B-tree tuning removes it, because it is inherent in
+keeping the data sorted on disk as it arrives. The <strong>log-structured merge-tree</strong> (LSM-tree), introduced by O'Neil, Cheng, Gawlick, and
+O'Neil in 1996 and made ubiquitous by Google's Bigtable and its descendants (LevelDB, RocksDB, Cassandra, HBase), takes the opposite bet: it
+<strong>never updates in place</strong>. Writes go into a sorted in-memory structure and are periodically flushed to disk as whole, immutable, sorted
+files written sequentially; reads consult memory first and then those files, newest to oldest; and the files are merged in the background to keep their
+number down. The trade is deliberate and total — the LSM-tree makes writes sequential and cheap and pays for it at read time and in space — and it is
+the write-optimized counterpart to the read-optimized B-tree. This chapter builds it in five steps: the inversion, and why appending is not enough by
+itself (&sect;53.1); the write path — the memtable, the write-ahead log that makes it durable, and the flush to an immutable SSTable (&sect;53.2); the
+read path — check memory, then the sorted files newest to oldest, with a tombstone for deletes, reproduced in a working model (&sect;53.3); the
+resulting <strong>read amplification</strong> and space cost that pile up as files accumulate, and its named trap (&sect;53.4); and what all of this hands
+to the compaction chapter that follows (&sect;53.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's Intel Core i7-12700H) implementing a faithful
+LSM write and read path: writes land in a sorted in-memory memtable; when it reaches a flush threshold it is written, in sorted order, as an immutable
+SSTable and a fresh memtable begins; a read checks the memtable and then the SSTables newest to oldest, stopping at the first hit; and a delete writes a
+tombstone. The program reports two <em>structural</em> quantities — how many SSTables accumulate, and how many of them a point read must scan (its
+<em>read amplification</em>) — and confirms that the newest write wins and a tombstone shadows older values. These are counts determined by the code's
+logic and a seeded key stream, not wall-clock timings. Where a sequential-versus-random write cost appears, it is the <a href="#ch46">Chapter 46</a>
+device figures (~916&nbsp;MB/s sequential, ~19&nbsp;MB/s random) measured earlier in this volume and cited here, not re-measured (a hardware-counter
+profiler, <code>perf</code>, is not installed on this machine).</p>
+
+<h2>53.1 The inversion: make writes sequential, pay at read time</h2>
+
+<p>Start from the cost that defines the problem. On the machine of Chapter 46 a large sequential write streams at ~916&nbsp;MB/s while random
+4&nbsp;KiB access manages ~19&nbsp;MB/s — a ~49&times; gap, and it is not an accident of one device: seeks cost on disk, and even flash pays for
+random writes through its erase-block granularity and garbage collection. A B-tree write is a random write (it updates the leaf a key belongs on), so
+the B-tree sits on the slow side of that gap for every insert. The obvious escape is to <strong>stop seeking</strong>: never place a key where it
+belongs, just <em>append</em> each new key-value to the end of a file in arrival order. Writes are now pure sequential appends at ~916&nbsp;MB/s — the
+fast side of the gap. But this naive log has made one thing catastrophic, which is the answer to the opener: a <strong>read</strong> for a key must now
+scan the <em>entire log</em>, because the log is in arrival order, not key order, and the key could be anywhere — and if the key was overwritten, the
+newest value is whichever copy is latest in the log, so you cannot even stop at the first match from the front. An append-only log is the best possible
+write structure and the worst possible read structure. The LSM-tree is the engineering that keeps the sequential-write win while making reads tractable
+again, and it does so with one idea: <strong>keep the in-memory buffer sorted, and flush it sorted</strong>. Then the on-disk files are each internally
+sorted (so a key is found in one file by binary search, not a scan), and there are few enough of them (because each flush is a whole batch, not one key)
+that a read consults a manageable handful. The LSM-tree is not &ldquo;a log&rdquo; in the naive sense; it is a log of <em>sorted runs</em>, and that word
+&ldquo;sorted&rdquo; is what turns an unreadable append log into a real index. What it cannot escape is that reads now touch <em>several</em> sorted
+files instead of one tree — the bill the write side deferred — and the rest of the chapter is about paying it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Appending every write to a log in arrival order makes writes maximally cheap. Which operation does it make catastrophically expensive, and why?
+What single property must the buffer and its flushed files have to make that operation tractable again? (Answer after the next section.)</p>
+</aside>
+
+<h2>53.2 The write path: the memtable, the WAL, and the immutable SSTable</h2>
+
+<p>A write enters the LSM-tree at the <strong>memtable</strong>: an in-memory, sorted, mutable structure — typically a balanced tree or a skip list, so
+inserts stay ordered and cheap — that accumulates recent writes. Because the memtable is in volatile memory, a crash would lose it, so every write is
+<em>first</em> appended to a <strong>write-ahead log</strong> (WAL) on disk (Chapter 41) — a sequential, <code>fsync</code>'d append, itself cheap — so
+that after a crash the memtable can be reconstructed by replaying the log. This is the crucial detail that makes the LSM-tree durable without a random
+write: the only synchronous disk write on the insert path is a <em>sequential</em> append to the WAL; the sorted placement happens in memory. When the
+memtable grows past a threshold, it is <strong>flushed</strong>: its contents, already sorted, are written out in one sequential pass as an immutable
+on-disk file — historically called an <strong>SSTable</strong> (Sorted String Table, the name from Bigtable) — and once the SSTable is safely on disk
+the corresponding WAL segment can be discarded and a fresh empty memtable takes over. Two properties of that flushed file are load-bearing for
+everything after. It is <strong>sorted</strong>, so a lookup within one SSTable is a binary search, not a scan, and two SSTables can be merged by a
+linear merge like the merge step of mergesort. And it is <strong>immutable</strong>: once written, an SSTable is never modified in place — not to update
+a key, not to delete one — which is what keeps writes sequential (no random rewrites ever happen) and also makes the files trivially safe to read
+concurrently and to cache, since nothing mutates underneath a reader. An update to an existing key does not find and change it; it simply writes the new
+value into the memtable, which will flush to a newer SSTable, and the newer value <em>shadows</em> the old one at read time. The disk fills with a stack
+of immutable sorted files, newest on top, and no random write was ever issued.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: buffer in memory and flush sorted, turning random writes into sequential ones</span>
+<p><strong>1. In words.</strong> Instead of updating the page a key belongs on (a random write), the LSM-tree collects writes in a sorted in-memory
+memtable and flushes the whole batch as one immutable sorted file in a single sequential pass. Every disk write it issues is sequential; the price is
+that a key's current value may live in memory or in any of the flushed files.</p>
+<p><strong>2. As a picture.</strong> Figure 53.1: writes flow into a memtable box; an arrow labeled &ldquo;flush (sequential)&rdquo; drops a sorted
+SSTable onto a growing stack of immutable files below, newest on top; a WAL append sits beside the memtable guarding durability.</p>
+<p><strong>3. As numbers.</strong> The write the LSM-tree avoids is the ~19&nbsp;MB/s random 4&nbsp;KiB update of Chapter 46; the writes it issues — the
+WAL append and the flush — are the ~916&nbsp;MB/s sequential stream, the same ~49&times; faster side of the gap. The cost moves to reads and space,
+quantified in &sect;53.3&ndash;&sect;53.4.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">LSM write path: writes -&gt; sorted memtable (+ WAL for durability) -&gt; flush as an immutable sorted SSTable.</text>
+<rect x="30" y="40" width="150" height="34" fill="#dfe8f4" stroke="#14406b"/><text x="42" y="61" font-size="9">memtable (sorted, in RAM)</text>
+<rect x="210" y="40" width="90" height="34" fill="#f4ecd8" stroke="#8c3a1d"/><text x="220" y="55" font-size="8">WAL append</text><text x="220" y="68" font-size="8">(fsync, seq)</text>
+<path d="M180 57 L210 57" stroke="#8c3a1d"/><text x="120" y="34" font-size="8" fill="#333">write</text><path d="M105 20 L105 40" stroke="#333"/>
+<text x="325" y="61" font-size="8" fill="#2f7d32">flush (sequential, when full)</text>
+<path d="M105 74 L105 110" stroke="#2f7d32" stroke-width="1.5"/><path d="M99 104 L105 110 L111 104" fill="none" stroke="#2f7d32"/>
+<rect x="30" y="112" width="150" height="18" fill="#dff0df" stroke="#2f7d32"/><text x="42" y="125" font-size="8">SSTable 3 (newest)</text>
+<rect x="30" y="134" width="150" height="18" fill="#e8f4e8" stroke="#2f7d32"/><text x="42" y="147" font-size="8">SSTable 2</text>
+<rect x="30" y="156" width="150" height="18" fill="#eef7ee" stroke="#2f7d32"/><text x="42" y="169" font-size="8">SSTable 1 (oldest)</text>
+<text x="200" y="128" font-size="8" fill="#14406b">each file: sorted + immutable</text>
+<text x="200" y="150" font-size="8" fill="#8c3a1d">a read checks memtable, then</text>
+<text x="200" y="163" font-size="8" fill="#8c3a1d">SSTables newest -&gt; oldest (read amp)</text>
+<text x="30" y="200" font-size="8" fill="#8c3a1d">No random write is ever issued: the WAL append and the flush are both sequential (~916 MB/s side of Ch.46).</text>
+</svg>
+<figcaption>Figure 53.1: the LSM write path. Writes update a sorted in-memory memtable and are logged sequentially to the WAL for durability; when the
+memtable fills, it is flushed in one sequential pass as an immutable sorted SSTable atop a stack of older ones. Every disk write is sequential; a read
+must consult the memtable and then the SSTables newest to oldest.</figcaption>
+</figure>
+
+<p><em>(Answer to the &sect;53.1 quick check: a naive arrival-order append log makes <strong>reads</strong> catastrophic — a lookup must scan the whole
+log, since the key could be anywhere and the newest copy is wherever it was last written. The property that makes reads tractable is
+<strong>sortedness</strong>: keep the memtable sorted and flush it sorted, so each on-disk file is internally sorted — found by binary search, mergeable
+linearly — and a read consults a handful of sorted runs instead of scanning an unordered log.)</em></p>
+
+<h2>53.3 The read path: newest wins, tombstones, and read amplification</h2>
+
+<p>Because a key's value can live in the memtable or in any flushed SSTable, and because a newer write shadows an older one, a <strong>read</strong> must
+consult the sources <em>newest first</em> and stop at the first hit. It checks the memtable; then, if not found, the SSTables from newest to oldest;
+the first source that contains the key holds its current value, and the search stops — anything older is a superseded version and must not be returned.
+This ordering is also how <strong>deletion</strong> works, and the mechanism is worth stating plainly because it surprises people: since SSTables are
+immutable, a delete cannot go back and erase the key from the older files where it still sits. Instead a delete writes a <strong>tombstone</strong> — a
+marker &ldquo;this key is deleted&rdquo; — into the memtable, which flushes to a newer SSTable like any other write. A later read finds the tombstone
+first (it is the newest entry for that key), stops, and reports the key absent, even though older SSTables still physically contain the old value. A
+delete, in an LSM-tree, is a <em>write</em>. The working model reproduces the whole path — newest-wins reads, tombstone-shadows-value deletes, and the
+count of files a read must touch:</p>
+
+<pre><code>LSM write path (100000 writes, keys drawn from a 40k-key space so keys are overwritten):
+  flush_threshold=1000: 100000 writes -> 99 SSTables on disk
+     avg SSTables scanned per point read: hit=35.9   miss=99  (a miss must touch ALL runs)
+  flush_threshold=5000: 100000 writes -> 19 SSTables on disk
+     avg SSTables scanned per point read: hit= 7.6   miss=19  (a miss must touch ALL runs)
+
+correctness: newest write wins; a tombstone shadows an older value
+  put v1, put v2, flush;  put v3, flush   -> get = v3           (newest of two SSTables)
+  delete, flush                           -> get = None         (tombstone shadows v2,v3, which still sit on disk)
+  SSTables on disk: 3  (the dead values are NOT reclaimed until compaction)
+</code></pre>
+
+<p>Two facts jump out. First, the model is <strong>correct</strong>: the newest write wins, and a tombstone hides values that physically still exist in
+older files — deletion by shadowing, not erasure. Second, and this is the whole cost of the design: a point read may have to scan <em>many</em> SSTables.
+A lookup for a key that is <em>absent</em> is the worst case — it finds the key in none of them, so it must touch <em>every</em> run before concluding
+&ldquo;not here&rdquo; (99 files at the small flush threshold, 19 at the larger). This is <strong>read amplification</strong>: the LSM-tree turned one
+logical read into many physical file probes, the exact mirror of the write amplification a B-tree pays. The flush threshold trades one against the other
+— a larger memtable means fewer, bigger SSTables (less read amplification) but more memory held and more lost on a crash before the WAL is replayed.
+And notice the deletion line: after deleting the key, three SSTables still sit on disk, two of them holding now-dead values plus a tombstone. The
+LSM-tree's write path has quietly created three problems that only grow with time — too many files to read, dead values wasting space, and tombstones
+that must be carried until every older copy they shadow is gone — and none of them is fixed by anything on the write path. Fixing them is the job of
+<em>compaction</em>, the next chapter; this chapter's job is to make you feel why compaction is not optional.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why must a read consult its sources newest-first and stop at the first hit — what would returning an older copy get wrong? And why is a point
+<em>miss</em>, not a hit, the worst case for read amplification? (Answer after the communicate box.)</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: a delete is a write — the tombstone, and the range-scan-over-tombstones cliff</span>
+<p>The intuition &ldquo;deleting frees space and speeds things up&rdquo; is exactly backwards in an LSM-tree, and it bites hard. A delete does not
+remove anything: it <strong>writes a tombstone</strong>, which <em>adds</em> data, consumes a memtable slot and eventually an SSTable entry, and leaves
+the old value physically on disk in older files until a later compaction finally drops both. So deleting a million keys makes the store temporarily
+<em>larger</em>, not smaller. Worse is the range scan. A range scan over an LSM-tree must merge the runs across the whole key range and <em>skip past
+every tombstone in it</em>, because a tombstone might be shadowing a live value in an older run and the scan cannot know without reading it. A key range
+that has been heavily deleted — say a queue table where rows are inserted and soon deleted, or a time range that was bulk-purged — can therefore hold
+thousands of tombstones with almost no live rows, and a scan of it reads all of them to return almost nothing: a query that touches &ldquo;ten live
+rows&rdquo; can physically read tens of thousands of tombstones and stall. This is a real and famous operational cliff (Cassandra operators know it as
+the &ldquo;tombstone scan&rdquo; problem, complete with warning thresholds). &ldquo;It's just a few deleted rows, the query should be fast&rdquo; and
+&ldquo;deletes clean up after themselves&rdquo; are both false on an LSM-tree: deletes are writes that linger, and reads pay for them until compaction
+removes them. The honest mental model is that in an LSM-tree <em>every</em> operation, including delete, is an append, and space and read cost are
+reclaimed only by the background merge — never by the delete itself.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;We moved our high-ingest service from Postgres to an LSM key-value store and writes got dramatically
+faster — great. But now point reads are noticeably slower than before, and the data directory is almost twice the size of the actual data. Did we
+misconfigure something?&rdquo; Cover the paragraph and answer in four or five sentences, drawing on &sect;53.1&ndash;&sect;53.4.</p>
+<p><em>Model answer.</em> &ldquo;Nothing is misconfigured — you're seeing the LSM-tree's trade working exactly as designed. It made writes fast by never
+updating in place: writes buffer in memory and flush as immutable sorted files, so every disk write is sequential instead of a random page update.
+The bill for that lands on reads and space. A point read has to check the memtable and then the sorted files newest-to-oldest, so it probes several
+files instead of one B-tree — that's read amplification, and it's why reads got slower. And the near-2&times; size is space amplification: old versions
+of updated keys and tombstones for deleted keys physically stay in older files until a background <em>compaction</em> merges the files and drops the
+dead entries. So it's the write-optimized side of a deliberate trade, not a bug. What you tune is compaction — how aggressively the files are merged —
+which buys back read speed and space at the cost of extra background write work; that's the knob, and it's the subject of the next chapter.&rdquo;
+Naming the in-place-vs-append inversion, read amplification, space amplification, and compaction as the knob is the senior register.</p>
+</aside>
+
+<h2>53.4 Why the files must be merged: read amplification and space, over time</h2>
+
+<p>The write path of &sect;53.2 has one relentless consequence: SSTables only accumulate. Every flush adds a file and none is ever removed by writing,
+so a long-running LSM-tree drifts toward a large stack of sorted runs, and the read path of &sect;53.3 pays for every one of them. Read amplification
+grows with the file count — a point miss touches all of them, and even a hit touches every file newer than the one holding the key. Space grows too, and
+for two distinct reasons the write path guarantees: <strong>obsolete versions</strong>, because updating a key writes a new copy while the old copy sits
+in an older file unremoved, so a hot key that is updated a thousand times has a thousand versions on disk with only the newest live; and
+<strong>tombstones</strong>, because a delete adds a marker and cannot remove the shadowed value, so deleted data occupies space until every copy it
+shadows is gone. Left alone, an LSM-tree becomes slower to read and larger on disk without bound, even as its <em>logical</em> contents stay the same
+size. The structure therefore has a mandatory second half that the write path implies but does not perform: <strong>compaction</strong>, a background
+process that reads several SSTables, merges their sorted contents into fewer (or one) new sorted SSTables, and along the way keeps only the newest
+version of each key and drops tombstones whose shadowed values it has now also seen and discarded. Compaction is what bounds the file count (bounding
+read amplification), reclaims the space of dead versions and tombstones (bounding space amplification), and it is the reason the &ldquo;LSM&rdquo; has
+&ldquo;merge&rdquo; in its name. It is not free — it re-reads and re-writes data that was already written, which is <em>write amplification</em>, the LSM's
+own version of the B-tree's random-write cost, only deferred and sequential — and how aggressively to run it is the central tuning decision, trading
+read amplification and space against write amplification. That three-way trade — the amount of extra reading, extra writing, and extra space you
+accept — is the subject of the next chapter, and it is why there is no single &ldquo;best&rdquo; LSM configuration: you choose which of the three to
+spend.</p>
+
+<p><em>(Answer to the &sect;53.3 quick check: a read must go newest-first and stop at the first hit because a newer write <strong>shadows</strong> an
+older one — the first source containing the key holds its current value, and any older copy is a superseded version that would be wrong to return. A
+point <strong>miss</strong> is the worst case because the key is in no source, so the read can never stop early: it must probe the memtable and every
+SSTable before it can conclude the key is absent — the full read amplification, every time.)</em></p>
+
+<h2>53.5 What to carry forward</h2>
+
+<p>The LSM-tree is the write-optimized storage engine, the mirror of the read-optimized B-tree. It exploits the Chapter 46 fact that sequential access
+is ~49&times; faster than random by <strong>never updating in place</strong>: writes go to a sorted in-memory <strong>memtable</strong>, made durable by
+a sequential <strong>WAL</strong> append, and are flushed in one sequential pass as an immutable, sorted <strong>SSTable</strong> — so every disk write is
+sequential and no random page update is ever issued (&sect;53.1&ndash;&sect;53.2). Reads pay for that: a lookup checks the memtable, then the SSTables
+<strong>newest to oldest</strong>, stopping at the first hit; a delete is a <strong>write</strong> of a tombstone that shadows older values rather than
+erasing them; and a point miss must touch every file — <strong>read amplification</strong>, reproduced at 19&ndash;99 files scanned in the working model
+(&sect;53.3). Because files only accumulate and dead versions and tombstones only pile up, the structure requires <strong>compaction</strong> to merge
+runs, drop obsolete versions and tombstones, and bound both read amplification and space — at the cost of <strong>write amplification</strong>
+(&sect;53.4).</p>
+
+<p>Step back and the two engines of this part are now both on the table, and they are exact opposites built on the same storage manager. The
+<strong>B-tree</strong> keeps data sorted on disk and updates it in place: reads and range scans are excellent (one shallow tree, one path), writes are
+random and expensive, and space is tight (~69% full). The <strong>LSM-tree</strong> keeps data sorted in memory and appends it to disk in immutable
+runs: writes are sequential and cheap, reads and range scans pay to merge many runs, and space is loose (dead versions and tombstones linger until
+compaction). Neither is better; they sit at opposite ends of a trade between the cost of reading, the cost of writing, and the cost of storage — and the
+next chapter makes that trade precise, showing how compaction strategy lets an LSM-tree slide along it, and why you cannot minimize all three at once.
+The chapter after builds the read-side rescue the LSM-tree needs — the Bloom filter that lets a point read skip files that cannot contain the key,
+cutting the read amplification &sect;53.3 measured. And the final chapter of the part puts B-tree and LSM-tree side by side and answers the question the
+whole part has been building toward: given a workload, which engine, and why. The B-tree gave you fast selective reads; the LSM-tree gives you fast
+durable writes; the art is knowing which bill you would rather pay.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>State the inversion: what the LSM-tree refuses to do, and which device fact of Chapter 46 makes that pay.</li>
+<li>Explain why a naive arrival-order append log is unreadable, and what property fixes it.</li>
+<li>Trace the write path: memtable, WAL, flush to an immutable SSTable, and why each disk write is sequential.</li>
+<li>Trace a read: which sources, in what order, and why newest wins; and explain how a tombstone deletes.</li>
+<li>Define read amplification and space amplification, and say why both grow over time without intervention.</li>
+<li>Explain why compaction is mandatory and what it costs (write amplification).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is the LSM-tree's core inversion, and which Chapter 46 measurement justifies it? (&sect;53.1)</li>
+<li><strong>R2.</strong> Describe the write path — memtable, WAL, SSTable flush — and why the flushed file must be sorted and immutable. (&sect;53.2)</li>
+<li><strong>R3.</strong> How does a read find a key's current value, and how does a tombstone delete one? (&sect;53.3)</li>
+<li><strong>R4.</strong> What is read amplification in an LSM-tree, and why is a point <em>miss</em> its worst case? (&sect;53.3&ndash;&sect;53.4)</li>
+<li><strong>R5.</strong> Why must SSTables be compacted, and what does compaction cost in return? (&sect;53.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Patrick O'Neil, Edward Cheng, Dieter Gawlick &amp; Elizabeth O'Neil, &ldquo;The Log-Structured Merge-Tree (LSM-Tree),&rdquo;
+<em>Acta Informatica</em> 33(4), 1996, pp. 351&ndash;385, DOI 10.1007/s002360050048.</strong> The paper that named and analyzed the structure: buffering
+in memory and merging sorted runs to convert random writes into sequential ones. First author Patrick O'Neil; venue, volume, pages, year, and DOI
+verified via SpringerLink and the ACM Digital Library.</li>
+<li><strong>Fay Chang et&nbsp;al., &ldquo;Bigtable: A Distributed Storage System for Structured Data,&rdquo; <em>7th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI&nbsp;'06)</em>, 2006, pp. 205&ndash;218.</strong> The system that popularized the memtable / SSTable / minor-
+and major-compaction vocabulary of &sect;53.2&ndash;&sect;53.4 and seeded LevelDB, RocksDB, HBase, and Cassandra. First author Fay Chang; venue, year,
+and pages verified via the USENIX proceedings listing.</li>
+<li><strong>Chen Luo &amp; Michael J. Carey, &ldquo;LSM-based storage techniques: a survey,&rdquo; <em>The VLDB Journal</em> 29(1), 2020, pp.
+393&ndash;418, DOI 10.1007/s00778-019-00555-y.</strong> The modern survey: the write/read paths, tombstones, and the read/write/space amplification
+framing this chapter and the next use. First author Chen Luo; venue, volume, pages, year, and DOI verified via SpringerLink and the ACM Digital
+Library.</li>
+<li><strong>Mendel Rosenblum &amp; John K. Ousterhout, &ldquo;The Design and Implementation of a Log-Structured File System,&rdquo; <em>ACM Transactions
+on Computer Systems</em> 10(1), 1992, pp. 26&ndash;52, DOI 10.1145/146941.146943.</strong> The intellectual ancestor of &sect;53.1: writing all changes
+sequentially to a log to make writes cheap, and cleaning (compacting) the log afterward. First author Mendel Rosenblum; venue, volume, pages, year, and
+DOI verified via the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex53.1"><span class="ex-label">53.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does the LSM-tree refuse to do that the B-tree does, and which Chapter 46 measurement makes that refusal pay off?</div>
+
+<div class="exercise" id="ex53.2"><span class="ex-label">53.2</span> <span class="ex-tag warm">warm-up</span>
+Name the three pieces of the write path in the order a write touches them, and say which one exists purely for durability.</div>
+
+<div class="exercise" id="ex53.3"><span class="ex-label">53.3</span> <span class="ex-tag warm">warm-up</span>
+In an LSM-tree, what does a delete actually write, and why can't it simply remove the key from disk?</div>
+
+<div class="exercise" id="ex53.4"><span class="ex-label">53.4</span> <span class="ex-tag core">core</span>
+The naive log. (a) Explain why appending every write to a file in arrival order makes writes maximally cheap. (b) Explain precisely why a point read on
+that log is catastrophic, including why you cannot stop at the first match found scanning from the front. (c) State the single property that turns the
+unreadable log into a real index, and how it helps both a single-file lookup and a two-file merge.</div>
+
+<div class="exercise" id="ex53.5"><span class="ex-label">53.5</span> <span class="ex-tag core">core</span>
+The read path. (a) List the sources a read consults and the order, and explain why newest must win. (b) Trace the model's sequence — put v2 (flush),
+put v3 (flush), delete (flush) — and give the result of a read after each flush, naming what shadows what. (c) Explain why a point <em>miss</em> is the
+worst case for read amplification.</div>
+
+<div class="exercise" id="ex53.6"><span class="ex-label">53.6</span> <span class="ex-tag core">core</span>
+Immutability. (a) Give two distinct things the &ldquo;SSTables are never modified in place&rdquo; rule buys (think writes, and think concurrent
+readers). (b) Given immutability, explain how an update to an existing key takes effect at all. (c) Explain how immutability forces deletion to use a
+tombstone rather than an in-place erase.</div>
+
+<div class="exercise" id="ex53.7"><span class="ex-label">53.7</span> <span class="ex-tag complexity">cost</span>
+Read amplification versus the flush threshold. (a) In the model, 100,000 writes produced 99 SSTables at a 1,000-key flush threshold and 19 at 5,000;
+explain the relationship. (b) A point miss scans how many files in each case, and why the miss and not the hit is the worst case? (c) What does raising
+the flush threshold cost, given the memtable is volatile and backed only by the WAL?</div>
+
+<div class="exercise" id="ex53.8"><span class="ex-label">53.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A queue table inserts rows and deletes each soon after it is processed; a monitoring query scans the
+table's key range expecting ~10 live rows and times out.
+<br><strong>Step 1 (given):</strong> each delete writes a tombstone, not an erase, so processed rows leave tombstones behind.
+<br><strong>Step 2 (given):</strong> the tombstones stay on disk until a compaction removes them and the values they shadow.
+<br><strong>Step 3 (given):</strong> a range scan must read and skip past every tombstone in the range, because each might shadow a live value in an older run.
+<br><strong>Step 4 (you):</strong> Explain why a scan expecting ~10 live rows can physically read tens of thousands of entries, and name what must
+happen for the scan to get fast again.</div>
+
+<div class="exercise" id="ex53.9"><span class="ex-label">53.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the LSM concept responsible — <em>the memtable</em>, <em>the WAL</em>, <em>SSTable immutability</em>, <em>the tombstone</em>, or
+<em>read amplification</em> — and why: (a) a crash loses no acknowledged write even though the memtable is in RAM; (b) a point miss must touch every
+file; (c) a deleted key still occupies disk space; (d) recent writes are served without touching disk at all; (e) an old SSTable can be read
+concurrently with no locking.</div>
+
+<div class="exercise" id="ex53.10"><span class="ex-label">53.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;An LSM-tree issues random writes only when the memtable is
+full.&rdquo; (b) &ldquo;A delete in an LSM-tree immediately frees the deleted key's space.&rdquo; (c) &ldquo;A read returns the value from the oldest
+SSTable that contains the key.&rdquo; (d) &ldquo;Every disk write an LSM-tree issues — WAL append and flush — is sequential.&rdquo; (e) &ldquo;Read
+amplification means one logical read may become many physical file probes.&rdquo;</div>
+
+<div class="exercise" id="ex53.11"><span class="ex-label">53.11</span> <span class="ex-tag stretch">stretch</span>
+The mirror. (a) Lay out the B-tree and LSM-tree as opposites on three axes — write cost, read cost, and space — citing the mechanism behind each
+(in-place update vs append; one tree vs many runs; ~69% fill vs lingering dead versions). (b) Argue that the LSM-tree's write amplification (from
+compaction) is the counterpart to the B-tree's random-write cost, and why one is deferred and sequential while the other is immediate and random.
+(c) From the three axes, state the kind of workload for which each engine is the right default.</div>
+
+<div class="exercise" id="ex53.12"><span class="ex-label">53.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Implement a memtable (a sorted map) that flushes to an immutable sorted SSTable at a threshold, a read that
+checks the memtable then SSTables newest-to-oldest, and a delete that writes a tombstone. (b) Drive it with a seeded stream of writes over a small key
+space and report how many SSTables accumulate and how many a point miss must scan. (c) Verify that the newest write wins and a tombstone hides an older
+value. (d) State your toolchain and explain why the file count and scan count are <em>structural</em> outcomes of the logic and the key stream, not
+wall-clock timings.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch54">
+<h1>Chapter 54 — Compaction and Amplification: Tuning the LSM-Tree</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (sequential ~916&nbsp;MB/s vs random ~19&nbsp;MB/s — compaction
+is large sequential work, which is why it is affordable at all), <a href="#ch48">Chapter 48</a> (compaction competes with foreground work for the buffer
+pool and the device), <a href="#ch51">Chapter 51</a> and <a href="#ch52">Chapter 52</a> (the B-tree, whose read cost and ~69% space this chapter's
+trade is measured against), <a href="#ch53">Chapter 53</a> (the LSM write and read path this chapter completes — the memtable, the immutable SSTable,
+tombstones, and the read amplification that made compaction mandatory). &nbsp;·&nbsp; Chapter 53 left the LSM-tree with a growing stack of immutable
+files, dead versions and tombstones piling up, and reads paying for all of it. This chapter is the missing second half: <strong>compaction</strong>,
+the background merge that bounds the mess — and the three amplifications it trades among, the tuning decision at the heart of every LSM store.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch53">Chapter 53</a> — why do SSTables only accumulate, and what two kinds of dead data pile up in them over time?
+(2) <a href="#ch53">Chapter 53</a> — a point-read miss must touch how many of the files, and what is that cost called? (3) <em>Predict:</em> compaction
+merges files to cut read amplification and reclaim space — but it does so by re-reading and re-writing data already on disk. So it lowers two costs and
+raises a third. Name the three costs an LSM-tree trades among, and guess whether any single compaction strategy can make all three small at once. Write
+your guess; &sect;54.2&ndash;&sect;54.3 answer it.</p>
+</aside>
+
+<p>Chapter 53 built the LSM-tree's write and read paths and ended at an uncomfortable place: the write path only ever <em>adds</em> immutable SSTables,
+so their number grows without bound, dead versions of updated keys and tombstones of deleted ones accumulate, and the read path pays for every file —
+read amplification and space that climb forever if nothing intervenes. <strong>Compaction</strong> is what intervenes. It is a background process that
+takes several SSTables, merges their sorted contents into fewer new SSTables, and along the way keeps only the newest version of each key and drops
+tombstones once it has passed the values they shadow — bounding the file count (and thus read amplification) and reclaiming the space of dead data. But
+compaction is not free: it re-reads and re-writes data that was already written, which is <strong>write amplification</strong>, the LSM-tree's own cost
+of keeping order, deferred and sequential where the B-tree's was immediate and random. So an LSM-tree is defined by a three-way tension — how much
+extra <em>reading</em>, extra <em>writing</em>, and extra <em>space</em> it accepts — and the compaction strategy is how you pick your point in that
+space. This chapter makes the trade precise: what compaction actually does, merging runs and dropping dead data, reproduced on real runs (&sect;54.1);
+the three amplifications — write, read, space — and the impossibility, the RUM tension, that you cannot minimize all three (&sect;54.2); the two great
+compaction families, <strong>leveled</strong> and <strong>size-tiered</strong>, and an arithmetic model of where each sits on the three axes (&sect;54.3);
+the tuning that follows and its named trap, that compaction is not free background work but a source of write stalls and device wear (&sect;54.4); and
+what this completes about the two storage-engine families (&sect;54.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's Intel Core i7-12700H) in two parts. First it runs
+a <strong>concrete compaction</strong>: given a set of overlapping sorted runs with updates and tombstones, it merges them keeping the newest value per
+key and dropping tombstones, and reports how many entries and runs remain — a structural result of the merge logic, showing read amplification and dead
+space collapse. Second it computes an <strong>amplification model</strong>: closed-form arithmetic for the write, read, and space amplification of
+leveled versus size-tiered compaction as a function of the size ratio between levels — exact functions of the parameters, hardware-independent, of the
+same kind as Chapter 51's fanout arithmetic, and clearly a model of the structure rather than a measurement of any device. Where a sequential-write cost
+appears it is the <a href="#ch46">Chapter 46</a> figure cited, not re-measured (a hardware-counter profiler, <code>perf</code>, is not installed on this
+machine); the amplification numbers are analytical, and labeled as such.</p>
+
+<h2>54.1 Compaction: merging runs, dropping dead versions and tombstones</h2>
+
+<p><strong>Compaction</strong> is a <em>k</em>-way merge of sorted runs, and it is cheap for the same reason the flush was: the inputs are already
+sorted, so merging them is one linear pass (the merge step of mergesort), reading sequentially and writing sequentially — the ~916&nbsp;MB/s side of
+Chapter 46, never a random access. As it merges, compaction does the garbage collection the immutable write path could not. When several runs contain
+the same key, it keeps only the <strong>newest version</strong> and discards the rest — reclaiming the space of every superseded update. And when it
+meets a <strong>tombstone</strong>, it drops the tombstone <em>and</em> the older values it shadows, since after the merge there is no older run left for
+those values to hide in — reclaiming deleted data and, finally, the tombstone itself. The output is fewer, larger sorted runs holding only live data, so
+a subsequent read touches fewer files (lower read amplification) over less dead space (lower space amplification). The working model compacts twenty
+overlapping runs full of updates and tombstones:</p>
+
+<pre><code>concrete compaction of 20 SSTable runs (updates + tombstones, keyspace 5000):
+  entries across runs before: 25934   (a point miss scans all 20 runs)
+  entries after full compaction: 3362 (a point read scans 1 run; dead versions + tombstones dropped)
+  space reclaimed: 87.0%   read amplification: 20x -> 1x
+</code></pre>
+
+<p>The twenty runs held 25,934 entries, but most were dead — superseded updates and tombstones — so merging them to keep only the newest live value per
+key left 3,362 entries in one run: <strong>87% of the physical data was garbage</strong> that compaction reclaimed, and read amplification for the
+compacted range fell from twenty files to one. That is the entire value proposition of compaction in one measurement — it converts the write path's
+accumulated slack back into a compact, cheap-to-read form. But look at what it cost to get there: to produce the 3,362-entry output, compaction had to
+<em>read all 25,934 input entries and write 3,362 out</em>, work spent re-processing data that was already on disk. Do this repeatedly, as an LSM-tree
+must — every byte is rewritten each time its run is compacted into a larger one — and the rewriting adds up to several times the original data volume.
+That is write amplification, and it is not a flaw to be fixed but the price of order; the only question is how much of it you pay, which depends entirely
+on <em>how</em> you compact.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Compaction merges sorted runs and, doing so, reclaims two kinds of dead data — name them, and say what happens to a tombstone and the value it
+shadows. Why is the merge itself a cheap (sequential) operation, and what new cost does repeatedly rewriting data create? (Answer in &sect;54.2.)</p>
+</aside>
+
+<h2>54.2 The three amplifications, and why you cannot minimize all three</h2>
+
+<p>An LSM-tree's behavior is captured by three <strong>amplification</strong> factors, each a ratio of physical work or space to the logical minimum.
+<strong>Write amplification</strong> is the bytes actually written to the device per byte of logical data — greater than one because compaction rewrites
+data as it merges runs into larger ones. <strong>Read amplification</strong> is the number of physical accesses per logical read — greater than one
+because a lookup probes multiple runs. <strong>Space amplification</strong> is the bytes on disk per byte of live data — greater than one because dead
+versions and tombstones linger until compaction removes them. Here is the fact that makes LSM tuning an art rather than a lookup: these three are in
+<strong>tension</strong>, and lowering one tends to raise another. Compact aggressively — merge runs the moment they appear — and you keep few runs (low
+read amplification) and little dead data (low space amplification), but you rewrite constantly (high write amplification). Compact lazily — let runs pile
+up before merging — and you rewrite rarely (low write amplification) but read across many runs (high read amplification) over lots of dead data (high
+space amplification). You cannot have all three small at once. This is a specific instance of a general law of access-method design, the
+<strong>RUM conjecture</strong> of Athanassoulis and colleagues (2016): optimizing any two of read overhead, update overhead, and memory/space overhead
+comes at the expense of the third. The LSM-tree does not escape the trade the B-tree faced; it relocates it — the B-tree spent its cost as immediate
+random writes and tight space, the LSM-tree spends its as deferred sequential write amplification and looser space — but the trilemma is the same, and
+answering the opener's second question: <strong>no single compaction strategy makes all three amplifications small</strong>. You choose which to spend.</p>
+
+<p><em>(Answer to the &sect;54.1 quick check: compaction reclaims <strong>superseded update versions</strong> (keeping only the newest value per key) and
+<strong>deleted data</strong> — when it meets a tombstone it drops both the tombstone and the older values it shadowed, since no older run remains to
+hide them. The merge is cheap because the inputs are sorted, so it is one sequential pass (Chapter 46's fast side), never a random access. The new cost
+is <strong>write amplification</strong>: repeatedly rewriting data as it is merged into larger runs writes several times the logical data volume over an
+item's lifetime.)</em></p>
+
+<h2>54.3 Leveled versus size-tiered compaction: the model</h2>
+
+<p>The two dominant compaction strategies sit at opposite ends of the write-versus-read-and-space trade, and both organize SSTables into
+<strong>levels</strong>, each level holding runs some size ratio <var>T</var> larger than the one above; the number of levels is
+<var>L</var>&nbsp;&asymp;&nbsp;log-base-<var>T</var> of the data size over the memtable size, so <var>L</var> is small (single digits) for the same
+logarithmic reason the B-tree is shallow. <strong>Leveled compaction</strong> keeps exactly <em>one sorted run per level</em>: when a level overflows,
+its data is merged into the next level's single run, which — because that level is <var>T</var> times bigger — rewrites roughly <var>T</var> bytes for
+each byte promoted, so write amplification is about <var>T</var>&times;<var>L</var>; but a read finds at most one run per level (low read amplification)
+and dead data is squeezed out quickly (low space amplification, near 1). <strong>Size-tiered compaction</strong> instead lets <em>up to <var>T</var> runs
+accumulate per level</em> and merges them, all at once, only when a level is full: each byte is written just once per level, so write amplification is
+only about <var>L</var>; but a read may probe up to <var>T</var> runs at every level (high read amplification, ~<var>T</var>&times;<var>L</var>) and a
+full level's worth of dead data can linger (space amplification up to ~<var>T</var>). Same structure, two policies, opposite corners. The model computes
+all three amplifications for a billion-entry store as the size ratio <var>T</var> varies:</p>
+
+<pre><code>amplification model (N=1e9 entries, flush unit B=1e6; W=write, R=read, S=space amp):
+  T    levels | LEVELED  (W / R / S)     | SIZE-TIERED (W / R / S)
+   2     10   |   20 /  10 / 1.50        |    10 /  20 /  2.0
+   4      5   |   20 /   5 / 1.25        |     5 /  20 /  4.0
+  10      3   |   30 /   3 / 1.10        |     3 /  30 / 10.0
+  20      3   |   60 /   3 / 1.05        |     3 /  60 / 20.0
+  -> leveled trades WRITE amp for low READ and SPACE amp; size-tiered does the reverse. Same tree.
+</code></pre>
+
+<p>Read the table across and the trade is stark and symmetric. At every size ratio, leveled compaction's read and space amplification are low (a handful
+of runs, space within ~10&ndash;50% of the live data) while it pays in write amplification (20&ndash;60&times;); size-tiered's write amplification is
+low (3&ndash;10&times;) while it pays in read amplification (up to 60&times;) and space (up to 2&ndash;20&times; the live data). Raising <var>T</var> makes
+the tree shallower — fewer levels — which cuts one column and inflates the other: leveled's write amplification climbs with <var>T</var> while its read
+and space fall; size-tiered's read and space climb with <var>T</var> while its write falls. There is no row where all three are small, which is the RUM
+tension made numeric. This is why real engines expose compaction as a <em>choice</em>: RocksDB defaults to leveled for read-heavy workloads that need
+tight space, offers size-tiered (universal) compaction for write-heavy ingest that can tolerate read and space blowup, and Cassandra, HBase, and
+ScyllaDB expose the same knob — because the &ldquo;right&rdquo; answer is a property of the workload, not of the structure.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: leveled and size-tiered are opposite corners of the write/read/space trade</span>
+<p><strong>1. In words.</strong> Leveled keeps one run per level, so reads and space are tight but every promotion rewrites a full larger level — high
+write amplification. Size-tiered lets runs pile up and merges in bulk, so each byte is written about once per level — low write amplification — but
+reads probe many runs over much dead data. You pick the corner your workload can afford.</p>
+<p><strong>2. As a picture.</strong> Figure 54.1: a triangle with corners labeled <em>read</em>, <em>write</em>, and <em>space</em>; a &ldquo;leveled&rdquo;
+dot pulled toward low-read/low-space (far from write), a &ldquo;size-tiered&rdquo; dot pulled toward low-write (far from read and space) — no dot can sit
+at the center.</p>
+<p><strong>3. As numbers.</strong> Modeled here at size ratio <var>T</var>=10 over a billion entries: leveled = write&nbsp;30 / read&nbsp;3 /
+space&nbsp;1.10; size-tiered = write&nbsp;3 / read&nbsp;30 / space&nbsp;10. The write and read columns literally swap, and space swings 1.1&times; vs
+10&times; — the trilemma, quantified.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The RUM trilemma: leveled and size-tiered compaction pull to opposite corners. No policy reaches all three.</text>
+<polygon points="320,40 120,175 520,175" fill="#f7f7f7" stroke="#14406b"/>
+<text x="300" y="34" font-size="9" fill="#14406b">low READ amp</text>
+<text x="70" y="188" font-size="9" fill="#8c3a1d">low WRITE amp</text>
+<text x="470" y="188" font-size="9" fill="#2f7d32">low SPACE amp</text>
+<circle cx="380" cy="150" r="6" fill="#14406b"/><text x="392" y="154" font-size="9" fill="#14406b">leveled (W30 / R3 / S1.1)</text>
+<circle cx="200" cy="120" r="6" fill="#8c3a1d"/><text x="150" y="112" font-size="9" fill="#8c3a1d">size-tiered (W3 / R30 / S10)</text>
+<text x="150" y="205" font-size="8" fill="#333">at T=10, 1e9 entries: the write and read amplifications swap; space swings 1.1x vs 10x. No dot sits at the centroid.</text>
+</svg>
+<figcaption>Figure 54.1: the read/write/space trilemma (the RUM tension). Leveled compaction sits near low read and low space, paying high write
+amplification; size-tiered sits near low write, paying high read and space. The modeled numbers at size ratio <var>T</var>=10 (leveled 30/3/1.1,
+size-tiered 3/30/10) show the columns swapping — no compaction policy occupies the center where all three are small.</figcaption>
+</figure>
+
+<aside class="warning">
+<span class="box-title">Trap: compaction is not free background work — write stalls, write amplification, and device wear</span>
+<p>&ldquo;Compaction runs in the background, so it's free&rdquo; is the trap, and it fails at three levels. First, <strong>throughput</strong>:
+compaction competes with foreground writes and reads for the same device bandwidth and buffer pool (Chapter 48), so a store under heavy ingest can find
+its reads and writes slowed by the very merging meant to help them — the background work is real work on the same disk. Second, and sharper,
+<strong>write stalls</strong>: if the ingest rate exceeds the rate at which compaction can merge, the unmerged runs (RocksDB's level&nbsp;0, for
+instance) pile up, read amplification spikes, and the engine must <em>throttle or stall incoming writes</em> to let compaction catch up — the LSM-tree's
+&ldquo;fast writes&rdquo; turn into periodic write stalls exactly when the write load is highest, which is a classic production surprise. Third,
+<strong>device wear</strong>: write amplification means the SSD physically writes several times the logical data — a leveled store at write amplification
+30 writes thirty bytes per logical byte — which multiplies flash wear and can dominate the storage budget. The two counter-traps are equal and
+opposite: switching to size-tiered to cut write amplification (and stalls and wear) can multiply <em>read</em> amplification and double or 10&times; the
+<em>space</em>; switching to leveled for read speed and tight space can triple or sextuple the write amplification and its stalls and wear.
+&ldquo;Compaction is free&rdquo; and &ldquo;just pick the cheap-write policy&rdquo; are both false: compaction is foreground-affecting work you provision
+for, and every policy spends one amplification to save another. The honest posture is to measure the workload's read/write/space mix, choose the
+compaction family that spends the amplification you can most afford, and provision compaction throughput so it keeps up with ingest.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Our LSM stores are wearing out SSDs and I've read that size-tiered compaction has much lower write
+amplification. Let's switch every table to size-tiered to cut the writes and save the flash.&rdquo; Cover the paragraph and answer in four or five
+sentences, drawing on &sect;54.2&ndash;&sect;54.3.</p>
+<p><em>Model answer.</em> &ldquo;Size-tiered really does cut write amplification — at size ratio 10 it's about 3&times; versus leveled's ~30&times;, so
+the flash-wear worry is legitimate for write-heavy tables. But it isn't free: size-tiered raises the other two amplifications by roughly the same factor
+it saves. Read amplification can jump to ~30&times; because a lookup probes many runs per level, and space amplification can hit ~10&times; because a
+level's worth of dead versions and tombstones lingers before the bulk merge — so our read-heavy tables would get slower and our disk usage could balloon.
+The right move is per-table, not global: keep leveled where reads and tight space matter, use size-tiered only on the write-heavy ingest tables that can
+tolerate the read and space cost, and either way provision enough compaction throughput that we don't hit write stalls under peak ingest. It's a
+three-way trade — read, write, space — and we should spend the amplification each table can most afford, not minimize writes everywhere.&rdquo; Naming
+the RUM trade, the specific read/space cost of size-tiered, and the per-workload choice is the senior register.</p>
+</aside>
+
+<h2>54.4 Tuning: choosing which amplification to spend</h2>
+
+<p>Everything above resolves into a single design decision made per store, sometimes per table: <em>which amplification can this workload most afford to
+spend?</em> A read-heavy or space-constrained workload — an index served under tight latency, a store on expensive fast storage — wants <strong>leveled
+compaction</strong>, accepting high write amplification to keep reads and space tight. A write-heavy ingest workload — a metrics or event firehose, a log
+store — wants <strong>size-tiered</strong>, accepting read and space blowup to keep write amplification and device wear low. The size ratio <var>T</var>
+is the finer knob within each: larger <var>T</var> means fewer levels, which for leveled raises write amplification while lowering read and space, and for
+size-tiered does the reverse — so <var>T</var> slides you along the same trade the family already chose. And whatever the choice, compaction throughput
+must be provisioned to keep pace with ingest, or the write stalls of the trap appear regardless of family. There is no universally correct setting
+because there is no workload-independent point in a three-way trade; the competent move is to characterize the workload's read/write/space sensitivity
+and pick the corner accordingly, which is exactly why every production LSM engine ships the choice as configuration rather than baking one in. The
+tuning is not a defect of the LSM-tree; it is the LSM-tree honestly exposing the trilemma the RUM conjecture says no access method can escape.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Leveled and size-tiered compaction each minimize one amplification and pay in the other two — state, for each, which one it minimizes and which two
+it pays. What does raising the size ratio <var>T</var> do to a leveled store's three amplifications? (Answer below.)</p>
+</aside>
+
+<h2>54.5 What to carry forward</h2>
+
+<p><strong>Compaction</strong> is the background <em>k</em>-way merge that completes the LSM-tree: it merges sorted runs in one sequential pass, keeping
+only the newest version of each key and dropping tombstones with the values they shadow, which bounds read amplification and reclaims space (the model
+reclaimed 87% dead data and cut read amplification 20&times;&rarr;1&times;) — at the cost of <strong>write amplification</strong> from rewriting data as
+it merges (&sect;54.1). An LSM-tree trades among three amplifications — <strong>write</strong> (bytes written per logical byte), <strong>read</strong>
+(accesses per logical read), and <strong>space</strong> (bytes stored per live byte) — and the <strong>RUM</strong> tension (Athanassoulis et&nbsp;al.
+2016) says no strategy makes all three small (&sect;54.2). <strong>Leveled</strong> compaction (one run per level) minimizes read and space at high
+write amplification ~<var>T</var>&times;<var>L</var>; <strong>size-tiered</strong> (many runs per level, bulk-merged) minimizes write at high read
+~<var>T</var>&times;<var>L</var> and space ~<var>T</var> — opposite corners, quantified by the model (&sect;54.3). The choice is per-workload, the size
+ratio <var>T</var> is the finer knob, and compaction throughput must keep pace with ingest or <strong>write stalls</strong> and device wear appear —
+compaction is provisioned work, not free (&sect;54.4).</p>
+
+<p>With this chapter the two storage-engine families are complete and fully drawn. The <strong>B-tree</strong> keeps data sorted on disk and updates it
+in place: excellent reads and range scans, random and immediate write cost, tight ~69% space, and a single point on the trade. The
+<strong>LSM-tree</strong> keeps data sorted in memory and appends immutable sorted runs, using compaction to bound the accumulation: cheap sequential
+writes, read and space costs paid through amplification, and — through the compaction strategy — a whole <em>curve</em> of points on the RUM trade you
+can slide along. That last difference is the deep one: the B-tree offers one balance of read, write, and space, while the LSM-tree offers a tunable
+family of balances, which is why write-optimized engines dominate high-ingest systems that need to place their cost deliberately. Two threads remain
+open for the rest of the part. The read amplification this chapter <em>bounds</em> but does not eliminate — a point read still probes several runs — is
+attacked next by the Bloom filter, a tiny in-memory structure that lets a read skip runs that provably cannot contain the key, cutting the probes toward
+one. And the whole question the part has been building toward — given a concrete workload, B-tree or LSM-tree, and at what settings — is answered in the
+part's final chapter, now that both engines and the amplification vocabulary to compare them are in hand. The B-tree optimizes reads; the LSM-tree
+optimizes writes and hands you the dial; and knowing which cost your workload can afford to spend is the whole of storage-engine judgment.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Describe what compaction does to updates and tombstones, and why the merge itself is cheap.</li>
+<li>Name the three amplifications and give the one-line reason each exceeds one.</li>
+<li>State the RUM tension and why no compaction strategy makes all three amplifications small.</li>
+<li>Contrast leveled and size-tiered compaction on all three axes, with the reason for each.</li>
+<li>Explain what raising the size ratio <var>T</var> does to a leveled and to a size-tiered store.</li>
+<li>Explain why compaction is not free — throughput contention, write stalls, and device wear.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What two kinds of dead data does compaction reclaim, and what happens to a tombstone during a merge? (&sect;54.1)</li>
+<li><strong>R2.</strong> Define write, read, and space amplification, and state the tension among them. (&sect;54.2)</li>
+<li><strong>R3.</strong> What is the RUM conjecture, and how does it apply to LSM compaction? (&sect;54.2)</li>
+<li><strong>R4.</strong> Contrast leveled and size-tiered compaction on write, read, and space amplification. (&sect;54.3)</li>
+<li><strong>R5.</strong> What is a write stall, and how does it arise from treating compaction as free? (&sect;54.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Chen Luo &amp; Michael J. Carey, &ldquo;LSM-based storage techniques: a survey,&rdquo; <em>The VLDB Journal</em> 29(1), 2020, pp.
+393&ndash;418, DOI 10.1007/s00778-019-00555-y.</strong> The definitive modern survey: leveled versus tiered compaction and the write/read/space
+amplification framing this chapter uses. First author Chen Luo; venue, volume, pages, year, and DOI verified via SpringerLink and the ACM Digital
+Library.</li>
+<li><strong>Manos Athanassoulis, Michael S. Kester, Lukas M. Maas, Radu Stoica, Stratos Idreos, Anastasia Ailamaki &amp; Mark Callaghan,
+&ldquo;Designing Access Methods: The RUM Conjecture,&rdquo; <em>19th International Conference on Extending Database Technology (EDBT&nbsp;2016)</em>,
+pp. 461&ndash;466, DOI 10.5441/002/edbt.2016.42.</strong> The read/update/memory trilemma of &sect;54.2: optimizing any two overheads costs the third.
+First author Manos Athanassoulis; venue, year, pages, and DOI verified via the EDBT proceedings and DBLP.</li>
+<li><strong>Siying Dong, Mark Callaghan, Leonidas Galanis, Dhruba Borthakur, Tony Savor &amp; Michael Strum, &ldquo;Optimizing Space Amplification in
+RocksDB,&rdquo; <em>8th Biennial Conference on Innovative Data Systems Research (CIDR&nbsp;2017)</em>.</strong> A production LSM engine's account of the
+space/write amplification trade and how leveled compaction and tuning manage it. First author Siying Dong; venue, year, and authorship verified via the
+CIDR 2017 proceedings (open access, no DOI).</li>
+<li><strong>Patrick O'Neil, Edward Cheng, Dieter Gawlick &amp; Elizabeth O'Neil, &ldquo;The Log-Structured Merge-Tree (LSM-Tree),&rdquo;
+<em>Acta Informatica</em> 33(4), 1996, pp. 351&ndash;385, DOI 10.1007/s002360050048.</strong> The original analysis of merging sorted runs across
+levels and the write-amplification cost that compaction strategy manages. First author Patrick O'Neil; venue, volume, pages, year, and DOI verified via
+SpringerLink.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex54.1"><span class="ex-label">54.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what two kinds of dead data does compaction reclaim, and what does it do with a tombstone it encounters?</div>
+
+<div class="exercise" id="ex54.2"><span class="ex-label">54.2</span> <span class="ex-tag warm">warm-up</span>
+Name the three amplifications an LSM-tree trades among, and give the one-phrase reason each is greater than one.</div>
+
+<div class="exercise" id="ex54.3"><span class="ex-label">54.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: which single amplification does leveled compaction minimize, and which does size-tiered minimize?</div>
+
+<div class="exercise" id="ex54.4"><span class="ex-label">54.4</span> <span class="ex-tag core">core</span>
+The merge, concretely. (a) The model compacted 20 runs of 25,934 entries down to 3,362; explain in terms of updates and tombstones why so much was
+dropped. (b) What did read amplification for that range become, and why? (c) Explain why, despite reclaiming 87% of the data, the compaction still
+<em>wrote</em> — and where that write shows up as an amplification.</div>
+
+<div class="exercise" id="ex54.5"><span class="ex-label">54.5</span> <span class="ex-tag core">core</span>
+The RUM tension. (a) State the RUM conjecture in terms of read, update, and memory/space. (b) Explain, using aggressive versus lazy compaction, why
+lowering read and space amplification raises write amplification. (c) Argue that the B-tree and LSM-tree face the same trilemma and differ only in where
+they spend it.</div>
+
+<div class="exercise" id="ex54.6"><span class="ex-label">54.6</span> <span class="ex-tag core">core</span>
+Leveled versus size-tiered. (a) Describe how each organizes runs within a level (one run vs up to <var>T</var>). (b) From that organization, derive why
+leveled's write amplification is ~<var>T</var>&times;<var>L</var> while size-tiered's is ~<var>L</var>. (c) From the same organization, derive why
+size-tiered's read amplification is ~<var>T</var>&times;<var>L</var> while leveled's is ~<var>L</var>.</div>
+
+<div class="exercise" id="ex54.7"><span class="ex-label">54.7</span> <span class="ex-tag complexity">cost</span>
+Reading the model. Using the table at size ratio <var>T</var>=10 over a billion entries (leveled 30/3/1.10, size-tiered 3/30/10): (a) which policy would
+you pick for a read-latency-critical index on expensive storage, and why? (b) which for a metrics firehose on cheap disk, and why? (c) A store writes
+1&nbsp;TB of logical data under leveled compaction at write amplification 30 — roughly how many bytes hit the device, and why does that matter for an
+SSD?</div>
+
+<div class="exercise" id="ex54.8"><span class="ex-label">54.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team runs a high-ingest LSM store with leveled compaction; during traffic spikes, write latency
+periodically jumps and then recovers.
+<br><strong>Step 1 (given):</strong> during a spike, incoming writes arrive faster than compaction can merge the newest level's runs.
+<br><strong>Step 2 (given):</strong> unmerged runs pile up at the top level, and read amplification there climbs.
+<br><strong>Step 3 (given):</strong> to keep read amplification bounded, the engine throttles incoming writes until compaction catches up.
+<br><strong>Step 4 (you):</strong> Name this phenomenon, explain why it appears precisely when write load is highest, and give two levers that reduce
+it (one about provisioning, one about compaction strategy).</div>
+
+<div class="exercise" id="ex54.9"><span class="ex-label">54.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>write amplification</em>, <em>read amplification</em>, <em>space amplification</em>, <em>leveled
+compaction</em>, or <em>size-tiered compaction</em> — and why: (a) an SSD wears out faster than the logical write volume suggests; (b) a store's disk
+usage is 10&times; its live data; (c) a point read probes many runs at every level; (d) the policy that keeps one run per level; (e) the policy that
+merges a level's runs only when it fills.</div>
+
+<div class="exercise" id="ex54.10"><span class="ex-label">54.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A good compaction strategy makes all three amplifications
+small.&rdquo; (b) &ldquo;Compaction is a random-access operation.&rdquo; (c) &ldquo;Size-tiered compaction has lower write amplification but higher read
+and space amplification than leveled.&rdquo; (d) &ldquo;Compaction runs in the background, so it never affects foreground latency.&rdquo; (e)
+&ldquo;Raising the size ratio <var>T</var> lowers the number of levels.&rdquo;</div>
+
+<div class="exercise" id="ex54.11"><span class="ex-label">54.11</span> <span class="ex-tag stretch">stretch</span>
+The whole trade. (a) Place B-tree, leveled-LSM, and size-tiered-LSM as three points in the read/write/space space, justifying each coordinate.
+(b) Argue that the LSM-tree offers a <em>curve</em> of points (via <var>T</var> and the compaction family) while the B-tree offers essentially one,
+and why that flexibility is the LSM-tree's structural advantage for high-ingest systems. (c) Explain why &ldquo;which engine and which settings&rdquo;
+cannot be answered without the workload, tying it to the RUM conjecture.</div>
+
+<div class="exercise" id="ex54.12"><span class="ex-label">54.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Implement a <em>k</em>-way merge of several sorted runs that keeps the newest value per key and drops
+tombstones, and report the input and output entry counts (the reclaimed fraction). (b) Compute, from closed-form arithmetic, the write, read, and space
+amplification of leveled and size-tiered compaction as functions of the size ratio <var>T</var> and level count <var>L</var>, and tabulate them for a
+few <var>T</var>. (c) State your toolchain and explain why the reclaimed fraction is a structural outcome of the merge logic and the amplification
+figures are exact arithmetic of a model — neither a wall-clock timing.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part X</div><h1>Durability & Recovery</h1><p class='part-blurb'>Write-ahead logging, ARIES, checkpoints, and crash recovery — how a database keeps its promises across failures.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XI</div><h1>Transactions & Concurrency Control</h1><p class='part-blurb'>ACID, isolation levels and their anomalies, 2PL, MVCC, and OCC — correctness under concurrency, implemented.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XII</div><h1>Query Processing & Execution</h1><p class='part-blurb'>Parser, planner, physical operators, and execution models (Volcano/vectorized/codegen) — turning SQL into work.</p></div>
@@ -26265,6 +27315,285 @@ of N); (c) states toolchain and CPU and notes the fanout table is <em>exact arit
 deterministic insert order — neither is a wall-clock timing, so both are reproducible and hardware-independent. <em>Tempting wrong answer:</em>
 reporting the tree height as a performance measurement — it is a structural property, not a clock reading. <strong>Feed-forward:</strong>
 &sect;51.3&ndash;&sect;51.4.</div>
+
+</section>
+
+<section class="solutions" id="sol52">
+<h1>Chapter 52 — Solutions</h1>
+
+<div class="solution" id="sol52.1"><span class="sol-label">52.1</span>
+Borrowing moves one key from a sibling that has a spare, rotating it through the parent separator, and leaves the tree's structure unchanged; merging
+fuses the under-full node with a sibling into one node and pulls the parent's separator key down between them, destroying a node. <em>Tempting wrong
+answer:</em> &ldquo;borrow moves a key directly between siblings&rdquo; — it must pass through the parent, because the separator has to stay between the
+two children. <strong>Feed-forward:</strong> &sect;52.1.</div>
+
+<div class="solution" id="sol52.2"><span class="sol-label">52.2</span>
+It shrinks at the root: when a merge propagates all the way up and empties the root, the root is removed and its single remaining child becomes the new
+root, dropping the height by one. <em>Tempting wrong answer:</em> &ldquo;the tree shrinks by making a leaf shallower&rdquo; — leaves never change depth
+individually; height changes only at the root, symmetric with growth. <strong>Feed-forward:</strong> &sect;52.1.</div>
+
+<div class="solution" id="sol52.3"><span class="sol-label">52.3</span>
+About 69% full — the constant ln&nbsp;2 &asymp; 0.693 (Yao 1978, measured here at 0.684&ndash;0.687). An index built by insertion carries about
+1/ln&nbsp;2 &asymp; 1.44&times; the pages of the same keys bulk-loaded — roughly 44% more. <em>Tempting wrong answer:</em> &ldquo;about 100% full&rdquo; —
+that is bulk-loading; naive 50/50 splits leave nodes averaging ln&nbsp;2. <strong>Feed-forward:</strong> &sect;52.3.</div>
+
+<div class="solution" id="sol52.4"><span class="sol-label">52.4</span>
+(a) A merge destroys a node (fusing two into one) and pulls a key <em>down</em> from the parent to sit between them — the exact reverse of a split,
+which creates a node and pushes a key up. (b) Pulling the separator down removes a key from the parent, which may itself drop below the minimum and
+merge, and so on up the tree. (c) The height decreases only when the merge reaches the root and leaves it with no keys and one child: that child becomes
+the new root. Because a whole level is removed uniformly at the top, every leaf loses the same one level, so all leaves stay at the same depth.
+<em>Tempting wrong answer:</em> &ldquo;a merge anywhere lowers the height&rdquo; — only a root-emptying merge does; internal merges just reduce a
+parent's key count. <strong>Feed-forward:</strong> &sect;52.1.</div>
+
+<div class="solution" id="sol52.5"><span class="sol-label">52.5</span>
+(a) An eager merge locks three pages at once — the under-full node, its sibling, and the parent — and may propagate and lock more, which is heavy
+contention to spend on the common case where the slot is soon refilled; so engines defer it. (b) Index bloat is the index keeping its page count as
+live keys fall: occupancy drops toward the deleted fraction and range scans still walk the mostly-empty pages, paying fetches for absent keys. (c) A
+rebuild (<code>REINDEX</code>, or drop-and-recreate) reclaims the space; it is denser because it bulk-loads the surviving keys bottom-up, packing nodes
+to ~100% rather than leaving the under-full pages the deletes created. <em>Tempting wrong answer:</em> &ldquo;lazy deletion is a bug&rdquo; — it is a
+deliberate space-for-concurrency trade. <strong>Feed-forward:</strong> &sect;52.2.</div>
+
+<div class="solution" id="sol52.6"><span class="sol-label">52.6</span>
+(a) About 69% (ln&nbsp;2), implying a size ratio 1/ln&nbsp;2 &asymp; 1.44. (b) Roughly 1,440,000 pages — about 44% more than the 1,000,000 packed
+pages. (c) The extra pages cost more buffer-pool space (fewer of the index's pages stay resident, so more look-ups miss to disk) and, because lower
+occupancy means lower effective fanout, the tree can be a level taller, adding a page fetch to some look-ups. <em>Tempting wrong answer:</em> &ldquo;the
+extra pages only waste disk&rdquo; — they also cost cache residency and can add height. <strong>Feed-forward:</strong> &sect;52.3.</div>
+
+<div class="solution" id="sol52.7"><span class="sol-label">52.7</span>
+(a) At most two at any moment — the current node and its parent — released as the search moves down; that is enough because crabbing never lets go of
+the parent until the child is safely latched, so no concurrent change can move a node out from under the descent. (b) It may hold the entire root-to-leaf
+path (up to the height) latched; it can release the ancestors only once it reaches a node that is <em>safe</em> — has room, so a change there cannot
+push a split upward. (c) When nodes are near-full, almost no node on the path is &ldquo;safe,&rdquo; so ancestor latches (including the root's) are held
+for the whole descent, and inserts serialize on the root. <em>Tempting wrong answer:</em> &ldquo;a read also holds the whole path&rdquo; — a read holds
+only one or two latches; it is the insert's split-safety that forces path-long holds. <strong>Feed-forward:</strong> &sect;52.4.</div>
+
+<div class="solution" id="sol52.8"><span class="sol-label">52.8</span>
+<strong>Step 4:</strong> The search compares its target to the leaf's recorded high key, sees the target now exceeds it, and <em>follows the
+right-link</em> to the new sibling that the split created — where its key now lives — and continues there. Because any downward move a split makes can be
+recovered by moving right, the search never needed the parent latch to protect against a split below it; the right-link makes the split locally
+recoverable, so one latch at a time suffices. <em>Tempting wrong answer:</em> &ldquo;it must restart from the root&rdquo; — the right-link lets it move
+sideways to the sibling without re-descending. <strong>Feed-forward:</strong> &sect;52.4.</div>
+
+<div class="solution" id="sol52.9"><span class="sol-label">52.9</span>
+(a) <strong>Lazy deletion</strong> — under-full pages are tolerated, not merged, so the page count holds. (b) <strong>Bulk-loading</strong> — the
+rebuild packs nodes to ~100% versus ln&nbsp;2. (c) <strong>Borrow</strong> — a single key moved from a sibling, no structural change. (d)
+<strong>Merge</strong> — the only operation that can lower height, when it empties the root. (e) <strong>The right-link</strong> — the search follows it
+sideways after a concurrent split. <em>Tempting wrong answer:</em> attributing (b) to borrow or merge — density comes from bulk-loading the survivors,
+not from rebalancing. <strong>Feed-forward:</strong> &sect;52.1&ndash;&sect;52.4.</div>
+
+<div class="solution" id="sol52.10"><span class="sol-label">52.10</span>
+(a) <strong>True</strong> — height decreases only when a merge propagates to and empties the root. (b) <strong>False</strong> — random insertion
+averages ln&nbsp;2 &asymp; 69%, not 85%. (c) <strong>True</strong> — building bottom-up from sorted data fills each node and never splits, so it packs to
+~100%. (d) <strong>False</strong> — deletion is usually lazy, leaving under-full pages; the index shrinks only on a rebuild. (e) <strong>False</strong> —
+the right-link's whole point is that a search holds only one latch and recovers a split by moving right, needing no parent latch. <em>Tempting wrong
+answer:</em> marking (d) true because &ldquo;deletes free space&rdquo; — they free logical entries, not on-disk pages, until a rebuild.
+<strong>Feed-forward:</strong> &sect;52.1&ndash;&sect;52.4.</div>
+
+<div class="solution" id="sol52.11"><span class="sol-label">52.11</span>
+(a) Insert: descend, and if the node is full, create a new node, move half the keys to it, push a separator up — propagating up, growing at the root.
+Delete: descend, and if the node underflows, merge with a sibling, move its keys in, pull a separator down — propagating up, shrinking at the root. Each
+step of one reverses a step of the other. (b) In practice the split is unavoidable (an over-full node cannot hold its keys) but an under-full node is
+still <em>correct</em> to read and search, so the merge can be safely skipped; deferring it avoids the three-page lock, breaking the symmetry for
+performance. (c) Insertion alone only reaches ln&nbsp;2 occupancy, and deferred merges leave deleted pages under-full, so a long-lived tree drifts to
+ever-lower density; periodic rebuilds (or online reorganization) counter the drift by repacking. <em>Tempting wrong answer:</em> &ldquo;the merge is
+skipped because it is incorrect&rdquo; — it is correct but costly; it is skipped for concurrency, not correctness. <strong>Feed-forward:</strong>
+&sect;52.1&ndash;&sect;52.3.</div>
+
+<div class="solution" id="sol52.12"><span class="sol-label">52.12</span>
+Open-ended and platform-specific. A correct write-up: (a) implements a minimum-degree <var>t</var> B-tree with split on insert and borrow/merge on
+delete; (b) inserts a seeded random key order and reports average node occupancy converging on ln&nbsp;2 &asymp; 0.693 across a few <var>t</var> (this
+chapter measured 0.684&ndash;0.687 at <var>t</var> = 16, 32, 64); (c) deletes most keys and shows the height shrinking with all survivors still found;
+(d) states toolchain and notes occupancy and height are <em>structural</em> results of a deterministic operation sequence — reproducible and
+hardware-independent, not wall-clock timings. <em>Tempting wrong answer:</em> reporting occupancy or height as a performance number — both are
+structural properties of the tree's shape. <strong>Feed-forward:</strong> &sect;52.3.</div>
+
+</section>
+
+<section class="solutions" id="sol53">
+<h1>Chapter 53 — Solutions</h1>
+
+<div class="solution" id="sol53.1"><span class="sol-label">53.1</span>
+The LSM-tree refuses to update pages in place; instead of finding a key's page and rewriting it (a random write), it buffers writes and flushes them
+sequentially. The Chapter 46 measurement that makes this pay is that sequential access (~916&nbsp;MB/s) is about 49&times; faster than random 4&nbsp;KiB
+access (~19&nbsp;MB/s). <em>Tempting wrong answer:</em> &ldquo;it avoids writing to disk&rdquo; — it writes plenty, but only sequentially.
+<strong>Feed-forward:</strong> &sect;53.1.</div>
+
+<div class="solution" id="sol53.2"><span class="sol-label">53.2</span>
+In order: the write-ahead log (WAL), then the memtable, then — when the memtable fills — the flushed SSTable. The WAL exists purely for durability: it
+is the sequential, <code>fsync</code>'d record that lets the in-memory memtable be rebuilt after a crash. <em>Tempting wrong answer:</em> naming the
+SSTable as the durability mechanism — the SSTable is the eventual sorted file; the WAL is what makes an in-RAM write survive a crash before the flush.
+<strong>Feed-forward:</strong> &sect;53.2.</div>
+
+<div class="solution" id="sol53.3"><span class="sol-label">53.3</span>
+A delete writes a <strong>tombstone</strong> — a marker &ldquo;this key is deleted&rdquo; — into the memtable, which flushes like any other write. It
+cannot remove the key from disk because SSTables are immutable, so the old value still sits in older files; the tombstone, being newest, shadows it at
+read time. <em>Tempting wrong answer:</em> &ldquo;it erases the key from the file&rdquo; — immutability forbids that; deletion is by shadowing, not
+erasure. <strong>Feed-forward:</strong> &sect;53.3.</div>
+
+<div class="solution" id="sol53.4"><span class="sol-label">53.4</span>
+(a) Appending in arrival order never seeks — every write is a pure sequential append, the fast side of the Chapter 46 gap. (b) A point read is
+catastrophic because the log is in arrival order, not key order, so the key could be anywhere and must be scanned for; and you cannot stop at the first
+match from the front, because a later append may hold a newer value, so the newest copy is whichever is <em>last</em> in the log. (c)
+<strong>Sortedness</strong>: keep the memtable sorted and flush it sorted, so each file is internally sorted — found by binary search in one file, and
+merged linearly across two like mergesort's merge step. <em>Tempting wrong answer:</em> &ldquo;scan from the back and stop at the first match&rdquo; —
+correct for finding the newest value but still a full-file scan per read; sortedness is what removes the scan. <strong>Feed-forward:</strong>
+&sect;53.1&ndash;&sect;53.2.</div>
+
+<div class="solution" id="sol53.5"><span class="sol-label">53.5</span>
+(a) The memtable, then the SSTables newest to oldest; newest must win because a later write shadows an earlier one, so the first source holding the key
+has its current value and older copies are superseded. (b) After put v2 (flush): read = v2. After put v3 (flush): read = v3 (the newer of two
+SSTables shadows v2). After delete (flush): read = None (the tombstone, newest, shadows v3 and v2, which still sit on disk). (c) A point miss must
+touch <em>every</em> source, because only after finding the key in none of them can it conclude absence — it can never stop early.
+<em>Tempting wrong answer:</em> &ldquo;a hit is the worst case because it reads a value&rdquo; — a hit can stop at the first source that has the key; a
+miss cannot stop at all. <strong>Feed-forward:</strong> &sect;53.3.</div>
+
+<div class="solution" id="sol53.6"><span class="sol-label">53.6</span>
+(a) It keeps writes sequential (no file is ever randomly rewritten) and makes files safe to read concurrently and to cache, since nothing mutates under
+a reader. (b) An update just writes the new value into the memtable, which flushes to a newer SSTable; the newer copy shadows the old at read time. (c)
+Since the old value cannot be erased from its immutable file, deletion writes a tombstone that, being newest, shadows the old value instead. <em>Tempting
+wrong answer:</em> &ldquo;immutability only helps concurrency&rdquo; — its first purpose is keeping every write sequential. <strong>Feed-forward:</strong>
+&sect;53.2&ndash;&sect;53.3.</div>
+
+<div class="solution" id="sol53.7"><span class="sol-label">53.7</span>
+(a) The number of SSTables is the total writes divided by the flush threshold (roughly 100,000/1,000 &asymp; 99 and 100,000/5,000 &asymp; 19 in the
+model), since each threshold's worth of writes flushes one file. (b) A miss scans all of them (99, then 19); the miss is the worst case because it
+cannot stop at a first hit — the key is in none of the files, so every one must be probed. (c) A larger flush threshold means a larger memtable held in
+volatile RAM and more writes to replay from the WAL after a crash — more memory and slower recovery. <em>Tempting wrong answer:</em> &ldquo;just make
+the threshold huge&rdquo; — that trades read amplification for memory and crash-recovery time. <strong>Feed-forward:</strong> &sect;53.3&ndash;&sect;53.4.</div>
+
+<div class="solution" id="sol53.8"><span class="sol-label">53.8</span>
+<strong>Step 4:</strong> Each processed-and-deleted row left a tombstone, and every tombstone in the scanned range must be read and skipped, because
+each might be shadowing a live value in an older run — the scan cannot know without reading it. So a range that has churned through tens of thousands of
+insert/delete cycles holds tens of thousands of tombstones over its ~10 live rows, and the scan physically reads all of them to return almost nothing.
+It gets fast again only when a <strong>compaction</strong> merges the runs and drops the tombstones (and the values they shadow) from that range.
+<em>Tempting wrong answer:</em> &ldquo;add an index on the range&rdquo; — the cost is the tombstones themselves; only compaction removes them.
+<strong>Feed-forward:</strong> &sect;53.3&ndash;&sect;53.4.</div>
+
+<div class="solution" id="sol53.9"><span class="sol-label">53.9</span>
+(a) <strong>The WAL</strong> — a crash replays the log to rebuild the memtable, so no acknowledged write is lost. (b) <strong>Read amplification</strong> —
+a miss probes every file. (c) <strong>The tombstone</strong> — a deleted key's marker and its shadowed value occupy space until compaction. (d)
+<strong>The memtable</strong> — recent writes are served from RAM. (e) <strong>SSTable immutability</strong> — nothing mutates the file, so it needs no
+read lock. <em>Tempting wrong answer:</em> crediting (a) to the memtable — the memtable is volatile; it is the WAL that survives the crash.
+<strong>Feed-forward:</strong> &sect;53.2&ndash;&sect;53.4.</div>
+
+<div class="solution" id="sol53.10"><span class="sol-label">53.10</span>
+(a) <strong>False</strong> — even the flush is a sequential write; an LSM-tree issues <em>no</em> random writes. (b) <strong>False</strong> — a delete
+writes a tombstone and adds data; space is reclaimed only by compaction. (c) <strong>False</strong> — a read returns the value from the
+<em>newest</em> source that contains the key. (d) <strong>True</strong> — both the WAL append and the flush are sequential. (e) <strong>True</strong> —
+that is exactly read amplification. <em>Tempting wrong answer:</em> marking (a) true because &ldquo;the flush goes to a specific place&rdquo; — the flush
+is one large sequential write of a whole sorted file, not a random update. <strong>Feed-forward:</strong> &sect;53.1&ndash;&sect;53.4.</div>
+
+<div class="solution" id="sol53.11"><span class="sol-label">53.11</span>
+(a) Write cost: B-tree updates a leaf in place (random write, expensive) vs LSM appends sequentially (cheap). Read cost: B-tree descends one shallow
+tree (cheap) vs LSM merges many sorted runs (read amplification). Space: B-tree packs to ~69% and holds one copy vs LSM lets dead versions and
+tombstones linger until compaction (loose). (b) The LSM's write amplification comes from compaction re-reading and re-writing data that was already
+written; it is the counterpart to the B-tree's random-write cost, but it is <em>deferred</em> (paid later, in the background) and <em>sequential</em>
+(large merges), whereas the B-tree's is <em>immediate</em> and <em>random</em> (per insert). (c) B-tree is the right default for read- and range-scan-heavy
+workloads that update in place; the LSM-tree for write- and ingest-heavy workloads that can afford background merging and looser space. <em>Tempting
+wrong answer:</em> &ldquo;the LSM has no write cost&rdquo; — it defers the cost into compaction as write amplification. <strong>Feed-forward:</strong>
+&sect;53.1&ndash;&sect;53.5.</div>
+
+<div class="solution" id="sol53.12"><span class="sol-label">53.12</span>
+Open-ended and platform-specific. A correct write-up: (a) implements a sorted memtable that flushes to an immutable sorted SSTable at a threshold, a
+newest-to-oldest read, and a tombstone delete; (b) drives it with a seeded write stream over a small key space and reports the SSTable count (writes /
+threshold) and the files a point miss must scan; (c) verifies newest-write-wins and tombstone-shadows-value (this chapter's model: 99 and 19 SSTables
+at thresholds 1,000 and 5,000, a miss scanning all of them, get = v3 then None after the delete); (d) states toolchain and notes the file count and
+scan count are <em>structural</em> outcomes of the logic and the key stream — reproducible, not wall-clock timings. <em>Tempting wrong answer:</em>
+timing the reads and reporting milliseconds as the result — the reproducible quantities are the structural counts. <strong>Feed-forward:</strong>
+&sect;53.3.</div>
+
+</section>
+
+<section class="solutions" id="sol54">
+<h1>Chapter 54 — Solutions</h1>
+
+<div class="solution" id="sol54.1"><span class="sol-label">54.1</span>
+It reclaims superseded update versions (keeping only the newest value per key) and deleted data; a tombstone it meets is dropped along with the older
+values it was shadowing, since after the merge no older run remains to hide them. <em>Tempting wrong answer:</em> &ldquo;it keeps the tombstone
+forever&rdquo; — the tombstone is dropped once compaction has merged past every value it shadowed. <strong>Feed-forward:</strong> &sect;54.1.</div>
+
+<div class="solution" id="sol54.2"><span class="sol-label">54.2</span>
+Write amplification (compaction rewrites data as it merges into larger runs), read amplification (a lookup probes several runs), and space
+amplification (dead versions and tombstones linger until compaction removes them). <em>Tempting wrong answer:</em> naming only write and read — space
+amplification is the third and the one size-tiered blows up most. <strong>Feed-forward:</strong> &sect;54.2.</div>
+
+<div class="solution" id="sol54.3"><span class="sol-label">54.3</span>
+Leveled compaction minimizes read (and space) amplification by keeping one run per level; size-tiered minimizes write amplification by writing each
+byte about once per level. <em>Tempting wrong answer:</em> &ldquo;leveled minimizes write amplification&rdquo; — it is the opposite; leveled pays the
+most in writes. <strong>Feed-forward:</strong> &sect;54.3.</div>
+
+<div class="solution" id="sol54.4"><span class="sol-label">54.4</span>
+(a) The keyspace was small (5,000) and the runs overlapped, so most of the 25,934 entries were superseded updates or tombstones of the same keys; only
+the newest live value of each surviving key remained — 3,362 entries. (b) It became 1&times; for that range: the merged output is a single run, so a
+read touches one file instead of twenty. (c) Compaction still read all 25,934 inputs and wrote 3,362 outputs; that rewriting of already-stored data is
+<strong>write amplification</strong>, the cost paid to lower read and space amplification. <em>Tempting wrong answer:</em> &ldquo;compaction is free
+because it shrinks the data&rdquo; — it shrinks stored data but spends write bandwidth to do it. <strong>Feed-forward:</strong> &sect;54.1&ndash;&sect;54.2.</div>
+
+<div class="solution" id="sol54.5"><span class="sol-label">54.5</span>
+(a) The RUM conjecture: optimizing any two of read overhead, update overhead, and memory/space overhead comes at the expense of the third. (b)
+Aggressive compaction merges runs promptly, so few runs and little dead data (low read and space) but constant rewriting (high write); lazy compaction
+merges rarely, so little rewriting (low write) but many runs and much dead data (high read and space). (c) Both engines face read/update/space; the
+B-tree spends it as immediate random writes and tight space, the LSM-tree as deferred sequential write amplification and looser space — same trilemma,
+different corner. <em>Tempting wrong answer:</em> &ldquo;the LSM-tree escapes the trade the B-tree faced&rdquo; — it relocates the trade, it does not
+escape it. <strong>Feed-forward:</strong> &sect;54.2.</div>
+
+<div class="solution" id="sol54.6"><span class="sol-label">54.6</span>
+(a) Leveled keeps exactly one sorted run per level; size-tiered lets up to <var>T</var> runs accumulate per level and merges them together when the
+level fills. (b) Leveled: promoting data into a level that is <var>T</var>&times; bigger rewrites ~<var>T</var> bytes per byte, across <var>L</var> levels
+&rarr; ~<var>T</var>&times;<var>L</var>; size-tiered: each byte is written once per level (in the bulk merge) &rarr; ~<var>L</var>. (c) Leveled: at most
+one run per level, so a read checks ~<var>L</var> runs; size-tiered: up to <var>T</var> runs per level, so a read checks ~<var>T</var>&times;<var>L</var>.
+<em>Tempting wrong answer:</em> assuming both read and write scale the same way — they scale oppositely, which is the whole trade.
+<strong>Feed-forward:</strong> &sect;54.3.</div>
+
+<div class="solution" id="sol54.7"><span class="sol-label">54.7</span>
+(a) Leveled — read amplification 3 and space 1.10 keep latency low and waste little of the expensive storage, at the cost of write amplification 30,
+which a read-critical index can afford. (b) Size-tiered — write amplification 3 spares the cheap disk's write bandwidth and wear, and the firehose can
+tolerate read amplification 30 and 10&times; space on cheap storage. (c) About 30&nbsp;TB hit the device (30&times;1&nbsp;TB); it matters because an
+SSD's endurance is finite writes, so 30&times; amplification burns through its rated lifetime ~30&times; faster. <em>Tempting wrong answer:</em>
+&ldquo;pick leveled everywhere because low read amp is always best&rdquo; — for the firehose its 30&times; write amplification is the dominant cost.
+<strong>Feed-forward:</strong> &sect;54.3&ndash;&sect;54.4.</div>
+
+<div class="solution" id="sol54.8"><span class="sol-label">54.8</span>
+<strong>Step 4:</strong> This is a <strong>write stall</strong> (write throttling). It appears exactly at peak write load because that is when ingest
+most outruns compaction: the top-level runs pile up faster than they can be merged, read amplification there climbs, and the engine throttles writes to
+keep it bounded — so the &ldquo;fast writes&rdquo; degrade precisely when they are busiest. Two levers: provision more compaction throughput (I/O
+bandwidth and threads) so merging keeps pace, and/or move to a compaction family with lower write amplification (size-tiered) so less merging is needed
+per byte — accepting its higher read and space cost. <em>Tempting wrong answer:</em> &ldquo;add more memory to the memtable&rdquo; — a bigger memtable
+delays but does not remove the stall; the bottleneck is compaction throughput versus ingest. <strong>Feed-forward:</strong> &sect;54.4.</div>
+
+<div class="solution" id="sol54.9"><span class="sol-label">54.9</span>
+(a) <strong>Write amplification</strong> — the device physically writes several times the logical volume. (b) <strong>Space amplification</strong> —
+dead versions and tombstones inflate on-disk size well past live data. (c) <strong>Read amplification</strong> — many runs probed per level. (d)
+<strong>Leveled compaction</strong> — one run per level. (e) <strong>Size-tiered compaction</strong> — merges a level's runs when it fills.
+<em>Tempting wrong answer:</em> crediting (a) to read amplification — reads do not wear the device; writes do. <strong>Feed-forward:</strong>
+&sect;54.2&ndash;&sect;54.3.</div>
+
+<div class="solution" id="sol54.10"><span class="sol-label">54.10</span>
+(a) <strong>False</strong> — the RUM tension means no strategy makes all three small; you spend one to save another. (b) <strong>False</strong> —
+compaction merges sorted runs in one sequential pass, reading and writing sequentially. (c) <strong>True</strong> — size-tiered trades higher read and
+space for lower write amplification. (d) <strong>False</strong> — compaction contends for device bandwidth and buffer pool and can cause write stalls,
+affecting foreground latency. (e) <strong>True</strong> — levels &asymp; log-base-<var>T</var>, so larger <var>T</var> means fewer levels.
+<em>Tempting wrong answer:</em> marking (d) true because &ldquo;background&rdquo; sounds free — it is real work on the same device.
+<strong>Feed-forward:</strong> &sect;54.1&ndash;&sect;54.4.</div>
+
+<div class="solution" id="sol54.11"><span class="sol-label">54.11</span>
+(a) B-tree: low read, high (random) write, low space (~69% fill) — one point. Leveled-LSM: low read, high write, low space — but write is deferred and
+sequential. Size-tiered-LSM: high read, low write, high space. Each coordinate follows from the mechanism (in-place update; one-run-per-level;
+many-runs-per-level). (b) By varying <var>T</var> and choosing the compaction family, the LSM-tree reaches many points along the read/write/space
+surface, whereas the B-tree's in-place discipline fixes it near one; that tunability lets high-ingest systems place their cost where they can afford it.
+(c) The best point depends on the workload's read/write/space sensitivity, and the RUM conjecture says no point is best on all three — so the answer is a
+function of the workload, not of the engine. <em>Tempting wrong answer:</em> &ldquo;the LSM-tree is strictly better because it's tunable&rdquo; — tunable
+means it can be set badly too; it is better only when the workload wants a corner the B-tree can't reach. <strong>Feed-forward:</strong>
+&sect;54.2&ndash;&sect;54.5.</div>
+
+<div class="solution" id="sol54.12"><span class="sol-label">54.12</span>
+Open-ended and platform-specific. A correct write-up: (a) implements a <em>k</em>-way merge keeping the newest value per key and dropping tombstones,
+reporting input and output counts and the reclaimed fraction (this chapter: 25,934 &rarr; 3,362, 87% reclaimed); (b) computes write/read/space
+amplification for leveled (~<var>T</var>&times;<var>L</var> / ~<var>L</var> / ~1) and size-tiered (~<var>L</var> / ~<var>T</var>&times;<var>L</var> /
+~<var>T</var>) across a few <var>T</var>; (c) states toolchain and notes the reclaimed fraction is a structural outcome of the merge logic and the
+amplification figures are exact model arithmetic — reproducible and hardware-independent, neither a wall-clock timing. <em>Tempting wrong answer:</em>
+reporting the amplification numbers as measured device throughput — they are a model of the structure, not a benchmark. <strong>Feed-forward:</strong>
+&sect;54.3.</div>
 
 </section>
 </body></html>

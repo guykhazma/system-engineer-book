@@ -1,0 +1,90 @@
+<section class="solutions" id="sol52">
+<h1>Chapter 52 — Solutions</h1>
+
+<div class="solution" id="sol52.1"><span class="sol-label">52.1</span>
+Borrowing moves one key from a sibling that has a spare, rotating it through the parent separator, and leaves the tree's structure unchanged; merging
+fuses the under-full node with a sibling into one node and pulls the parent's separator key down between them, destroying a node. <em>Tempting wrong
+answer:</em> &ldquo;borrow moves a key directly between siblings&rdquo; — it must pass through the parent, because the separator has to stay between the
+two children. <strong>Feed-forward:</strong> &sect;52.1.</div>
+
+<div class="solution" id="sol52.2"><span class="sol-label">52.2</span>
+It shrinks at the root: when a merge propagates all the way up and empties the root, the root is removed and its single remaining child becomes the new
+root, dropping the height by one. <em>Tempting wrong answer:</em> &ldquo;the tree shrinks by making a leaf shallower&rdquo; — leaves never change depth
+individually; height changes only at the root, symmetric with growth. <strong>Feed-forward:</strong> &sect;52.1.</div>
+
+<div class="solution" id="sol52.3"><span class="sol-label">52.3</span>
+About 69% full — the constant ln&nbsp;2 &asymp; 0.693 (Yao 1978, measured here at 0.684&ndash;0.687). An index built by insertion carries about
+1/ln&nbsp;2 &asymp; 1.44&times; the pages of the same keys bulk-loaded — roughly 44% more. <em>Tempting wrong answer:</em> &ldquo;about 100% full&rdquo; —
+that is bulk-loading; naive 50/50 splits leave nodes averaging ln&nbsp;2. <strong>Feed-forward:</strong> &sect;52.3.</div>
+
+<div class="solution" id="sol52.4"><span class="sol-label">52.4</span>
+(a) A merge destroys a node (fusing two into one) and pulls a key <em>down</em> from the parent to sit between them — the exact reverse of a split,
+which creates a node and pushes a key up. (b) Pulling the separator down removes a key from the parent, which may itself drop below the minimum and
+merge, and so on up the tree. (c) The height decreases only when the merge reaches the root and leaves it with no keys and one child: that child becomes
+the new root. Because a whole level is removed uniformly at the top, every leaf loses the same one level, so all leaves stay at the same depth.
+<em>Tempting wrong answer:</em> &ldquo;a merge anywhere lowers the height&rdquo; — only a root-emptying merge does; internal merges just reduce a
+parent's key count. <strong>Feed-forward:</strong> &sect;52.1.</div>
+
+<div class="solution" id="sol52.5"><span class="sol-label">52.5</span>
+(a) An eager merge locks three pages at once — the under-full node, its sibling, and the parent — and may propagate and lock more, which is heavy
+contention to spend on the common case where the slot is soon refilled; so engines defer it. (b) Index bloat is the index keeping its page count as
+live keys fall: occupancy drops toward the deleted fraction and range scans still walk the mostly-empty pages, paying fetches for absent keys. (c) A
+rebuild (<code>REINDEX</code>, or drop-and-recreate) reclaims the space; it is denser because it bulk-loads the surviving keys bottom-up, packing nodes
+to ~100% rather than leaving the under-full pages the deletes created. <em>Tempting wrong answer:</em> &ldquo;lazy deletion is a bug&rdquo; — it is a
+deliberate space-for-concurrency trade. <strong>Feed-forward:</strong> &sect;52.2.</div>
+
+<div class="solution" id="sol52.6"><span class="sol-label">52.6</span>
+(a) About 69% (ln&nbsp;2), implying a size ratio 1/ln&nbsp;2 &asymp; 1.44. (b) Roughly 1,440,000 pages — about 44% more than the 1,000,000 packed
+pages. (c) The extra pages cost more buffer-pool space (fewer of the index's pages stay resident, so more look-ups miss to disk) and, because lower
+occupancy means lower effective fanout, the tree can be a level taller, adding a page fetch to some look-ups. <em>Tempting wrong answer:</em> &ldquo;the
+extra pages only waste disk&rdquo; — they also cost cache residency and can add height. <strong>Feed-forward:</strong> &sect;52.3.</div>
+
+<div class="solution" id="sol52.7"><span class="sol-label">52.7</span>
+(a) At most two at any moment — the current node and its parent — released as the search moves down; that is enough because crabbing never lets go of
+the parent until the child is safely latched, so no concurrent change can move a node out from under the descent. (b) It may hold the entire root-to-leaf
+path (up to the height) latched; it can release the ancestors only once it reaches a node that is <em>safe</em> — has room, so a change there cannot
+push a split upward. (c) When nodes are near-full, almost no node on the path is &ldquo;safe,&rdquo; so ancestor latches (including the root's) are held
+for the whole descent, and inserts serialize on the root. <em>Tempting wrong answer:</em> &ldquo;a read also holds the whole path&rdquo; — a read holds
+only one or two latches; it is the insert's split-safety that forces path-long holds. <strong>Feed-forward:</strong> &sect;52.4.</div>
+
+<div class="solution" id="sol52.8"><span class="sol-label">52.8</span>
+<strong>Step 4:</strong> The search compares its target to the leaf's recorded high key, sees the target now exceeds it, and <em>follows the
+right-link</em> to the new sibling that the split created — where its key now lives — and continues there. Because any downward move a split makes can be
+recovered by moving right, the search never needed the parent latch to protect against a split below it; the right-link makes the split locally
+recoverable, so one latch at a time suffices. <em>Tempting wrong answer:</em> &ldquo;it must restart from the root&rdquo; — the right-link lets it move
+sideways to the sibling without re-descending. <strong>Feed-forward:</strong> &sect;52.4.</div>
+
+<div class="solution" id="sol52.9"><span class="sol-label">52.9</span>
+(a) <strong>Lazy deletion</strong> — under-full pages are tolerated, not merged, so the page count holds. (b) <strong>Bulk-loading</strong> — the
+rebuild packs nodes to ~100% versus ln&nbsp;2. (c) <strong>Borrow</strong> — a single key moved from a sibling, no structural change. (d)
+<strong>Merge</strong> — the only operation that can lower height, when it empties the root. (e) <strong>The right-link</strong> — the search follows it
+sideways after a concurrent split. <em>Tempting wrong answer:</em> attributing (b) to borrow or merge — density comes from bulk-loading the survivors,
+not from rebalancing. <strong>Feed-forward:</strong> &sect;52.1&ndash;&sect;52.4.</div>
+
+<div class="solution" id="sol52.10"><span class="sol-label">52.10</span>
+(a) <strong>True</strong> — height decreases only when a merge propagates to and empties the root. (b) <strong>False</strong> — random insertion
+averages ln&nbsp;2 &asymp; 69%, not 85%. (c) <strong>True</strong> — building bottom-up from sorted data fills each node and never splits, so it packs to
+~100%. (d) <strong>False</strong> — deletion is usually lazy, leaving under-full pages; the index shrinks only on a rebuild. (e) <strong>False</strong> —
+the right-link's whole point is that a search holds only one latch and recovers a split by moving right, needing no parent latch. <em>Tempting wrong
+answer:</em> marking (d) true because &ldquo;deletes free space&rdquo; — they free logical entries, not on-disk pages, until a rebuild.
+<strong>Feed-forward:</strong> &sect;52.1&ndash;&sect;52.4.</div>
+
+<div class="solution" id="sol52.11"><span class="sol-label">52.11</span>
+(a) Insert: descend, and if the node is full, create a new node, move half the keys to it, push a separator up — propagating up, growing at the root.
+Delete: descend, and if the node underflows, merge with a sibling, move its keys in, pull a separator down — propagating up, shrinking at the root. Each
+step of one reverses a step of the other. (b) In practice the split is unavoidable (an over-full node cannot hold its keys) but an under-full node is
+still <em>correct</em> to read and search, so the merge can be safely skipped; deferring it avoids the three-page lock, breaking the symmetry for
+performance. (c) Insertion alone only reaches ln&nbsp;2 occupancy, and deferred merges leave deleted pages under-full, so a long-lived tree drifts to
+ever-lower density; periodic rebuilds (or online reorganization) counter the drift by repacking. <em>Tempting wrong answer:</em> &ldquo;the merge is
+skipped because it is incorrect&rdquo; — it is correct but costly; it is skipped for concurrency, not correctness. <strong>Feed-forward:</strong>
+&sect;52.1&ndash;&sect;52.3.</div>
+
+<div class="solution" id="sol52.12"><span class="sol-label">52.12</span>
+Open-ended and platform-specific. A correct write-up: (a) implements a minimum-degree <var>t</var> B-tree with split on insert and borrow/merge on
+delete; (b) inserts a seeded random key order and reports average node occupancy converging on ln&nbsp;2 &asymp; 0.693 across a few <var>t</var> (this
+chapter measured 0.684&ndash;0.687 at <var>t</var> = 16, 32, 64); (c) deletes most keys and shows the height shrinking with all survivors still found;
+(d) states toolchain and notes occupancy and height are <em>structural</em> results of a deterministic operation sequence — reproducible and
+hardware-independent, not wall-clock timings. <em>Tempting wrong answer:</em> reporting occupancy or height as a performance number — both are
+structural properties of the tree's shape. <strong>Feed-forward:</strong> &sect;52.3.</div>
+
+</section>

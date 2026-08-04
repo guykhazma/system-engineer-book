@@ -1,0 +1,375 @@
+<section class="chapter" id="ch33">
+<h1>Chapter 33 — Measure First: Profiling and Benchmarking</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch05">Chapter 5</a> (mechanical sympathy and the cost model —
+this part makes that model operational, by measuring where the costs land), <a href="#ch26">Chapter 26</a> (Amdahl's law — the ceiling
+on speeding up a part, and why the dominant cost is the only one worth attacking), <a href="#ch10">Chapter 10</a> (the optimizing
+compiler — dead-code elimination will silently wreck a naive benchmark), <a href="#ch03">Chapter 3</a> (memory hierarchy and caches
+— one of the main places the time actually goes). &nbsp;·&nbsp; This chapter opens the performance part with the discipline the whole
+book has implied: <em>measure before you optimize</em>, because a guess about where time goes is almost always wrong.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch26">Chapter 26</a> — state Amdahl's law in one line; if a function is 5% of total
+runtime and you make it infinitely fast, what is the most you can speed up the whole program? (2) <a href="#ch10">Chapter 10</a> —
+what is the optimizing compiler permitted to do to a computation whose result is never used? (3) <em>Predict:</em> you write a loop
+that sums a billion products into a variable, never read the variable, and time it at <code>-O2</code>; what elapsed time do you
+expect? And if you run that timing exactly once, is the number you get representative? Write your guesses; &sect;33.2 and &sect;33.3
+answer all three.</p>
+</aside>
+
+<p>A note on this part before we begin. The previous five parts built up, from the hardware to the type system, a <em>model</em> of
+what a program costs to run. This part is about the other half of engineering with that model: finding out where the cost actually
+falls, which is almost never where intuition says. The cardinal rule is <strong>measure before you optimize</strong>. Programmers
+are notoriously bad at guessing bottlenecks — you spend an afternoon hand-tuning a function that turns out to be 2% of runtime while
+the real cost sits in an allocation or a cache-missing loop you never suspected. Donald Knuth's much-abused line — &ldquo;premature
+optimization is the root of all evil&rdquo; — is precisely this point: he argued that we should forgo optimization in the
+non-critical 97% of code and instead find, by measurement, the critical few percent where effort pays (Knuth, 1974). So this chapter
+is the toolset for that finding. First, why measuring is not optional and how Amdahl's law decides <em>what</em> to measure
+(&sect;33.1). Then the single most common way a benchmark lies to you — the optimizer deleting the work you meant to time — shown in
+real C where the same loop reports 0.0000&nbsp;s or 1.56&nbsp;s depending only on whether its result is used (&sect;33.2). Then how
+to time correctly: which clock, and why you run many trials and report the minimum rather than one number (&sect;33.3). Then
+<strong>profiling</strong> — sampling vs. instrumentation, and reading a profile as a map of where the time went, so Amdahl points
+your effort (&sect;33.4). We close by making the measure&ndash;optimize loop explicit and turning toward the specific costs the rest
+of the part attacks (&sect;33.5).</p>
+
+<p><strong>On the code in this part.</strong> Unlike the Rust part, the programs here are C, and they were compiled with gcc 11.4.0
+and run in this environment, so their <em>output is real</em>. Absolute times, however, are hardware- and load-specific: the numbers
+below are illustrative of the <em>effect</em> (a deleted loop, run-to-run variance, a lopsided phase split), not benchmarks of any
+particular machine, and your own numbers will differ. Where a tool is named that is <em>not</em> installed here (<code>perf</code>,
+<code>gprof</code>, <code>valgrind</code>), it is discussed from its documentation and cited, not run.</p>
+
+<h2>33.1 Measure before you optimize</h2>
+
+<p>The discipline has two halves, and Amdahl's law (Chapter 26) supplies the second. The first half is: do not optimize on a hunch,
+because hunches about performance are wrong at a rate that would be comical if it were not so expensive. The compiler, the cache, the
+allocator, and the branch predictor all move the real cost somewhere other than the arithmetic you can see in the source. The second
+half is: even once you know a function is slow, speeding it up is only worth it in proportion to its <em>share of total runtime</em>.
+This is Amdahl's law read as a budgeting rule. If a function is 5% of runtime, then making it infinitely fast — not twice as fast,
+<em>infinitely</em> — speeds the whole program by at most 5% (from 100 units to 95). If another is 90% of runtime, a mere 2&times;
+speedup on it saves 45 units, nine times the entire budget of the first. So the order is fixed: <em>find the dominant cost first,
+then optimize it</em>, and measurement is the only way to know which is which. Optimizing before measuring is not just wasted effort;
+it is effort spent, by the arithmetic of Amdahl, on the part that mathematically cannot matter. Everything else in this chapter
+serves this: benchmarking to compare two implementations honestly (&sect;33.2&ndash;&sect;33.3), and profiling to locate the
+dominant cost in the first place (&sect;33.4).</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the two halves of &ldquo;measure before you optimize.&rdquo; Using Amdahl's law, how much can you speed up a program by
+perfectly optimizing a part that is 5% of its runtime? Why does that make locating the <em>dominant</em> cost the first job?
+(Answer after the next section.)</p>
+</aside>
+
+<h2>33.2 The benchmark that lies: dead-code elimination</h2>
+
+<p>The most common benchmarking bug is that the compiler deletes the very work you are trying to time. From Chapter 10: if a
+computation's result is never observed, the optimizer is free to remove the computation entirely — it is not required to run code
+whose output no program can see. A microbenchmark that computes into a variable and never uses it hands the optimizer exactly that
+license. Here is the same loop compiled two ways, differing only in whether the result is consumed — compiled and run in this
+environment (gcc 11.4.0, <code>-O2</code>):</p>
+
+<pre><code>double s = 0.0;
+for (long i = 0; i &lt; 1000000000L; i++) s += (double)(i &amp; 1023) * 0.5;
+// version A: never use s.   version B: consume s (print it / store to volatile).
+
+$ gcc -O2 bench.c -o nosink &amp;&amp; ./nosink
+no sink   : 0.0000 s                         # the loop was deleted entirely
+$ gcc -O2 -DSINK bench.c -o sink &amp;&amp; ./sink
+with sink : 1.5592 s  (checksum 255749934464.0)   # the loop actually ran</code></pre>
+
+<p>Version A reports <code>0.0000&nbsp;s</code> not because a billion iterations are free but because they never happened: with
+<code>s</code> unused, the compiler proved the loop had no observable effect and removed it, exactly as Chapter 10 said it may. A
+newcomer reads &ldquo;0.0000 s&rdquo; as &ldquo;my code is blazing fast&rdquo; and ships a benchmark that measures nothing. Version B
+prints the checksum, so <code>s</code> is observed, so the loop must run, and now you see its real cost — 1.56&nbsp;s here. The fix is
+a rule: <strong>make the result observable</strong>, by printing a checksum, writing to a <code>volatile</code>, or feeding it to a
+compiler-opaque sink, so the optimizer cannot elide the work. Two companion rules follow. Benchmark the build you will
+<em>ship</em> — measure at <code>-O2</code>, not <code>-O0</code>, since the debug build's costs are not the release build's. And be
+sure the input is not a compile-time constant the optimizer can fold away. The through-line is that a benchmark is only honest if the
+work it claims to time is work the compiler was actually forced to do.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why did version A report <code>0.0000&nbsp;s</code> — what did the compiler do, and by which Chapter 10 rule? What single change
+turned the loop back on? Give two further rules for a benchmark that is not lying to you. (Answer below the communicate box.)</p>
+</aside>
+
+<h2>33.3 Timing correctly: which clock, and how many runs</h2>
+
+<p>Suppose the loop is safe from the optimizer. Two questions remain: <em>which clock</em> you read, and <em>how many times</em>. For
+elapsed time you want a monotonic wall clock that never jumps — on Linux, <code>clock_gettime(CLOCK_MONOTONIC, &amp;t)</code>, which
+is immune to wall-time adjustments (NTP, daylight saving) that can make a naive timer run backwards. (Wall-clock time and CPU time
+differ: a program blocked on I/O consumes little CPU while wall time passes, so choose the one that matches the question you are
+asking.) The second question matters more than beginners expect: <em>a single measurement is nearly meaningless</em>, because runtime
+varies from run to run due to the OS scheduler, cache and TLB state, frequency scaling, and other tenants on the machine. You must
+run the workload several times. Compiled and run here (gcc 11.4.0, the same kernel run five times):</p>
+
+<pre><code>for (int r = 0; r &lt; 5; r++) { t0 = now(); sink += work(300000000L); t1 = now();
+                               printf("trial %d: %.4f s\n", r+1, t1 - t0); }
+
+$ gcc -O2 trials.c -o trials &amp;&amp; ./trials
+trial 1: 0.6824 s
+trial 2: 0.7081 s
+trial 3: 0.6694 s
+trial 4: 0.8198 s     &lt;- an outlier: the OS scheduled something else here
+trial 5: 0.6743 s
+min over 5 trials: 0.6694 s</code></pre>
+
+<p>The five runs of identical work span 0.6694&nbsp;s to 0.8198&nbsp;s — a 22% spread, from nothing the program did. Reporting any
+single one of them, especially the first (cold caches) or the fourth (an interruption), would misrepresent the code. The usual
+practice is to run many trials and report the <strong>minimum</strong> (the run least disturbed by outside interference, closest to
+the code's intrinsic cost) or the median, and to state the spread rather than hide it behind one number; a first, warm-up run is
+often discarded because it pays cold-cache and page-fault costs the steady state will not. The mean is a poor summary here because it
+is dragged upward by one-directional outliers like trial 4 — interference only ever makes a run <em>slower</em>, never faster, so the
+minimum is the more principled floor. The discipline, then: monotonic clock, warm up, many trials, report the minimum and the spread.
+A benchmark that reports one number from one run is a benchmark you cannot trust.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a measurement is only as honest as its method</span>
+<p><strong>1. In words.</strong> Optimize only after measuring, and only the dominant cost (Amdahl). Make the timed work observable
+so the optimizer cannot delete it; time it at the shipping optimization level with a monotonic clock; run many trials and report the
+minimum and spread, not one number. Then profile to find the dominant cost before you touch anything.</p>
+<p><strong>2. As a picture.</strong> Figure 33.1: a pipeline — <em>profile</em> (find the hot spot) &rarr; <em>benchmark</em> the hot
+spot honestly (observable result, <code>-O2</code>, many trials) &rarr; <em>optimize</em> &rarr; <em>re-measure</em> &rarr; stop when
+good enough — with two red &ldquo;lies&rdquo; branching off: a deleted loop reporting 0.0000&nbsp;s, and a single run reporting an
+outlier.</p>
+<p><strong>3. As numbers/contrast.</strong> The same billion-iteration loop reported <code>0.0000&nbsp;s</code> (deleted) vs.
+<code>1.5592&nbsp;s</code> (real) depending only on whether its result was used; the same kernel run five times reported
+<code>0.6694</code>&ndash;<code>0.8198&nbsp;s</code>, a 22% spread. Two different methods, two different &ldquo;answers&rdquo; for
+identical code — which is why the method, not the stopwatch, is the measurement.</p>
+</aside>
+
+<p><em>(Answer to the &sect;33.1 quick check: the two halves are (1) do not optimize on a hunch — measure, because bottlenecks are
+rarely where you guess — and (2) optimize only in proportion to a part's share of runtime, per Amdahl's law. Perfectly optimizing a
+part that is 5% of runtime speeds the whole program by at most 5% (100 units become 95), even if that part becomes infinitely fast.
+That is why finding the dominant cost is the first job: effort on a small part cannot pay off no matter how good the optimization,
+so you must locate the part that dominates before optimizing anything.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">The measure&ndash;optimize loop, and the two ways a benchmark lies.</text>
+<rect x="20" y="40" width="90" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="34" y="59" font-size="9">profile</text>
+<rect x="130" y="40" width="100" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="140" y="59" font-size="9">benchmark</text>
+<rect x="250" y="40" width="90" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="264" y="59" font-size="9">optimize</text>
+<rect x="360" y="40" width="100" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="370" y="59" font-size="9">re-measure</text>
+<rect x="480" y="40" width="110" height="30" fill="#dfeee0" stroke="#2f7d32"/><text x="490" y="59" font-size="9">good enough? stop</text>
+<line x1="110" y1="55" x2="130" y2="55" stroke="#14406b" marker-end="url(#pa)"/>
+<line x1="230" y1="55" x2="250" y2="55" stroke="#14406b" marker-end="url(#pa)"/>
+<line x1="340" y1="55" x2="360" y2="55" stroke="#14406b" marker-end="url(#pa)"/>
+<line x1="460" y1="55" x2="480" y2="55" stroke="#2f7d32" marker-end="url(#pb)"/>
+<path d="M410,70 C410,110 180,110 180,72" fill="none" stroke="#14406b" marker-end="url(#pa)"/><text x="250" y="108" font-size="8" fill="#14406b">not yet: next hot spot</text>
+<text x="120" y="140" font-size="9" fill="#8c3a1d">LIE 1: result unused &rarr; loop deleted &rarr; 0.0000 s</text>
+<text x="120" y="158" font-size="9" fill="#8c3a1d">LIE 2: one run &rarr; reports an outlier (0.82 vs 0.67 s)</text>
+<defs>
+<marker id="pa" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#14406b"/></marker>
+<marker id="pb" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#2f7d32"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 33.1: The measure&ndash;optimize loop — profile to find the hot spot, benchmark it honestly, optimize, re-measure,
+and stop when good enough — with the two classic benchmark lies: a deleted loop reporting <code>0.0000&nbsp;s</code> (&sect;33.2)
+and a single run reporting an outlier (&sect;33.3).</figcaption>
+</figure>
+
+<h2>33.4 Profiling: where the time actually goes</h2>
+
+<p>Benchmarking compares two versions of a known piece of code; <strong>profiling</strong> answers the prior question — <em>which</em>
+piece of code to look at. A profiler attributes runtime to the functions (and lines) that spend it, so Amdahl's dominant cost stops
+being a guess. There are two families. An <strong>instrumenting</strong> profiler (the classic <code>gprof</code>) inserts counting
+and timing code at function entry and exit; it is exact about call counts but perturbs the very timing it measures and can distort
+the picture for tiny, hot functions (Graham, Kessler &amp; McKusick, 1982). A <strong>sampling</strong> profiler (Linux
+<code>perf</code>, and most modern tools) instead interrupts the running program many times per second and records where the program
+counter is; over enough samples this builds a statistical map of where time is spent, with negligible overhead and no recompilation
+(Gregg, 2020). The output is often drawn as a <strong>flame graph</strong> — stacked bars whose width is time spent — so the widest
+box is, quite literally, where to optimize. To make the payoff concrete, here is a two-phase program timed by hand, the poor
+engineer's profile, compiled and run here (gcc 11.4.0, <code>-O2</code>):</p>
+
+<pre><code>t0 = now(); parse(...);   t1 = now();     // a setup phase
+            compute(...); t2 = now();     // the main work
+
+$ gcc -O2 profile.c -o profile &amp;&amp; ./profile
+parse   : 0.1577 s  ( 6.4% of runtime)
+compute : 2.2904 s  (93.6% of runtime)</code></pre>
+
+<p>The profile is unambiguous: <code>compute</code> is 93.6% of runtime, <code>parse</code> only 6.4%. Amdahl now dictates strategy.
+Every hour spent optimizing <code>parse</code> buys at most a 6.4% whole-program improvement even if you make it vanish; a modest
+30% cut to <code>compute</code> saves 0.30 &times; 93.6% = 28% of the whole. A programmer who <em>guessed</em> — who found
+<code>parse</code>'s string handling ugly and spent the afternoon there — would have optimized the part that cannot matter, which is
+exactly the failure &sect;33.1 warned of. This is why the loop is <em>profile first</em>: the profiler replaces the guess with a
+measurement, points you at the 93.6% box, and only then do you benchmark candidate improvements to it honestly (&sect;33.2&ndash;
+&sect;33.3). A real profiler does this across hundreds of functions you would never think to time by hand — but the logic is the
+one above, scaled up: measure where the time is, attack the widest box, re-measure, stop.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: optimizing without a profile, and trusting a benchmark that measured nothing</span>
+<p>Two mistakes, both the &ldquo;measure first&rdquo; rule violated from opposite ends. The first is optimizing on intuition:
+rewriting the function that <em>looks</em> expensive — a clever-looking loop, some string formatting — without a profile showing it
+is expensive. Nine times in ten it is not the bottleneck, and you have added complexity and risk to code that was 3% of runtime while
+the real 90% sits untouched; worse, you now believe the problem is &ldquo;handled.&rdquo; Always get a profile first, then optimize
+the box the profile makes wide. The second mistake is trusting a benchmark that never ran the work: the <code>0.0000&nbsp;s</code> of
+&sect;33.2 (dead-code elimination), a loop over a constant the compiler folded, a measurement taken at <code>-O0</code> that has
+nothing to do with the shipped build, or a single run that happened to be an outlier. Both mistakes feel like measurement — you ran
+something, you got a number — which is what makes them dangerous. The number is only meaningful if the method behind it (a profile to
+choose the target, an observable result, the shipping optimization level, many trials) is sound. A confident optimization built on a
+lying benchmark is worse than no optimization, because you will defend it.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I profiled nothing, but I'm sure the JSON parsing is our bottleneck — it just
+<em>looks</em> slow. I rewrote it with a hand-tuned loop and my microbenchmark says it's 100&times; faster. Ship it?&rdquo; Cover the
+paragraph and respond in four or five sentences, drawing on &sect;33.1&ndash;&sect;33.4.</p>
+<p><em>Model answer.</em> &ldquo;Two problems, and both are &lsquo;measure first.&rsquo; First, &lsquo;looks slow&rsquo; isn't a
+measurement — we need a profile of the real workload showing parsing is actually a big share of runtime, because if it's 5% of the
+total, Amdahl says even your 100&times; win is at most a 5% whole-program improvement, and you've added a hand-tuned loop we now have
+to maintain. Second, a 100&times; microbenchmark speedup is exactly the number I distrust: it usually means the compiler deleted the
+work because the result was unused, or you benchmarked a constant, or you compared a <code>-O0</code> build to a <code>-O2</code> one
+— make the result observable, benchmark at the shipping optimization level, and run it many times. So before we ship: profile the
+real path, confirm parsing is the dominant cost, then re-run your benchmark honestly and show the whole-program time moved. If the
+profile says parsing is 3%, the right call is to revert and go look at the 90% box instead.&rdquo; Refusing to ship an optimization
+without a profile that justifies the target and a benchmark that survives scrutiny is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;33.2 quick check: version A reported <code>0.0000&nbsp;s</code> because the compiler deleted the loop —
+with <code>s</code> never used, the loop had no observable effect, and by the Chapter 10 rule the optimizer may remove computations
+whose results are never observed. Making <code>s</code> observable — printing it as a checksum, or writing it to a
+<code>volatile</code>/opaque sink — turns the loop back on. Two further rules: benchmark at the optimization level you will ship
+(<code>-O2</code>, not <code>-O0</code>), and ensure the input is not a compile-time constant the optimizer can fold away.)</em></p>
+
+<h2>33.5 What to carry forward</h2>
+
+<p>Performance engineering starts with a refusal: do not optimize what you have not measured. The governing rule is <strong>measure
+before you optimize</strong>, and Amdahl's law (Chapter 26) makes it quantitative — a part that is 5% of runtime caps its own
+whole-program payoff at 5%, so the <em>dominant</em> cost is the only target worth your effort, and only a <strong>profile</strong>
+tells you which part that is. Profiling comes in two forms — <strong>instrumenting</strong> (exact counts, perturbs timing, e.g.
+<code>gprof</code>) and <strong>sampling</strong> (statistical, low overhead, e.g. <code>perf</code>, drawn as flame graphs) — and its
+job is to replace a guess with the widest box. <strong>Benchmarking</strong> then compares candidate fixes, but only honestly: make
+the timed result observable so the optimizer cannot delete it (the <code>0.0000&nbsp;s</code> vs. <code>1.5592&nbsp;s</code> of
+&sect;33.2), time at the shipping optimization level, use a monotonic clock, and run many trials reporting the minimum and the spread
+(the 0.6694&ndash;0.8198&nbsp;s of &sect;33.3), not one number. Put together, these form the loop: profile, benchmark, optimize,
+re-measure, and stop when good enough.</p>
+
+<p>What the profile does <em>not</em> tell you is <em>why</em> the widest box is wide — and that is the rest of this part. When
+<code>compute</code> is 93.6% of runtime, the question becomes where <em>its</em> time goes, and the answer is usually not the
+instruction count you can read in the source but the costs the earlier volumes named: cache misses (Chapter 3), branch
+mispredictions, memory bandwidth, allocation, the layout of your data. The next chapters take the dominant cost the profiler hands
+you and open it up — <strong>cache-aware and data-oriented design</strong>, then wider techniques like <strong>SIMD</strong> — always
+returning to this chapter's loop to prove that a change actually moved the number. Safety was the compiler's job in the last part;
+speed is yours, and it begins not with a clever rewrite but with a measurement honest enough to bet on.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State &ldquo;measure before you optimize&rdquo; and use Amdahl's law to say why the dominant cost is the only target.</li>
+<li>Explain why a loop whose result is unused can report <code>0.0000&nbsp;s</code>, and the Chapter 10 rule behind it.</li>
+<li>Give the fix (observable result) and two more rules for an honest benchmark.</li>
+<li>Say which clock to use and why one run is untrustworthy; explain why you report the minimum.</li>
+<li>Distinguish sampling from instrumenting profilers, with a cost of each.</li>
+<li>State the measure&ndash;optimize loop end to end.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are the two halves of &ldquo;measure before you optimize,&rdquo; and how does Amdahl's law make the second quantitative? (&sect;33.1)</li>
+<li><strong>R2.</strong> Why can a microbenchmark report <code>0.0000&nbsp;s</code>, and what makes the work run again? (&sect;33.2)</li>
+<li><strong>R3.</strong> Why is a single timing untrustworthy, and why report the minimum of many trials rather than the mean? (&sect;33.3)</li>
+<li><strong>R4.</strong> What is the difference between sampling and instrumenting profilers, and what does each cost? (&sect;33.4)</li>
+<li><strong>R5.</strong> Given a profile showing one function at 90%+ of runtime, what does Amdahl say to do, and why? (&sect;33.1, &sect;33.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Brendan Gregg, <em>Systems Performance: Enterprise and the Cloud</em>, 2nd ed. (Addison-Wesley, 2020), ISBN
+978-0-13-682015-4.</strong> The standard modern reference for performance methodology, sampling profilers (<code>perf</code>,
+BPF-based tools), and flame graphs of &sect;33.4; the source for the measure-first methodology of this chapter. Author, edition, and
+year verified via the publisher.</li>
+<li><strong>Donald E. Knuth, &ldquo;Structured Programming with go to Statements,&rdquo; <em>ACM Computing Surveys</em> 6(4),
+261&ndash;301 (1974), DOI 10.1145/356635.356640.</strong> The origin (p. 268) of &ldquo;premature optimization is the root of all
+evil&rdquo; quoted in &sect;33.1 — and the fuller argument that measurement should find the critical few percent of code worth tuning.
+First author Donald Knuth; DOI verified via the ACM Digital Library.</li>
+<li><strong>Susan L. Graham, Peter B. Kessler &amp; Marshall K. McKusick, &ldquo;gprof: a Call Graph Execution Profiler,&rdquo;
+<em>ACM SIGPLAN Notices</em> 17(6), 120&ndash;126 (1982), DOI 10.1145/872726.806987.</strong> The classic instrumenting profiler of
+&sect;33.4 — call-graph attribution of runtime, and the source of its counts-vs-perturbation trade-off. First author Susan Graham;
+DOI verified via the ACM Digital Library.</li>
+<li><strong>The Linux <code>perf</code> tool (<code>perf_events</code>) documentation (<code>perfwiki.github.io</code>, and
+<code>man perf</code>).</strong> Reference for the sampling profiler named in &sect;33.4 — how it counts hardware events and samples
+the program counter with low overhead. Not installed in this environment, so discussed from its documentation, not run; verify
+against your distribution's version.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex33.1"><span class="ex-label">33.1</span> <span class="ex-tag warm">warm-up</span>
+State the rule &ldquo;measure before you optimize&rdquo; in one sentence, and say what a profiler is for versus what a benchmark is for.</div>
+
+<div class="exercise" id="ex33.2"><span class="ex-label">33.2</span> <span class="ex-tag warm">warm-up</span>
+Why can a microbenchmark of a loop report <code>0.0000&nbsp;s</code> even though the loop appears to do real work?</div>
+
+<div class="exercise" id="ex33.3"><span class="ex-label">33.3</span> <span class="ex-tag warm">warm-up</span>
+Why do you run a benchmark many times and report the minimum (or median) rather than a single run's time?</div>
+
+<div class="exercise" id="ex33.4"><span class="ex-label">33.4</span> <span class="ex-tag core">core</span>
+Take the two-phase profile of &sect;33.4 (<code>parse</code> 6.4%, <code>compute</code> 93.6%). (a) Using Amdahl's law, what is
+the most you can improve total runtime by perfectly optimizing <code>parse</code>? (b) What whole-program improvement does a 30% cut
+to <code>compute</code> give? (c) A colleague, without profiling, spends a day optimizing <code>parse</code> because its code
+&ldquo;looks slow.&rdquo; Explain precisely why this violates &sect;33.1.</div>
+
+<div class="exercise" id="ex33.5"><span class="ex-label">33.5</span> <span class="ex-tag core">core</span>
+Explain the dead-code-elimination benchmark bug of &sect;33.2. (a) Under what condition is the compiler allowed to delete the timed
+loop, and which Chapter 10 principle is that? (b) Name two distinct ways to make the result observable so the work runs. (c) Why
+must you also benchmark at the optimization level you ship rather than at <code>-O0</code>?</div>
+
+<div class="exercise" id="ex33.6"><span class="ex-label">33.6</span> <span class="ex-tag core">core</span>
+Contrast sampling and instrumenting profilers. (a) How does each obtain its data? (b) What is the cost or distortion of each,
+especially for many tiny, hot functions? (c) For a first look at a large program you do not want to recompile, which would you reach
+for, and why?</div>
+
+<div class="exercise" id="ex33.7"><span class="ex-label">33.7</span> <span class="ex-tag complexity">cost</span>
+Reason about measurement error. (a) The five trials of &sect;33.3 spanned 0.6694&ndash;0.8198&nbsp;s for identical work; list three
+sources of that run-to-run variation. (b) Why is the <em>minimum</em> a more principled estimate of intrinsic cost than the mean,
+given that interference only ever slows a run? (c) When would the median be a better summary than the minimum, and what should you
+always report alongside either?</div>
+
+<div class="exercise" id="ex33.8"><span class="ex-label">33.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A developer benchmarks a hashing routine: <code>t0 = now(); for (i=0;i&lt;N;i++)
+hash(key); t1 = now();</code> and reports <code>0.0000&nbsp;s</code>, concluding the hash is &ldquo;essentially free.&rdquo;
+<br><strong>Step 1 (given):</strong> the return value of <code>hash(key)</code> is never used, so the calls have no observable effect.
+<br><strong>Step 2 (given):</strong> at <code>-O2</code> the compiler may therefore remove the entire loop (Chapter 10), so nothing was timed.
+<br><strong>Step 3 (given):</strong> the input <code>key</code> is also loop-invariant, which the optimizer can hoist or fold, compounding the problem.
+<br><strong>Step 4 (you):</strong> Rewrite the benchmark so it honestly times the hash — make the result observable and vary the
+input across iterations — and state what you would additionally do (clock, trials) before trusting the number.</div>
+
+<div class="exercise" id="ex33.9"><span class="ex-label">33.9</span> <span class="ex-tag mixed">mixed</span>
+For each situation, say whether you would <em>profile</em>, <em>benchmark</em>, or <em>neither yet</em>, and why: (a) a service is
+&ldquo;slow&rdquo; but you have no idea which part; (b) you have two candidate implementations of the confirmed hot function and must
+pick one; (c) a teammate proposes rewriting a module that is 2% of runtime; (d) you changed the hot function and want to know if
+total runtime actually dropped.</div>
+
+<div class="exercise" id="ex33.10"><span class="ex-label">33.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A benchmark reporting <code>0.0000&nbsp;s</code>
+means the code is extremely fast.&rdquo; (b) &ldquo;Benchmarking at <code>-O0</code> tells you the shipped build's performance.&rdquo;
+(c) &ldquo;A sampling profiler requires recompiling the program.&rdquo; (d) &ldquo;Optimizing a part that is 4% of runtime can, at
+best, speed the program by 4%.&rdquo; (e) &ldquo;One timing run is enough if the machine is otherwise idle.&rdquo;</div>
+
+<div class="exercise" id="ex33.11"><span class="ex-label">33.11</span> <span class="ex-tag stretch">stretch</span>
+Tie this chapter to the cost model. (a) The profiler in &sect;33.4 says <code>compute</code> is 93.6% of runtime but not
+<em>why</em>; list three costs from Chapters 3&ndash;5 that could be the real reason a loop is slow even at a low instruction count.
+(b) Explain how you would use the &sect;33.3 timing method to test whether a proposed cache-friendlier layout actually helps —
+what exactly must you hold constant, and what must you make observable? (c) Argue why &ldquo;profile &rarr; hypothesize a cause
+&rarr; change one thing &rarr; re-measure&rdquo; is the scientific method applied to performance.</div>
+
+<div class="exercise" id="ex33.12"><span class="ex-label">33.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices): (a) Reproduce &sect;33.2 — write a loop that sums into a variable, compile at
+<code>-O2</code> without using the variable and time it, then print the variable and time it again; report both times and explain
+the difference. (b) Reproduce &sect;33.3 — run an honest version five times with <code>clock_gettime(CLOCK_MONOTONIC, ...)</code>,
+report the five times and the minimum, and compute the spread. (c) If your platform has <code>perf</code> (or <code>gprof</code>),
+profile a small two-function program like &sect;33.4's and confirm the profiler agrees with hand timing about which function
+dominates; if not, do the hand timing and state which tool you would use and what it would add. Note your toolchain versions and CPU.</div>
+
+</section>
+</section>

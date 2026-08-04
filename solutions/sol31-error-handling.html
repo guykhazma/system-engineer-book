@@ -1,0 +1,116 @@
+<section class="solutions" id="sol31">
+<h1>Chapter 31 — Solutions</h1>
+
+<div class="solution" id="sol31.1"><span class="sol-label">31.1</span>
+<code>Option&lt;T&gt;</code> represents a value that may be absent — variants <code>Some(T)</code> and <code>None</code> — replacing
+the null pointer. <code>Result&lt;T, E&gt;</code> represents an operation that may fail with a reason — variants <code>Ok(T)</code>
+and <code>Err(E)</code>. <em>Tempting wrong answer:</em> &ldquo;<code>None</code> is Rust's null pointer&rdquo; — <code>None</code>
+is a variant the type system tracks, not a pointer value that inhabits every reference type; you cannot dereference it. <strong>Feed-forward:</strong>
+&sect;31.2, &sect;31.3.</div>
+
+<div class="solution" id="sol31.2"><span class="sol-label">31.2</span>
+On an expression <code>x</code> of type <code>Result&lt;T, E&gt;</code>, <code>x?</code> evaluates to the inner <code>T</code> if
+<code>x</code> is <code>Ok(T)</code>, and otherwise performs an early <em>return</em> of the <code>Err(E)</code> from the enclosing
+function (converting the error type through <code>From</code> if needed). <em>Tempting wrong answer:</em> &ldquo;<code>?</code>
+panics on <code>Err</code>&rdquo; — that is <code>unwrap()</code>; <code>?</code> returns the error to the caller instead.
+<strong>Feed-forward:</strong> &sect;31.4.</div>
+
+<div class="solution" id="sol31.3"><span class="sol-label">31.3</span>
+<code>Result</code> is for <em>recoverable</em> failures the caller should handle; <code>panic!</code> is for <em>unrecoverable</em>
+bugs or violated invariants, and it unwinds the stack and aborts the thread. <code>unwrap()</code> is a shortcut for &ldquo;if this
+is <code>Err</code>, treat it as a bug and <code>panic!</code>&rdquo;. <em>Tempting wrong answer:</em> &ldquo;<code>panic!</code> is
+just Rust's exception you catch upstream&rdquo; — it is meant for unrecoverable conditions, not routine control flow; recoverable
+errors use <code>Result</code>. <strong>Feed-forward:</strong> &sect;31.4.</div>
+
+<div class="solution" id="sol31.4"><span class="sol-label">31.4</span>
+(a) The program did not check <code>fopen</code>'s return value; C signals that failure by returning a <code>NULL</code> pointer
+(and setting <code>errno</code>). (b) <code>-Wall</code> did not warn because checking a returned sentinel is a convention the
+compiler does not enforce; the warning it emitted was the unrelated <code>-Wunused-result</code> for ignoring <code>fgets</code>'s
+own <code>warn_unused_result</code> return. (c) The <code>NULL</code> <code>fp</code> is dereferenced inside <code>fgets</code>,
+causing a segmentation fault (exit 139); dereferencing an invalid pointer is undefined behavior (Chapter 10), so the compiler may
+assume it never happens and no diagnostic is required. <em>Tempting wrong answer:</em> &ldquo;the warning means the compiler caught
+the NULL bug&rdquo; — the warning was about <code>fgets</code>'s return, not the unchecked <code>fp</code>. <strong>Feed-forward:</strong>
+&sect;31.1, &sect;31.3.</div>
+
+<div class="solution" id="sol31.5"><span class="sol-label">31.5</span>
+(a) The success value lives inside the <code>Ok(T)</code> variant, so to reach a usable value you must write code that also names
+the <code>Err</code> case (a <code>match</code>, a combinator, or <code>?</code>). (b) <code>#[must_use]</code> makes the compiler
+<em>warn</em> if you discard the whole <code>Result</code> without using it — the enforcement C's convention lacks. (c)
+<code>unwrap()</code> is the closest analog to skipping C's check because it reaches the success value while turning any
+<code>Err</code> into a <code>panic!</code>; it is at least visible and greppable, unlike C's silent fall-through.
+<em>Tempting wrong answer:</em> &ldquo;<code>unwrap()</code> is safe because it can't segfault&rdquo; — it can't corrupt memory,
+but it still crashes the thread on a recoverable error. <strong>Feed-forward:</strong> &sect;31.3.</div>
+
+<div class="solution" id="sol31.6"><span class="sol-label">31.6</span>
+(a) <code>?</code> propagates an <code>Err</code> by returning it from the enclosing function, but <code>load</code> returns
+<code>()</code>, which has nowhere to put a propagated error — so the operation is ill-typed and reported as <code>E0277</code>. (b)
+Corrected: <code>fn load(path: &amp;str) -&gt; Result&lt;(), io::Error&gt;</code> (with <code>Ok(())</code> at the end). (c) Adding
+<code>.unwrap()</code> compiles but changes the semantics: a missing file — a recoverable error — now <code>panic!</code>s and aborts
+the thread instead of being handed to the caller who could recover. <em>Tempting wrong answer:</em> &ldquo;<code>E0277</code> means
+<code>File::open</code> returned the wrong type&rdquo; — the operand type is fine; the enclosing function's return type is what
+disallows <code>?</code>. <strong>Feed-forward:</strong> &sect;31.4.</div>
+
+<div class="solution" id="sol31.7"><span class="sol-label">31.7</span>
+(a) In C the worst case is undefined behavior at run time — the NULL dereference and segfault of &sect;31.1, or worse, silent
+corruption. (b) In Rust, dropping the <code>Result</code> is caught at compile time as a <code>#[must_use]</code> <em>warning</em>
+(the value is unused, no crash), whereas reflexively <code>unwrap()</code>ing it downgrades a recoverable error to a run-time
+<code>panic!</code> that aborts the thread — bad, but a controlled unwind, not UB. (c) Ordered by severity: compile-time diagnostic
+(safest, before the program runs) &lt; warning &lt; controlled <code>panic!</code> &lt; runtime UB (worst). This ordering matters
+because a system you cannot easily debug in production fails most cheaply when the compiler catches the omission, and most
+expensively when it is silent undefined behavior. <em>Tempting wrong answer:</em> &ldquo;a Rust panic is as bad as a C
+segfault&rdquo; — a panic is a defined, controlled unwind with a message; UB is undefined and may corrupt silently.
+<strong>Feed-forward:</strong> &sect;31.1, &sect;31.4.</div>
+
+<div class="solution" id="sol31.8"><span class="sol-label">31.8</span>
+<strong>Step 4:</strong> Corrected: <code>fn first(path: &amp;str) -&gt; Result&lt;String, io::Error&gt; { let s =
+std::fs::read_to_string(path)?; Ok(s) }</code> — the function now returns a <code>Result</code>, so the <code>io::Error</code> that
+<code>?</code> may propagate has somewhere to go, and the success value is wrapped in <code>Ok</code>. This is preferable to
+<code>.unwrap()</code> because a missing or unreadable file is a routine, recoverable condition the caller may want to handle (fall
+back to defaults, report to the user); <code>unwrap()</code> would <code>panic!</code> and abort instead. <em>Tempting wrong
+answer:</em> &ldquo;return <code>String</code> and <code>unwrap()</code> so the signature stays simple&rdquo; — that hides a
+recoverable failure behind a crash. <strong>Feed-forward:</strong> &sect;31.4.</div>
+
+<div class="solution" id="sol31.9"><span class="sol-label">31.9</span>
+(a) <strong><code>Option</code></strong> — a key's presence is a plain absent/present question with no error reason (or
+<code>Result</code> only if the lookup itself can fail). (b) <strong><code>Result</code></strong> — malformed input is an
+expected, recoverable failure carrying a reason. (c) <strong><code>panic!</code></strong> is acceptable — an out-of-range index you
+just proved in-range would be a bug, so a panic (or plain indexing, which panics) documents the invariant; alternatively return
+<code>Result</code> if the proof is not airtight. (d) <strong><code>Result</code></strong> — a user-specified file may legitimately
+be missing or unreadable; the caller should recover. <em>Method-selection cue:</em> absence with no reason &rarr; <code>Option</code>;
+expected failure with a reason &rarr; <code>Result</code>; a violated invariant/bug &rarr; <code>panic!</code>.
+<strong>Feed-forward:</strong> &sect;31.2&ndash;&sect;31.4.</div>
+
+<div class="solution" id="sol31.10"><span class="sol-label">31.10</span>
+(a) <strong>False</strong> — <code>None</code> is an <code>Option</code> variant the type system tracks, not a null pointer that
+inhabits every reference type. (b) <strong>False</strong> — <code>?</code> is only valid in a function returning <code>Result</code>
+or <code>Option</code> (else <code>E0277</code>). (c) <strong>False</strong> — dropping a <code>Result</code> is a <code>#[must_use]</code>
+<em>warning</em>, not an error. (d) <strong>False</strong> — <code>unwrap()</code> on <code>Err</code> <code>panic!</code>s;
+<code>unwrap_or</code> is the one that returns a default. (e) <strong>True</strong> — <code>?</code> converts the error type through
+the <code>From</code> trait on the way out. <em>Tempting wrong answer:</em> marking (c) true by analogy to (b) — dropping a value is
+a warning, using <code>?</code> in the wrong context is the hard error. <strong>Feed-forward:</strong> &sect;31.2&ndash;&sect;31.4.</div>
+
+<div class="solution" id="sol31.11"><span class="sol-label">31.11</span>
+(a) Using <code>?</code> states a requirement on the enclosing function: &ldquo;this function can absorb a propagated error&rdquo;
+— i.e. its return type implements the residual/conversion machinery (built on <code>From</code>). That is a trait requirement, so
+its violation is the same <code>E0277</code> (&ldquo;trait bound not satisfied&rdquo;) as an unmet bound in Chapter 30. (b) Because
+<code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> are <em>generic</em>, one <code>?</code> operator is defined over
+all their instantiations at once — it works uniformly on <code>Result&lt;File, io::Error&gt;</code>,
+<code>Result&lt;String, ParseError&gt;</code>, and every other fallible return without per-type code, exactly the reuse
+monomorphization gives. (c) A worker's result would travel as a <code>Result&lt;Output, E&gt;</code> (&ldquo;the work, or why it
+failed&rdquo;); a thread <code>panic!</code> is observed by the parent as an <code>Err</code> from <code>JoinHandle::join</code>,
+carrying the panic payload. <em>Tempting wrong answer:</em> &ldquo;<code>?</code>'s error is a special language feature unrelated to
+traits&rdquo; — it is built on the <code>From</code>/residual traits, which is why the diagnostic is a trait-bound error.
+<strong>Feed-forward:</strong> &sect;31.5; the concurrency chapter ahead, and Chapter 30.</div>
+
+<div class="solution" id="sol31.12"><span class="sol-label">31.12</span>
+Toolchain-specific. A correct write-up reports: (a) <code>cerr.c</code> compiles (with only the <code>-Wunused-result</code>
+warning) and, on a missing file, terminates with SIGSEGV (exit status 139); adding <code>if (fp == NULL) { perror(...); return
+1; }</code> converts the crash into a clean error message and non-crashing exit. (b) With <code>rustc</code>,
+<code>read_config</code> returning <code>Result&lt;String, io::Error&gt;</code> returns the error on a missing path (no crash);
+changing its return type to <code>()</code> produces <code>error[E0277]</code> on the <code>?</code> line. Without <code>rustc</code>,
+name the <code>?</code> line and the return type as the cause. (c) Replacing a <code>?</code> with <code>.unwrap()</code> changes a
+propagated, recoverable error into a thread-aborting <code>panic!</code>. <em>Tempting wrong answer:</em> &ldquo;since <code>cerr.c</code>
+compiled, the NULL path is fine&rdquo; — it compiles but is undefined behavior at run time. <strong>Feed-forward:</strong> &sect;31.1,
+&sect;31.4.</div>
+
+</section>

@@ -272,7 +272,10 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch28">Chapter 28 — Borrowing and References</a></li>
 <li class="toc-ch"><a href="#ch29">Chapter 29 — Lifetimes</a></li>
 <li class="toc-ch"><a href="#ch30">Chapter 30 — Traits and Generics</a></li>
+<li class="toc-ch"><a href="#ch31">Chapter 31 — Error Handling</a></li>
+<li class="toc-ch"><a href="#ch32">Chapter 32 — Fearless Concurrency</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VI &mdash; Performance Engineering</li>
+<li class="toc-ch"><a href="#ch33">Chapter 33 — Measure First: Profiling and Benchmarking</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VII &mdash; I/O & Networking, Low-Level</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part VIII &mdash; Storage & the Disk</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part IX &mdash; Storage Engines</li>
@@ -12570,7 +12573,1197 @@ explain why a monomorphized generic could not hold both in one vector. Note your
 </section>
 </section>
 
+<section class="chapter" id="ch31">
+<h1>Chapter 31 — Error Handling</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch30">Chapter 30</a> (traits and generics — <code>Option</code>
+and <code>Result</code> are generic enums, and <code>?</code> leans on the <code>From</code> trait, so this chapter is those tools
+put to work), <a href="#ch09">Chapter 9</a> (manual allocation and what goes wrong — C signals failure with return codes,
+<code>errno</code>, and NULL, none of which the compiler makes you check), <a href="#ch27">Chapter 27</a> (ownership — an error
+value is owned and moved like any other, which is why <code>?</code> can hand it back to the caller), <a href="#ch10">Chapter
+10</a> (undefined behavior — dereferencing a NULL you forgot to check is exactly the UB a type can rule out). &nbsp;·&nbsp; Chapter
+30 promised that in Rust a guarantee is usually a type; this chapter is that promise applied to failure — &ldquo;did you handle the
+error?&rdquo; becomes a thing that does not compile.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch30">Chapter 30</a> — what is a generic type, and what does a trait bound like
+<code>T: From&lt;E&gt;</code> let a body assume? (2) <a href="#ch09">Chapter 9</a> — name the ways C reports that an operation
+failed (a sentinel return value, <code>errno</code>, a NULL pointer); does the C compiler force the caller to inspect any of them?
+(3) <em>Predict:</em> in C, <code>FILE *fp = fopen(path, "r");</code> returns NULL when the file is missing; if you forget to check
+and call <code>fgets(buf, n, fp)</code>, does that <em>compile</em>? does it <em>run</em> correctly? In Rust, <code>File::open</code>
+returns a <code>Result</code>; can you use the file handle without first confronting the failure case? Write your guesses;
+&sect;31.1 and &sect;31.3 answer all three.</p>
+</aside>
+
+<p>Every real program meets conditions it cannot control: a file is missing, a socket closes, a parse fails, an allocation returns
+nothing. The question is not whether errors happen but whether the language <em>makes you deal with them</em>. C's answer, from
+Chapter 9, is a set of conventions — a sentinel return value (<code>-1</code>, <code>NULL</code>), the global <code>errno</code>,
+sometimes a status code — all of which the compiler is happy to let you ignore. Rust's answer is to make failure a value with a
+type the compiler forces you to handle: <strong><code>Option&lt;T&gt;</code></strong> for &ldquo;a value that might be absent&rdquo;
+(there is no null), and <strong><code>Result&lt;T, E&gt;</code></strong> for &ldquo;an operation that might fail.&rdquo; Both are the
+ordinary generic enums of Chapter 30, and handling them is ordinary pattern matching. First, how C signals failure and why every
+signal is silently ignorable, in real C that compiles and then segfaults (&sect;31.1). Then <code>Option&lt;T&gt;</code>: the type
+that abolishes the null pointer and forces the absent case into the open (&sect;31.2). Then <code>Result&lt;T, E&gt;</code> for
+recoverable failure, marked <code>#[must_use]</code> so ignoring it warns (&sect;31.3). Then the <strong><code>?</code>
+operator</strong>, which propagates an error to the caller in one character, and <strong><code>panic!</code></strong> for the
+unrecoverable — with the compile error <code>E0277</code> that fires when <code>?</code> is used in a function that returns neither
+(&sect;31.4). We close by carrying error values forward into concurrency, where a panic on one thread and a <code>Result</code>
+crossing a channel are the next chapter's concern (&sect;31.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust error index, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>31.1 How C signals failure — and why it is ignorable</h2>
+
+<p>C has no single error mechanism; it has conventions. A function returns a <em>sentinel</em> — <code>NULL</code> from
+<code>fopen</code> and <code>malloc</code>, <code>-1</code> from <code>read</code> and <code>open</code> — and often also sets the
+global <code>errno</code> to say why. The caller is supposed to check. Nothing enforces it. Here is real C that forgets one check,
+compiled and run in this environment (gcc 11.4.0):</p>
+
+<pre><code>FILE *fp = fopen("does-not-exist.txt", "r");   /* returns NULL on failure */
+char buf[64];
+fgets(buf, sizeof buf, fp);                    /* fp never checked for NULL */
+printf("read: %s\n", buf);
+
+$ gcc -O2 -Wall cerr.c -o cerr
+cerr.c:5: warning: ignoring return value of 'fgets' ... [-Wunused-result]
+$ ./cerr
+Segmentation fault (core dumped)               # exit status 139</code></pre>
+
+<p>Look closely at what the compiler did and did not say. It emitted a warning — but about the wrong thing: <code>fgets</code>
+happens to be marked <code>warn_unused_result</code>, so ignoring <em>its</em> return drew a note. The actual bug — that
+<code>fp</code> is NULL and is dereferenced inside <code>fgets</code> — drew nothing, because checking <code>fopen</code>'s return
+is a convention, not a rule. The program compiles cleanly enough to ship and then segfaults on the missing file: the NULL
+dereference is the undefined behavior of Chapter 10, reached because the failure was expressible but not enforced. This is the
+recurring shape of C error handling: the information is there (the sentinel, <code>errno</code>), and the discipline to check it is
+entirely on you. Rust's move is to make the failure part of the return <em>type</em>, so there is no unchecked value to forget —
+the success value is only reachable by first accounting for the failure. That type is an enum, and we meet the simpler one first.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name three ways C reports failure. In the snippet above, which check was skipped, and why did the compiler not flag the real bug
+even with <code>-Wall</code>? What runtime event does the skipped check ultimately cause, and which chapter's concept is that?
+(Answer after the next section.)</p>
+</aside>
+
+<h2>31.2 <code>Option&lt;T&gt;</code>: there is no null</h2>
+
+<p>Rust has no null pointer. A value that may be absent has type <strong><code>Option&lt;T&gt;</code></strong>, a generic enum with
+two variants — <code>Some(T)</code> carrying a value, or <code>None</code>. Because absence is a distinct variant rather than a
+special pointer bit, the type system knows a <code>T</code> might not be there and refuses to let you use it as if it always is;
+you must pattern-match both cases (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>enum Option&lt;T&gt; { Some(T), None }        // in the standard library, generic over T
+
+fn first_char(s: &amp;str) -&gt; Option&lt;char&gt; {
+    s.chars().next()                     // Some(c) if non-empty, None if empty
+}
+
+match first_char(name) {
+    Some(c) =&gt; println!("starts with {c}"),
+    None    =&gt; println!("empty name"),   // the compiler forces this arm to exist
+}</code></pre>
+
+<p>The point is what you <em>cannot</em> do: you cannot treat an <code>Option&lt;char&gt;</code> as a <code>char</code> and call
+methods on it, because it is a different type. To get at the inner value you must go through the <code>None</code> case — by
+<code>match</code>, or by a combinator like <code>unwrap_or</code>, or by <code>?</code> (&sect;31.4). This is precisely the check
+C omitted in &sect;31.1, now made unskippable: the &ldquo;might be missing&rdquo; is in the type, so the missing case cannot be
+silently dereferenced. It is the language-level fix for what C. A. R. Hoare, who introduced the null reference in 1965, later called
+his &ldquo;billion-dollar mistake&rdquo; — a value that inhabits every reference type yet supports no operation, so every use is a
+latent crash (Hoare, QCon London, 2009). <code>Option</code> puts the absent case back into the type where the compiler can see it,
+turning a whole family of C's NULL-dereference segfaults into a match arm you are made to write.</p>
+
+<h2>31.3 <code>Result&lt;T, E&gt;</code>: recoverable failure as a value</h2>
+
+<p>Absence is one thing; a failed operation that carries a <em>reason</em> is another. For that Rust has
+<strong><code>Result&lt;T, E&gt;</code></strong>, a generic enum over the success type <code>T</code> and the error type
+<code>E</code>, with variants <code>Ok(T)</code> and <code>Err(E)</code>. Fallible standard-library operations return it —
+<code>File::open</code> returns <code>Result&lt;File, io::Error&gt;</code> — and it is annotated <code>#[must_use]</code>, so
+ignoring one is a warning, not a shrug (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>enum Result&lt;T, E&gt; { Ok(T), Err(E) }      // generic over success T and error E
+
+let f = File::open("data.txt");          // Result&lt;File, io::Error&gt;
+let file = match f {
+    Ok(handle) =&gt; handle,                // the File, only reachable through Ok
+    Err(e)     =&gt; return Err(e),         // must confront the failure to proceed
+};
+// File::open("x");   // warning: unused `Result` that must be used  (#[must_use])</code></pre>
+
+<p>Compare this line by line with the C of &sect;31.1. There, <code>fopen</code> returned a <code>FILE*</code> that was
+<code>NULL</code> on failure, and reaching the &ldquo;file&rdquo; without checking was legal and segfaulted. Here,
+<code>File::open</code> returns a <code>Result</code> whose <code>File</code> is <em>inside</em> the <code>Ok</code> variant: the
+only way to a usable <code>File</code> is through code that also names what to do on <code>Err</code>. If you throw the whole
+<code>Result</code> away, the <code>#[must_use]</code> attribute makes the compiler warn that a result that must be used was not —
+the diagnostic C's <code>warn_unused_result</code> gestured at, here applied to every fallible operation by construction. You still
+have escape hatches — <code>unwrap()</code> returns the <code>Ok</code> value or <strong>panics</strong> on <code>Err</code>, and
+<code>expect("msg")</code> does the same with your message — but they are visible, greppable choices to convert a recoverable error
+into a crash, not the silent default. Handling the error is the path of least resistance; ignoring it takes a deliberate keystroke.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What are the two variants of <code>Result&lt;T, E&gt;</code>, and where does the success value live? What does
+<code>#[must_use]</code> buy you over C's conventions, and what do <code>unwrap()</code> / <code>expect()</code> do on an
+<code>Err</code>? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>31.4 Propagation with <code>?</code>, and <code>panic!</code> for the unrecoverable</h2>
+
+<p>Matching every <code>Result</code> by hand would bury real logic under error plumbing. The <strong><code>?</code>
+operator</strong> is the shorthand: on an expression of type <code>Result</code>, <code>x?</code> evaluates to the inner value if
+it is <code>Ok</code>, and otherwise <em>returns the <code>Err</code> from the enclosing function</em> — an early return that hands
+the error to the caller. When the caller's error type differs, <code>?</code> converts through the <code>From</code> trait of
+Chapter 30 (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>fn read_config(path: &amp;str) -&gt; Result&lt;String, io::Error&gt; {
+    let mut f = File::open(path)?;       // if Err, return it now; else bind the File
+    let mut s = String::new();
+    f.read_to_string(&amp;mut s)?;           // same: propagate on Err, continue on Ok
+    Ok(s)                                // reached only if every step succeeded
+}</code></pre>
+
+<p>Each <code>?</code> is the whole match-and-early-return of &sect;31.3 compressed to one character, and the function reads as the
+happy path with the failures factored out. The catch — and it is a helpful one — is that <code>?</code> only makes sense in a
+function that itself returns a <code>Result</code> (or an <code>Option</code>): it needs somewhere to return the <code>Err</code>
+<em>to</em>. Use <code>?</code> in a function returning <code>()</code> and the compiler stops you with
+<strong><code>E0277</code></strong> — &ldquo;the <code>?</code> operator can only be used in a function that returns
+<code>Result</code> or <code>Option</code>&rdquo; (per the official Rust error index) — the same error code as an unmet trait bound
+in Chapter 30, because &ldquo;this function can absorb a propagated error&rdquo; is itself a trait requirement. The fix is to give
+the function a <code>Result</code> return type, not to reach for <code>unwrap</code>.</p>
+
+<p>Not every failure is recoverable. When a program hits a bug or a violated invariant it cannot sensibly continue past —
+an index out of bounds, an assertion, a &ldquo;this should be impossible&rdquo; branch — it calls <strong><code>panic!</code></strong>,
+which unwinds the stack (running destructors) and aborts the thread. The distinction is the whole design: <code>Result</code> is for
+<em>expected, recoverable</em> conditions the caller should handle (a missing file, a bad request); <code>panic!</code> is for
+<em>unexpected, unrecoverable</em> ones that signal a bug (Klabnik &amp; Nichols, 2023, ch. 9). Choosing <code>unwrap()</code> is
+choosing &ldquo;if this is <code>Err</code>, that is a bug, so panic&rdquo; — sometimes right (a hard-coded string you know parses),
+often a shortcut that turns a routine error into a crash. The rule of thumb: return a <code>Result</code> when the caller can do
+something about it; <code>panic!</code> only when continuing would mean running on broken assumptions.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: an error is a value the type system forces you to handle</span>
+<p><strong>1. In words.</strong> Fallibility is encoded in the return type — <code>Option&lt;T&gt;</code> for absence,
+<code>Result&lt;T, E&gt;</code> for failure-with-reason — so the success value is reachable only through code that also accounts
+for the failure. <code>?</code> propagates an <code>Err</code> to the caller; <code>panic!</code> is reserved for unrecoverable
+bugs. Ignoring a <code>Result</code> warns (<code>#[must_use]</code>); using <code>?</code> without a place to return the error is
+<code>E0277</code>.</p>
+<p><strong>2. As a picture.</strong> Figure 31.1: one call fanning into two arms — <code>Ok(T)</code>/<code>Some(T)</code> to the
+happy path, <code>Err(E)</code>/<code>None</code> to a handler — with <code>?</code> drawn as an arrow from the <code>Err</code> arm
+straight back out to the caller, versus C's single return value with a dashed &ldquo;did you remember to check?&rdquo; branch that
+falls through to a NULL dereference.</p>
+<p><strong>3. As numbers/contrast.</strong> The C of &sect;31.1 compiled and reached exit status 139 (SIGSEGV) on a missing file
+because the NULL check was optional. The Rust equivalent cannot reach the <code>File</code> without a matching <code>Err</code>
+handler; the same &ldquo;forgot to check&rdquo; is a compile-time warning (<code>#[must_use]</code>) or, for <code>?</code> in the
+wrong context, a compile error (<code>E0277</code>) — a runtime segfault turned into a message before the program runs.</p>
+</aside>
+
+<p><em>(Answer to the &sect;31.1 quick check: C reports failure by sentinel return values (<code>NULL</code>, <code>-1</code>), by
+setting <code>errno</code>, and by explicit status codes. The skipped check was <code>fopen</code>'s return for
+<code>NULL</code>; <code>-Wall</code> did not flag it because checking a return sentinel is a convention the compiler does not
+enforce — it warned only about ignoring <code>fgets</code>'s own <code>warn_unused_result</code>. The unchecked NULL is
+dereferenced inside <code>fgets</code>, causing a segmentation fault — the undefined behavior of Chapter 10.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">An error is a value with two arms; C's single return has an optional, skippable check.</text>
+<rect x="30" y="40" width="150" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="42" y="59" font-size="10">File::open(path)</text>
+<text x="200" y="34" font-size="9" fill="#2f7d32">RUST: type forces both arms</text>
+<rect x="210" y="42" width="120" height="26" fill="#dfeee0" stroke="#2f7d32"/><text x="222" y="59" font-size="9">Ok(File) — use it</text>
+<rect x="210" y="78" width="120" height="26" fill="#fdeee6" stroke="#8c3a1d"/><text x="222" y="95" font-size="9">Err(e) — handle</text>
+<line x1="180" y1="52" x2="210" y2="55" stroke="#2f7d32" marker-end="url(#ra)"/>
+<line x1="180" y1="60" x2="210" y2="90" stroke="#8c3a1d" marker-end="url(#rb)"/>
+<text x="345" y="95" font-size="8" fill="#8c3a1d">? returns Err to caller</text>
+<line x1="330" y1="91" x2="470" y2="91" stroke="#8c3a1d" stroke-dasharray="3,2" marker-end="url(#rb)"/>
+<text x="30" y="150" font-size="9" fill="#8c3a1d">C: one return; the check is optional</text>
+<rect x="30" y="158" width="150" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="42" y="177" font-size="10">fp = fopen(path)</text>
+<rect x="210" y="158" width="120" height="26" fill="#dfeee0" stroke="#2f7d32"/><text x="222" y="175" font-size="9">use fp</text>
+<line x1="180" y1="173" x2="210" y2="172" stroke="#14406b" marker-end="url(#ra)"/>
+<text x="345" y="163" font-size="8" fill="#8c3a1d">if fp==NULL … (skippable)</text>
+<text x="345" y="180" font-size="8" fill="#8c3a1d">skipped &rarr; NULL deref &rarr; SIGSEGV</text>
+<defs>
+<marker id="ra" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#2f7d32"/></marker>
+<marker id="rb" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#8c3a1d"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 31.1: A <code>Result</code>/<code>Option</code> forces both arms — the success value lives inside <code>Ok</code>/<code>Some</code>,
+and <code>?</code> routes an <code>Err</code> back to the caller. C's single return value makes the failure check optional, and skipping
+it falls through to the NULL dereference of &sect;31.1.</figcaption>
+</figure>
+
+<aside class="warning">
+<span class="box-title">Trap: reflexive <code>.unwrap()</code>, and silencing <code>#[must_use]</code> with <code>let _ =</code></span>
+<p>Two related shortcuts undo everything this chapter buys. The first is reaching for <code>.unwrap()</code> or
+<code>.expect()</code> on every <code>Result</code> to make the types line up, because matching feels like ceremony. Each
+<code>unwrap</code> is a decision that &ldquo;an <code>Err</code> here is an unrecoverable bug&rdquo; — fine for a literal you know
+parses, but on a file open, a network read, or user input it converts a routine, recoverable error into a
+<code>panic!</code> that aborts the thread. The mechanical fix when the compiler complains that <code>?</code> needs a
+<code>Result</code>-returning function (<code>E0277</code>) is <em>not</em> to slap on <code>unwrap</code>; it is to give the
+function a <code>Result</code> return type and propagate. The second shortcut is silencing the <code>#[must_use]</code> warning with
+<code>let _ = fallible();</code> — the exact analog of ignoring C's return sentinel, now with a paper trail. Both are the
+&sect;31.1 mistake wearing Rust syntax: the error is still there, you have just re-hidden it. Handle it, propagate it with
+<code>?</code>, or — if a failure truly is a bug — <code>panic!</code> <em>deliberately</em> with a message that says why; do not
+launder a recoverable error into a crash to quiet the compiler.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;<code>Result</code> and <code>?</code> everywhere are just checked exceptions with
+extra typing — in C I return <code>-1</code> and check it, which is simpler and I can see the control flow. Isn't all this enum
+stuff ceremony?&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;31.1&ndash;&sect;31.4.</p>
+<p><em>Model answer.</em> &ldquo;The difference isn't typing, it's what the compiler enforces. In C the <code>-1</code>-and-check is
+a convention — nothing stops you from skipping it, and when you do you don't get an exception, you get the &sect;31.1 segfault at
+run time on a missing file. <code>Result&lt;T, E&gt;</code> puts the success value inside <code>Ok</code>, so you literally can't
+reach it without naming the <code>Err</code> case, and <code>#[must_use]</code> warns if you drop the whole thing — that's the check
+you keep meaning to write in C, made non-optional. And <code>?</code> is not hidden control flow like an exception: it's a visible,
+one-character early return that only compiles in a function that returns <code>Result</code>, so the error path is explicit and
+type-checked all the way up. It's also not exceptions — there's no invisible unwinding through ten stack frames; a panic is the
+separate, deliberate tool for <em>unrecoverable</em> bugs. So you get C's explicit control flow plus the compiler making sure you
+didn't forget the check.&rdquo; Framing <code>Result</code> as &ldquo;the check you meant to write, enforced&rdquo; and separating
+it cleanly from panics is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;31.3 quick check: <code>Result&lt;T, E&gt;</code> has variants <code>Ok(T)</code> and
+<code>Err(E)</code>, and the success value lives inside <code>Ok</code> — reachable only through code that also names the
+<code>Err</code> case (a match, a combinator, or <code>?</code>). <code>#[must_use]</code> makes the compiler warn if you discard
+the whole <code>Result</code>, an enforcement C's return-value convention lacks. <code>unwrap()</code> returns the <code>Ok</code>
+value or <code>panic!</code>s on <code>Err</code>, and <code>expect("msg")</code> does the same with your message — visible,
+greppable ways to convert a recoverable error into a crash.)</em></p>
+
+<h2>31.5 What to carry forward</h2>
+
+<p>Error handling in Rust is the Chapter 30 pattern once more: name the possibility in a type, and let the compiler force the
+handling. <strong><code>Option&lt;T&gt;</code></strong> (<code>Some</code>/<code>None</code>) replaces the null pointer, so a
+value that might be absent cannot be used as if it were present — abolishing a whole class of C's NULL-dereference crashes.
+<strong><code>Result&lt;T, E&gt;</code></strong> (<code>Ok</code>/<code>Err</code>) makes a fallible operation return its success
+value <em>inside</em> the success variant and is <code>#[must_use]</code>, so the failure cannot be reached without being named and
+cannot be silently discarded. The <strong><code>?</code> operator</strong> propagates an <code>Err</code> to the caller in one
+character, converting error types through <code>From</code>, and is only valid where there is a <code>Result</code> or
+<code>Option</code> to return to (<code>E0277</code> otherwise). <strong><code>panic!</code></strong> is the separate tool for the
+unrecoverable — a bug or violated invariant — and <code>unwrap()</code>/<code>expect()</code> are the visible, greppable way to opt
+into it, never the silent default. The whole design turns &sect;31.1's optional-and-forgotten check, whose penalty was a runtime
+segfault, into a compile-time obligation.</p>
+
+<p>The next chapter, <strong>fearless concurrency</strong>, is where these threads (literally) come together. Errors do not stop at
+a thread boundary: a worker thread can <code>panic!</code>, and its <code>Result</code> — of joining it, of the work it did — has
+to travel back to whoever spawned it, often across a channel that itself yields <code>Result</code> when the other end has hung up.
+And the deeper link is the one Chapter 30 previewed: just as <code>Result</code> encodes &ldquo;this might fail&rdquo; in a type,
+the traits <strong><code>Send</code></strong> and <strong><code>Sync</code></strong> encode &ldquo;this is safe to move to, or share
+across, threads,&rdquo; lifting the ownership and borrowing discipline of Chapters 27&ndash;28 over the thread boundary — so the
+data races you had to reason about by hand in Chapter 24 become, like the unchecked errors here, a compile error rather than
+undefined behavior. Same move, applied to time and threads instead of to failure.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name three ways C signals failure and explain why each is silently ignorable (&sect;31.1's segfault).</li>
+<li>State the variants of <code>Option&lt;T&gt;</code> and why it abolishes the null pointer.</li>
+<li>State the variants of <code>Result&lt;T, E&gt;</code>, where the success value lives, and what <code>#[must_use]</code> does.</li>
+<li>Explain what <code>?</code> does, how it converts error types, and why <code>E0277</code> fires when it is misused.</li>
+<li>Distinguish <code>Result</code> (recoverable) from <code>panic!</code> (unrecoverable), and say what <code>unwrap()</code> chooses.</li>
+<li>Explain why reflexive <code>unwrap</code> and <code>let _ =</code> re-create the C mistake.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> How does C signal failure, and why did the &sect;31.1 program compile with <code>-Wall</code> yet segfault? (&sect;31.1)</li>
+<li><strong>R2.</strong> What is <code>Option&lt;T&gt;</code>, and how does it eliminate a class of NULL-dereference bugs? (&sect;31.2)</li>
+<li><strong>R3.</strong> What is <code>Result&lt;T, E&gt;</code>, where is the success value, and what does <code>#[must_use]</code> add over C? (&sect;31.3)</li>
+<li><strong>R4.</strong> What does <code>?</code> do, what trait does it use to convert errors, and which error code reports its misuse? (&sect;31.4)</li>
+<li><strong>R5.</strong> When do you return a <code>Result</code> vs. call <code>panic!</code>, and what does <code>unwrap()</code> really choose? (&sect;31.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 9
+&ldquo;Error Handling&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source for
+<code>Result</code>, <code>panic!</code>, the <code>?</code> operator, and the recoverable-vs-unrecoverable guidance of
+&sect;31.3&ndash;&sect;31.4; ch. 6 covers <code>Option</code> and enums. Authors, edition, and chapter numbers verified via the
+publisher and the online book; not compiled here.</li>
+<li><strong>The Rust Error Index, entries <code>E0277</code> and <code>E0308</code> (<code>doc.rust-lang.org/error_codes</code>).</strong>
+The official meanings used in &sect;31.4: <code>E0277</code> covers &ldquo;the <code>?</code> operator can only be used in a
+function that returns <code>Result</code> or <code>Option</code>&rdquo; (an unsatisfied <code>FromResidual</code>/trait bound), and
+<code>E0308</code> is &ldquo;mismatched types.&rdquo; Both verified against the current error index.</li>
+<li><strong>C. A. R. Hoare, &ldquo;Null References: The Billion Dollar Mistake,&rdquo; QCon London, 2009 (recorded talk, InfoQ).</strong>
+Hoare's account of introducing the null reference in ALGOL W (1965) and why it was a mistake — the motivation for
+<code>Option&lt;T&gt;</code> in &sect;31.2. A talk, not a paper; speaker, venue, and year verified via the InfoQ recording.</li>
+<li><strong>The Rust standard-library documentation for <code>std::option::Option</code> and <code>std::result::Result</code>
+(<code>doc.rust-lang.org/std</code>).</strong> The definitions, the <code>#[must_use]</code> annotation on <code>Result</code>, and
+the combinators (<code>unwrap</code>, <code>expect</code>, <code>unwrap_or</code>, <code>map</code>, <code>and_then</code>) referenced
+throughout. Reference for the exact API; verify against the current stable docs.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex31.1"><span class="ex-label">31.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, say what <code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> represent, and name the two variants of each.</div>
+
+<div class="exercise" id="ex31.2"><span class="ex-label">31.2</span> <span class="ex-tag warm">warm-up</span>
+What does the <code>?</code> operator do to an expression of type <code>Result&lt;T, E&gt;</code> — what happens on <code>Ok</code>, and what on <code>Err</code>?</div>
+
+<div class="exercise" id="ex31.3"><span class="ex-label">31.3</span> <span class="ex-tag warm">warm-up</span>
+What is the difference between returning a <code>Result</code> and calling <code>panic!</code>, and which is <code>unwrap()</code> a shortcut for?</div>
+
+<div class="exercise" id="ex31.4"><span class="ex-label">31.4</span> <span class="ex-tag core">core</span>
+Take the C of &sect;31.1. (a) Which failure did the program not check, and how does C signal that failure? (b) Why did
+<code>gcc -Wall</code> not warn about the real bug, and what was the warning it <em>did</em> emit about? (c) Explain, in terms of
+Chapter 10, what runtime event the missing check causes and why it is undefined behavior.</div>
+
+<div class="exercise" id="ex31.5"><span class="ex-label">31.5</span> <span class="ex-tag core">core</span>
+Explain how <code>Result&lt;T, E&gt;</code> makes the &sect;31.1 mistake hard to repeat. (a) Where does the success value live, and
+what must you write to reach it? (b) What does <code>#[must_use]</code> add if you discard the whole <code>Result</code>? (c) In
+what sense is <code>unwrap()</code> the closest Rust analog to skipping C's check, and why is it at least visible?</div>
+
+<div class="exercise" id="ex31.6"><span class="ex-label">31.6</span> <span class="ex-tag core">core</span>
+A function <code>fn load(path: &amp;str)</code> with return type <code>()</code> contains <code>let f = File::open(path)?;</code> and
+fails to compile with <code>error[E0277]: the ? operator can only be used in a function that returns Result or Option</code>. (a)
+Why is <code>?</code> illegal here specifically? (b) Give the corrected signature. (c) Why is adding <code>.unwrap()</code> instead
+the wrong fix in general?</div>
+
+<div class="exercise" id="ex31.7"><span class="ex-label">31.7</span> <span class="ex-tag complexity">cost</span>
+Consider the cost of the two error styles, not in CPU cycles but in <em>failure modes</em>. (a) What is the worst-case runtime
+outcome of a forgotten check in C (as in &sect;31.1)? (b) What is the worst-case outcome of the corresponding omission in Rust —
+distinguishing &ldquo;dropped the <code>Result</code>&rdquo; from &ldquo;reflexively <code>unwrap()</code>ed it&rdquo;? (c) Argue
+which class of failure (compile-time diagnostic, warning, or runtime UB) each lands in, and why that ordering matters for a system
+you cannot easily debug in production.</div>
+
+<div class="exercise" id="ex31.8"><span class="ex-label">31.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer writes <code>fn first(path: &amp;str) -&gt; String { let s =
+std::fs::read_to_string(path)?; s }</code> in a function returning <code>String</code> and gets
+<code>error[E0277]</code> on the <code>?</code>.
+<br><strong>Step 1 (given):</strong> <code>read_to_string</code> returns <code>Result&lt;String, io::Error&gt;</code>, so
+<code>?</code> may early-return an <code>io::Error</code>.
+<br><strong>Step 2 (given):</strong> the function's declared return type is <code>String</code>, which has no place for that
+propagated <code>Err</code> to go — hence <code>E0277</code>.
+<br><strong>Step 3 (given):</strong> to keep <code>?</code>, the function must return a <code>Result</code> whose error type the
+<code>io::Error</code> can become.
+<br><strong>Step 4 (you):</strong> Give the corrected signature and body (returning <code>Result&lt;String, io::Error&gt;</code>),
+and explain why this is preferable to changing <code>?</code> to <code>.unwrap()</code> for a file that might legitimately be missing.</div>
+
+<div class="exercise" id="ex31.9"><span class="ex-label">31.9</span> <span class="ex-tag mixed">mixed</span>
+For each situation, say whether you would return <code>Result</code>, return <code>Option</code>, or <code>panic!</code>, and why:
+(a) looking up a key that may or may not be in a map; (b) parsing a network request whose bytes may be malformed; (c) indexing a
+slice with an integer your own code just computed and proved in-range; (d) opening a user-specified config file.</div>
+
+<div class="exercise" id="ex31.10"><span class="ex-label">31.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Rust's null pointer is written
+<code>None</code>.&rdquo; (b) &ldquo;<code>?</code> works in any function.&rdquo; (c) &ldquo;Dropping a <code>Result</code> is a
+compile error.&rdquo; (d) &ldquo;<code>unwrap()</code> on an <code>Err</code> returns a default value.&rdquo; (e) &ldquo;<code>?</code>
+can convert one error type into another on the way out.&rdquo;</div>
+
+<div class="exercise" id="ex31.11"><span class="ex-label">31.11</span> <span class="ex-tag stretch">stretch</span>
+&ldquo;An error is a value the type system forces you to handle.&rdquo; (a) Explain how this is the same mechanism as Chapter 30's
+trait bounds — what &ldquo;requirement&rdquo; is <code>?</code>-in-a-function stating, and why is its violation the <em>same</em>
+error code (<code>E0277</code>) as an unmet bound? (b) Show how <code>Option</code> and <code>Result</code> being <em>generic</em>
+(Chapter 30) is what lets one <code>?</code> work uniformly across every fallible operation. (c) Preview: if a worker thread's
+result must return to its spawner, what type would carry &ldquo;the work, or why it failed,&rdquo; and how might a thread
+<code>panic!</code> be observed by the parent?</div>
+
+<div class="exercise" id="ex31.12"><span class="ex-label">31.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile and run the &sect;31.1 <code>cerr.c</code>;
+confirm it builds and observe the exit status on a missing file (expect a SIGSEGV, status 139). Add the missing
+<code>if (fp == NULL)</code> check and confirm the crash becomes a clean error message. (b) If you have <code>rustc</code>, write
+<code>read_config</code> from &sect;31.4 returning <code>Result&lt;String, io::Error&gt;</code>, call it on a missing path, and
+observe that the error is returned rather than crashing; then change the return type to <code>()</code> and observe
+<code>E0277</code>. Without <code>rustc</code>, explain from this chapter which line each change affects. (c) Replace one
+<code>?</code> with <code>.unwrap()</code> and describe how the failure mode changes. Note your toolchain versions.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch32">
+<h1>Chapter 32 — Fearless Concurrency</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch24">Chapter 24</a> (the memory model — a data race is
+undefined behavior you had to rule out by hand; this chapter makes it a compile error), <a href="#ch28">Chapter 28</a> (borrowing —
+aliasing XOR mutation, the rule that <code>Send</code> and <code>Sync</code> lift across threads), <a href="#ch20">Chapter 20</a>
+(mutual-exclusion locks — Rust's <code>Mutex</code> bundles the lock <em>with</em> the data it guards), <a href="#ch31">Chapter
+31</a> (error handling — joining a thread and receiving on a channel both yield <code>Result</code>). &nbsp;·&nbsp; This chapter
+finishes the Rust part: the aliasing discipline you proved by hand in the concurrency volume becomes two traits the compiler checks,
+so a data race stops compiling.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch24">Chapter 24</a> — what exactly is a <em>data race</em>, and what is its status in
+C and C++ (defined behavior? undefined?)? (2) <a href="#ch28">Chapter 28</a> — state the borrow rule in one line (how many mutable
+references may coexist with how many shared ones?). (3) <em>Predict:</em> in C, two threads each increment a shared
+<code>long</code> a million times with no lock; does the program <em>compile</em>? does it print the expected total? In Rust, can
+you hand the same <code>&amp;mut</code> to two threads at once? Write your guesses; &sect;32.1 and &sect;32.3 answer all three.</p>
+</aside>
+
+<p>The concurrency volume (Chapters 20&ndash;26) taught the hazards — data races, torn reads, lost updates, deadlock — and the
+tools to avoid them: locks, atomics, the memory model. What it could not give you was a <em>guarantee</em>. In C, whether your
+locking is correct is a property you argue for by inspection, and a single unlocked access to shared mutable state is undefined
+behavior (Chapter 24) that may work in testing and corrupt in production. Rust calls its alternative <strong>fearless
+concurrency</strong>: the same aliasing rule that made single-threaded code safe — one mutable reference or many shared ones, never
+both (Chapter 28) — is extended across threads by two marker traits, <strong><code>Send</code></strong> and
+<strong><code>Sync</code></strong>, so that sharing mutable state without synchronization does not type-check. First, the C data
+race, compiled and run so you can see it compile cleanly and print the wrong answer (&sect;32.1). Then <code>Send</code> and
+<code>Sync</code>: what each means and how <code>thread::spawn</code> uses them to police the thread boundary (&sect;32.2). Then the
+compiler stopping the &sect;32.1 race with two named diagnostics — <strong><code>E0373</code></strong> (a closure would outlive its
+borrow) and <strong><code>E0277</code></strong> (a non-thread-safe type crossing threads) (&sect;32.3). Then the safe way to share:
+<strong><code>Arc&lt;Mutex&lt;T&gt;&gt;</code></strong> and message-passing <strong>channels</strong>, where the <code>Mutex</code>
+holds the data it guards and joining or receiving yields the <code>Result</code> of Chapter 31 (&sect;32.4). We close by completing
+the Rust part and turning toward performance (&sect;32.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023), the Rustonomicon, and the official Rust error index, and are labeled as such.
+Nothing about Rust's behavior below is invented — it is cited.</p>
+
+<h2>32.1 The C data race, compiled and run</h2>
+
+<p>Here is the smallest interesting concurrency bug: two threads increment one shared counter, with no synchronization. Each
+<code>counter++</code> is a read-modify-write — load, add one, store — and if the two threads interleave between a load and its
+store, one update is lost (Chapter 24). Compiled and run in this environment (gcc 11.4.0), without optimization so each
+<code>++</code> is a real load/add/store:</p>
+
+<pre><code>static long counter = 0;                 /* shared, no lock */
+static void *bump(void *arg) {
+    for (int i = 0; i &lt; 2000000; i++) counter++;   /* a data race */
+    return NULL;
+}
+// main: create two threads running bump, join both, print counter
+
+$ gcc -O0 -Wall -pthread race.c -o race
+$ ./race
+expected 4000000, got 2453233                       # and a different number each run:
+$ ./race                                             #   2284135, 2799577, 2159965, ...
+expected 4000000, got 2284135</code></pre>
+
+<p>Two things to notice. First, it <em>compiled cleanly</em> — the data race is invisible to the C compiler; there is no rule in the
+language against two threads touching <code>counter</code> at once, only your discipline to add a lock. Second, the answer is
+<em>wrong and nondeterministic</em>: roughly two million of the four million increments vanished, and a different number vanishes
+each run, because the loss depends on the exact interleaving. This is the undefined behavior of Chapter 24 made concrete — the
+program has no defined meaning, so &ldquo;works in testing&rdquo; tells you nothing. The C fix is a mutex around
+<code>counter++</code>, which you must remember to place on <em>every</em> access; forget one and the race returns, silently. Rust's
+move is to make the sharing itself illegal unless it is synchronized — and to do it with the ordinary trait mechanism of Chapter
+30.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why did the &sect;32.1 program compile despite the data race? Why is the printed total both wrong and different each run, and
+which chapter's concept is that? What is the C fix, and what is its fragility? (Answer after the next section.)</p>
+</aside>
+
+<h2>32.2 <code>Send</code> and <code>Sync</code>: thread-safety as a trait</h2>
+
+<p>Rust encodes thread-safety in two <strong>marker traits</strong> — traits with no methods, which simply classify types.
+<strong><code>Send</code></strong> means a value of the type is safe to <em>transfer</em> (move) to another thread.
+<strong><code>Sync</code></strong> means it is safe to <em>share</em> a reference to the type across threads — precisely,
+<code>T</code> is <code>Sync</code> when <code>&amp;T</code> is <code>Send</code> (Rustonomicon, &ldquo;Send and Sync&rdquo;). They are
+<em>auto traits</em>: the compiler derives them structurally, so a struct is <code>Send</code> if all its fields are, and you almost
+never write them by hand. Most types are both; the important exceptions are the ones that would make a race possible. Crucially,
+<code>thread::spawn</code> requires its closure to be <code>Send</code> and <code>'static</code>, which is where the borrow rule of
+Chapter 28 crosses the thread boundary (Rust; not compiled here — behavior per the cited sources):</p>
+
+<pre><code>// thread::spawn's bound (simplified): the closure F must be Send and 'static
+pub fn spawn&lt;F&gt;(f: F) -&gt; JoinHandle&lt;...&gt; where F: FnOnce() + Send + 'static { ... }
+
+let data = vec![1, 2, 3];
+let handle = thread::spawn(move || {     // `move` gives the closure ownership of data
+    println!("{:?}", data);              // data is Send (Vec&lt;i32&gt; is Send), so this is allowed
+});
+handle.join().unwrap();                  // wait for the thread; join yields a Result</code></pre>
+
+<p>The bound <code>F: Send + 'static</code> is the whole guarantee in one line. <code>Send</code> ensures every value captured by
+the closure is safe to move to the new thread; <code>'static</code> ensures the closure holds no borrow that could dangle when the
+parent frame ends (Chapter 29). What the type system will not let you do is give two threads simultaneous mutable access to the same
+data without synchronization — because that would require sharing something that is not <code>Sync</code>, or aliasing a
+<code>&amp;mut</code>, both of which the borrow rules forbid. The <code>&sect;32.1</code> C race required exactly that unsynchronized
+shared mutation; in Rust it cannot be expressed. The reference-counting pointer <code>Rc&lt;T&gt;</code> from Chapter 30's world of
+smart pointers is the canonical <em>not-<code>Send</code></em> type: its reference count is a plain non-atomic integer, so sending an
+<code>Rc</code> to another thread could race on that count — and the compiler knows, because <code>Rc</code> is marked not
+<code>Send</code>.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define <code>Send</code> and <code>Sync</code> in one line each, and state the relationship between them. What two bounds does
+<code>thread::spawn</code> put on its closure, and what does each prevent? Why is <code>Rc</code> not <code>Send</code>? (Answer
+below the next section.)</p>
+</aside>
+
+<h2>32.3 The compiler stops the race: two named errors</h2>
+
+<p>Turn the &sect;32.1 race into Rust and it does not compile — in one of two ways, each a diagnostic you should learn to read. The
+first arises when a closure <em>borrows</em> local data and is handed to a thread that may outlive the borrow. The compiler reports
+<strong><code>E0373</code></strong>, &ldquo;closure may outlive the current function, but it borrows a value owned by the current
+function,&rdquo; and suggests the fix: <code>move</code>, to give the closure ownership instead of a borrow (Rust; not compiled here
+— behavior per the cited sources):</p>
+
+<pre><code>let v = vec![1, 2, 3];
+let h = thread::spawn(|| println!("{:?}", v));   // borrows v
+error[E0373]: closure may outlive the current function, but it borrows `v`,
+              which is owned by the current function
+help: to force the closure to take ownership, use the `move` keyword
+// fix: thread::spawn(move || println!("{:?}", v));</code></pre>
+
+<p>The second arises when you try to <em>share</em> a value that is not thread-safe. Suppose you reach for <code>Rc</code> to share
+a counter between threads: because <code>Rc</code> is not <code>Send</code>, the <code>Send</code> bound on <code>spawn</code>'s
+closure is unsatisfied, and the compiler reports <strong><code>E0277</code></strong> — the same trait-bound error as Chapters 30 and
+31 — with a message naming the exact missing capability (per the official Rust error index):</p>
+
+<pre><code>let count = Rc::new(Mutex::new(0));
+let h = thread::spawn(move || { *count.lock().unwrap() += 1; });   // Rc is !Send
+error[E0277]: `Rc&lt;Mutex&lt;i32&gt;&gt;` cannot be sent between threads safely
+note: the trait `Send` is not implemented for `Rc&lt;Mutex&lt;i32&gt;&gt;`
+// fix: use Arc (atomic reference count), which IS Send + Sync</code></pre>
+
+<p>This is what &ldquo;fearless&rdquo; means. The &sect;32.1 program that compiled and silently lost updates is, in Rust, a compile
+error that names the problem before the program runs — either &ldquo;this borrow could dangle, take ownership&rdquo;
+(<code>E0373</code>) or &ldquo;this type is not safe to send/share across threads&rdquo; (<code>E0277</code>). And both are ordinary
+consequences of machinery you already have: <code>E0373</code> is the lifetime rule of Chapter 29 applied to a closure that escapes
+to a thread; <code>E0277</code> is the trait-bound check of Chapter 30 applied to <code>Send</code>. The data race did not become
+easier to avoid by convention — it became impossible to write, because the type of the shared value refuses to cross the boundary
+unsynchronized.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: thread-safety is a trait the compiler checks, not a discipline you keep</span>
+<p><strong>1. In words.</strong> <code>Send</code> (safe to move to a thread) and <code>Sync</code> (safe to share across threads,
+i.e. <code>&amp;T</code> is <code>Send</code>) are auto traits the compiler derives structurally. <code>thread::spawn</code> requires
+its closure to be <code>Send + 'static</code>, so unsynchronized shared mutation — the &sect;32.1 race — cannot be expressed;
+attempting it is <code>E0373</code> (dangling borrow) or <code>E0277</code> (a non-<code>Send</code> type crossing threads).</p>
+<p><strong>2. As a picture.</strong> Figure 32.1: two threads reaching for one box of data; a &ldquo;<code>Send</code>/<code>Sync</code>
+gate&rdquo; on the boundary passes an <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> (thread-safe) and rejects a bare <code>&amp;mut</code> or
+an <code>Rc</code> with a red <code>E0277</code>/<code>E0373</code> stamp — versus C's boundary, which is wide open and lets the
+unlocked <code>counter++</code> through to a lost update.</p>
+<p><strong>3. As numbers/contrast.</strong> The C race of &sect;32.1 compiled and printed <code>2453233</code> of an expected
+<code>4000000</code> — a different wrong number each run. The Rust equivalent produces <em>zero</em> runs, wrong or right: it stops
+at compile time with <code>E0373</code> or <code>E0277</code>. A nondeterministic runtime corruption becomes a deterministic message
+before execution.</p>
+</aside>
+
+<p><em>(Answer to the &sect;32.1 quick check: it compiled because C has no rule against two threads touching shared mutable state —
+the data race is invisible to the compiler, only to your discipline. The total is wrong because increments interleave and lose
+updates, and different each run because the loss depends on the nondeterministic interleaving — the undefined behavior of Chapter
+24. The C fix is a mutex around every access to <code>counter</code>; its fragility is that you must remember it on every access,
+and one omission silently reintroduces the race.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Send/Sync gate the thread boundary; only thread-safe sharing gets through.</text>
+<rect x="20" y="46" width="90" height="26" fill="#f5f8fb" stroke="#14406b"/><text x="34" y="63" font-size="9">thread A</text>
+<rect x="20" y="120" width="90" height="26" fill="#f5f8fb" stroke="#14406b"/><text x="34" y="137" font-size="9">thread B</text>
+<line x1="300" y1="30" x2="300" y2="185" stroke="#14406b" stroke-dasharray="4,3"/>
+<text x="250" y="30" font-size="8" fill="#14406b">Send/Sync gate</text>
+<rect x="330" y="80" width="150" height="30" fill="#dfeee0" stroke="#2f7d32"/><text x="342" y="99" font-size="9">Arc&lt;Mutex&lt;T&gt;&gt; — OK</text>
+<line x1="110" y1="59" x2="330" y2="90" stroke="#2f7d32" marker-end="url(#sa)"/>
+<line x1="110" y1="133" x2="330" y2="100" stroke="#2f7d32" marker-end="url(#sa)"/>
+<rect x="330" y="130" width="150" height="26" fill="#fdeee6" stroke="#8c3a1d"/><text x="342" y="147" font-size="8">&amp;mut / Rc — rejected</text>
+<text x="330" y="172" font-size="8" fill="#8c3a1d">E0373 (dangling borrow) / E0277 (not Send)</text>
+<text x="330" y="60" font-size="8" fill="#2f7d32">atomic refcount + lock:</text><text x="330" y="72" font-size="8" fill="#2f7d32">Send + Sync</text>
+<defs>
+<marker id="sa" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#2f7d32"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 32.1: The <code>Send</code>/<code>Sync</code> gate on the thread boundary. A thread-safe
+<code>Arc&lt;Mutex&lt;T&gt;&gt;</code> passes; a bare <code>&amp;mut</code> or a non-<code>Send</code> <code>Rc</code> is rejected at
+compile time with <code>E0373</code> or <code>E0277</code>. C's boundary has no gate, so the unsynchronized <code>counter++</code> of
+&sect;32.1 goes through to a lost update.</figcaption>
+</figure>
+
+<h2>32.4 Sharing safely: <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> and channels</h2>
+
+<p>Two patterns cover most shared state. The first is <strong>shared mutable state behind a lock</strong>. To share ownership of a
+value across threads you wrap it in <strong><code>Arc&lt;T&gt;</code></strong> — an <em>atomic</em> reference-counted pointer, the
+<code>Send + Sync</code> sibling of <code>Rc</code> whose count is updated with the atomics of Chapter 22 — and to mutate it you wrap
+the inner value in <strong><code>Mutex&lt;T&gt;</code></strong>. The decisive difference from Chapter 20's C mutex is that Rust's
+<code>Mutex</code> <em>owns the data it guards</em>: there is no way to reach the value without calling <code>lock()</code>, which
+returns a guard granting access and releases the lock automatically when the guard is dropped (Rust; not compiled here — behavior
+per the cited book):</p>
+
+<pre><code>let counter = Arc::new(Mutex::new(0));           // shared, lock bundled with the data
+let mut handles = vec![];
+for _ in 0..10 {
+    let c = Arc::clone(&amp;counter);               // bump the atomic refcount; move the clone
+    handles.push(thread::spawn(move || {
+        let mut n = c.lock().unwrap();           // acquire lock; `n` is a guard, not an int
+        *n += 1;                                 // the ONLY way to the data is through the lock
+    }));                                         // guard dropped here -&gt; lock released
+}
+for h in handles { h.join().unwrap(); }
+// *counter.lock().unwrap() == 10, deterministically — no lost updates</code></pre>
+
+<p>Because the integer lives <em>inside</em> the <code>Mutex</code>, the Chapter 20 mistake of accessing shared data without holding
+its lock is not a discipline you maintain — it is unrepresentable, since the only handle to the data is the guard <code>lock()</code>
+hands back. Two threads of Chapter 31 also reappear here: <code>lock()</code> returns a <code>Result</code> because a <code>Mutex</code>
+becomes <em>poisoned</em> if a thread panics while holding it (so the <code>unwrap()</code> is you deciding a poisoned lock is
+unrecoverable), and <code>join()</code> returns a <code>Result</code> whose <code>Err</code> carries a panicked thread's payload.
+The second pattern is <strong>message passing</strong>: rather than share memory, threads communicate over a <strong>channel</strong>
+(<code>std::sync::mpsc</code>), where sending a value <em>moves</em> its ownership down the channel (Chapter 27), so the sender can no
+longer touch it and there is nothing to race on. Receiving returns a <code>Result</code> — <code>Err</code> when the sending end has
+hung up. Both patterns turn Chapter 24's shared-memory hazards into ownership and type problems the compiler checks.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: <code>unsafe impl Send</code> to silence <code>E0277</code>, and treating <code>Mutex</code> as deadlock-proof</span>
+<p>Two failure modes, one at each end of caution. The first is over-riding the compiler: seeing <code>error[E0277]: Rc&lt;...&gt;
+cannot be sent between threads safely</code> and writing <code>unsafe impl Send for MyType {}</code> to make it compile. That does
+not make the type thread-safe; it <em>asserts</em> to the compiler that it is, switching off the exact check that was protecting you
+and reintroducing the &sect;32.1 race with a signed confession (<code>unsafe</code>) attached. The right fix is almost always to use
+the thread-safe type — <code>Arc</code> for <code>Rc</code>, an atomic for a plain counter — not to claim <code>Send</code> you have
+not earned. The second failure is the opposite complacency: assuming <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> makes concurrency
+&ldquo;safe&rdquo; in every sense. It abolishes <em>data races</em> — unsynchronized access is impossible — but it does <em>not</em>
+abolish the higher-level hazards of Chapter 20: two locks acquired in opposite orders by two threads still <strong>deadlock</strong>,
+and holding a <code>Mutex</code> across a long or blocking operation still serializes everything (Chapter 26's contention). Rust
+guarantees you locked the data; it does not guarantee your <em>lock ordering</em> or <em>granularity</em> is sane. Fearless means no
+data races, not no concurrency bugs.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;&lsquo;Fearless concurrency&rsquo; is marketing. A mutex is a mutex; Rust just
+makes me fight the borrow checker across threads, and I can deadlock in Rust same as in C. What does it actually buy me?&rdquo; Cover
+the paragraph and respond in four or five sentences, drawing on &sect;32.1&ndash;&sect;32.4.</p>
+<p><em>Model answer.</em> &ldquo;It buys you exactly one thing, and it's the thing that ruins your week: it makes <em>data races</em>
+— unsynchronized access to shared mutable state — a compile error instead of undefined behavior. The C version in &sect;32.1
+compiled fine and printed a different wrong number every run; the Rust version won't compile until the shared thing is
+<code>Send</code>/<code>Sync</code>, which in practice means you wrapped it in <code>Arc&lt;Mutex&gt;</code> or an atomic — so
+&lsquo;I forgot to lock this one access&rsquo; is unrepresentable, because the data lives inside the lock. You're right that it does
+<em>not</em> save you from deadlock or from holding a lock too long — those are lock-ordering and granularity bugs, not data races,
+and Rust doesn't check them. So the honest claim is narrow but huge: the entire category of nondeterministic memory-corruption
+concurrency bugs, the ones that pass tests and page you at 3 a.m., is gone at compile time; the logical concurrency bugs are still
+yours to design around.&rdquo; Naming precisely what Rust does and does not guarantee — races yes, deadlock no — is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;32.2 quick check: <code>Send</code> means a value is safe to move to another thread;
+<code>Sync</code> means it is safe to share a reference across threads, i.e. <code>T: Sync</code> exactly when <code>&amp;T: Send</code>.
+<code>thread::spawn</code> bounds its closure <code>Send + 'static</code>: <code>Send</code> so every captured value can move to the
+new thread, <code>'static</code> so the closure holds no borrow that could dangle after the parent returns. <code>Rc</code> is not
+<code>Send</code> because its reference count is a non-atomic integer, so sending it across threads could race on that count.)</em></p>
+
+<h2>32.5 What to carry forward</h2>
+
+<p>Fearless concurrency is the last application of the pattern this whole part has repeated: name a property in the type system and
+let the compiler enforce it. A <strong>data race</strong> — the undefined behavior of Chapter 24 — is prevented not by discipline
+but by two marker traits: <strong><code>Send</code></strong> (safe to move to a thread) and <strong><code>Sync</code></strong> (safe
+to share across threads, <code>&amp;T: Send</code>), auto-derived structurally, required by <code>thread::spawn</code> as
+<code>Send + 'static</code>. Attempting the unsynchronized sharing of &sect;32.1 is a compile error — <strong><code>E0373</code></strong>
+(a borrow that would outlive its owner, fixed by <code>move</code>) or <strong><code>E0277</code></strong> (a non-<code>Send</code>
+type crossing threads, fixed by the thread-safe type). Safe sharing uses <strong><code>Arc&lt;Mutex&lt;T&gt;&gt;</code></strong>,
+where the <code>Mutex</code> owns the data so it cannot be touched without the lock, or <strong>channels</strong>, where sending
+moves ownership so there is nothing to race on — with poisoning and hang-ups surfacing as the <code>Result</code>s of Chapter 31. And
+the guarantee is honest about its edge: it kills data races, not deadlock or contention.</p>
+
+<p>That completes the Rust part, and with it the argument the last six chapters have been making. Across the C volumes you proved
+invariants by hand: memory freed exactly once and used only while valid, references that never dangle, shared state accessed only
+under a lock, no data races. Rust encodes each as something the compiler checks — <strong>ownership and moves</strong> (Chapter 27),
+<strong>borrowing</strong> (Chapter 28), <strong>lifetimes</strong> (Chapter 29), <strong>traits and generics</strong> (Chapter 30),
+<strong>error handling</strong> (Chapter 31), and now <strong>data-race freedom</strong> — all with the same machine underneath and,
+after monomorphization and lifetime erasure, the same generated code. What Rust does <em>not</em> give you is speed: a memory-safe,
+race-free program can still be slow, cache-hostile, and blocked on I/O. The next part turns to that. It opens with the discipline
+the whole book has implied and never stated outright — <strong>measure before you optimize</strong> — because the cost model of
+Chapter 5 is only useful if you can see where the time actually goes. Safety was the compiler's job; performance is yours, and it
+starts with a profiler, not a guess.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why the &sect;32.1 C program compiled yet printed a wrong, different-each-run total.</li>
+<li>Define <code>Send</code> and <code>Sync</code> and state the relationship between them.</li>
+<li>Say what bounds <code>thread::spawn</code> puts on its closure and what each prevents.</li>
+<li>Name the two compile errors that stop the race (<code>E0373</code>, <code>E0277</code>) and the fix for each.</li>
+<li>Explain how <code>Mutex&lt;T&gt;</code> owning its data makes &ldquo;access without the lock&rdquo; unrepresentable.</li>
+<li>State precisely what fearless concurrency does and does not guarantee (races vs. deadlock).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why did the &sect;32.1 program compile, and why is its output wrong and nondeterministic? (&sect;32.1)</li>
+<li><strong>R2.</strong> Define <code>Send</code> and <code>Sync</code>; what does <code>thread::spawn</code> require, and why is <code>Rc</code> not <code>Send</code>? (&sect;32.2)</li>
+<li><strong>R3.</strong> What do <code>E0373</code> and <code>E0277</code> each report in the concurrency setting, and what fixes each? (&sect;32.3)</li>
+<li><strong>R4.</strong> How does <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> make unsynchronized access impossible, and where does <code>Result</code> appear? (&sect;32.4)</li>
+<li><strong>R5.</strong> What does fearless concurrency guarantee, and what class of concurrency bug does it <em>not</em> prevent? (&sect;32.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 16
+&ldquo;Fearless Concurrency&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source for
+<code>thread::spawn</code>, the <code>move</code> closure, <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>, channels, and
+<code>Send</code>/<code>Sync</code> of &sect;32.2&ndash;&sect;32.4; ch. 15 covers <code>Rc</code>/smart pointers.
+Authors, edition, and chapter numbers verified via the publisher and the online book; not compiled here.</li>
+<li><strong>The Rustonomicon, &ldquo;Send and Sync&rdquo; (<code>doc.rust-lang.org/nomicon/send-and-sync.html</code>).</strong> The
+authoritative account of the two marker traits used in &sect;32.2: what each means, why they are auto traits derived structurally,
+and why <code>Rc</code> opts out. Reference for the exact semantics; verify against the current edition.</li>
+<li><strong>The Rust Error Index, entries <code>E0373</code> and <code>E0277</code> (<code>doc.rust-lang.org/error_codes</code>).</strong>
+The official meanings used in &sect;32.3: <code>E0373</code> &ldquo;closure may outlive the current function&hellip; use the
+<code>move</code> keyword,&rdquo; and <code>E0277</code> for an unsatisfied <code>Send</code> bound (&ldquo;cannot be sent between
+threads safely&rdquo;). Both verified against the current error index.</li>
+<li><strong>Jung, Jourdan, Krebbers &amp; Dreyer, &ldquo;RustBelt: Securing the Foundations of the Rust Programming Language,&rdquo;
+<em>Proc. ACM on Programming Languages</em> 2(POPL), Article 66 (2018), DOI 10.1145/3158154.</strong> The formal proof that Rust's
+type system — including <code>Send</code>/<code>Sync</code> and the aliasing discipline — actually guarantees data-race freedom.
+First author Ralf Jung; verified via the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex32.1"><span class="ex-label">32.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define <code>Send</code> and <code>Sync</code>, and state the relationship between them.</div>
+
+<div class="exercise" id="ex32.2"><span class="ex-label">32.2</span> <span class="ex-tag warm">warm-up</span>
+What is a data race, and what is its status in C (per Chapter 24)? What is its status in safe Rust?</div>
+
+<div class="exercise" id="ex32.3"><span class="ex-label">32.3</span> <span class="ex-tag warm">warm-up</span>
+What does the <code>move</code> keyword do to a closure passed to <code>thread::spawn</code>, and which error does its absence often cause?</div>
+
+<div class="exercise" id="ex32.4"><span class="ex-label">32.4</span> <span class="ex-tag core">core</span>
+Take the C of &sect;32.1. (a) Why did it compile despite the data race? (b) Explain, in read-modify-write terms, why the total is
+both too low and different each run. (c) State the C fix and one way it is fragile that Rust's approach is not.</div>
+
+<div class="exercise" id="ex32.5"><span class="ex-label">32.5</span> <span class="ex-tag core">core</span>
+Explain how <code>thread::spawn</code>'s bound <code>F: Send + 'static</code> prevents the &sect;32.1 race. (a) What does the
+<code>Send</code> part rule out? (b) What does the <code>'static</code> part rule out, and which chapter's concept is that? (c) Why
+does trying to share an <code>Rc</code> across threads violate the <code>Send</code> part specifically?</div>
+
+<div class="exercise" id="ex32.6"><span class="ex-label">32.6</span> <span class="ex-tag core">core</span>
+Contrast <code>E0373</code> and <code>E0277</code> as they appear in concurrent code. (a) What does each report, and what borrowing/
+trait concept from earlier chapters is each an instance of? (b) Give the standard fix for each. (c) Why is
+<code>unsafe impl Send</code> the wrong fix for <code>E0277</code> here?</div>
+
+<div class="exercise" id="ex32.7"><span class="ex-label">32.7</span> <span class="ex-tag complexity">cost</span>
+Weigh <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> against message passing for a shared counter updated by many threads. (a) What does the
+<code>Mutex</code> approach cost per update, and what Chapter 26 hazard grows as thread count rises? (b) What does the channel
+approach cost, and what does moving ownership down the channel buy you? (c) For a high-contention counter specifically, name a third
+option from Chapter 22 that avoids a lock entirely, and say when you would still prefer the <code>Mutex</code>.</div>
+
+<div class="exercise" id="ex32.8"><span class="ex-label">32.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer shares a counter with <code>let c = Rc::new(Mutex::new(0));</code> and
+spawns threads that each do <code>let cc = c.clone(); thread::spawn(move || *cc.lock().unwrap() += 1);</code>, getting
+<code>error[E0277]: `Rc&lt;Mutex&lt;i32&gt;&gt;` cannot be sent between threads safely</code>.
+<br><strong>Step 1 (given):</strong> <code>thread::spawn</code> requires the closure — and thus everything it captures — to be <code>Send</code>.
+<br><strong>Step 2 (given):</strong> <code>Rc</code> is not <code>Send</code> because its reference count is non-atomic, so the bound fails: <code>E0277</code>.
+<br><strong>Step 3 (given):</strong> the fix is a shared pointer whose count is atomic and which is therefore <code>Send + Sync</code>.
+<br><strong>Step 4 (you):</strong> Name the replacement type, rewrite the two changed lines, and explain why this is a real fix
+whereas <code>unsafe impl Send for ...</code> would only silence the check.</div>
+
+<div class="exercise" id="ex32.9"><span class="ex-label">32.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether it is prevented by safe Rust's type system, and if so how (or if not, why not): (a) two threads incrementing a
+shared <code>i32</code> with no synchronization; (b) two threads acquiring locks <code>A</code> then <code>B</code> vs. <code>B</code>
+then <code>A</code> (deadlock); (c) sending an <code>Rc</code> to another thread; (d) holding a <code>Mutex</code> guard across a
+slow network call (serializing everyone).</div>
+
+<div class="exercise" id="ex32.10"><span class="ex-label">32.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;<code>Send</code> and <code>Sync</code> have
+methods you implement.&rdquo; (b) &ldquo;A Rust <code>Mutex</code> can be unlocked-and-accessed like C's, with the data separate
+from the lock.&rdquo; (c) &ldquo;<code>Arc</code> is just <code>Rc</code> with an atomic reference count.&rdquo; (d)
+&ldquo;Fearless concurrency prevents deadlock.&rdquo; (e) &ldquo;Sending a value down a channel copies it and leaves the sender a
+usable copy.&rdquo;</div>
+
+<div class="exercise" id="ex32.11"><span class="ex-label">32.11</span> <span class="ex-tag stretch">stretch</span>
+&ldquo;A guarantee in Rust is usually a trait.&rdquo; Tie the whole part together. (a) Show how <code>Send</code>/<code>Sync</code>
+lift the Chapter 28 borrow rule (aliasing XOR mutation) across the thread boundary — what would sharing a <code>&amp;mut</code>
+between two threads violate? (b) Explain why the concurrency errors reuse the <em>same</em> error code (<code>E0277</code>) as an
+unmet bound in Chapter 30 and a misused <code>?</code> in Chapter 31. (c) In two sentences, state the through-line of Chapters
+27&ndash;32: what did the C volumes make you prove by hand, and what does Rust do with each such proof?</div>
+
+<div class="exercise" id="ex32.12"><span class="ex-label">32.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile the &sect;32.1 <code>race.c</code> at
+<code>-O0</code> and run it several times; record the totals and confirm they are below <code>4000000</code> and vary. Then compile
+at <code>-O2</code> and note whether the race still manifests, and hypothesize why the optimizer changed the outcome. (b) Add a
+<code>pthread_mutex_t</code> around <code>counter++</code> and confirm the total becomes exactly <code>4000000</code>. (c) If you
+have <code>rustc</code>, write the <code>Arc&lt;Mutex&lt;i32&gt;&gt;</code> version from &sect;32.4 and confirm it is deterministic;
+then try the <code>Rc</code> version and observe <code>E0277</code>. Without <code>rustc</code>, explain from this chapter which line
+each error points at. Note your toolchain versions.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VI</div><h1>Performance Engineering</h1><p class='part-blurb'>Measure before you optimize: profiling, benchmarking, cache-aware and data-oriented design, SIMD, and reasoning about where time actually goes.</p></div>
+<section class="chapter" id="ch33">
+<h1>Chapter 33 — Measure First: Profiling and Benchmarking</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch05">Chapter 5</a> (mechanical sympathy and the cost model —
+this part makes that model operational, by measuring where the costs land), <a href="#ch26">Chapter 26</a> (Amdahl's law — the ceiling
+on speeding up a part, and why the dominant cost is the only one worth attacking), <a href="#ch10">Chapter 10</a> (the optimizing
+compiler — dead-code elimination will silently wreck a naive benchmark), <a href="#ch03">Chapter 3</a> (memory hierarchy and caches
+— one of the main places the time actually goes). &nbsp;·&nbsp; This chapter opens the performance part with the discipline the whole
+book has implied: <em>measure before you optimize</em>, because a guess about where time goes is almost always wrong.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch26">Chapter 26</a> — state Amdahl's law in one line; if a function is 5% of total
+runtime and you make it infinitely fast, what is the most you can speed up the whole program? (2) <a href="#ch10">Chapter 10</a> —
+what is the optimizing compiler permitted to do to a computation whose result is never used? (3) <em>Predict:</em> you write a loop
+that sums a billion products into a variable, never read the variable, and time it at <code>-O2</code>; what elapsed time do you
+expect? And if you run that timing exactly once, is the number you get representative? Write your guesses; &sect;33.2 and &sect;33.3
+answer all three.</p>
+</aside>
+
+<p>A note on this part before we begin. The previous five parts built up, from the hardware to the type system, a <em>model</em> of
+what a program costs to run. This part is about the other half of engineering with that model: finding out where the cost actually
+falls, which is almost never where intuition says. The cardinal rule is <strong>measure before you optimize</strong>. Programmers
+are notoriously bad at guessing bottlenecks — you spend an afternoon hand-tuning a function that turns out to be 2% of runtime while
+the real cost sits in an allocation or a cache-missing loop you never suspected. Donald Knuth's much-abused line — &ldquo;premature
+optimization is the root of all evil&rdquo; — is precisely this point: he argued that we should forgo optimization in the
+non-critical 97% of code and instead find, by measurement, the critical few percent where effort pays (Knuth, 1974). So this chapter
+is the toolset for that finding. First, why measuring is not optional and how Amdahl's law decides <em>what</em> to measure
+(&sect;33.1). Then the single most common way a benchmark lies to you — the optimizer deleting the work you meant to time — shown in
+real C where the same loop reports 0.0000&nbsp;s or 1.56&nbsp;s depending only on whether its result is used (&sect;33.2). Then how
+to time correctly: which clock, and why you run many trials and report the minimum rather than one number (&sect;33.3). Then
+<strong>profiling</strong> — sampling vs. instrumentation, and reading a profile as a map of where the time went, so Amdahl points
+your effort (&sect;33.4). We close by making the measure&ndash;optimize loop explicit and turning toward the specific costs the rest
+of the part attacks (&sect;33.5).</p>
+
+<p><strong>On the code in this part.</strong> Unlike the Rust part, the programs here are C, and they were compiled with gcc 11.4.0
+and run in this environment, so their <em>output is real</em>. Absolute times, however, are hardware- and load-specific: the numbers
+below are illustrative of the <em>effect</em> (a deleted loop, run-to-run variance, a lopsided phase split), not benchmarks of any
+particular machine, and your own numbers will differ. Where a tool is named that is <em>not</em> installed here (<code>perf</code>,
+<code>gprof</code>, <code>valgrind</code>), it is discussed from its documentation and cited, not run.</p>
+
+<h2>33.1 Measure before you optimize</h2>
+
+<p>The discipline has two halves, and Amdahl's law (Chapter 26) supplies the second. The first half is: do not optimize on a hunch,
+because hunches about performance are wrong at a rate that would be comical if it were not so expensive. The compiler, the cache, the
+allocator, and the branch predictor all move the real cost somewhere other than the arithmetic you can see in the source. The second
+half is: even once you know a function is slow, speeding it up is only worth it in proportion to its <em>share of total runtime</em>.
+This is Amdahl's law read as a budgeting rule. If a function is 5% of runtime, then making it infinitely fast — not twice as fast,
+<em>infinitely</em> — speeds the whole program by at most 5% (from 100 units to 95). If another is 90% of runtime, a mere 2&times;
+speedup on it saves 45 units, nine times the entire budget of the first. So the order is fixed: <em>find the dominant cost first,
+then optimize it</em>, and measurement is the only way to know which is which. Optimizing before measuring is not just wasted effort;
+it is effort spent, by the arithmetic of Amdahl, on the part that mathematically cannot matter. Everything else in this chapter
+serves this: benchmarking to compare two implementations honestly (&sect;33.2&ndash;&sect;33.3), and profiling to locate the
+dominant cost in the first place (&sect;33.4).</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the two halves of &ldquo;measure before you optimize.&rdquo; Using Amdahl's law, how much can you speed up a program by
+perfectly optimizing a part that is 5% of its runtime? Why does that make locating the <em>dominant</em> cost the first job?
+(Answer after the next section.)</p>
+</aside>
+
+<h2>33.2 The benchmark that lies: dead-code elimination</h2>
+
+<p>The most common benchmarking bug is that the compiler deletes the very work you are trying to time. From Chapter 10: if a
+computation's result is never observed, the optimizer is free to remove the computation entirely — it is not required to run code
+whose output no program can see. A microbenchmark that computes into a variable and never uses it hands the optimizer exactly that
+license. Here is the same loop compiled two ways, differing only in whether the result is consumed — compiled and run in this
+environment (gcc 11.4.0, <code>-O2</code>):</p>
+
+<pre><code>double s = 0.0;
+for (long i = 0; i &lt; 1000000000L; i++) s += (double)(i &amp; 1023) * 0.5;
+// version A: never use s.   version B: consume s (print it / store to volatile).
+
+$ gcc -O2 bench.c -o nosink &amp;&amp; ./nosink
+no sink   : 0.0000 s                         # the loop was deleted entirely
+$ gcc -O2 -DSINK bench.c -o sink &amp;&amp; ./sink
+with sink : 1.5592 s  (checksum 255749934464.0)   # the loop actually ran</code></pre>
+
+<p>Version A reports <code>0.0000&nbsp;s</code> not because a billion iterations are free but because they never happened: with
+<code>s</code> unused, the compiler proved the loop had no observable effect and removed it, exactly as Chapter 10 said it may. A
+newcomer reads &ldquo;0.0000 s&rdquo; as &ldquo;my code is blazing fast&rdquo; and ships a benchmark that measures nothing. Version B
+prints the checksum, so <code>s</code> is observed, so the loop must run, and now you see its real cost — 1.56&nbsp;s here. The fix is
+a rule: <strong>make the result observable</strong>, by printing a checksum, writing to a <code>volatile</code>, or feeding it to a
+compiler-opaque sink, so the optimizer cannot elide the work. Two companion rules follow. Benchmark the build you will
+<em>ship</em> — measure at <code>-O2</code>, not <code>-O0</code>, since the debug build's costs are not the release build's. And be
+sure the input is not a compile-time constant the optimizer can fold away. The through-line is that a benchmark is only honest if the
+work it claims to time is work the compiler was actually forced to do.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why did version A report <code>0.0000&nbsp;s</code> — what did the compiler do, and by which Chapter 10 rule? What single change
+turned the loop back on? Give two further rules for a benchmark that is not lying to you. (Answer below the communicate box.)</p>
+</aside>
+
+<h2>33.3 Timing correctly: which clock, and how many runs</h2>
+
+<p>Suppose the loop is safe from the optimizer. Two questions remain: <em>which clock</em> you read, and <em>how many times</em>. For
+elapsed time you want a monotonic wall clock that never jumps — on Linux, <code>clock_gettime(CLOCK_MONOTONIC, &amp;t)</code>, which
+is immune to wall-time adjustments (NTP, daylight saving) that can make a naive timer run backwards. (Wall-clock time and CPU time
+differ: a program blocked on I/O consumes little CPU while wall time passes, so choose the one that matches the question you are
+asking.) The second question matters more than beginners expect: <em>a single measurement is nearly meaningless</em>, because runtime
+varies from run to run due to the OS scheduler, cache and TLB state, frequency scaling, and other tenants on the machine. You must
+run the workload several times. Compiled and run here (gcc 11.4.0, the same kernel run five times):</p>
+
+<pre><code>for (int r = 0; r &lt; 5; r++) { t0 = now(); sink += work(300000000L); t1 = now();
+                               printf("trial %d: %.4f s\n", r+1, t1 - t0); }
+
+$ gcc -O2 trials.c -o trials &amp;&amp; ./trials
+trial 1: 0.6824 s
+trial 2: 0.7081 s
+trial 3: 0.6694 s
+trial 4: 0.8198 s     &lt;- an outlier: the OS scheduled something else here
+trial 5: 0.6743 s
+min over 5 trials: 0.6694 s</code></pre>
+
+<p>The five runs of identical work span 0.6694&nbsp;s to 0.8198&nbsp;s — a 22% spread, from nothing the program did. Reporting any
+single one of them, especially the first (cold caches) or the fourth (an interruption), would misrepresent the code. The usual
+practice is to run many trials and report the <strong>minimum</strong> (the run least disturbed by outside interference, closest to
+the code's intrinsic cost) or the median, and to state the spread rather than hide it behind one number; a first, warm-up run is
+often discarded because it pays cold-cache and page-fault costs the steady state will not. The mean is a poor summary here because it
+is dragged upward by one-directional outliers like trial 4 — interference only ever makes a run <em>slower</em>, never faster, so the
+minimum is the more principled floor. The discipline, then: monotonic clock, warm up, many trials, report the minimum and the spread.
+A benchmark that reports one number from one run is a benchmark you cannot trust.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a measurement is only as honest as its method</span>
+<p><strong>1. In words.</strong> Optimize only after measuring, and only the dominant cost (Amdahl). Make the timed work observable
+so the optimizer cannot delete it; time it at the shipping optimization level with a monotonic clock; run many trials and report the
+minimum and spread, not one number. Then profile to find the dominant cost before you touch anything.</p>
+<p><strong>2. As a picture.</strong> Figure 33.1: a pipeline — <em>profile</em> (find the hot spot) &rarr; <em>benchmark</em> the hot
+spot honestly (observable result, <code>-O2</code>, many trials) &rarr; <em>optimize</em> &rarr; <em>re-measure</em> &rarr; stop when
+good enough — with two red &ldquo;lies&rdquo; branching off: a deleted loop reporting 0.0000&nbsp;s, and a single run reporting an
+outlier.</p>
+<p><strong>3. As numbers/contrast.</strong> The same billion-iteration loop reported <code>0.0000&nbsp;s</code> (deleted) vs.
+<code>1.5592&nbsp;s</code> (real) depending only on whether its result was used; the same kernel run five times reported
+<code>0.6694</code>&ndash;<code>0.8198&nbsp;s</code>, a 22% spread. Two different methods, two different &ldquo;answers&rdquo; for
+identical code — which is why the method, not the stopwatch, is the measurement.</p>
+</aside>
+
+<p><em>(Answer to the &sect;33.1 quick check: the two halves are (1) do not optimize on a hunch — measure, because bottlenecks are
+rarely where you guess — and (2) optimize only in proportion to a part's share of runtime, per Amdahl's law. Perfectly optimizing a
+part that is 5% of runtime speeds the whole program by at most 5% (100 units become 95), even if that part becomes infinitely fast.
+That is why finding the dominant cost is the first job: effort on a small part cannot pay off no matter how good the optimization,
+so you must locate the part that dominates before optimizing anything.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">The measure&ndash;optimize loop, and the two ways a benchmark lies.</text>
+<rect x="20" y="40" width="90" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="34" y="59" font-size="9">profile</text>
+<rect x="130" y="40" width="100" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="140" y="59" font-size="9">benchmark</text>
+<rect x="250" y="40" width="90" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="264" y="59" font-size="9">optimize</text>
+<rect x="360" y="40" width="100" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="370" y="59" font-size="9">re-measure</text>
+<rect x="480" y="40" width="110" height="30" fill="#dfeee0" stroke="#2f7d32"/><text x="490" y="59" font-size="9">good enough? stop</text>
+<line x1="110" y1="55" x2="130" y2="55" stroke="#14406b" marker-end="url(#pa)"/>
+<line x1="230" y1="55" x2="250" y2="55" stroke="#14406b" marker-end="url(#pa)"/>
+<line x1="340" y1="55" x2="360" y2="55" stroke="#14406b" marker-end="url(#pa)"/>
+<line x1="460" y1="55" x2="480" y2="55" stroke="#2f7d32" marker-end="url(#pb)"/>
+<path d="M410,70 C410,110 180,110 180,72" fill="none" stroke="#14406b" marker-end="url(#pa)"/><text x="250" y="108" font-size="8" fill="#14406b">not yet: next hot spot</text>
+<text x="120" y="140" font-size="9" fill="#8c3a1d">LIE 1: result unused &rarr; loop deleted &rarr; 0.0000 s</text>
+<text x="120" y="158" font-size="9" fill="#8c3a1d">LIE 2: one run &rarr; reports an outlier (0.82 vs 0.67 s)</text>
+<defs>
+<marker id="pa" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#14406b"/></marker>
+<marker id="pb" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#2f7d32"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 33.1: The measure&ndash;optimize loop — profile to find the hot spot, benchmark it honestly, optimize, re-measure,
+and stop when good enough — with the two classic benchmark lies: a deleted loop reporting <code>0.0000&nbsp;s</code> (&sect;33.2)
+and a single run reporting an outlier (&sect;33.3).</figcaption>
+</figure>
+
+<h2>33.4 Profiling: where the time actually goes</h2>
+
+<p>Benchmarking compares two versions of a known piece of code; <strong>profiling</strong> answers the prior question — <em>which</em>
+piece of code to look at. A profiler attributes runtime to the functions (and lines) that spend it, so Amdahl's dominant cost stops
+being a guess. There are two families. An <strong>instrumenting</strong> profiler (the classic <code>gprof</code>) inserts counting
+and timing code at function entry and exit; it is exact about call counts but perturbs the very timing it measures and can distort
+the picture for tiny, hot functions (Graham, Kessler &amp; McKusick, 1982). A <strong>sampling</strong> profiler (Linux
+<code>perf</code>, and most modern tools) instead interrupts the running program many times per second and records where the program
+counter is; over enough samples this builds a statistical map of where time is spent, with negligible overhead and no recompilation
+(Gregg, 2020). The output is often drawn as a <strong>flame graph</strong> — stacked bars whose width is time spent — so the widest
+box is, quite literally, where to optimize. To make the payoff concrete, here is a two-phase program timed by hand, the poor
+engineer's profile, compiled and run here (gcc 11.4.0, <code>-O2</code>):</p>
+
+<pre><code>t0 = now(); parse(...);   t1 = now();     // a setup phase
+            compute(...); t2 = now();     // the main work
+
+$ gcc -O2 profile.c -o profile &amp;&amp; ./profile
+parse   : 0.1577 s  ( 6.4% of runtime)
+compute : 2.2904 s  (93.6% of runtime)</code></pre>
+
+<p>The profile is unambiguous: <code>compute</code> is 93.6% of runtime, <code>parse</code> only 6.4%. Amdahl now dictates strategy.
+Every hour spent optimizing <code>parse</code> buys at most a 6.4% whole-program improvement even if you make it vanish; a modest
+30% cut to <code>compute</code> saves 0.30 &times; 93.6% = 28% of the whole. A programmer who <em>guessed</em> — who found
+<code>parse</code>'s string handling ugly and spent the afternoon there — would have optimized the part that cannot matter, which is
+exactly the failure &sect;33.1 warned of. This is why the loop is <em>profile first</em>: the profiler replaces the guess with a
+measurement, points you at the 93.6% box, and only then do you benchmark candidate improvements to it honestly (&sect;33.2&ndash;
+&sect;33.3). A real profiler does this across hundreds of functions you would never think to time by hand — but the logic is the
+one above, scaled up: measure where the time is, attack the widest box, re-measure, stop.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: optimizing without a profile, and trusting a benchmark that measured nothing</span>
+<p>Two mistakes, both the &ldquo;measure first&rdquo; rule violated from opposite ends. The first is optimizing on intuition:
+rewriting the function that <em>looks</em> expensive — a clever-looking loop, some string formatting — without a profile showing it
+is expensive. Nine times in ten it is not the bottleneck, and you have added complexity and risk to code that was 3% of runtime while
+the real 90% sits untouched; worse, you now believe the problem is &ldquo;handled.&rdquo; Always get a profile first, then optimize
+the box the profile makes wide. The second mistake is trusting a benchmark that never ran the work: the <code>0.0000&nbsp;s</code> of
+&sect;33.2 (dead-code elimination), a loop over a constant the compiler folded, a measurement taken at <code>-O0</code> that has
+nothing to do with the shipped build, or a single run that happened to be an outlier. Both mistakes feel like measurement — you ran
+something, you got a number — which is what makes them dangerous. The number is only meaningful if the method behind it (a profile to
+choose the target, an observable result, the shipping optimization level, many trials) is sound. A confident optimization built on a
+lying benchmark is worse than no optimization, because you will defend it.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I profiled nothing, but I'm sure the JSON parsing is our bottleneck — it just
+<em>looks</em> slow. I rewrote it with a hand-tuned loop and my microbenchmark says it's 100&times; faster. Ship it?&rdquo; Cover the
+paragraph and respond in four or five sentences, drawing on &sect;33.1&ndash;&sect;33.4.</p>
+<p><em>Model answer.</em> &ldquo;Two problems, and both are &lsquo;measure first.&rsquo; First, &lsquo;looks slow&rsquo; isn't a
+measurement — we need a profile of the real workload showing parsing is actually a big share of runtime, because if it's 5% of the
+total, Amdahl says even your 100&times; win is at most a 5% whole-program improvement, and you've added a hand-tuned loop we now have
+to maintain. Second, a 100&times; microbenchmark speedup is exactly the number I distrust: it usually means the compiler deleted the
+work because the result was unused, or you benchmarked a constant, or you compared a <code>-O0</code> build to a <code>-O2</code> one
+— make the result observable, benchmark at the shipping optimization level, and run it many times. So before we ship: profile the
+real path, confirm parsing is the dominant cost, then re-run your benchmark honestly and show the whole-program time moved. If the
+profile says parsing is 3%, the right call is to revert and go look at the 90% box instead.&rdquo; Refusing to ship an optimization
+without a profile that justifies the target and a benchmark that survives scrutiny is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;33.2 quick check: version A reported <code>0.0000&nbsp;s</code> because the compiler deleted the loop —
+with <code>s</code> never used, the loop had no observable effect, and by the Chapter 10 rule the optimizer may remove computations
+whose results are never observed. Making <code>s</code> observable — printing it as a checksum, or writing it to a
+<code>volatile</code>/opaque sink — turns the loop back on. Two further rules: benchmark at the optimization level you will ship
+(<code>-O2</code>, not <code>-O0</code>), and ensure the input is not a compile-time constant the optimizer can fold away.)</em></p>
+
+<h2>33.5 What to carry forward</h2>
+
+<p>Performance engineering starts with a refusal: do not optimize what you have not measured. The governing rule is <strong>measure
+before you optimize</strong>, and Amdahl's law (Chapter 26) makes it quantitative — a part that is 5% of runtime caps its own
+whole-program payoff at 5%, so the <em>dominant</em> cost is the only target worth your effort, and only a <strong>profile</strong>
+tells you which part that is. Profiling comes in two forms — <strong>instrumenting</strong> (exact counts, perturbs timing, e.g.
+<code>gprof</code>) and <strong>sampling</strong> (statistical, low overhead, e.g. <code>perf</code>, drawn as flame graphs) — and its
+job is to replace a guess with the widest box. <strong>Benchmarking</strong> then compares candidate fixes, but only honestly: make
+the timed result observable so the optimizer cannot delete it (the <code>0.0000&nbsp;s</code> vs. <code>1.5592&nbsp;s</code> of
+&sect;33.2), time at the shipping optimization level, use a monotonic clock, and run many trials reporting the minimum and the spread
+(the 0.6694&ndash;0.8198&nbsp;s of &sect;33.3), not one number. Put together, these form the loop: profile, benchmark, optimize,
+re-measure, and stop when good enough.</p>
+
+<p>What the profile does <em>not</em> tell you is <em>why</em> the widest box is wide — and that is the rest of this part. When
+<code>compute</code> is 93.6% of runtime, the question becomes where <em>its</em> time goes, and the answer is usually not the
+instruction count you can read in the source but the costs the earlier volumes named: cache misses (Chapter 3), branch
+mispredictions, memory bandwidth, allocation, the layout of your data. The next chapters take the dominant cost the profiler hands
+you and open it up — <strong>cache-aware and data-oriented design</strong>, then wider techniques like <strong>SIMD</strong> — always
+returning to this chapter's loop to prove that a change actually moved the number. Safety was the compiler's job in the last part;
+speed is yours, and it begins not with a clever rewrite but with a measurement honest enough to bet on.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State &ldquo;measure before you optimize&rdquo; and use Amdahl's law to say why the dominant cost is the only target.</li>
+<li>Explain why a loop whose result is unused can report <code>0.0000&nbsp;s</code>, and the Chapter 10 rule behind it.</li>
+<li>Give the fix (observable result) and two more rules for an honest benchmark.</li>
+<li>Say which clock to use and why one run is untrustworthy; explain why you report the minimum.</li>
+<li>Distinguish sampling from instrumenting profilers, with a cost of each.</li>
+<li>State the measure&ndash;optimize loop end to end.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are the two halves of &ldquo;measure before you optimize,&rdquo; and how does Amdahl's law make the second quantitative? (&sect;33.1)</li>
+<li><strong>R2.</strong> Why can a microbenchmark report <code>0.0000&nbsp;s</code>, and what makes the work run again? (&sect;33.2)</li>
+<li><strong>R3.</strong> Why is a single timing untrustworthy, and why report the minimum of many trials rather than the mean? (&sect;33.3)</li>
+<li><strong>R4.</strong> What is the difference between sampling and instrumenting profilers, and what does each cost? (&sect;33.4)</li>
+<li><strong>R5.</strong> Given a profile showing one function at 90%+ of runtime, what does Amdahl say to do, and why? (&sect;33.1, &sect;33.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Brendan Gregg, <em>Systems Performance: Enterprise and the Cloud</em>, 2nd ed. (Addison-Wesley, 2020), ISBN
+978-0-13-682015-4.</strong> The standard modern reference for performance methodology, sampling profilers (<code>perf</code>,
+BPF-based tools), and flame graphs of &sect;33.4; the source for the measure-first methodology of this chapter. Author, edition, and
+year verified via the publisher.</li>
+<li><strong>Donald E. Knuth, &ldquo;Structured Programming with go to Statements,&rdquo; <em>ACM Computing Surveys</em> 6(4),
+261&ndash;301 (1974), DOI 10.1145/356635.356640.</strong> The origin (p. 268) of &ldquo;premature optimization is the root of all
+evil&rdquo; quoted in &sect;33.1 — and the fuller argument that measurement should find the critical few percent of code worth tuning.
+First author Donald Knuth; DOI verified via the ACM Digital Library.</li>
+<li><strong>Susan L. Graham, Peter B. Kessler &amp; Marshall K. McKusick, &ldquo;gprof: a Call Graph Execution Profiler,&rdquo;
+<em>ACM SIGPLAN Notices</em> 17(6), 120&ndash;126 (1982), DOI 10.1145/872726.806987.</strong> The classic instrumenting profiler of
+&sect;33.4 — call-graph attribution of runtime, and the source of its counts-vs-perturbation trade-off. First author Susan Graham;
+DOI verified via the ACM Digital Library.</li>
+<li><strong>The Linux <code>perf</code> tool (<code>perf_events</code>) documentation (<code>perfwiki.github.io</code>, and
+<code>man perf</code>).</strong> Reference for the sampling profiler named in &sect;33.4 — how it counts hardware events and samples
+the program counter with low overhead. Not installed in this environment, so discussed from its documentation, not run; verify
+against your distribution's version.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex33.1"><span class="ex-label">33.1</span> <span class="ex-tag warm">warm-up</span>
+State the rule &ldquo;measure before you optimize&rdquo; in one sentence, and say what a profiler is for versus what a benchmark is for.</div>
+
+<div class="exercise" id="ex33.2"><span class="ex-label">33.2</span> <span class="ex-tag warm">warm-up</span>
+Why can a microbenchmark of a loop report <code>0.0000&nbsp;s</code> even though the loop appears to do real work?</div>
+
+<div class="exercise" id="ex33.3"><span class="ex-label">33.3</span> <span class="ex-tag warm">warm-up</span>
+Why do you run a benchmark many times and report the minimum (or median) rather than a single run's time?</div>
+
+<div class="exercise" id="ex33.4"><span class="ex-label">33.4</span> <span class="ex-tag core">core</span>
+Take the two-phase profile of &sect;33.4 (<code>parse</code> 6.4%, <code>compute</code> 93.6%). (a) Using Amdahl's law, what is
+the most you can improve total runtime by perfectly optimizing <code>parse</code>? (b) What whole-program improvement does a 30% cut
+to <code>compute</code> give? (c) A colleague, without profiling, spends a day optimizing <code>parse</code> because its code
+&ldquo;looks slow.&rdquo; Explain precisely why this violates &sect;33.1.</div>
+
+<div class="exercise" id="ex33.5"><span class="ex-label">33.5</span> <span class="ex-tag core">core</span>
+Explain the dead-code-elimination benchmark bug of &sect;33.2. (a) Under what condition is the compiler allowed to delete the timed
+loop, and which Chapter 10 principle is that? (b) Name two distinct ways to make the result observable so the work runs. (c) Why
+must you also benchmark at the optimization level you ship rather than at <code>-O0</code>?</div>
+
+<div class="exercise" id="ex33.6"><span class="ex-label">33.6</span> <span class="ex-tag core">core</span>
+Contrast sampling and instrumenting profilers. (a) How does each obtain its data? (b) What is the cost or distortion of each,
+especially for many tiny, hot functions? (c) For a first look at a large program you do not want to recompile, which would you reach
+for, and why?</div>
+
+<div class="exercise" id="ex33.7"><span class="ex-label">33.7</span> <span class="ex-tag complexity">cost</span>
+Reason about measurement error. (a) The five trials of &sect;33.3 spanned 0.6694&ndash;0.8198&nbsp;s for identical work; list three
+sources of that run-to-run variation. (b) Why is the <em>minimum</em> a more principled estimate of intrinsic cost than the mean,
+given that interference only ever slows a run? (c) When would the median be a better summary than the minimum, and what should you
+always report alongside either?</div>
+
+<div class="exercise" id="ex33.8"><span class="ex-label">33.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A developer benchmarks a hashing routine: <code>t0 = now(); for (i=0;i&lt;N;i++)
+hash(key); t1 = now();</code> and reports <code>0.0000&nbsp;s</code>, concluding the hash is &ldquo;essentially free.&rdquo;
+<br><strong>Step 1 (given):</strong> the return value of <code>hash(key)</code> is never used, so the calls have no observable effect.
+<br><strong>Step 2 (given):</strong> at <code>-O2</code> the compiler may therefore remove the entire loop (Chapter 10), so nothing was timed.
+<br><strong>Step 3 (given):</strong> the input <code>key</code> is also loop-invariant, which the optimizer can hoist or fold, compounding the problem.
+<br><strong>Step 4 (you):</strong> Rewrite the benchmark so it honestly times the hash — make the result observable and vary the
+input across iterations — and state what you would additionally do (clock, trials) before trusting the number.</div>
+
+<div class="exercise" id="ex33.9"><span class="ex-label">33.9</span> <span class="ex-tag mixed">mixed</span>
+For each situation, say whether you would <em>profile</em>, <em>benchmark</em>, or <em>neither yet</em>, and why: (a) a service is
+&ldquo;slow&rdquo; but you have no idea which part; (b) you have two candidate implementations of the confirmed hot function and must
+pick one; (c) a teammate proposes rewriting a module that is 2% of runtime; (d) you changed the hot function and want to know if
+total runtime actually dropped.</div>
+
+<div class="exercise" id="ex33.10"><span class="ex-label">33.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A benchmark reporting <code>0.0000&nbsp;s</code>
+means the code is extremely fast.&rdquo; (b) &ldquo;Benchmarking at <code>-O0</code> tells you the shipped build's performance.&rdquo;
+(c) &ldquo;A sampling profiler requires recompiling the program.&rdquo; (d) &ldquo;Optimizing a part that is 4% of runtime can, at
+best, speed the program by 4%.&rdquo; (e) &ldquo;One timing run is enough if the machine is otherwise idle.&rdquo;</div>
+
+<div class="exercise" id="ex33.11"><span class="ex-label">33.11</span> <span class="ex-tag stretch">stretch</span>
+Tie this chapter to the cost model. (a) The profiler in &sect;33.4 says <code>compute</code> is 93.6% of runtime but not
+<em>why</em>; list three costs from Chapters 3&ndash;5 that could be the real reason a loop is slow even at a low instruction count.
+(b) Explain how you would use the &sect;33.3 timing method to test whether a proposed cache-friendlier layout actually helps —
+what exactly must you hold constant, and what must you make observable? (c) Argue why &ldquo;profile &rarr; hypothesize a cause
+&rarr; change one thing &rarr; re-measure&rdquo; is the scientific method applied to performance.</div>
+
+<div class="exercise" id="ex33.12"><span class="ex-label">33.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices): (a) Reproduce &sect;33.2 — write a loop that sums into a variable, compile at
+<code>-O2</code> without using the variable and time it, then print the variable and time it again; report both times and explain
+the difference. (b) Reproduce &sect;33.3 — run an honest version five times with <code>clock_gettime(CLOCK_MONOTONIC, ...)</code>,
+report the five times and the minimum, and compute the spread. (c) If your platform has <code>perf</code> (or <code>gprof</code>),
+profile a small two-function program like &sect;33.4's and confirm the profiler agrees with hand timing about which function
+dominates; if not, do the hand timing and state which tool you would use and what it would add. Note your toolchain versions and CPU.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VII</div><h1>I/O & Networking, Low-Level</h1><p class='part-blurb'>Files, sockets, blocking vs async, epoll/io_uring, zero-copy — the systems substrate under every data pipeline and service.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part VIII</div><h1>Storage & the Disk</h1><p class='part-blurb'>Pages, files, the buffer pool, and the storage manager — the foundation you build a database on.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part IX</div><h1>Storage Engines</h1><p class='part-blurb'>B-trees and LSM-trees implemented and analyzed — the two families and when each wins.</p></div>
@@ -16163,6 +17356,347 @@ Copy&gt;</code> compiles at two types; removing the bounds yields <code>error[E0
 a single monomorphized generic <code>Vec&lt;T&gt;</code> is one concrete type and cannot hold two different types at once.
 <em>Tempting wrong answer:</em> &ldquo;the wrong-typed <code>qsort</code> comparator is fine because it compiled&rdquo; — it
 compiles but reinterprets bytes wrongly at run time. <strong>Feed-forward:</strong> &sect;30.1, &sect;30.4.</div>
+
+</section>
+
+<section class="solutions" id="sol31">
+<h1>Chapter 31 — Solutions</h1>
+
+<div class="solution" id="sol31.1"><span class="sol-label">31.1</span>
+<code>Option&lt;T&gt;</code> represents a value that may be absent — variants <code>Some(T)</code> and <code>None</code> — replacing
+the null pointer. <code>Result&lt;T, E&gt;</code> represents an operation that may fail with a reason — variants <code>Ok(T)</code>
+and <code>Err(E)</code>. <em>Tempting wrong answer:</em> &ldquo;<code>None</code> is Rust's null pointer&rdquo; — <code>None</code>
+is a variant the type system tracks, not a pointer value that inhabits every reference type; you cannot dereference it. <strong>Feed-forward:</strong>
+&sect;31.2, &sect;31.3.</div>
+
+<div class="solution" id="sol31.2"><span class="sol-label">31.2</span>
+On an expression <code>x</code> of type <code>Result&lt;T, E&gt;</code>, <code>x?</code> evaluates to the inner <code>T</code> if
+<code>x</code> is <code>Ok(T)</code>, and otherwise performs an early <em>return</em> of the <code>Err(E)</code> from the enclosing
+function (converting the error type through <code>From</code> if needed). <em>Tempting wrong answer:</em> &ldquo;<code>?</code>
+panics on <code>Err</code>&rdquo; — that is <code>unwrap()</code>; <code>?</code> returns the error to the caller instead.
+<strong>Feed-forward:</strong> &sect;31.4.</div>
+
+<div class="solution" id="sol31.3"><span class="sol-label">31.3</span>
+<code>Result</code> is for <em>recoverable</em> failures the caller should handle; <code>panic!</code> is for <em>unrecoverable</em>
+bugs or violated invariants, and it unwinds the stack and aborts the thread. <code>unwrap()</code> is a shortcut for &ldquo;if this
+is <code>Err</code>, treat it as a bug and <code>panic!</code>&rdquo;. <em>Tempting wrong answer:</em> &ldquo;<code>panic!</code> is
+just Rust's exception you catch upstream&rdquo; — it is meant for unrecoverable conditions, not routine control flow; recoverable
+errors use <code>Result</code>. <strong>Feed-forward:</strong> &sect;31.4.</div>
+
+<div class="solution" id="sol31.4"><span class="sol-label">31.4</span>
+(a) The program did not check <code>fopen</code>'s return value; C signals that failure by returning a <code>NULL</code> pointer
+(and setting <code>errno</code>). (b) <code>-Wall</code> did not warn because checking a returned sentinel is a convention the
+compiler does not enforce; the warning it emitted was the unrelated <code>-Wunused-result</code> for ignoring <code>fgets</code>'s
+own <code>warn_unused_result</code> return. (c) The <code>NULL</code> <code>fp</code> is dereferenced inside <code>fgets</code>,
+causing a segmentation fault (exit 139); dereferencing an invalid pointer is undefined behavior (Chapter 10), so the compiler may
+assume it never happens and no diagnostic is required. <em>Tempting wrong answer:</em> &ldquo;the warning means the compiler caught
+the NULL bug&rdquo; — the warning was about <code>fgets</code>'s return, not the unchecked <code>fp</code>. <strong>Feed-forward:</strong>
+&sect;31.1, &sect;31.3.</div>
+
+<div class="solution" id="sol31.5"><span class="sol-label">31.5</span>
+(a) The success value lives inside the <code>Ok(T)</code> variant, so to reach a usable value you must write code that also names
+the <code>Err</code> case (a <code>match</code>, a combinator, or <code>?</code>). (b) <code>#[must_use]</code> makes the compiler
+<em>warn</em> if you discard the whole <code>Result</code> without using it — the enforcement C's convention lacks. (c)
+<code>unwrap()</code> is the closest analog to skipping C's check because it reaches the success value while turning any
+<code>Err</code> into a <code>panic!</code>; it is at least visible and greppable, unlike C's silent fall-through.
+<em>Tempting wrong answer:</em> &ldquo;<code>unwrap()</code> is safe because it can't segfault&rdquo; — it can't corrupt memory,
+but it still crashes the thread on a recoverable error. <strong>Feed-forward:</strong> &sect;31.3.</div>
+
+<div class="solution" id="sol31.6"><span class="sol-label">31.6</span>
+(a) <code>?</code> propagates an <code>Err</code> by returning it from the enclosing function, but <code>load</code> returns
+<code>()</code>, which has nowhere to put a propagated error — so the operation is ill-typed and reported as <code>E0277</code>. (b)
+Corrected: <code>fn load(path: &amp;str) -&gt; Result&lt;(), io::Error&gt;</code> (with <code>Ok(())</code> at the end). (c) Adding
+<code>.unwrap()</code> compiles but changes the semantics: a missing file — a recoverable error — now <code>panic!</code>s and aborts
+the thread instead of being handed to the caller who could recover. <em>Tempting wrong answer:</em> &ldquo;<code>E0277</code> means
+<code>File::open</code> returned the wrong type&rdquo; — the operand type is fine; the enclosing function's return type is what
+disallows <code>?</code>. <strong>Feed-forward:</strong> &sect;31.4.</div>
+
+<div class="solution" id="sol31.7"><span class="sol-label">31.7</span>
+(a) In C the worst case is undefined behavior at run time — the NULL dereference and segfault of &sect;31.1, or worse, silent
+corruption. (b) In Rust, dropping the <code>Result</code> is caught at compile time as a <code>#[must_use]</code> <em>warning</em>
+(the value is unused, no crash), whereas reflexively <code>unwrap()</code>ing it downgrades a recoverable error to a run-time
+<code>panic!</code> that aborts the thread — bad, but a controlled unwind, not UB. (c) Ordered by severity: compile-time diagnostic
+(safest, before the program runs) &lt; warning &lt; controlled <code>panic!</code> &lt; runtime UB (worst). This ordering matters
+because a system you cannot easily debug in production fails most cheaply when the compiler catches the omission, and most
+expensively when it is silent undefined behavior. <em>Tempting wrong answer:</em> &ldquo;a Rust panic is as bad as a C
+segfault&rdquo; — a panic is a defined, controlled unwind with a message; UB is undefined and may corrupt silently.
+<strong>Feed-forward:</strong> &sect;31.1, &sect;31.4.</div>
+
+<div class="solution" id="sol31.8"><span class="sol-label">31.8</span>
+<strong>Step 4:</strong> Corrected: <code>fn first(path: &amp;str) -&gt; Result&lt;String, io::Error&gt; { let s =
+std::fs::read_to_string(path)?; Ok(s) }</code> — the function now returns a <code>Result</code>, so the <code>io::Error</code> that
+<code>?</code> may propagate has somewhere to go, and the success value is wrapped in <code>Ok</code>. This is preferable to
+<code>.unwrap()</code> because a missing or unreadable file is a routine, recoverable condition the caller may want to handle (fall
+back to defaults, report to the user); <code>unwrap()</code> would <code>panic!</code> and abort instead. <em>Tempting wrong
+answer:</em> &ldquo;return <code>String</code> and <code>unwrap()</code> so the signature stays simple&rdquo; — that hides a
+recoverable failure behind a crash. <strong>Feed-forward:</strong> &sect;31.4.</div>
+
+<div class="solution" id="sol31.9"><span class="sol-label">31.9</span>
+(a) <strong><code>Option</code></strong> — a key's presence is a plain absent/present question with no error reason (or
+<code>Result</code> only if the lookup itself can fail). (b) <strong><code>Result</code></strong> — malformed input is an
+expected, recoverable failure carrying a reason. (c) <strong><code>panic!</code></strong> is acceptable — an out-of-range index you
+just proved in-range would be a bug, so a panic (or plain indexing, which panics) documents the invariant; alternatively return
+<code>Result</code> if the proof is not airtight. (d) <strong><code>Result</code></strong> — a user-specified file may legitimately
+be missing or unreadable; the caller should recover. <em>Method-selection cue:</em> absence with no reason &rarr; <code>Option</code>;
+expected failure with a reason &rarr; <code>Result</code>; a violated invariant/bug &rarr; <code>panic!</code>.
+<strong>Feed-forward:</strong> &sect;31.2&ndash;&sect;31.4.</div>
+
+<div class="solution" id="sol31.10"><span class="sol-label">31.10</span>
+(a) <strong>False</strong> — <code>None</code> is an <code>Option</code> variant the type system tracks, not a null pointer that
+inhabits every reference type. (b) <strong>False</strong> — <code>?</code> is only valid in a function returning <code>Result</code>
+or <code>Option</code> (else <code>E0277</code>). (c) <strong>False</strong> — dropping a <code>Result</code> is a <code>#[must_use]</code>
+<em>warning</em>, not an error. (d) <strong>False</strong> — <code>unwrap()</code> on <code>Err</code> <code>panic!</code>s;
+<code>unwrap_or</code> is the one that returns a default. (e) <strong>True</strong> — <code>?</code> converts the error type through
+the <code>From</code> trait on the way out. <em>Tempting wrong answer:</em> marking (c) true by analogy to (b) — dropping a value is
+a warning, using <code>?</code> in the wrong context is the hard error. <strong>Feed-forward:</strong> &sect;31.2&ndash;&sect;31.4.</div>
+
+<div class="solution" id="sol31.11"><span class="sol-label">31.11</span>
+(a) Using <code>?</code> states a requirement on the enclosing function: &ldquo;this function can absorb a propagated error&rdquo;
+— i.e. its return type implements the residual/conversion machinery (built on <code>From</code>). That is a trait requirement, so
+its violation is the same <code>E0277</code> (&ldquo;trait bound not satisfied&rdquo;) as an unmet bound in Chapter 30. (b) Because
+<code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> are <em>generic</em>, one <code>?</code> operator is defined over
+all their instantiations at once — it works uniformly on <code>Result&lt;File, io::Error&gt;</code>,
+<code>Result&lt;String, ParseError&gt;</code>, and every other fallible return without per-type code, exactly the reuse
+monomorphization gives. (c) A worker's result would travel as a <code>Result&lt;Output, E&gt;</code> (&ldquo;the work, or why it
+failed&rdquo;); a thread <code>panic!</code> is observed by the parent as an <code>Err</code> from <code>JoinHandle::join</code>,
+carrying the panic payload. <em>Tempting wrong answer:</em> &ldquo;<code>?</code>'s error is a special language feature unrelated to
+traits&rdquo; — it is built on the <code>From</code>/residual traits, which is why the diagnostic is a trait-bound error.
+<strong>Feed-forward:</strong> &sect;31.5; the concurrency chapter ahead, and Chapter 30.</div>
+
+<div class="solution" id="sol31.12"><span class="sol-label">31.12</span>
+Toolchain-specific. A correct write-up reports: (a) <code>cerr.c</code> compiles (with only the <code>-Wunused-result</code>
+warning) and, on a missing file, terminates with SIGSEGV (exit status 139); adding <code>if (fp == NULL) { perror(...); return
+1; }</code> converts the crash into a clean error message and non-crashing exit. (b) With <code>rustc</code>,
+<code>read_config</code> returning <code>Result&lt;String, io::Error&gt;</code> returns the error on a missing path (no crash);
+changing its return type to <code>()</code> produces <code>error[E0277]</code> on the <code>?</code> line. Without <code>rustc</code>,
+name the <code>?</code> line and the return type as the cause. (c) Replacing a <code>?</code> with <code>.unwrap()</code> changes a
+propagated, recoverable error into a thread-aborting <code>panic!</code>. <em>Tempting wrong answer:</em> &ldquo;since <code>cerr.c</code>
+compiled, the NULL path is fine&rdquo; — it compiles but is undefined behavior at run time. <strong>Feed-forward:</strong> &sect;31.1,
+&sect;31.4.</div>
+
+</section>
+
+<section class="solutions" id="sol32">
+<h1>Chapter 32 — Solutions</h1>
+
+<div class="solution" id="sol32.1"><span class="sol-label">32.1</span>
+<code>Send</code> means a value of the type is safe to <em>move</em> (transfer) to another thread; <code>Sync</code> means it is safe
+to <em>share</em> a reference to it across threads. The relationship: <code>T: Sync</code> exactly when <code>&amp;T: Send</code>.
+<em>Tempting wrong answer:</em> &ldquo;<code>Send</code> is for moving and <code>Sync</code> is for locking&rdquo; — <code>Sync</code>
+is about shared references being sendable, not about acquiring locks. <strong>Feed-forward:</strong> &sect;32.2.</div>
+
+<div class="solution" id="sol32.2"><span class="sol-label">32.2</span>
+A <strong>data race</strong> is two threads accessing the same memory concurrently, at least one writing, with no synchronization
+ordering the accesses. In C (and C++) it is <em>undefined behavior</em> (Chapter 24). In safe Rust it cannot occur: the type system
+(the <code>Send</code>/<code>Sync</code> bounds plus the borrow rules) rejects the unsynchronized sharing at compile time.
+<em>Tempting wrong answer:</em> &ldquo;a data race just gives a wrong answer&rdquo; — in C it is UB, so the program has no defined
+meaning at all, not merely a wrong number. <strong>Feed-forward:</strong> &sect;32.1, &sect;32.3.</div>
+
+<div class="solution" id="sol32.3"><span class="sol-label">32.3</span>
+<code>move</code> forces the closure to take <em>ownership</em> of the variables it uses rather than borrowing them, so the data
+lives as long as the thread. Without it, a closure that borrows a local and is handed to a thread that may outlive the borrow draws
+<code>error[E0373]</code> (&ldquo;closure may outlive the current function&rdquo;). <em>Tempting wrong answer:</em>
+&ldquo;<code>move</code> copies the captured data&rdquo; — it transfers ownership (a move), which for non-<code>Copy</code> types
+invalidates the original. <strong>Feed-forward:</strong> &sect;32.3.</div>
+
+<div class="solution" id="sol32.4"><span class="sol-label">32.4</span>
+(a) It compiled because C has no rule against two threads touching shared mutable state; the data race is invisible to the compiler.
+(b) Each <code>counter++</code> is load&ndash;add&ndash;store; when two threads read the same value before either stores, one
+increment overwrites the other and is lost, so the total is below <code>4000000</code>, and because the interleaving is
+nondeterministic the exact loss differs each run. (c) The C fix is a mutex around every access to <code>counter</code>; it is
+fragile because it relies on you remembering the lock at <em>every</em> access site — one omission silently reintroduces the race,
+whereas Rust makes the unsynchronized access unrepresentable. <em>Tempting wrong answer:</em> &ldquo;the total is low because the
+loop ran too few times&rdquo; — the loop ran fully; updates were lost to interleaving. <strong>Feed-forward:</strong> &sect;32.1,
+&sect;32.4.</div>
+
+<div class="solution" id="sol32.5"><span class="sol-label">32.5</span>
+(a) <code>Send</code> rules out moving into the new thread any value that is not safe to transfer across threads — including any
+setup that would give two threads unsynchronized mutable access. (b) <code>'static</code> rules out the closure holding a borrow of
+data owned by the parent frame, which could dangle once the parent returns — the lifetime rule of Chapter 29. (c) An <code>Rc</code>
+is not <code>Send</code> (non-atomic refcount), so capturing it in a <code>spawn</code> closure leaves the closure non-<code>Send</code>
+and the bound fails. <em>Tempting wrong answer:</em> &ldquo;<code>'static</code> means the thread runs forever&rdquo; —
+<code>'static</code> bounds the <em>lifetime of borrows</em> the closure may hold, not the thread's duration.
+<strong>Feed-forward:</strong> &sect;32.2.</div>
+
+<div class="solution" id="sol32.6"><span class="sol-label">32.6</span>
+(a) <code>E0373</code> reports that a closure would outlive a value it borrows — an instance of the Chapter 28&ndash;29
+borrowing/lifetime rules applied to a closure escaping to a thread; <code>E0277</code> reports an unsatisfied <code>Send</code> (or
+<code>Sync</code>) bound — an instance of the Chapter 30 trait-bound check applied to <code>Send</code>. (b) Fix <code>E0373</code>
+with <code>move</code> (take ownership); fix <code>E0277</code> by using the thread-safe type (<code>Arc</code> for <code>Rc</code>,
+an atomic for a plain counter). (c) <code>unsafe impl Send</code> merely <em>asserts</em> thread-safety the type does not have,
+disabling the check and reintroducing the race — an unearned promise, not a fix. <em>Tempting wrong answer:</em>
+&ldquo;<code>E0373</code> and <code>E0277</code> are the same borrow error&rdquo; — one is a lifetime/borrow problem, the other a
+trait-bound problem, with different fixes. <strong>Feed-forward:</strong> &sect;32.3.</div>
+
+<div class="solution" id="sol32.7"><span class="sol-label">32.7</span>
+(a) The <code>Mutex</code> costs a lock acquire/release per update; as thread count rises, <strong>lock contention</strong>
+(Chapter 26) grows and can serialize the threads, throttling throughput. (b) The channel costs a send/receive and the move of the
+value; moving ownership down the channel means the sender can no longer touch the value, so there is nothing to race on and no lock
+to contend. (c) For a high-contention counter, an <strong>atomic</strong> (Chapter 22, e.g. a lock-free
+<code>fetch_add</code>) avoids the lock entirely; you would still prefer the <code>Mutex</code> when each update touches
+<em>multiple</em> fields that must change together atomically, which a single atomic cannot express. <em>Tempting wrong answer:</em>
+&ldquo;channels are always faster than a mutex&rdquo; — for a single hot counter an atomic or even a mutex may beat channel
+overhead; it depends on the access pattern. <strong>Feed-forward:</strong> &sect;32.4.</div>
+
+<div class="solution" id="sol32.8"><span class="sol-label">32.8</span>
+<strong>Step 4:</strong> Replace <code>Rc</code> with <strong><code>Arc</code></strong>: <code>let c = Arc::new(Mutex::new(0));</code>
+and, inside the loop, <code>let cc = Arc::clone(&amp;c);</code> before the <code>move</code> closure. This is a real fix because
+<code>Arc</code>'s reference count is updated with atomic operations, so it is genuinely safe to send/share across threads and
+therefore <code>Send + Sync</code> — the bound is now satisfied by fact, not by fiat. <code>unsafe impl Send for ...</code> would
+instead assert <code>Send</code> for the non-atomic <code>Rc</code>, switching off the check while the underlying refcount race
+remains — silencing the diagnostic without removing the bug. <em>Tempting wrong answer:</em> &ldquo;wrap the <code>Rc</code> in a
+<code>Mutex</code> too&rdquo; — the problem is the non-atomic refcount of <code>Rc</code> itself, not the interior value; you need
+<code>Arc</code>. <strong>Feed-forward:</strong> &sect;32.3.</div>
+
+<div class="solution" id="sol32.9"><span class="sol-label">32.9</span>
+(a) <strong>Prevented</strong> — sharing an <code>i32</code> mutably across threads requires either a non-<code>Sync</code> share or
+aliasing a <code>&amp;mut</code>, both rejected; you must use a <code>Mutex</code>/atomic. (b) <strong>Not prevented</strong> —
+deadlock from opposite lock-ordering is a logical bug, not a data race; the type system does not analyze lock order. (c)
+<strong>Prevented</strong> — <code>Rc</code> is not <code>Send</code>, so sending it across threads is <code>E0277</code>. (d)
+<strong>Not prevented</strong> — holding a guard across a slow call is safe (no race) but a contention/granularity problem the
+compiler does not flag. <em>Method-selection cue:</em> data races (unsynchronized shared mutation) are prevented; higher-level bugs
+(deadlock, contention, granularity) are not. <strong>Feed-forward:</strong> &sect;32.3, &sect;32.4.</div>
+
+<div class="solution" id="sol32.10"><span class="sol-label">32.10</span>
+(a) <strong>False</strong> — <code>Send</code>/<code>Sync</code> are marker (auto) traits with no methods, derived structurally. (b)
+<strong>False</strong> — Rust's <code>Mutex</code> <em>owns</em> the data; the only way to the value is through <code>lock()</code>,
+so lock and data are not separable. (c) <strong>True</strong> — <code>Arc</code> is <code>Rc</code> with an atomic reference count,
+making it <code>Send + Sync</code>. (d) <strong>False</strong> — it prevents data races, not deadlock. (e) <strong>False</strong> —
+sending <em>moves</em> ownership; the sender can no longer use the value. <em>Tempting wrong answer:</em> marking (b) true by analogy
+to C's separate <code>pthread_mutex_t</code> — Rust deliberately bundles the data inside the <code>Mutex</code>.
+<strong>Feed-forward:</strong> &sect;32.2&ndash;&sect;32.4.</div>
+
+<div class="solution" id="sol32.11"><span class="sol-label">32.11</span>
+(a) <code>Send</code>/<code>Sync</code> extend aliasing-XOR-mutation across threads: sharing a <code>&amp;mut</code> between two
+threads would create two mutable paths to one value at once (aliased mutation), which is exactly what the borrow rule forbids and
+what would be a data race — so it does not type-check. (b) All three are <em>trait-bound</em> failures: an unmet generic bound
+(Chapter 30), a <code>?</code> in a function that cannot absorb the error (Chapter 31, an unmet residual/<code>From</code> bound),
+and a non-<code>Send</code> type crossing threads (here) are all &ldquo;a required trait is not implemented,&rdquo; which is
+<code>E0277</code>. (c) The C volumes made you prove by hand that memory is freed once and used while valid, references never
+dangle, and shared state is never raced on; Rust turns each such proof into a type-system rule the compiler checks (ownership,
+borrowing, lifetimes, <code>Send</code>/<code>Sync</code>) — same machine, same generated code, proof automated.
+<em>Tempting wrong answer:</em> &ldquo;the reused error code is a coincidence&rdquo; — it reflects that thread-safety, error
+propagation, and generic reuse are all expressed as trait requirements. <strong>Feed-forward:</strong> &sect;32.5; Chapters
+27&ndash;31.</div>
+
+<div class="solution" id="sol32.12"><span class="sol-label">32.12</span>
+Toolchain-specific. A correct write-up reports: (a) at <code>-O0</code> the totals are below <code>4000000</code> and differ run to
+run (e.g. ~2.1&ndash;2.8 million), since each <code>++</code> is a real load/add/store with a wide race window; at <code>-O2</code>
+the optimizer may collapse the loop into a single register update, shrinking the window so the race often does not manifest — a
+reminder that a data race is UB and its observable effect depends on optimization and scheduling. (b) A
+<code>pthread_mutex_t</code> around <code>counter++</code> makes the total exactly <code>4000000</code>, deterministically. (c) With
+<code>rustc</code>, the <code>Arc&lt;Mutex&lt;i32&gt;&gt;</code> version is deterministic; the <code>Rc</code> version fails with
+<code>E0277</code> on the <code>spawn</code> capturing the non-<code>Send</code> <code>Rc</code>. Without <code>rustc</code>, name
+that line. <em>Tempting wrong answer:</em> &ldquo;<code>-O2</code> printing <code>4000000</code> proves the race is gone&rdquo; — it
+proves only that the window closed this time; the program is still UB. <strong>Feed-forward:</strong> &sect;32.1, &sect;32.4.</div>
+
+</section>
+
+<section class="solutions" id="sol33">
+<h1>Chapter 33 — Solutions</h1>
+
+<div class="solution" id="sol33.1"><span class="sol-label">33.1</span>
+&ldquo;Measure before you optimize&rdquo;: locate the real cost by measurement before spending effort, because bottlenecks are rarely
+where intuition says. A <strong>profiler</strong> tells you <em>which</em> code spends the runtime (find the target); a
+<strong>benchmark</strong> compares two versions of a known piece of code honestly (evaluate a fix). <em>Tempting wrong answer:</em>
+&ldquo;profiling and benchmarking are the same thing&rdquo; — profiling finds the hot spot across a whole program; benchmarking
+times a specific candidate. <strong>Feed-forward:</strong> &sect;33.1, &sect;33.4.</div>
+
+<div class="solution" id="sol33.2"><span class="sol-label">33.2</span>
+Because the loop's result is never used, so at <code>-O2</code> the optimizer proves the loop has no observable effect and deletes
+it entirely (Chapter 10) — nothing runs, so the timer reads <code>0.0000&nbsp;s</code>. <em>Tempting wrong answer:</em> &ldquo;the
+CPU is just that fast&rdquo; — a billion iterations are not free; they did not happen. <strong>Feed-forward:</strong> &sect;33.2.</div>
+
+<div class="solution" id="sol33.3"><span class="sol-label">33.3</span>
+A single run is disturbed by the scheduler, cache/TLB state, frequency scaling, and other tenants, so its time is noisy; running
+many trials and reporting the minimum (or median) gives the run least disturbed by outside interference — closest to the code's
+intrinsic cost — and you report the spread too. <em>Tempting wrong answer:</em> &ldquo;average the runs&rdquo; — the mean is dragged
+up by one-directional outliers (interference only slows a run), so the minimum is a more principled floor. <strong>Feed-forward:</strong>
+&sect;33.3.</div>
+
+<div class="solution" id="sol33.4"><span class="sol-label">33.4</span>
+(a) At most 6.4% — perfectly optimizing a 6.4%-of-runtime part caps its whole-program payoff at 6.4% (Amdahl). (b) 0.30 &times;
+93.6% = 28.1% of total runtime. (c) It violates &sect;33.1 because effort was spent on the part that mathematically cannot matter
+(&le;6.4%) while the 93.6% dominant cost went untouched — and the target was chosen by how the code &ldquo;looks&rdquo; rather than
+by a profile. <em>Tempting wrong answer:</em> &ldquo;optimizing <code>parse</code> is fine because every bit helps&rdquo; — Amdahl
+bounds &ldquo;every bit&rdquo; at 6.4%, a poor return versus <code>compute</code>. <strong>Feed-forward:</strong> &sect;33.1,
+&sect;33.4.</div>
+
+<div class="solution" id="sol33.5"><span class="sol-label">33.5</span>
+(a) When the loop's result is never observed, the compiler may delete it — the Chapter 10 principle that computations with no
+observable effect can be removed. (b) Make the result observable: print it as a checksum, or write it to a <code>volatile</code> (or
+a compiler-opaque sink). (c) Because the debug (<code>-O0</code>) build's costs are not the release build's — you must measure the
+code as it will actually be compiled and shipped, or the number describes a program you are not deploying.
+<em>Tempting wrong answer:</em> &ldquo;add a <code>printf</code> inside the loop&rdquo; — that dominates the timing with I/O; consume
+the result once, after the loop. <strong>Feed-forward:</strong> &sect;33.2.</div>
+
+<div class="solution" id="sol33.6"><span class="sol-label">33.6</span>
+(a) An instrumenting profiler inserts counting/timing code at function entry and exit (exact call counts); a sampling profiler
+interrupts the program many times per second and records the program counter, building a statistical map. (b) Instrumentation
+perturbs timing and can badly distort tiny, hot functions whose own cost is dwarfed by the added instrumentation; sampling has
+negligible overhead but is statistical (needs enough samples for accuracy). (c) For a first look at a large program without
+recompiling, reach for the <strong>sampling</strong> profiler — low overhead, no rebuild, and it points at the dominant cost.
+<em>Method-selection cue:</em> exact counts on specific calls &rarr; instrumenting; low-overhead whole-program map &rarr; sampling.
+<strong>Feed-forward:</strong> &sect;33.4.</div>
+
+<div class="solution" id="sol33.7"><span class="sol-label">33.7</span>
+(a) Three sources: the OS scheduler preempting the process (as in trial 4); cache/TLB and branch-predictor state differing between
+runs; and CPU frequency scaling (turbo/thermal) plus contention from other tenants. (b) Interference only ever makes a run
+<em>slower</em> — there is no mechanism that makes identical work finish faster than its intrinsic cost — so the minimum is the
+closest estimate of that intrinsic floor, whereas the mean is pulled upward by outliers. (c) The median is better when you care about
+<em>typical</em> behavior under realistic interference (e.g. tail-aware service work) rather than the best case; alongside either,
+always report the spread (range or a percentile) so the reader sees the variance. <em>Tempting wrong answer:</em> &ldquo;discard the
+outlier and average the rest&rdquo; — arbitrary trimming hides real variance; report the minimum/median and the spread instead.
+<strong>Feed-forward:</strong> &sect;33.3.</div>
+
+<div class="solution" id="sol33.8"><span class="sol-label">33.8</span>
+<strong>Step 4:</strong> Accumulate the hash results and consume the accumulator once after the loop, and vary the input so the call
+is not loop-invariant, e.g. <code>unsigned long acc = 0; for (i=0;i&lt;N;i++) acc ^= hash(key[i]); // vary input</code> then
+<code>printf("%lu\n", acc);</code> (or write <code>acc</code> to a <code>volatile</code>). This makes the work observable so the
+optimizer cannot delete it, and the varying <code>key[i]</code> defeats constant-folding/hoisting. Before trusting the number:
+time with <code>clock_gettime(CLOCK_MONOTONIC, ...)</code> at the shipping optimization level, warm up once, run several trials, and
+report the minimum and spread. <em>Tempting wrong answer:</em> &ldquo;mark <code>hash</code> <code>volatile</code>&rdquo; — consume
+the <em>result</em>; a volatile qualifier on the function is not the fix. <strong>Feed-forward:</strong> &sect;33.2, &sect;33.3.</div>
+
+<div class="solution" id="sol33.9"><span class="sol-label">33.9</span>
+(a) <strong>Profile</strong> — you do not yet know which part is slow; a profile finds it. (b) <strong>Benchmark</strong> — the hot
+function is confirmed; benchmark the two candidates head to head (honestly). (c) <strong>Neither yet</strong> — first profile to see
+if that 2% module even matters; per Amdahl a rewrite of 2% buys &le;2%, so likely do not optimize it at all. (d)
+<strong>Benchmark</strong> (or re-profile) — measure total runtime before and after to confirm the change actually moved the whole
+program, not just the microbenchmark. <em>Method-selection cue:</em> unknown target &rarr; profile; compare known candidates or
+confirm a whole-program win &rarr; benchmark; small share &rarr; do not optimize yet. <strong>Feed-forward:</strong> &sect;33.1,
+&sect;33.4.</div>
+
+<div class="solution" id="sol33.10"><span class="sol-label">33.10</span>
+(a) <strong>False</strong> — <code>0.0000&nbsp;s</code> almost always means the loop was deleted (dead-code elimination), so nothing
+was measured. (b) <strong>False</strong> — <code>-O0</code> costs differ from the shipped <code>-O2</code> build; benchmark what you
+ship. (c) <strong>False</strong> — a sampling profiler needs no recompilation; it samples the running program. (d) <strong>True</strong>
+— Amdahl caps a 4%-of-runtime part's whole-program payoff at 4%. (e) <strong>False</strong> — even on an idle machine, cache state,
+frequency scaling, and cold-start effects vary a single run; run several. <em>Tempting wrong answer:</em> marking (e) true because
+&ldquo;idle means no interference&rdquo; — idle removes some noise, not cache/frequency/warm-up variation. <strong>Feed-forward:</strong>
+&sect;33.2&ndash;&sect;33.4.</div>
+
+<div class="solution" id="sol33.11"><span class="sol-label">33.11</span>
+(a) A loop can be slow at a low instruction count because of <strong>cache misses</strong> (Chapter 3) stalling on memory,
+<strong>branch mispredictions</strong> flushing the pipeline, and <strong>memory-bandwidth</strong> limits or poor data layout
+(Chapters 4&ndash;5) — the instruction is cheap; the data it touches is not. (b) To test a cache-friendlier layout, hold everything
+else constant (same inputs, same optimization level, same machine, same measurement harness), change only the layout, make the
+result observable so the loop runs, and run many trials reporting the minimum and spread for both layouts — then compare. (c) It is
+the scientific method: the profile is an observation, &ldquo;the layout causes cache misses&rdquo; is a hypothesis, changing one
+thing is a controlled experiment, and re-measuring tests the prediction — changing several things at once, or not re-measuring,
+forfeits the ability to attribute the result. <em>Tempting wrong answer:</em> &ldquo;the profile already tells you why it's
+slow&rdquo; — it tells you <em>where</em>, not <em>why</em>; the cause is a separate hypothesis to test. <strong>Feed-forward:</strong>
+&sect;33.3, &sect;33.4; the cache and data-layout chapters ahead.</div>
+
+<div class="solution" id="sol33.12"><span class="sol-label">33.12</span>
+Platform-specific. A correct write-up reports: (a) the unused-result loop times near <code>0.0000&nbsp;s</code> (deleted), and after
+printing the variable it times to its real cost (a fraction of a second to seconds depending on <code>N</code> and hardware), with
+the difference attributed to dead-code elimination. (b) Five <code>CLOCK_MONOTONIC</code> trials of the honest version, with a
+minimum below the others and a spread (max &minus; min) of some percent — e.g. a ~20% span is unremarkable. (c) With
+<code>perf</code>/<code>gprof</code>, the profiler agrees that the heavier function dominates; without them, hand timing shows the
+split (e.g. ~94% vs ~6%) and the write-up names the sampling profiler it would use and that it adds per-line/whole-program
+attribution without recompilation. <em>Tempting wrong answer:</em> &ldquo;report the first run's time&rdquo; — the first run pays
+cold-cache/warm-up costs; report the minimum of several. <strong>Feed-forward:</strong> &sect;33.2&ndash;&sect;33.4.</div>
 
 </section>
 </body></html>

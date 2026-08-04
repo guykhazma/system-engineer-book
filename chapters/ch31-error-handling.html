@@ -1,0 +1,407 @@
+<section class="chapter" id="ch31">
+<h1>Chapter 31 — Error Handling</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch30">Chapter 30</a> (traits and generics — <code>Option</code>
+and <code>Result</code> are generic enums, and <code>?</code> leans on the <code>From</code> trait, so this chapter is those tools
+put to work), <a href="#ch09">Chapter 9</a> (manual allocation and what goes wrong — C signals failure with return codes,
+<code>errno</code>, and NULL, none of which the compiler makes you check), <a href="#ch27">Chapter 27</a> (ownership — an error
+value is owned and moved like any other, which is why <code>?</code> can hand it back to the caller), <a href="#ch10">Chapter
+10</a> (undefined behavior — dereferencing a NULL you forgot to check is exactly the UB a type can rule out). &nbsp;·&nbsp; Chapter
+30 promised that in Rust a guarantee is usually a type; this chapter is that promise applied to failure — &ldquo;did you handle the
+error?&rdquo; becomes a thing that does not compile.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch30">Chapter 30</a> — what is a generic type, and what does a trait bound like
+<code>T: From&lt;E&gt;</code> let a body assume? (2) <a href="#ch09">Chapter 9</a> — name the ways C reports that an operation
+failed (a sentinel return value, <code>errno</code>, a NULL pointer); does the C compiler force the caller to inspect any of them?
+(3) <em>Predict:</em> in C, <code>FILE *fp = fopen(path, "r");</code> returns NULL when the file is missing; if you forget to check
+and call <code>fgets(buf, n, fp)</code>, does that <em>compile</em>? does it <em>run</em> correctly? In Rust, <code>File::open</code>
+returns a <code>Result</code>; can you use the file handle without first confronting the failure case? Write your guesses;
+&sect;31.1 and &sect;31.3 answer all three.</p>
+</aside>
+
+<p>Every real program meets conditions it cannot control: a file is missing, a socket closes, a parse fails, an allocation returns
+nothing. The question is not whether errors happen but whether the language <em>makes you deal with them</em>. C's answer, from
+Chapter 9, is a set of conventions — a sentinel return value (<code>-1</code>, <code>NULL</code>), the global <code>errno</code>,
+sometimes a status code — all of which the compiler is happy to let you ignore. Rust's answer is to make failure a value with a
+type the compiler forces you to handle: <strong><code>Option&lt;T&gt;</code></strong> for &ldquo;a value that might be absent&rdquo;
+(there is no null), and <strong><code>Result&lt;T, E&gt;</code></strong> for &ldquo;an operation that might fail.&rdquo; Both are the
+ordinary generic enums of Chapter 30, and handling them is ordinary pattern matching. First, how C signals failure and why every
+signal is silently ignorable, in real C that compiles and then segfaults (&sect;31.1). Then <code>Option&lt;T&gt;</code>: the type
+that abolishes the null pointer and forces the absent case into the open (&sect;31.2). Then <code>Result&lt;T, E&gt;</code> for
+recoverable failure, marked <code>#[must_use]</code> so ignoring it warns (&sect;31.3). Then the <strong><code>?</code>
+operator</strong>, which propagates an error to the caller in one character, and <strong><code>panic!</code></strong> for the
+unrecoverable — with the compile error <code>E0277</code> that fires when <code>?</code> is used in a function that returns neither
+(&sect;31.4). We close by carrying error values forward into concurrency, where a panic on one thread and a <code>Result</code>
+crossing a channel are the next chapter's concern (&sect;31.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust error index, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>31.1 How C signals failure — and why it is ignorable</h2>
+
+<p>C has no single error mechanism; it has conventions. A function returns a <em>sentinel</em> — <code>NULL</code> from
+<code>fopen</code> and <code>malloc</code>, <code>-1</code> from <code>read</code> and <code>open</code> — and often also sets the
+global <code>errno</code> to say why. The caller is supposed to check. Nothing enforces it. Here is real C that forgets one check,
+compiled and run in this environment (gcc 11.4.0):</p>
+
+<pre><code>FILE *fp = fopen("does-not-exist.txt", "r");   /* returns NULL on failure */
+char buf[64];
+fgets(buf, sizeof buf, fp);                    /* fp never checked for NULL */
+printf("read: %s\n", buf);
+
+$ gcc -O2 -Wall cerr.c -o cerr
+cerr.c:5: warning: ignoring return value of 'fgets' ... [-Wunused-result]
+$ ./cerr
+Segmentation fault (core dumped)               # exit status 139</code></pre>
+
+<p>Look closely at what the compiler did and did not say. It emitted a warning — but about the wrong thing: <code>fgets</code>
+happens to be marked <code>warn_unused_result</code>, so ignoring <em>its</em> return drew a note. The actual bug — that
+<code>fp</code> is NULL and is dereferenced inside <code>fgets</code> — drew nothing, because checking <code>fopen</code>'s return
+is a convention, not a rule. The program compiles cleanly enough to ship and then segfaults on the missing file: the NULL
+dereference is the undefined behavior of Chapter 10, reached because the failure was expressible but not enforced. This is the
+recurring shape of C error handling: the information is there (the sentinel, <code>errno</code>), and the discipline to check it is
+entirely on you. Rust's move is to make the failure part of the return <em>type</em>, so there is no unchecked value to forget —
+the success value is only reachable by first accounting for the failure. That type is an enum, and we meet the simpler one first.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name three ways C reports failure. In the snippet above, which check was skipped, and why did the compiler not flag the real bug
+even with <code>-Wall</code>? What runtime event does the skipped check ultimately cause, and which chapter's concept is that?
+(Answer after the next section.)</p>
+</aside>
+
+<h2>31.2 <code>Option&lt;T&gt;</code>: there is no null</h2>
+
+<p>Rust has no null pointer. A value that may be absent has type <strong><code>Option&lt;T&gt;</code></strong>, a generic enum with
+two variants — <code>Some(T)</code> carrying a value, or <code>None</code>. Because absence is a distinct variant rather than a
+special pointer bit, the type system knows a <code>T</code> might not be there and refuses to let you use it as if it always is;
+you must pattern-match both cases (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>enum Option&lt;T&gt; { Some(T), None }        // in the standard library, generic over T
+
+fn first_char(s: &amp;str) -&gt; Option&lt;char&gt; {
+    s.chars().next()                     // Some(c) if non-empty, None if empty
+}
+
+match first_char(name) {
+    Some(c) =&gt; println!("starts with {c}"),
+    None    =&gt; println!("empty name"),   // the compiler forces this arm to exist
+}</code></pre>
+
+<p>The point is what you <em>cannot</em> do: you cannot treat an <code>Option&lt;char&gt;</code> as a <code>char</code> and call
+methods on it, because it is a different type. To get at the inner value you must go through the <code>None</code> case — by
+<code>match</code>, or by a combinator like <code>unwrap_or</code>, or by <code>?</code> (&sect;31.4). This is precisely the check
+C omitted in &sect;31.1, now made unskippable: the &ldquo;might be missing&rdquo; is in the type, so the missing case cannot be
+silently dereferenced. It is the language-level fix for what C. A. R. Hoare, who introduced the null reference in 1965, later called
+his &ldquo;billion-dollar mistake&rdquo; — a value that inhabits every reference type yet supports no operation, so every use is a
+latent crash (Hoare, QCon London, 2009). <code>Option</code> puts the absent case back into the type where the compiler can see it,
+turning a whole family of C's NULL-dereference segfaults into a match arm you are made to write.</p>
+
+<h2>31.3 <code>Result&lt;T, E&gt;</code>: recoverable failure as a value</h2>
+
+<p>Absence is one thing; a failed operation that carries a <em>reason</em> is another. For that Rust has
+<strong><code>Result&lt;T, E&gt;</code></strong>, a generic enum over the success type <code>T</code> and the error type
+<code>E</code>, with variants <code>Ok(T)</code> and <code>Err(E)</code>. Fallible standard-library operations return it —
+<code>File::open</code> returns <code>Result&lt;File, io::Error&gt;</code> — and it is annotated <code>#[must_use]</code>, so
+ignoring one is a warning, not a shrug (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>enum Result&lt;T, E&gt; { Ok(T), Err(E) }      // generic over success T and error E
+
+let f = File::open("data.txt");          // Result&lt;File, io::Error&gt;
+let file = match f {
+    Ok(handle) =&gt; handle,                // the File, only reachable through Ok
+    Err(e)     =&gt; return Err(e),         // must confront the failure to proceed
+};
+// File::open("x");   // warning: unused `Result` that must be used  (#[must_use])</code></pre>
+
+<p>Compare this line by line with the C of &sect;31.1. There, <code>fopen</code> returned a <code>FILE*</code> that was
+<code>NULL</code> on failure, and reaching the &ldquo;file&rdquo; without checking was legal and segfaulted. Here,
+<code>File::open</code> returns a <code>Result</code> whose <code>File</code> is <em>inside</em> the <code>Ok</code> variant: the
+only way to a usable <code>File</code> is through code that also names what to do on <code>Err</code>. If you throw the whole
+<code>Result</code> away, the <code>#[must_use]</code> attribute makes the compiler warn that a result that must be used was not —
+the diagnostic C's <code>warn_unused_result</code> gestured at, here applied to every fallible operation by construction. You still
+have escape hatches — <code>unwrap()</code> returns the <code>Ok</code> value or <strong>panics</strong> on <code>Err</code>, and
+<code>expect("msg")</code> does the same with your message — but they are visible, greppable choices to convert a recoverable error
+into a crash, not the silent default. Handling the error is the path of least resistance; ignoring it takes a deliberate keystroke.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What are the two variants of <code>Result&lt;T, E&gt;</code>, and where does the success value live? What does
+<code>#[must_use]</code> buy you over C's conventions, and what do <code>unwrap()</code> / <code>expect()</code> do on an
+<code>Err</code>? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>31.4 Propagation with <code>?</code>, and <code>panic!</code> for the unrecoverable</h2>
+
+<p>Matching every <code>Result</code> by hand would bury real logic under error plumbing. The <strong><code>?</code>
+operator</strong> is the shorthand: on an expression of type <code>Result</code>, <code>x?</code> evaluates to the inner value if
+it is <code>Ok</code>, and otherwise <em>returns the <code>Err</code> from the enclosing function</em> — an early return that hands
+the error to the caller. When the caller's error type differs, <code>?</code> converts through the <code>From</code> trait of
+Chapter 30 (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>fn read_config(path: &amp;str) -&gt; Result&lt;String, io::Error&gt; {
+    let mut f = File::open(path)?;       // if Err, return it now; else bind the File
+    let mut s = String::new();
+    f.read_to_string(&amp;mut s)?;           // same: propagate on Err, continue on Ok
+    Ok(s)                                // reached only if every step succeeded
+}</code></pre>
+
+<p>Each <code>?</code> is the whole match-and-early-return of &sect;31.3 compressed to one character, and the function reads as the
+happy path with the failures factored out. The catch — and it is a helpful one — is that <code>?</code> only makes sense in a
+function that itself returns a <code>Result</code> (or an <code>Option</code>): it needs somewhere to return the <code>Err</code>
+<em>to</em>. Use <code>?</code> in a function returning <code>()</code> and the compiler stops you with
+<strong><code>E0277</code></strong> — &ldquo;the <code>?</code> operator can only be used in a function that returns
+<code>Result</code> or <code>Option</code>&rdquo; (per the official Rust error index) — the same error code as an unmet trait bound
+in Chapter 30, because &ldquo;this function can absorb a propagated error&rdquo; is itself a trait requirement. The fix is to give
+the function a <code>Result</code> return type, not to reach for <code>unwrap</code>.</p>
+
+<p>Not every failure is recoverable. When a program hits a bug or a violated invariant it cannot sensibly continue past —
+an index out of bounds, an assertion, a &ldquo;this should be impossible&rdquo; branch — it calls <strong><code>panic!</code></strong>,
+which unwinds the stack (running destructors) and aborts the thread. The distinction is the whole design: <code>Result</code> is for
+<em>expected, recoverable</em> conditions the caller should handle (a missing file, a bad request); <code>panic!</code> is for
+<em>unexpected, unrecoverable</em> ones that signal a bug (Klabnik &amp; Nichols, 2023, ch. 9). Choosing <code>unwrap()</code> is
+choosing &ldquo;if this is <code>Err</code>, that is a bug, so panic&rdquo; — sometimes right (a hard-coded string you know parses),
+often a shortcut that turns a routine error into a crash. The rule of thumb: return a <code>Result</code> when the caller can do
+something about it; <code>panic!</code> only when continuing would mean running on broken assumptions.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: an error is a value the type system forces you to handle</span>
+<p><strong>1. In words.</strong> Fallibility is encoded in the return type — <code>Option&lt;T&gt;</code> for absence,
+<code>Result&lt;T, E&gt;</code> for failure-with-reason — so the success value is reachable only through code that also accounts
+for the failure. <code>?</code> propagates an <code>Err</code> to the caller; <code>panic!</code> is reserved for unrecoverable
+bugs. Ignoring a <code>Result</code> warns (<code>#[must_use]</code>); using <code>?</code> without a place to return the error is
+<code>E0277</code>.</p>
+<p><strong>2. As a picture.</strong> Figure 31.1: one call fanning into two arms — <code>Ok(T)</code>/<code>Some(T)</code> to the
+happy path, <code>Err(E)</code>/<code>None</code> to a handler — with <code>?</code> drawn as an arrow from the <code>Err</code> arm
+straight back out to the caller, versus C's single return value with a dashed &ldquo;did you remember to check?&rdquo; branch that
+falls through to a NULL dereference.</p>
+<p><strong>3. As numbers/contrast.</strong> The C of &sect;31.1 compiled and reached exit status 139 (SIGSEGV) on a missing file
+because the NULL check was optional. The Rust equivalent cannot reach the <code>File</code> without a matching <code>Err</code>
+handler; the same &ldquo;forgot to check&rdquo; is a compile-time warning (<code>#[must_use]</code>) or, for <code>?</code> in the
+wrong context, a compile error (<code>E0277</code>) — a runtime segfault turned into a message before the program runs.</p>
+</aside>
+
+<p><em>(Answer to the &sect;31.1 quick check: C reports failure by sentinel return values (<code>NULL</code>, <code>-1</code>), by
+setting <code>errno</code>, and by explicit status codes. The skipped check was <code>fopen</code>'s return for
+<code>NULL</code>; <code>-Wall</code> did not flag it because checking a return sentinel is a convention the compiler does not
+enforce — it warned only about ignoring <code>fgets</code>'s own <code>warn_unused_result</code>. The unchecked NULL is
+dereferenced inside <code>fgets</code>, causing a segmentation fault — the undefined behavior of Chapter 10.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">An error is a value with two arms; C's single return has an optional, skippable check.</text>
+<rect x="30" y="40" width="150" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="42" y="59" font-size="10">File::open(path)</text>
+<text x="200" y="34" font-size="9" fill="#2f7d32">RUST: type forces both arms</text>
+<rect x="210" y="42" width="120" height="26" fill="#dfeee0" stroke="#2f7d32"/><text x="222" y="59" font-size="9">Ok(File) — use it</text>
+<rect x="210" y="78" width="120" height="26" fill="#fdeee6" stroke="#8c3a1d"/><text x="222" y="95" font-size="9">Err(e) — handle</text>
+<line x1="180" y1="52" x2="210" y2="55" stroke="#2f7d32" marker-end="url(#ra)"/>
+<line x1="180" y1="60" x2="210" y2="90" stroke="#8c3a1d" marker-end="url(#rb)"/>
+<text x="345" y="95" font-size="8" fill="#8c3a1d">? returns Err to caller</text>
+<line x1="330" y1="91" x2="470" y2="91" stroke="#8c3a1d" stroke-dasharray="3,2" marker-end="url(#rb)"/>
+<text x="30" y="150" font-size="9" fill="#8c3a1d">C: one return; the check is optional</text>
+<rect x="30" y="158" width="150" height="30" fill="#f5f8fb" stroke="#14406b"/><text x="42" y="177" font-size="10">fp = fopen(path)</text>
+<rect x="210" y="158" width="120" height="26" fill="#dfeee0" stroke="#2f7d32"/><text x="222" y="175" font-size="9">use fp</text>
+<line x1="180" y1="173" x2="210" y2="172" stroke="#14406b" marker-end="url(#ra)"/>
+<text x="345" y="163" font-size="8" fill="#8c3a1d">if fp==NULL … (skippable)</text>
+<text x="345" y="180" font-size="8" fill="#8c3a1d">skipped &rarr; NULL deref &rarr; SIGSEGV</text>
+<defs>
+<marker id="ra" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#2f7d32"/></marker>
+<marker id="rb" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#8c3a1d"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 31.1: A <code>Result</code>/<code>Option</code> forces both arms — the success value lives inside <code>Ok</code>/<code>Some</code>,
+and <code>?</code> routes an <code>Err</code> back to the caller. C's single return value makes the failure check optional, and skipping
+it falls through to the NULL dereference of &sect;31.1.</figcaption>
+</figure>
+
+<aside class="warning">
+<span class="box-title">Trap: reflexive <code>.unwrap()</code>, and silencing <code>#[must_use]</code> with <code>let _ =</code></span>
+<p>Two related shortcuts undo everything this chapter buys. The first is reaching for <code>.unwrap()</code> or
+<code>.expect()</code> on every <code>Result</code> to make the types line up, because matching feels like ceremony. Each
+<code>unwrap</code> is a decision that &ldquo;an <code>Err</code> here is an unrecoverable bug&rdquo; — fine for a literal you know
+parses, but on a file open, a network read, or user input it converts a routine, recoverable error into a
+<code>panic!</code> that aborts the thread. The mechanical fix when the compiler complains that <code>?</code> needs a
+<code>Result</code>-returning function (<code>E0277</code>) is <em>not</em> to slap on <code>unwrap</code>; it is to give the
+function a <code>Result</code> return type and propagate. The second shortcut is silencing the <code>#[must_use]</code> warning with
+<code>let _ = fallible();</code> — the exact analog of ignoring C's return sentinel, now with a paper trail. Both are the
+&sect;31.1 mistake wearing Rust syntax: the error is still there, you have just re-hidden it. Handle it, propagate it with
+<code>?</code>, or — if a failure truly is a bug — <code>panic!</code> <em>deliberately</em> with a message that says why; do not
+launder a recoverable error into a crash to quiet the compiler.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;<code>Result</code> and <code>?</code> everywhere are just checked exceptions with
+extra typing — in C I return <code>-1</code> and check it, which is simpler and I can see the control flow. Isn't all this enum
+stuff ceremony?&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;31.1&ndash;&sect;31.4.</p>
+<p><em>Model answer.</em> &ldquo;The difference isn't typing, it's what the compiler enforces. In C the <code>-1</code>-and-check is
+a convention — nothing stops you from skipping it, and when you do you don't get an exception, you get the &sect;31.1 segfault at
+run time on a missing file. <code>Result&lt;T, E&gt;</code> puts the success value inside <code>Ok</code>, so you literally can't
+reach it without naming the <code>Err</code> case, and <code>#[must_use]</code> warns if you drop the whole thing — that's the check
+you keep meaning to write in C, made non-optional. And <code>?</code> is not hidden control flow like an exception: it's a visible,
+one-character early return that only compiles in a function that returns <code>Result</code>, so the error path is explicit and
+type-checked all the way up. It's also not exceptions — there's no invisible unwinding through ten stack frames; a panic is the
+separate, deliberate tool for <em>unrecoverable</em> bugs. So you get C's explicit control flow plus the compiler making sure you
+didn't forget the check.&rdquo; Framing <code>Result</code> as &ldquo;the check you meant to write, enforced&rdquo; and separating
+it cleanly from panics is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;31.3 quick check: <code>Result&lt;T, E&gt;</code> has variants <code>Ok(T)</code> and
+<code>Err(E)</code>, and the success value lives inside <code>Ok</code> — reachable only through code that also names the
+<code>Err</code> case (a match, a combinator, or <code>?</code>). <code>#[must_use]</code> makes the compiler warn if you discard
+the whole <code>Result</code>, an enforcement C's return-value convention lacks. <code>unwrap()</code> returns the <code>Ok</code>
+value or <code>panic!</code>s on <code>Err</code>, and <code>expect("msg")</code> does the same with your message — visible,
+greppable ways to convert a recoverable error into a crash.)</em></p>
+
+<h2>31.5 What to carry forward</h2>
+
+<p>Error handling in Rust is the Chapter 30 pattern once more: name the possibility in a type, and let the compiler force the
+handling. <strong><code>Option&lt;T&gt;</code></strong> (<code>Some</code>/<code>None</code>) replaces the null pointer, so a
+value that might be absent cannot be used as if it were present — abolishing a whole class of C's NULL-dereference crashes.
+<strong><code>Result&lt;T, E&gt;</code></strong> (<code>Ok</code>/<code>Err</code>) makes a fallible operation return its success
+value <em>inside</em> the success variant and is <code>#[must_use]</code>, so the failure cannot be reached without being named and
+cannot be silently discarded. The <strong><code>?</code> operator</strong> propagates an <code>Err</code> to the caller in one
+character, converting error types through <code>From</code>, and is only valid where there is a <code>Result</code> or
+<code>Option</code> to return to (<code>E0277</code> otherwise). <strong><code>panic!</code></strong> is the separate tool for the
+unrecoverable — a bug or violated invariant — and <code>unwrap()</code>/<code>expect()</code> are the visible, greppable way to opt
+into it, never the silent default. The whole design turns &sect;31.1's optional-and-forgotten check, whose penalty was a runtime
+segfault, into a compile-time obligation.</p>
+
+<p>The next chapter, <strong>fearless concurrency</strong>, is where these threads (literally) come together. Errors do not stop at
+a thread boundary: a worker thread can <code>panic!</code>, and its <code>Result</code> — of joining it, of the work it did — has
+to travel back to whoever spawned it, often across a channel that itself yields <code>Result</code> when the other end has hung up.
+And the deeper link is the one Chapter 30 previewed: just as <code>Result</code> encodes &ldquo;this might fail&rdquo; in a type,
+the traits <strong><code>Send</code></strong> and <strong><code>Sync</code></strong> encode &ldquo;this is safe to move to, or share
+across, threads,&rdquo; lifting the ownership and borrowing discipline of Chapters 27&ndash;28 over the thread boundary — so the
+data races you had to reason about by hand in Chapter 24 become, like the unchecked errors here, a compile error rather than
+undefined behavior. Same move, applied to time and threads instead of to failure.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name three ways C signals failure and explain why each is silently ignorable (&sect;31.1's segfault).</li>
+<li>State the variants of <code>Option&lt;T&gt;</code> and why it abolishes the null pointer.</li>
+<li>State the variants of <code>Result&lt;T, E&gt;</code>, where the success value lives, and what <code>#[must_use]</code> does.</li>
+<li>Explain what <code>?</code> does, how it converts error types, and why <code>E0277</code> fires when it is misused.</li>
+<li>Distinguish <code>Result</code> (recoverable) from <code>panic!</code> (unrecoverable), and say what <code>unwrap()</code> chooses.</li>
+<li>Explain why reflexive <code>unwrap</code> and <code>let _ =</code> re-create the C mistake.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> How does C signal failure, and why did the &sect;31.1 program compile with <code>-Wall</code> yet segfault? (&sect;31.1)</li>
+<li><strong>R2.</strong> What is <code>Option&lt;T&gt;</code>, and how does it eliminate a class of NULL-dereference bugs? (&sect;31.2)</li>
+<li><strong>R3.</strong> What is <code>Result&lt;T, E&gt;</code>, where is the success value, and what does <code>#[must_use]</code> add over C? (&sect;31.3)</li>
+<li><strong>R4.</strong> What does <code>?</code> do, what trait does it use to convert errors, and which error code reports its misuse? (&sect;31.4)</li>
+<li><strong>R5.</strong> When do you return a <code>Result</code> vs. call <code>panic!</code>, and what does <code>unwrap()</code> really choose? (&sect;31.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 9
+&ldquo;Error Handling&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source for
+<code>Result</code>, <code>panic!</code>, the <code>?</code> operator, and the recoverable-vs-unrecoverable guidance of
+&sect;31.3&ndash;&sect;31.4; ch. 6 covers <code>Option</code> and enums. Authors, edition, and chapter numbers verified via the
+publisher and the online book; not compiled here.</li>
+<li><strong>The Rust Error Index, entries <code>E0277</code> and <code>E0308</code> (<code>doc.rust-lang.org/error_codes</code>).</strong>
+The official meanings used in &sect;31.4: <code>E0277</code> covers &ldquo;the <code>?</code> operator can only be used in a
+function that returns <code>Result</code> or <code>Option</code>&rdquo; (an unsatisfied <code>FromResidual</code>/trait bound), and
+<code>E0308</code> is &ldquo;mismatched types.&rdquo; Both verified against the current error index.</li>
+<li><strong>C. A. R. Hoare, &ldquo;Null References: The Billion Dollar Mistake,&rdquo; QCon London, 2009 (recorded talk, InfoQ).</strong>
+Hoare's account of introducing the null reference in ALGOL W (1965) and why it was a mistake — the motivation for
+<code>Option&lt;T&gt;</code> in &sect;31.2. A talk, not a paper; speaker, venue, and year verified via the InfoQ recording.</li>
+<li><strong>The Rust standard-library documentation for <code>std::option::Option</code> and <code>std::result::Result</code>
+(<code>doc.rust-lang.org/std</code>).</strong> The definitions, the <code>#[must_use]</code> annotation on <code>Result</code>, and
+the combinators (<code>unwrap</code>, <code>expect</code>, <code>unwrap_or</code>, <code>map</code>, <code>and_then</code>) referenced
+throughout. Reference for the exact API; verify against the current stable docs.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex31.1"><span class="ex-label">31.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, say what <code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> represent, and name the two variants of each.</div>
+
+<div class="exercise" id="ex31.2"><span class="ex-label">31.2</span> <span class="ex-tag warm">warm-up</span>
+What does the <code>?</code> operator do to an expression of type <code>Result&lt;T, E&gt;</code> — what happens on <code>Ok</code>, and what on <code>Err</code>?</div>
+
+<div class="exercise" id="ex31.3"><span class="ex-label">31.3</span> <span class="ex-tag warm">warm-up</span>
+What is the difference between returning a <code>Result</code> and calling <code>panic!</code>, and which is <code>unwrap()</code> a shortcut for?</div>
+
+<div class="exercise" id="ex31.4"><span class="ex-label">31.4</span> <span class="ex-tag core">core</span>
+Take the C of &sect;31.1. (a) Which failure did the program not check, and how does C signal that failure? (b) Why did
+<code>gcc -Wall</code> not warn about the real bug, and what was the warning it <em>did</em> emit about? (c) Explain, in terms of
+Chapter 10, what runtime event the missing check causes and why it is undefined behavior.</div>
+
+<div class="exercise" id="ex31.5"><span class="ex-label">31.5</span> <span class="ex-tag core">core</span>
+Explain how <code>Result&lt;T, E&gt;</code> makes the &sect;31.1 mistake hard to repeat. (a) Where does the success value live, and
+what must you write to reach it? (b) What does <code>#[must_use]</code> add if you discard the whole <code>Result</code>? (c) In
+what sense is <code>unwrap()</code> the closest Rust analog to skipping C's check, and why is it at least visible?</div>
+
+<div class="exercise" id="ex31.6"><span class="ex-label">31.6</span> <span class="ex-tag core">core</span>
+A function <code>fn load(path: &amp;str)</code> with return type <code>()</code> contains <code>let f = File::open(path)?;</code> and
+fails to compile with <code>error[E0277]: the ? operator can only be used in a function that returns Result or Option</code>. (a)
+Why is <code>?</code> illegal here specifically? (b) Give the corrected signature. (c) Why is adding <code>.unwrap()</code> instead
+the wrong fix in general?</div>
+
+<div class="exercise" id="ex31.7"><span class="ex-label">31.7</span> <span class="ex-tag complexity">cost</span>
+Consider the cost of the two error styles, not in CPU cycles but in <em>failure modes</em>. (a) What is the worst-case runtime
+outcome of a forgotten check in C (as in &sect;31.1)? (b) What is the worst-case outcome of the corresponding omission in Rust —
+distinguishing &ldquo;dropped the <code>Result</code>&rdquo; from &ldquo;reflexively <code>unwrap()</code>ed it&rdquo;? (c) Argue
+which class of failure (compile-time diagnostic, warning, or runtime UB) each lands in, and why that ordering matters for a system
+you cannot easily debug in production.</div>
+
+<div class="exercise" id="ex31.8"><span class="ex-label">31.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer writes <code>fn first(path: &amp;str) -&gt; String { let s =
+std::fs::read_to_string(path)?; s }</code> in a function returning <code>String</code> and gets
+<code>error[E0277]</code> on the <code>?</code>.
+<br><strong>Step 1 (given):</strong> <code>read_to_string</code> returns <code>Result&lt;String, io::Error&gt;</code>, so
+<code>?</code> may early-return an <code>io::Error</code>.
+<br><strong>Step 2 (given):</strong> the function's declared return type is <code>String</code>, which has no place for that
+propagated <code>Err</code> to go — hence <code>E0277</code>.
+<br><strong>Step 3 (given):</strong> to keep <code>?</code>, the function must return a <code>Result</code> whose error type the
+<code>io::Error</code> can become.
+<br><strong>Step 4 (you):</strong> Give the corrected signature and body (returning <code>Result&lt;String, io::Error&gt;</code>),
+and explain why this is preferable to changing <code>?</code> to <code>.unwrap()</code> for a file that might legitimately be missing.</div>
+
+<div class="exercise" id="ex31.9"><span class="ex-label">31.9</span> <span class="ex-tag mixed">mixed</span>
+For each situation, say whether you would return <code>Result</code>, return <code>Option</code>, or <code>panic!</code>, and why:
+(a) looking up a key that may or may not be in a map; (b) parsing a network request whose bytes may be malformed; (c) indexing a
+slice with an integer your own code just computed and proved in-range; (d) opening a user-specified config file.</div>
+
+<div class="exercise" id="ex31.10"><span class="ex-label">31.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Rust's null pointer is written
+<code>None</code>.&rdquo; (b) &ldquo;<code>?</code> works in any function.&rdquo; (c) &ldquo;Dropping a <code>Result</code> is a
+compile error.&rdquo; (d) &ldquo;<code>unwrap()</code> on an <code>Err</code> returns a default value.&rdquo; (e) &ldquo;<code>?</code>
+can convert one error type into another on the way out.&rdquo;</div>
+
+<div class="exercise" id="ex31.11"><span class="ex-label">31.11</span> <span class="ex-tag stretch">stretch</span>
+&ldquo;An error is a value the type system forces you to handle.&rdquo; (a) Explain how this is the same mechanism as Chapter 30's
+trait bounds — what &ldquo;requirement&rdquo; is <code>?</code>-in-a-function stating, and why is its violation the <em>same</em>
+error code (<code>E0277</code>) as an unmet bound? (b) Show how <code>Option</code> and <code>Result</code> being <em>generic</em>
+(Chapter 30) is what lets one <code>?</code> work uniformly across every fallible operation. (c) Preview: if a worker thread's
+result must return to its spawner, what type would carry &ldquo;the work, or why it failed,&rdquo; and how might a thread
+<code>panic!</code> be observed by the parent?</div>
+
+<div class="exercise" id="ex31.12"><span class="ex-label">31.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile and run the &sect;31.1 <code>cerr.c</code>;
+confirm it builds and observe the exit status on a missing file (expect a SIGSEGV, status 139). Add the missing
+<code>if (fp == NULL)</code> check and confirm the crash becomes a clean error message. (b) If you have <code>rustc</code>, write
+<code>read_config</code> from &sect;31.4 returning <code>Result&lt;String, io::Error&gt;</code>, call it on a missing path, and
+observe that the error is returned rather than crashing; then change the return type to <code>()</code> and observe
+<code>E0277</code>. Without <code>rustc</code>, explain from this chapter which line each change affects. (c) Replace one
+<code>?</code> with <code>.unwrap()</code> and describe how the failure mode changes. Note your toolchain versions.</div>
+
+</section>
+</section>

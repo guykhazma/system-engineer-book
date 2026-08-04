@@ -1,0 +1,405 @@
+<section class="chapter" id="ch32">
+<h1>Chapter 32 — Fearless Concurrency</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch24">Chapter 24</a> (the memory model — a data race is
+undefined behavior you had to rule out by hand; this chapter makes it a compile error), <a href="#ch28">Chapter 28</a> (borrowing —
+aliasing XOR mutation, the rule that <code>Send</code> and <code>Sync</code> lift across threads), <a href="#ch20">Chapter 20</a>
+(mutual-exclusion locks — Rust's <code>Mutex</code> bundles the lock <em>with</em> the data it guards), <a href="#ch31">Chapter
+31</a> (error handling — joining a thread and receiving on a channel both yield <code>Result</code>). &nbsp;·&nbsp; This chapter
+finishes the Rust part: the aliasing discipline you proved by hand in the concurrency volume becomes two traits the compiler checks,
+so a data race stops compiling.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch24">Chapter 24</a> — what exactly is a <em>data race</em>, and what is its status in
+C and C++ (defined behavior? undefined?)? (2) <a href="#ch28">Chapter 28</a> — state the borrow rule in one line (how many mutable
+references may coexist with how many shared ones?). (3) <em>Predict:</em> in C, two threads each increment a shared
+<code>long</code> a million times with no lock; does the program <em>compile</em>? does it print the expected total? In Rust, can
+you hand the same <code>&amp;mut</code> to two threads at once? Write your guesses; &sect;32.1 and &sect;32.3 answer all three.</p>
+</aside>
+
+<p>The concurrency volume (Chapters 20&ndash;26) taught the hazards — data races, torn reads, lost updates, deadlock — and the
+tools to avoid them: locks, atomics, the memory model. What it could not give you was a <em>guarantee</em>. In C, whether your
+locking is correct is a property you argue for by inspection, and a single unlocked access to shared mutable state is undefined
+behavior (Chapter 24) that may work in testing and corrupt in production. Rust calls its alternative <strong>fearless
+concurrency</strong>: the same aliasing rule that made single-threaded code safe — one mutable reference or many shared ones, never
+both (Chapter 28) — is extended across threads by two marker traits, <strong><code>Send</code></strong> and
+<strong><code>Sync</code></strong>, so that sharing mutable state without synchronization does not type-check. First, the C data
+race, compiled and run so you can see it compile cleanly and print the wrong answer (&sect;32.1). Then <code>Send</code> and
+<code>Sync</code>: what each means and how <code>thread::spawn</code> uses them to police the thread boundary (&sect;32.2). Then the
+compiler stopping the &sect;32.1 race with two named diagnostics — <strong><code>E0373</code></strong> (a closure would outlive its
+borrow) and <strong><code>E0277</code></strong> (a non-thread-safe type crossing threads) (&sect;32.3). Then the safe way to share:
+<strong><code>Arc&lt;Mutex&lt;T&gt;&gt;</code></strong> and message-passing <strong>channels</strong>, where the <code>Mutex</code>
+holds the data it guards and joining or receiving yields the <code>Result</code> of Chapter 31 (&sect;32.4). We close by completing
+the Rust part and turning toward performance (&sect;32.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023), the Rustonomicon, and the official Rust error index, and are labeled as such.
+Nothing about Rust's behavior below is invented — it is cited.</p>
+
+<h2>32.1 The C data race, compiled and run</h2>
+
+<p>Here is the smallest interesting concurrency bug: two threads increment one shared counter, with no synchronization. Each
+<code>counter++</code> is a read-modify-write — load, add one, store — and if the two threads interleave between a load and its
+store, one update is lost (Chapter 24). Compiled and run in this environment (gcc 11.4.0), without optimization so each
+<code>++</code> is a real load/add/store:</p>
+
+<pre><code>static long counter = 0;                 /* shared, no lock */
+static void *bump(void *arg) {
+    for (int i = 0; i &lt; 2000000; i++) counter++;   /* a data race */
+    return NULL;
+}
+// main: create two threads running bump, join both, print counter
+
+$ gcc -O0 -Wall -pthread race.c -o race
+$ ./race
+expected 4000000, got 2453233                       # and a different number each run:
+$ ./race                                             #   2284135, 2799577, 2159965, ...
+expected 4000000, got 2284135</code></pre>
+
+<p>Two things to notice. First, it <em>compiled cleanly</em> — the data race is invisible to the C compiler; there is no rule in the
+language against two threads touching <code>counter</code> at once, only your discipline to add a lock. Second, the answer is
+<em>wrong and nondeterministic</em>: roughly two million of the four million increments vanished, and a different number vanishes
+each run, because the loss depends on the exact interleaving. This is the undefined behavior of Chapter 24 made concrete — the
+program has no defined meaning, so &ldquo;works in testing&rdquo; tells you nothing. The C fix is a mutex around
+<code>counter++</code>, which you must remember to place on <em>every</em> access; forget one and the race returns, silently. Rust's
+move is to make the sharing itself illegal unless it is synchronized — and to do it with the ordinary trait mechanism of Chapter
+30.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why did the &sect;32.1 program compile despite the data race? Why is the printed total both wrong and different each run, and
+which chapter's concept is that? What is the C fix, and what is its fragility? (Answer after the next section.)</p>
+</aside>
+
+<h2>32.2 <code>Send</code> and <code>Sync</code>: thread-safety as a trait</h2>
+
+<p>Rust encodes thread-safety in two <strong>marker traits</strong> — traits with no methods, which simply classify types.
+<strong><code>Send</code></strong> means a value of the type is safe to <em>transfer</em> (move) to another thread.
+<strong><code>Sync</code></strong> means it is safe to <em>share</em> a reference to the type across threads — precisely,
+<code>T</code> is <code>Sync</code> when <code>&amp;T</code> is <code>Send</code> (Rustonomicon, &ldquo;Send and Sync&rdquo;). They are
+<em>auto traits</em>: the compiler derives them structurally, so a struct is <code>Send</code> if all its fields are, and you almost
+never write them by hand. Most types are both; the important exceptions are the ones that would make a race possible. Crucially,
+<code>thread::spawn</code> requires its closure to be <code>Send</code> and <code>'static</code>, which is where the borrow rule of
+Chapter 28 crosses the thread boundary (Rust; not compiled here — behavior per the cited sources):</p>
+
+<pre><code>// thread::spawn's bound (simplified): the closure F must be Send and 'static
+pub fn spawn&lt;F&gt;(f: F) -&gt; JoinHandle&lt;...&gt; where F: FnOnce() + Send + 'static { ... }
+
+let data = vec![1, 2, 3];
+let handle = thread::spawn(move || {     // `move` gives the closure ownership of data
+    println!("{:?}", data);              // data is Send (Vec&lt;i32&gt; is Send), so this is allowed
+});
+handle.join().unwrap();                  // wait for the thread; join yields a Result</code></pre>
+
+<p>The bound <code>F: Send + 'static</code> is the whole guarantee in one line. <code>Send</code> ensures every value captured by
+the closure is safe to move to the new thread; <code>'static</code> ensures the closure holds no borrow that could dangle when the
+parent frame ends (Chapter 29). What the type system will not let you do is give two threads simultaneous mutable access to the same
+data without synchronization — because that would require sharing something that is not <code>Sync</code>, or aliasing a
+<code>&amp;mut</code>, both of which the borrow rules forbid. The <code>&sect;32.1</code> C race required exactly that unsynchronized
+shared mutation; in Rust it cannot be expressed. The reference-counting pointer <code>Rc&lt;T&gt;</code> from Chapter 30's world of
+smart pointers is the canonical <em>not-<code>Send</code></em> type: its reference count is a plain non-atomic integer, so sending an
+<code>Rc</code> to another thread could race on that count — and the compiler knows, because <code>Rc</code> is marked not
+<code>Send</code>.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define <code>Send</code> and <code>Sync</code> in one line each, and state the relationship between them. What two bounds does
+<code>thread::spawn</code> put on its closure, and what does each prevent? Why is <code>Rc</code> not <code>Send</code>? (Answer
+below the next section.)</p>
+</aside>
+
+<h2>32.3 The compiler stops the race: two named errors</h2>
+
+<p>Turn the &sect;32.1 race into Rust and it does not compile — in one of two ways, each a diagnostic you should learn to read. The
+first arises when a closure <em>borrows</em> local data and is handed to a thread that may outlive the borrow. The compiler reports
+<strong><code>E0373</code></strong>, &ldquo;closure may outlive the current function, but it borrows a value owned by the current
+function,&rdquo; and suggests the fix: <code>move</code>, to give the closure ownership instead of a borrow (Rust; not compiled here
+— behavior per the cited sources):</p>
+
+<pre><code>let v = vec![1, 2, 3];
+let h = thread::spawn(|| println!("{:?}", v));   // borrows v
+error[E0373]: closure may outlive the current function, but it borrows `v`,
+              which is owned by the current function
+help: to force the closure to take ownership, use the `move` keyword
+// fix: thread::spawn(move || println!("{:?}", v));</code></pre>
+
+<p>The second arises when you try to <em>share</em> a value that is not thread-safe. Suppose you reach for <code>Rc</code> to share
+a counter between threads: because <code>Rc</code> is not <code>Send</code>, the <code>Send</code> bound on <code>spawn</code>'s
+closure is unsatisfied, and the compiler reports <strong><code>E0277</code></strong> — the same trait-bound error as Chapters 30 and
+31 — with a message naming the exact missing capability (per the official Rust error index):</p>
+
+<pre><code>let count = Rc::new(Mutex::new(0));
+let h = thread::spawn(move || { *count.lock().unwrap() += 1; });   // Rc is !Send
+error[E0277]: `Rc&lt;Mutex&lt;i32&gt;&gt;` cannot be sent between threads safely
+note: the trait `Send` is not implemented for `Rc&lt;Mutex&lt;i32&gt;&gt;`
+// fix: use Arc (atomic reference count), which IS Send + Sync</code></pre>
+
+<p>This is what &ldquo;fearless&rdquo; means. The &sect;32.1 program that compiled and silently lost updates is, in Rust, a compile
+error that names the problem before the program runs — either &ldquo;this borrow could dangle, take ownership&rdquo;
+(<code>E0373</code>) or &ldquo;this type is not safe to send/share across threads&rdquo; (<code>E0277</code>). And both are ordinary
+consequences of machinery you already have: <code>E0373</code> is the lifetime rule of Chapter 29 applied to a closure that escapes
+to a thread; <code>E0277</code> is the trait-bound check of Chapter 30 applied to <code>Send</code>. The data race did not become
+easier to avoid by convention — it became impossible to write, because the type of the shared value refuses to cross the boundary
+unsynchronized.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: thread-safety is a trait the compiler checks, not a discipline you keep</span>
+<p><strong>1. In words.</strong> <code>Send</code> (safe to move to a thread) and <code>Sync</code> (safe to share across threads,
+i.e. <code>&amp;T</code> is <code>Send</code>) are auto traits the compiler derives structurally. <code>thread::spawn</code> requires
+its closure to be <code>Send + 'static</code>, so unsynchronized shared mutation — the &sect;32.1 race — cannot be expressed;
+attempting it is <code>E0373</code> (dangling borrow) or <code>E0277</code> (a non-<code>Send</code> type crossing threads).</p>
+<p><strong>2. As a picture.</strong> Figure 32.1: two threads reaching for one box of data; a &ldquo;<code>Send</code>/<code>Sync</code>
+gate&rdquo; on the boundary passes an <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> (thread-safe) and rejects a bare <code>&amp;mut</code> or
+an <code>Rc</code> with a red <code>E0277</code>/<code>E0373</code> stamp — versus C's boundary, which is wide open and lets the
+unlocked <code>counter++</code> through to a lost update.</p>
+<p><strong>3. As numbers/contrast.</strong> The C race of &sect;32.1 compiled and printed <code>2453233</code> of an expected
+<code>4000000</code> — a different wrong number each run. The Rust equivalent produces <em>zero</em> runs, wrong or right: it stops
+at compile time with <code>E0373</code> or <code>E0277</code>. A nondeterministic runtime corruption becomes a deterministic message
+before execution.</p>
+</aside>
+
+<p><em>(Answer to the &sect;32.1 quick check: it compiled because C has no rule against two threads touching shared mutable state —
+the data race is invisible to the compiler, only to your discipline. The total is wrong because increments interleave and lose
+updates, and different each run because the loss depends on the nondeterministic interleaving — the undefined behavior of Chapter
+24. The C fix is a mutex around every access to <code>counter</code>; its fragility is that you must remember it on every access,
+and one omission silently reintroduces the race.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Send/Sync gate the thread boundary; only thread-safe sharing gets through.</text>
+<rect x="20" y="46" width="90" height="26" fill="#f5f8fb" stroke="#14406b"/><text x="34" y="63" font-size="9">thread A</text>
+<rect x="20" y="120" width="90" height="26" fill="#f5f8fb" stroke="#14406b"/><text x="34" y="137" font-size="9">thread B</text>
+<line x1="300" y1="30" x2="300" y2="185" stroke="#14406b" stroke-dasharray="4,3"/>
+<text x="250" y="30" font-size="8" fill="#14406b">Send/Sync gate</text>
+<rect x="330" y="80" width="150" height="30" fill="#dfeee0" stroke="#2f7d32"/><text x="342" y="99" font-size="9">Arc&lt;Mutex&lt;T&gt;&gt; — OK</text>
+<line x1="110" y1="59" x2="330" y2="90" stroke="#2f7d32" marker-end="url(#sa)"/>
+<line x1="110" y1="133" x2="330" y2="100" stroke="#2f7d32" marker-end="url(#sa)"/>
+<rect x="330" y="130" width="150" height="26" fill="#fdeee6" stroke="#8c3a1d"/><text x="342" y="147" font-size="8">&amp;mut / Rc — rejected</text>
+<text x="330" y="172" font-size="8" fill="#8c3a1d">E0373 (dangling borrow) / E0277 (not Send)</text>
+<text x="330" y="60" font-size="8" fill="#2f7d32">atomic refcount + lock:</text><text x="330" y="72" font-size="8" fill="#2f7d32">Send + Sync</text>
+<defs>
+<marker id="sa" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#2f7d32"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 32.1: The <code>Send</code>/<code>Sync</code> gate on the thread boundary. A thread-safe
+<code>Arc&lt;Mutex&lt;T&gt;&gt;</code> passes; a bare <code>&amp;mut</code> or a non-<code>Send</code> <code>Rc</code> is rejected at
+compile time with <code>E0373</code> or <code>E0277</code>. C's boundary has no gate, so the unsynchronized <code>counter++</code> of
+&sect;32.1 goes through to a lost update.</figcaption>
+</figure>
+
+<h2>32.4 Sharing safely: <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> and channels</h2>
+
+<p>Two patterns cover most shared state. The first is <strong>shared mutable state behind a lock</strong>. To share ownership of a
+value across threads you wrap it in <strong><code>Arc&lt;T&gt;</code></strong> — an <em>atomic</em> reference-counted pointer, the
+<code>Send + Sync</code> sibling of <code>Rc</code> whose count is updated with the atomics of Chapter 22 — and to mutate it you wrap
+the inner value in <strong><code>Mutex&lt;T&gt;</code></strong>. The decisive difference from Chapter 20's C mutex is that Rust's
+<code>Mutex</code> <em>owns the data it guards</em>: there is no way to reach the value without calling <code>lock()</code>, which
+returns a guard granting access and releases the lock automatically when the guard is dropped (Rust; not compiled here — behavior
+per the cited book):</p>
+
+<pre><code>let counter = Arc::new(Mutex::new(0));           // shared, lock bundled with the data
+let mut handles = vec![];
+for _ in 0..10 {
+    let c = Arc::clone(&amp;counter);               // bump the atomic refcount; move the clone
+    handles.push(thread::spawn(move || {
+        let mut n = c.lock().unwrap();           // acquire lock; `n` is a guard, not an int
+        *n += 1;                                 // the ONLY way to the data is through the lock
+    }));                                         // guard dropped here -&gt; lock released
+}
+for h in handles { h.join().unwrap(); }
+// *counter.lock().unwrap() == 10, deterministically — no lost updates</code></pre>
+
+<p>Because the integer lives <em>inside</em> the <code>Mutex</code>, the Chapter 20 mistake of accessing shared data without holding
+its lock is not a discipline you maintain — it is unrepresentable, since the only handle to the data is the guard <code>lock()</code>
+hands back. Two threads of Chapter 31 also reappear here: <code>lock()</code> returns a <code>Result</code> because a <code>Mutex</code>
+becomes <em>poisoned</em> if a thread panics while holding it (so the <code>unwrap()</code> is you deciding a poisoned lock is
+unrecoverable), and <code>join()</code> returns a <code>Result</code> whose <code>Err</code> carries a panicked thread's payload.
+The second pattern is <strong>message passing</strong>: rather than share memory, threads communicate over a <strong>channel</strong>
+(<code>std::sync::mpsc</code>), where sending a value <em>moves</em> its ownership down the channel (Chapter 27), so the sender can no
+longer touch it and there is nothing to race on. Receiving returns a <code>Result</code> — <code>Err</code> when the sending end has
+hung up. Both patterns turn Chapter 24's shared-memory hazards into ownership and type problems the compiler checks.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: <code>unsafe impl Send</code> to silence <code>E0277</code>, and treating <code>Mutex</code> as deadlock-proof</span>
+<p>Two failure modes, one at each end of caution. The first is over-riding the compiler: seeing <code>error[E0277]: Rc&lt;...&gt;
+cannot be sent between threads safely</code> and writing <code>unsafe impl Send for MyType {}</code> to make it compile. That does
+not make the type thread-safe; it <em>asserts</em> to the compiler that it is, switching off the exact check that was protecting you
+and reintroducing the &sect;32.1 race with a signed confession (<code>unsafe</code>) attached. The right fix is almost always to use
+the thread-safe type — <code>Arc</code> for <code>Rc</code>, an atomic for a plain counter — not to claim <code>Send</code> you have
+not earned. The second failure is the opposite complacency: assuming <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> makes concurrency
+&ldquo;safe&rdquo; in every sense. It abolishes <em>data races</em> — unsynchronized access is impossible — but it does <em>not</em>
+abolish the higher-level hazards of Chapter 20: two locks acquired in opposite orders by two threads still <strong>deadlock</strong>,
+and holding a <code>Mutex</code> across a long or blocking operation still serializes everything (Chapter 26's contention). Rust
+guarantees you locked the data; it does not guarantee your <em>lock ordering</em> or <em>granularity</em> is sane. Fearless means no
+data races, not no concurrency bugs.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;&lsquo;Fearless concurrency&rsquo; is marketing. A mutex is a mutex; Rust just
+makes me fight the borrow checker across threads, and I can deadlock in Rust same as in C. What does it actually buy me?&rdquo; Cover
+the paragraph and respond in four or five sentences, drawing on &sect;32.1&ndash;&sect;32.4.</p>
+<p><em>Model answer.</em> &ldquo;It buys you exactly one thing, and it's the thing that ruins your week: it makes <em>data races</em>
+— unsynchronized access to shared mutable state — a compile error instead of undefined behavior. The C version in &sect;32.1
+compiled fine and printed a different wrong number every run; the Rust version won't compile until the shared thing is
+<code>Send</code>/<code>Sync</code>, which in practice means you wrapped it in <code>Arc&lt;Mutex&gt;</code> or an atomic — so
+&lsquo;I forgot to lock this one access&rsquo; is unrepresentable, because the data lives inside the lock. You're right that it does
+<em>not</em> save you from deadlock or from holding a lock too long — those are lock-ordering and granularity bugs, not data races,
+and Rust doesn't check them. So the honest claim is narrow but huge: the entire category of nondeterministic memory-corruption
+concurrency bugs, the ones that pass tests and page you at 3 a.m., is gone at compile time; the logical concurrency bugs are still
+yours to design around.&rdquo; Naming precisely what Rust does and does not guarantee — races yes, deadlock no — is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;32.2 quick check: <code>Send</code> means a value is safe to move to another thread;
+<code>Sync</code> means it is safe to share a reference across threads, i.e. <code>T: Sync</code> exactly when <code>&amp;T: Send</code>.
+<code>thread::spawn</code> bounds its closure <code>Send + 'static</code>: <code>Send</code> so every captured value can move to the
+new thread, <code>'static</code> so the closure holds no borrow that could dangle after the parent returns. <code>Rc</code> is not
+<code>Send</code> because its reference count is a non-atomic integer, so sending it across threads could race on that count.)</em></p>
+
+<h2>32.5 What to carry forward</h2>
+
+<p>Fearless concurrency is the last application of the pattern this whole part has repeated: name a property in the type system and
+let the compiler enforce it. A <strong>data race</strong> — the undefined behavior of Chapter 24 — is prevented not by discipline
+but by two marker traits: <strong><code>Send</code></strong> (safe to move to a thread) and <strong><code>Sync</code></strong> (safe
+to share across threads, <code>&amp;T: Send</code>), auto-derived structurally, required by <code>thread::spawn</code> as
+<code>Send + 'static</code>. Attempting the unsynchronized sharing of &sect;32.1 is a compile error — <strong><code>E0373</code></strong>
+(a borrow that would outlive its owner, fixed by <code>move</code>) or <strong><code>E0277</code></strong> (a non-<code>Send</code>
+type crossing threads, fixed by the thread-safe type). Safe sharing uses <strong><code>Arc&lt;Mutex&lt;T&gt;&gt;</code></strong>,
+where the <code>Mutex</code> owns the data so it cannot be touched without the lock, or <strong>channels</strong>, where sending
+moves ownership so there is nothing to race on — with poisoning and hang-ups surfacing as the <code>Result</code>s of Chapter 31. And
+the guarantee is honest about its edge: it kills data races, not deadlock or contention.</p>
+
+<p>That completes the Rust part, and with it the argument the last six chapters have been making. Across the C volumes you proved
+invariants by hand: memory freed exactly once and used only while valid, references that never dangle, shared state accessed only
+under a lock, no data races. Rust encodes each as something the compiler checks — <strong>ownership and moves</strong> (Chapter 27),
+<strong>borrowing</strong> (Chapter 28), <strong>lifetimes</strong> (Chapter 29), <strong>traits and generics</strong> (Chapter 30),
+<strong>error handling</strong> (Chapter 31), and now <strong>data-race freedom</strong> — all with the same machine underneath and,
+after monomorphization and lifetime erasure, the same generated code. What Rust does <em>not</em> give you is speed: a memory-safe,
+race-free program can still be slow, cache-hostile, and blocked on I/O. The next part turns to that. It opens with the discipline
+the whole book has implied and never stated outright — <strong>measure before you optimize</strong> — because the cost model of
+Chapter 5 is only useful if you can see where the time actually goes. Safety was the compiler's job; performance is yours, and it
+starts with a profiler, not a guess.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why the &sect;32.1 C program compiled yet printed a wrong, different-each-run total.</li>
+<li>Define <code>Send</code> and <code>Sync</code> and state the relationship between them.</li>
+<li>Say what bounds <code>thread::spawn</code> puts on its closure and what each prevents.</li>
+<li>Name the two compile errors that stop the race (<code>E0373</code>, <code>E0277</code>) and the fix for each.</li>
+<li>Explain how <code>Mutex&lt;T&gt;</code> owning its data makes &ldquo;access without the lock&rdquo; unrepresentable.</li>
+<li>State precisely what fearless concurrency does and does not guarantee (races vs. deadlock).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why did the &sect;32.1 program compile, and why is its output wrong and nondeterministic? (&sect;32.1)</li>
+<li><strong>R2.</strong> Define <code>Send</code> and <code>Sync</code>; what does <code>thread::spawn</code> require, and why is <code>Rc</code> not <code>Send</code>? (&sect;32.2)</li>
+<li><strong>R3.</strong> What do <code>E0373</code> and <code>E0277</code> each report in the concurrency setting, and what fixes each? (&sect;32.3)</li>
+<li><strong>R4.</strong> How does <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> make unsynchronized access impossible, and where does <code>Result</code> appear? (&sect;32.4)</li>
+<li><strong>R5.</strong> What does fearless concurrency guarantee, and what class of concurrency bug does it <em>not</em> prevent? (&sect;32.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 16
+&ldquo;Fearless Concurrency&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source for
+<code>thread::spawn</code>, the <code>move</code> closure, <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>, channels, and
+<code>Send</code>/<code>Sync</code> of &sect;32.2&ndash;&sect;32.4; ch. 15 covers <code>Rc</code>/smart pointers.
+Authors, edition, and chapter numbers verified via the publisher and the online book; not compiled here.</li>
+<li><strong>The Rustonomicon, &ldquo;Send and Sync&rdquo; (<code>doc.rust-lang.org/nomicon/send-and-sync.html</code>).</strong> The
+authoritative account of the two marker traits used in &sect;32.2: what each means, why they are auto traits derived structurally,
+and why <code>Rc</code> opts out. Reference for the exact semantics; verify against the current edition.</li>
+<li><strong>The Rust Error Index, entries <code>E0373</code> and <code>E0277</code> (<code>doc.rust-lang.org/error_codes</code>).</strong>
+The official meanings used in &sect;32.3: <code>E0373</code> &ldquo;closure may outlive the current function&hellip; use the
+<code>move</code> keyword,&rdquo; and <code>E0277</code> for an unsatisfied <code>Send</code> bound (&ldquo;cannot be sent between
+threads safely&rdquo;). Both verified against the current error index.</li>
+<li><strong>Jung, Jourdan, Krebbers &amp; Dreyer, &ldquo;RustBelt: Securing the Foundations of the Rust Programming Language,&rdquo;
+<em>Proc. ACM on Programming Languages</em> 2(POPL), Article 66 (2018), DOI 10.1145/3158154.</strong> The formal proof that Rust's
+type system — including <code>Send</code>/<code>Sync</code> and the aliasing discipline — actually guarantees data-race freedom.
+First author Ralf Jung; verified via the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex32.1"><span class="ex-label">32.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define <code>Send</code> and <code>Sync</code>, and state the relationship between them.</div>
+
+<div class="exercise" id="ex32.2"><span class="ex-label">32.2</span> <span class="ex-tag warm">warm-up</span>
+What is a data race, and what is its status in C (per Chapter 24)? What is its status in safe Rust?</div>
+
+<div class="exercise" id="ex32.3"><span class="ex-label">32.3</span> <span class="ex-tag warm">warm-up</span>
+What does the <code>move</code> keyword do to a closure passed to <code>thread::spawn</code>, and which error does its absence often cause?</div>
+
+<div class="exercise" id="ex32.4"><span class="ex-label">32.4</span> <span class="ex-tag core">core</span>
+Take the C of &sect;32.1. (a) Why did it compile despite the data race? (b) Explain, in read-modify-write terms, why the total is
+both too low and different each run. (c) State the C fix and one way it is fragile that Rust's approach is not.</div>
+
+<div class="exercise" id="ex32.5"><span class="ex-label">32.5</span> <span class="ex-tag core">core</span>
+Explain how <code>thread::spawn</code>'s bound <code>F: Send + 'static</code> prevents the &sect;32.1 race. (a) What does the
+<code>Send</code> part rule out? (b) What does the <code>'static</code> part rule out, and which chapter's concept is that? (c) Why
+does trying to share an <code>Rc</code> across threads violate the <code>Send</code> part specifically?</div>
+
+<div class="exercise" id="ex32.6"><span class="ex-label">32.6</span> <span class="ex-tag core">core</span>
+Contrast <code>E0373</code> and <code>E0277</code> as they appear in concurrent code. (a) What does each report, and what borrowing/
+trait concept from earlier chapters is each an instance of? (b) Give the standard fix for each. (c) Why is
+<code>unsafe impl Send</code> the wrong fix for <code>E0277</code> here?</div>
+
+<div class="exercise" id="ex32.7"><span class="ex-label">32.7</span> <span class="ex-tag complexity">cost</span>
+Weigh <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> against message passing for a shared counter updated by many threads. (a) What does the
+<code>Mutex</code> approach cost per update, and what Chapter 26 hazard grows as thread count rises? (b) What does the channel
+approach cost, and what does moving ownership down the channel buy you? (c) For a high-contention counter specifically, name a third
+option from Chapter 22 that avoids a lock entirely, and say when you would still prefer the <code>Mutex</code>.</div>
+
+<div class="exercise" id="ex32.8"><span class="ex-label">32.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer shares a counter with <code>let c = Rc::new(Mutex::new(0));</code> and
+spawns threads that each do <code>let cc = c.clone(); thread::spawn(move || *cc.lock().unwrap() += 1);</code>, getting
+<code>error[E0277]: `Rc&lt;Mutex&lt;i32&gt;&gt;` cannot be sent between threads safely</code>.
+<br><strong>Step 1 (given):</strong> <code>thread::spawn</code> requires the closure — and thus everything it captures — to be <code>Send</code>.
+<br><strong>Step 2 (given):</strong> <code>Rc</code> is not <code>Send</code> because its reference count is non-atomic, so the bound fails: <code>E0277</code>.
+<br><strong>Step 3 (given):</strong> the fix is a shared pointer whose count is atomic and which is therefore <code>Send + Sync</code>.
+<br><strong>Step 4 (you):</strong> Name the replacement type, rewrite the two changed lines, and explain why this is a real fix
+whereas <code>unsafe impl Send for ...</code> would only silence the check.</div>
+
+<div class="exercise" id="ex32.9"><span class="ex-label">32.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether it is prevented by safe Rust's type system, and if so how (or if not, why not): (a) two threads incrementing a
+shared <code>i32</code> with no synchronization; (b) two threads acquiring locks <code>A</code> then <code>B</code> vs. <code>B</code>
+then <code>A</code> (deadlock); (c) sending an <code>Rc</code> to another thread; (d) holding a <code>Mutex</code> guard across a
+slow network call (serializing everyone).</div>
+
+<div class="exercise" id="ex32.10"><span class="ex-label">32.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;<code>Send</code> and <code>Sync</code> have
+methods you implement.&rdquo; (b) &ldquo;A Rust <code>Mutex</code> can be unlocked-and-accessed like C's, with the data separate
+from the lock.&rdquo; (c) &ldquo;<code>Arc</code> is just <code>Rc</code> with an atomic reference count.&rdquo; (d)
+&ldquo;Fearless concurrency prevents deadlock.&rdquo; (e) &ldquo;Sending a value down a channel copies it and leaves the sender a
+usable copy.&rdquo;</div>
+
+<div class="exercise" id="ex32.11"><span class="ex-label">32.11</span> <span class="ex-tag stretch">stretch</span>
+&ldquo;A guarantee in Rust is usually a trait.&rdquo; Tie the whole part together. (a) Show how <code>Send</code>/<code>Sync</code>
+lift the Chapter 28 borrow rule (aliasing XOR mutation) across the thread boundary — what would sharing a <code>&amp;mut</code>
+between two threads violate? (b) Explain why the concurrency errors reuse the <em>same</em> error code (<code>E0277</code>) as an
+unmet bound in Chapter 30 and a misused <code>?</code> in Chapter 31. (c) In two sentences, state the through-line of Chapters
+27&ndash;32: what did the C volumes make you prove by hand, and what does Rust do with each such proof?</div>
+
+<div class="exercise" id="ex32.12"><span class="ex-label">32.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile the &sect;32.1 <code>race.c</code> at
+<code>-O0</code> and run it several times; record the totals and confirm they are below <code>4000000</code> and vary. Then compile
+at <code>-O2</code> and note whether the race still manifests, and hypothesize why the optimizer changed the outcome. (b) Add a
+<code>pthread_mutex_t</code> around <code>counter++</code> and confirm the total becomes exactly <code>4000000</code>. (c) If you
+have <code>rustc</code>, write the <code>Arc&lt;Mutex&lt;i32&gt;&gt;</code> version from &sect;32.4 and confirm it is deterministic;
+then try the <code>Rc</code> version and observe <code>E0277</code>. Without <code>rustc</code>, explain from this chapter which line
+each error points at. Note your toolchain versions.</div>
+
+</section>
+</section>

@@ -1,0 +1,115 @@
+<section class="solutions" id="sol32">
+<h1>Chapter 32 — Solutions</h1>
+
+<div class="solution" id="sol32.1"><span class="sol-label">32.1</span>
+<code>Send</code> means a value of the type is safe to <em>move</em> (transfer) to another thread; <code>Sync</code> means it is safe
+to <em>share</em> a reference to it across threads. The relationship: <code>T: Sync</code> exactly when <code>&amp;T: Send</code>.
+<em>Tempting wrong answer:</em> &ldquo;<code>Send</code> is for moving and <code>Sync</code> is for locking&rdquo; — <code>Sync</code>
+is about shared references being sendable, not about acquiring locks. <strong>Feed-forward:</strong> &sect;32.2.</div>
+
+<div class="solution" id="sol32.2"><span class="sol-label">32.2</span>
+A <strong>data race</strong> is two threads accessing the same memory concurrently, at least one writing, with no synchronization
+ordering the accesses. In C (and C++) it is <em>undefined behavior</em> (Chapter 24). In safe Rust it cannot occur: the type system
+(the <code>Send</code>/<code>Sync</code> bounds plus the borrow rules) rejects the unsynchronized sharing at compile time.
+<em>Tempting wrong answer:</em> &ldquo;a data race just gives a wrong answer&rdquo; — in C it is UB, so the program has no defined
+meaning at all, not merely a wrong number. <strong>Feed-forward:</strong> &sect;32.1, &sect;32.3.</div>
+
+<div class="solution" id="sol32.3"><span class="sol-label">32.3</span>
+<code>move</code> forces the closure to take <em>ownership</em> of the variables it uses rather than borrowing them, so the data
+lives as long as the thread. Without it, a closure that borrows a local and is handed to a thread that may outlive the borrow draws
+<code>error[E0373]</code> (&ldquo;closure may outlive the current function&rdquo;). <em>Tempting wrong answer:</em>
+&ldquo;<code>move</code> copies the captured data&rdquo; — it transfers ownership (a move), which for non-<code>Copy</code> types
+invalidates the original. <strong>Feed-forward:</strong> &sect;32.3.</div>
+
+<div class="solution" id="sol32.4"><span class="sol-label">32.4</span>
+(a) It compiled because C has no rule against two threads touching shared mutable state; the data race is invisible to the compiler.
+(b) Each <code>counter++</code> is load&ndash;add&ndash;store; when two threads read the same value before either stores, one
+increment overwrites the other and is lost, so the total is below <code>4000000</code>, and because the interleaving is
+nondeterministic the exact loss differs each run. (c) The C fix is a mutex around every access to <code>counter</code>; it is
+fragile because it relies on you remembering the lock at <em>every</em> access site — one omission silently reintroduces the race,
+whereas Rust makes the unsynchronized access unrepresentable. <em>Tempting wrong answer:</em> &ldquo;the total is low because the
+loop ran too few times&rdquo; — the loop ran fully; updates were lost to interleaving. <strong>Feed-forward:</strong> &sect;32.1,
+&sect;32.4.</div>
+
+<div class="solution" id="sol32.5"><span class="sol-label">32.5</span>
+(a) <code>Send</code> rules out moving into the new thread any value that is not safe to transfer across threads — including any
+setup that would give two threads unsynchronized mutable access. (b) <code>'static</code> rules out the closure holding a borrow of
+data owned by the parent frame, which could dangle once the parent returns — the lifetime rule of Chapter 29. (c) An <code>Rc</code>
+is not <code>Send</code> (non-atomic refcount), so capturing it in a <code>spawn</code> closure leaves the closure non-<code>Send</code>
+and the bound fails. <em>Tempting wrong answer:</em> &ldquo;<code>'static</code> means the thread runs forever&rdquo; —
+<code>'static</code> bounds the <em>lifetime of borrows</em> the closure may hold, not the thread's duration.
+<strong>Feed-forward:</strong> &sect;32.2.</div>
+
+<div class="solution" id="sol32.6"><span class="sol-label">32.6</span>
+(a) <code>E0373</code> reports that a closure would outlive a value it borrows — an instance of the Chapter 28&ndash;29
+borrowing/lifetime rules applied to a closure escaping to a thread; <code>E0277</code> reports an unsatisfied <code>Send</code> (or
+<code>Sync</code>) bound — an instance of the Chapter 30 trait-bound check applied to <code>Send</code>. (b) Fix <code>E0373</code>
+with <code>move</code> (take ownership); fix <code>E0277</code> by using the thread-safe type (<code>Arc</code> for <code>Rc</code>,
+an atomic for a plain counter). (c) <code>unsafe impl Send</code> merely <em>asserts</em> thread-safety the type does not have,
+disabling the check and reintroducing the race — an unearned promise, not a fix. <em>Tempting wrong answer:</em>
+&ldquo;<code>E0373</code> and <code>E0277</code> are the same borrow error&rdquo; — one is a lifetime/borrow problem, the other a
+trait-bound problem, with different fixes. <strong>Feed-forward:</strong> &sect;32.3.</div>
+
+<div class="solution" id="sol32.7"><span class="sol-label">32.7</span>
+(a) The <code>Mutex</code> costs a lock acquire/release per update; as thread count rises, <strong>lock contention</strong>
+(Chapter 26) grows and can serialize the threads, throttling throughput. (b) The channel costs a send/receive and the move of the
+value; moving ownership down the channel means the sender can no longer touch the value, so there is nothing to race on and no lock
+to contend. (c) For a high-contention counter, an <strong>atomic</strong> (Chapter 22, e.g. a lock-free
+<code>fetch_add</code>) avoids the lock entirely; you would still prefer the <code>Mutex</code> when each update touches
+<em>multiple</em> fields that must change together atomically, which a single atomic cannot express. <em>Tempting wrong answer:</em>
+&ldquo;channels are always faster than a mutex&rdquo; — for a single hot counter an atomic or even a mutex may beat channel
+overhead; it depends on the access pattern. <strong>Feed-forward:</strong> &sect;32.4.</div>
+
+<div class="solution" id="sol32.8"><span class="sol-label">32.8</span>
+<strong>Step 4:</strong> Replace <code>Rc</code> with <strong><code>Arc</code></strong>: <code>let c = Arc::new(Mutex::new(0));</code>
+and, inside the loop, <code>let cc = Arc::clone(&amp;c);</code> before the <code>move</code> closure. This is a real fix because
+<code>Arc</code>'s reference count is updated with atomic operations, so it is genuinely safe to send/share across threads and
+therefore <code>Send + Sync</code> — the bound is now satisfied by fact, not by fiat. <code>unsafe impl Send for ...</code> would
+instead assert <code>Send</code> for the non-atomic <code>Rc</code>, switching off the check while the underlying refcount race
+remains — silencing the diagnostic without removing the bug. <em>Tempting wrong answer:</em> &ldquo;wrap the <code>Rc</code> in a
+<code>Mutex</code> too&rdquo; — the problem is the non-atomic refcount of <code>Rc</code> itself, not the interior value; you need
+<code>Arc</code>. <strong>Feed-forward:</strong> &sect;32.3.</div>
+
+<div class="solution" id="sol32.9"><span class="sol-label">32.9</span>
+(a) <strong>Prevented</strong> — sharing an <code>i32</code> mutably across threads requires either a non-<code>Sync</code> share or
+aliasing a <code>&amp;mut</code>, both rejected; you must use a <code>Mutex</code>/atomic. (b) <strong>Not prevented</strong> —
+deadlock from opposite lock-ordering is a logical bug, not a data race; the type system does not analyze lock order. (c)
+<strong>Prevented</strong> — <code>Rc</code> is not <code>Send</code>, so sending it across threads is <code>E0277</code>. (d)
+<strong>Not prevented</strong> — holding a guard across a slow call is safe (no race) but a contention/granularity problem the
+compiler does not flag. <em>Method-selection cue:</em> data races (unsynchronized shared mutation) are prevented; higher-level bugs
+(deadlock, contention, granularity) are not. <strong>Feed-forward:</strong> &sect;32.3, &sect;32.4.</div>
+
+<div class="solution" id="sol32.10"><span class="sol-label">32.10</span>
+(a) <strong>False</strong> — <code>Send</code>/<code>Sync</code> are marker (auto) traits with no methods, derived structurally. (b)
+<strong>False</strong> — Rust's <code>Mutex</code> <em>owns</em> the data; the only way to the value is through <code>lock()</code>,
+so lock and data are not separable. (c) <strong>True</strong> — <code>Arc</code> is <code>Rc</code> with an atomic reference count,
+making it <code>Send + Sync</code>. (d) <strong>False</strong> — it prevents data races, not deadlock. (e) <strong>False</strong> —
+sending <em>moves</em> ownership; the sender can no longer use the value. <em>Tempting wrong answer:</em> marking (b) true by analogy
+to C's separate <code>pthread_mutex_t</code> — Rust deliberately bundles the data inside the <code>Mutex</code>.
+<strong>Feed-forward:</strong> &sect;32.2&ndash;&sect;32.4.</div>
+
+<div class="solution" id="sol32.11"><span class="sol-label">32.11</span>
+(a) <code>Send</code>/<code>Sync</code> extend aliasing-XOR-mutation across threads: sharing a <code>&amp;mut</code> between two
+threads would create two mutable paths to one value at once (aliased mutation), which is exactly what the borrow rule forbids and
+what would be a data race — so it does not type-check. (b) All three are <em>trait-bound</em> failures: an unmet generic bound
+(Chapter 30), a <code>?</code> in a function that cannot absorb the error (Chapter 31, an unmet residual/<code>From</code> bound),
+and a non-<code>Send</code> type crossing threads (here) are all &ldquo;a required trait is not implemented,&rdquo; which is
+<code>E0277</code>. (c) The C volumes made you prove by hand that memory is freed once and used while valid, references never
+dangle, and shared state is never raced on; Rust turns each such proof into a type-system rule the compiler checks (ownership,
+borrowing, lifetimes, <code>Send</code>/<code>Sync</code>) — same machine, same generated code, proof automated.
+<em>Tempting wrong answer:</em> &ldquo;the reused error code is a coincidence&rdquo; — it reflects that thread-safety, error
+propagation, and generic reuse are all expressed as trait requirements. <strong>Feed-forward:</strong> &sect;32.5; Chapters
+27&ndash;31.</div>
+
+<div class="solution" id="sol32.12"><span class="sol-label">32.12</span>
+Toolchain-specific. A correct write-up reports: (a) at <code>-O0</code> the totals are below <code>4000000</code> and differ run to
+run (e.g. ~2.1&ndash;2.8 million), since each <code>++</code> is a real load/add/store with a wide race window; at <code>-O2</code>
+the optimizer may collapse the loop into a single register update, shrinking the window so the race often does not manifest — a
+reminder that a data race is UB and its observable effect depends on optimization and scheduling. (b) A
+<code>pthread_mutex_t</code> around <code>counter++</code> makes the total exactly <code>4000000</code>, deterministically. (c) With
+<code>rustc</code>, the <code>Arc&lt;Mutex&lt;i32&gt;&gt;</code> version is deterministic; the <code>Rc</code> version fails with
+<code>E0277</code> on the <code>spawn</code> capturing the non-<code>Send</code> <code>Rc</code>. Without <code>rustc</code>, name
+that line. <em>Tempting wrong answer:</em> &ldquo;<code>-O2</code> printing <code>4000000</code> proves the race is gone&rdquo; — it
+proves only that the window closed this time; the program is still UB. <strong>Feed-forward:</strong> &sect;32.1, &sect;32.4.</div>
+
+</section>

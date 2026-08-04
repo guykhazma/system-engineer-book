@@ -1,0 +1,107 @@
+<section class="solutions" id="sol33">
+<h1>Chapter 33 — Solutions</h1>
+
+<div class="solution" id="sol33.1"><span class="sol-label">33.1</span>
+&ldquo;Measure before you optimize&rdquo;: locate the real cost by measurement before spending effort, because bottlenecks are rarely
+where intuition says. A <strong>profiler</strong> tells you <em>which</em> code spends the runtime (find the target); a
+<strong>benchmark</strong> compares two versions of a known piece of code honestly (evaluate a fix). <em>Tempting wrong answer:</em>
+&ldquo;profiling and benchmarking are the same thing&rdquo; — profiling finds the hot spot across a whole program; benchmarking
+times a specific candidate. <strong>Feed-forward:</strong> &sect;33.1, &sect;33.4.</div>
+
+<div class="solution" id="sol33.2"><span class="sol-label">33.2</span>
+Because the loop's result is never used, so at <code>-O2</code> the optimizer proves the loop has no observable effect and deletes
+it entirely (Chapter 10) — nothing runs, so the timer reads <code>0.0000&nbsp;s</code>. <em>Tempting wrong answer:</em> &ldquo;the
+CPU is just that fast&rdquo; — a billion iterations are not free; they did not happen. <strong>Feed-forward:</strong> &sect;33.2.</div>
+
+<div class="solution" id="sol33.3"><span class="sol-label">33.3</span>
+A single run is disturbed by the scheduler, cache/TLB state, frequency scaling, and other tenants, so its time is noisy; running
+many trials and reporting the minimum (or median) gives the run least disturbed by outside interference — closest to the code's
+intrinsic cost — and you report the spread too. <em>Tempting wrong answer:</em> &ldquo;average the runs&rdquo; — the mean is dragged
+up by one-directional outliers (interference only slows a run), so the minimum is a more principled floor. <strong>Feed-forward:</strong>
+&sect;33.3.</div>
+
+<div class="solution" id="sol33.4"><span class="sol-label">33.4</span>
+(a) At most 6.4% — perfectly optimizing a 6.4%-of-runtime part caps its whole-program payoff at 6.4% (Amdahl). (b) 0.30 &times;
+93.6% = 28.1% of total runtime. (c) It violates &sect;33.1 because effort was spent on the part that mathematically cannot matter
+(&le;6.4%) while the 93.6% dominant cost went untouched — and the target was chosen by how the code &ldquo;looks&rdquo; rather than
+by a profile. <em>Tempting wrong answer:</em> &ldquo;optimizing <code>parse</code> is fine because every bit helps&rdquo; — Amdahl
+bounds &ldquo;every bit&rdquo; at 6.4%, a poor return versus <code>compute</code>. <strong>Feed-forward:</strong> &sect;33.1,
+&sect;33.4.</div>
+
+<div class="solution" id="sol33.5"><span class="sol-label">33.5</span>
+(a) When the loop's result is never observed, the compiler may delete it — the Chapter 10 principle that computations with no
+observable effect can be removed. (b) Make the result observable: print it as a checksum, or write it to a <code>volatile</code> (or
+a compiler-opaque sink). (c) Because the debug (<code>-O0</code>) build's costs are not the release build's — you must measure the
+code as it will actually be compiled and shipped, or the number describes a program you are not deploying.
+<em>Tempting wrong answer:</em> &ldquo;add a <code>printf</code> inside the loop&rdquo; — that dominates the timing with I/O; consume
+the result once, after the loop. <strong>Feed-forward:</strong> &sect;33.2.</div>
+
+<div class="solution" id="sol33.6"><span class="sol-label">33.6</span>
+(a) An instrumenting profiler inserts counting/timing code at function entry and exit (exact call counts); a sampling profiler
+interrupts the program many times per second and records the program counter, building a statistical map. (b) Instrumentation
+perturbs timing and can badly distort tiny, hot functions whose own cost is dwarfed by the added instrumentation; sampling has
+negligible overhead but is statistical (needs enough samples for accuracy). (c) For a first look at a large program without
+recompiling, reach for the <strong>sampling</strong> profiler — low overhead, no rebuild, and it points at the dominant cost.
+<em>Method-selection cue:</em> exact counts on specific calls &rarr; instrumenting; low-overhead whole-program map &rarr; sampling.
+<strong>Feed-forward:</strong> &sect;33.4.</div>
+
+<div class="solution" id="sol33.7"><span class="sol-label">33.7</span>
+(a) Three sources: the OS scheduler preempting the process (as in trial 4); cache/TLB and branch-predictor state differing between
+runs; and CPU frequency scaling (turbo/thermal) plus contention from other tenants. (b) Interference only ever makes a run
+<em>slower</em> — there is no mechanism that makes identical work finish faster than its intrinsic cost — so the minimum is the
+closest estimate of that intrinsic floor, whereas the mean is pulled upward by outliers. (c) The median is better when you care about
+<em>typical</em> behavior under realistic interference (e.g. tail-aware service work) rather than the best case; alongside either,
+always report the spread (range or a percentile) so the reader sees the variance. <em>Tempting wrong answer:</em> &ldquo;discard the
+outlier and average the rest&rdquo; — arbitrary trimming hides real variance; report the minimum/median and the spread instead.
+<strong>Feed-forward:</strong> &sect;33.3.</div>
+
+<div class="solution" id="sol33.8"><span class="sol-label">33.8</span>
+<strong>Step 4:</strong> Accumulate the hash results and consume the accumulator once after the loop, and vary the input so the call
+is not loop-invariant, e.g. <code>unsigned long acc = 0; for (i=0;i&lt;N;i++) acc ^= hash(key[i]); // vary input</code> then
+<code>printf("%lu\n", acc);</code> (or write <code>acc</code> to a <code>volatile</code>). This makes the work observable so the
+optimizer cannot delete it, and the varying <code>key[i]</code> defeats constant-folding/hoisting. Before trusting the number:
+time with <code>clock_gettime(CLOCK_MONOTONIC, ...)</code> at the shipping optimization level, warm up once, run several trials, and
+report the minimum and spread. <em>Tempting wrong answer:</em> &ldquo;mark <code>hash</code> <code>volatile</code>&rdquo; — consume
+the <em>result</em>; a volatile qualifier on the function is not the fix. <strong>Feed-forward:</strong> &sect;33.2, &sect;33.3.</div>
+
+<div class="solution" id="sol33.9"><span class="sol-label">33.9</span>
+(a) <strong>Profile</strong> — you do not yet know which part is slow; a profile finds it. (b) <strong>Benchmark</strong> — the hot
+function is confirmed; benchmark the two candidates head to head (honestly). (c) <strong>Neither yet</strong> — first profile to see
+if that 2% module even matters; per Amdahl a rewrite of 2% buys &le;2%, so likely do not optimize it at all. (d)
+<strong>Benchmark</strong> (or re-profile) — measure total runtime before and after to confirm the change actually moved the whole
+program, not just the microbenchmark. <em>Method-selection cue:</em> unknown target &rarr; profile; compare known candidates or
+confirm a whole-program win &rarr; benchmark; small share &rarr; do not optimize yet. <strong>Feed-forward:</strong> &sect;33.1,
+&sect;33.4.</div>
+
+<div class="solution" id="sol33.10"><span class="sol-label">33.10</span>
+(a) <strong>False</strong> — <code>0.0000&nbsp;s</code> almost always means the loop was deleted (dead-code elimination), so nothing
+was measured. (b) <strong>False</strong> — <code>-O0</code> costs differ from the shipped <code>-O2</code> build; benchmark what you
+ship. (c) <strong>False</strong> — a sampling profiler needs no recompilation; it samples the running program. (d) <strong>True</strong>
+— Amdahl caps a 4%-of-runtime part's whole-program payoff at 4%. (e) <strong>False</strong> — even on an idle machine, cache state,
+frequency scaling, and cold-start effects vary a single run; run several. <em>Tempting wrong answer:</em> marking (e) true because
+&ldquo;idle means no interference&rdquo; — idle removes some noise, not cache/frequency/warm-up variation. <strong>Feed-forward:</strong>
+&sect;33.2&ndash;&sect;33.4.</div>
+
+<div class="solution" id="sol33.11"><span class="sol-label">33.11</span>
+(a) A loop can be slow at a low instruction count because of <strong>cache misses</strong> (Chapter 3) stalling on memory,
+<strong>branch mispredictions</strong> flushing the pipeline, and <strong>memory-bandwidth</strong> limits or poor data layout
+(Chapters 4&ndash;5) — the instruction is cheap; the data it touches is not. (b) To test a cache-friendlier layout, hold everything
+else constant (same inputs, same optimization level, same machine, same measurement harness), change only the layout, make the
+result observable so the loop runs, and run many trials reporting the minimum and spread for both layouts — then compare. (c) It is
+the scientific method: the profile is an observation, &ldquo;the layout causes cache misses&rdquo; is a hypothesis, changing one
+thing is a controlled experiment, and re-measuring tests the prediction — changing several things at once, or not re-measuring,
+forfeits the ability to attribute the result. <em>Tempting wrong answer:</em> &ldquo;the profile already tells you why it's
+slow&rdquo; — it tells you <em>where</em>, not <em>why</em>; the cause is a separate hypothesis to test. <strong>Feed-forward:</strong>
+&sect;33.3, &sect;33.4; the cache and data-layout chapters ahead.</div>
+
+<div class="solution" id="sol33.12"><span class="sol-label">33.12</span>
+Platform-specific. A correct write-up reports: (a) the unused-result loop times near <code>0.0000&nbsp;s</code> (deleted), and after
+printing the variable it times to its real cost (a fraction of a second to seconds depending on <code>N</code> and hardware), with
+the difference attributed to dead-code elimination. (b) Five <code>CLOCK_MONOTONIC</code> trials of the honest version, with a
+minimum below the others and a spread (max &minus; min) of some percent — e.g. a ~20% span is unremarkable. (c) With
+<code>perf</code>/<code>gprof</code>, the profiler agrees that the heavier function dominates; without them, hand timing shows the
+split (e.g. ~94% vs ~6%) and the write-up names the sampling profiler it would use and that it adds per-line/whole-program
+attribution without recompilation. <em>Tempting wrong answer:</em> &ldquo;report the first run's time&rdquo; — the first run pays
+cold-cache/warm-up costs; report the minimum of several. <strong>Feed-forward:</strong> &sect;33.2&ndash;&sect;33.4.</div>
+
+</section>

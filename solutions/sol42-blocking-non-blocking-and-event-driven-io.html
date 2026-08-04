@@ -1,0 +1,104 @@
+<section class="solutions" id="sol42">
+<h1>Chapter 42 — Solutions</h1>
+
+<div class="solution" id="sol42.1"><span class="sol-label">42.1</span>
+A blocking <code>read</code> uses no CPU because the kernel takes the thread off the run queue entirely and wakes it only when data
+arrives — waiting is not spinning. Two costs a thread carries regardless of activity: its <strong>stack</strong> (often a megabyte or more of
+reserved address space) and its presence as a <strong>scheduler-visible entity</strong> (run-queue bookkeeping and context-switch cost when
+it wakes). <em>Tempting wrong answer:</em> &ldquo;idle threads are free&rdquo; — they hold memory and scheduler state whether or not they
+run. <strong>Feed-forward:</strong> &sect;42.1.</div>
+
+<div class="solution" id="sol42.2"><span class="sol-label">42.2</span>
+It makes the <code>read</code> return immediately instead of parking the thread, reporting the error <code>EAGAIN</code> (equivalently
+<code>EWOULDBLOCK</code>) to mean &ldquo;nothing ready now, try later.&rdquo; <em>Tempting wrong answer:</em> &ldquo;it returns 0 bytes / EOF&rdquo;
+— 0 means end-of-stream; not-ready is the distinct <code>EAGAIN</code>. <strong>Feed-forward:</strong> &sect;42.2.</div>
+
+<div class="solution" id="sol42.3"><span class="sol-label">42.3</span>
+<code>select</code> passes the whole descriptor set on every call and the kernel scans all of them to find the ready ones; <code>epoll</code>
+registers interest once and each <code>epoll_wait</code> returns only the descriptors that have become ready. <strong><code>select</code>'s</strong>
+cost grows with the total number watched. <em>Tempting wrong answer:</em> &ldquo;<code>epoll</code> is just a faster <code>select</code>&rdquo;
+— it is a different model (register-once, return-active), not merely a tuned scan. <strong>Feed-forward:</strong> &sect;42.3.</div>
+
+<div class="solution" id="sol42.4"><span class="sol-label">42.4</span>
+(a) Each connection needs its own thread, and each thread costs a <strong>stack</strong> (gigabytes of address space across ten thousand)
+and <strong>scheduler churn</strong> (context switches to wake the few that become ready). (b) The costs are properties of having the thread,
+not of running it — an idle thread still reserves its stack and still sits in the scheduler's structures. (c) The event loop ties only a
+<strong>descriptor and a little state</strong> to each connection, not a thread and a stack, so a few threads can hold hundreds of thousands
+of connections. <em>Tempting wrong answer:</em> &ldquo;shrink the stacks and it scales&rdquo; — smaller stacks help a little, but the
+scheduler cost and the fundamental one-thread-per-wait mismatch remain. <strong>Feed-forward:</strong> &sect;42.1, &sect;42.4.</div>
+
+<div class="solution" id="sol42.5"><span class="sol-label">42.5</span>
+(a) Because the thread never sleeps: it spins issuing <code>read</code> after <code>read</code>, mostly collecting <code>EAGAIN</code>, so
+it uses a full core asking &ldquo;ready yet?&rdquo; instead of waiting for free. (b) A tight scan of 10,000 descriptors at ~199&nbsp;ns/syscall
+is ~1.99&nbsp;ms per full pass, so a single thread does on the order of <strong>~500 passes/s = ~5&nbsp;million syscalls/s</strong>, nearly
+all returning <code>EAGAIN</code> — a whole core burned to discover that almost nothing is ready. (c) Readiness notification lets the thread
+<strong>sleep in one call</strong> until at least one descriptor is ready and wake with the list of ready ones, restoring the CPU-free wait
+of blocking while still serving many descriptors. <em>Tempting wrong answer:</em> &ldquo;add a small sleep between passes&rdquo; — that trades
+CPU for latency and still scans everything; readiness notification removes the scan. <strong>Feed-forward:</strong> &sect;42.2&ndash;&sect;42.3.</div>
+
+<div class="solution" id="sol42.6"><span class="sol-label">42.6</span>
+(a) <code>select</code> climbs roughly linearly — ~0.7&nbsp;&micro;s at 10, ~2.6 at 100, ~14.6 at 500 — while <code>epoll_wait</code> stays
+flat at ~0.4&nbsp;&micro;s. (b) On every call <code>select</code> copies and scans the entire descriptor set to find the ready ones (O(N));
+<code>epoll</code> already holds the registered interest and returns only the descriptors that became ready (O(active)), doing no full scan.
+(c) <code>FD_SETSIZE</code> (1024 here) is the fixed size of the <code>fd_set</code> bitmap, so <code>select</code> cannot watch a descriptor
+numbered at or above it — fatal for a server needing tens of thousands of descriptors. <em>Tempting wrong answer:</em> &ldquo;raise
+<code>FD_SETSIZE</code> and <code>select</code> scales&rdquo; — even ignoring the cap, the O(N) rescan still dominates at large N.
+<strong>Feed-forward:</strong> &sect;42.3.</div>
+
+<div class="solution" id="sol42.7"><span class="sol-label">42.7</span>
+(a) <code>epoll</code> is dramatically better when <var>M</var> is large but <var>a</var> is small — many watched, few ready per wakeup (the
+typical server), so <var>p</var>&middot;<var>M</var> is huge while <var>q</var>&middot;<var>a</var>+<var>r</var> is tiny; they are comparable
+when <var>a</var> &asymp; <var>M</var> (nearly all ready every wakeup), since both then do work proportional to <var>M</var>. (b) At
+<var>M</var>=500, <var>a</var>=1: ~14.6&nbsp;&micro;s vs ~0.4&nbsp;&micro;s, about <strong>35&ndash;40&times;</strong>. (c) When almost every
+watched descriptor is ready each wakeup, <code>epoll</code> must return them all, so its cost rises toward <code>select</code>'s — the
+advantage comes from the active set being much smaller than the watched set. <em>Tempting wrong answer:</em> &ldquo;<code>epoll</code> is
+always O(1)&rdquo; — it is O(active), which equals O(N) when everything is active. <strong>Feed-forward:</strong> &sect;42.3.</div>
+
+<div class="solution" id="sol42.8"><span class="sol-label">42.8</span>
+<strong>Step 4:</strong> The one thread runs all handlers in sequence, so while that handler is blocked in the cold <code>read</code> for
+milliseconds it cannot call <code>epoll_wait</code> or service any other ready descriptor — every connection that thread owns waits the same
+milliseconds, which is why the spikes are correlated across thousands of unrelated requests. The load test missed it because the config file
+was warm in the page cache, so the read returned instantly and never actually blocked — the bug only appears when the file is cold, a
+condition the test did not create. The fix is to remove all blocking from handlers: read the config once at startup (or via a thread pool)
+rather than in a request handler, and generally dispatch any potentially-blocking operation to a thread pool whose completion returns to the
+loop as an event. <em>Tempting wrong answer:</em> &ldquo;add more event-loop threads&rdquo; — that reduces but does not remove the blast
+radius; the blocking call must leave the loop entirely. <strong>Feed-forward:</strong> &sect;42.4.</div>
+
+<div class="solution" id="sol42.9"><span class="sol-label">42.9</span>
+(a) <strong>Safe</strong> — a non-blocking <code>read</code> returning <code>EAGAIN</code> is exactly the model; it returns at once. (b)
+<strong>Move to a pool</strong> — <code>fsync</code> blocks on a device flush (~8.6&nbsp;ms, &sect;41.2) and would stall the loop. (c)
+<strong>Safe</strong> — parsing 200 bytes already in memory is a trivial, bounded CPU cost. (d) <strong>Move to a pool</strong> — a
+synchronous DNS lookup blocks on the network (use an async resolver or a pool). (e) <strong>Move to a pool</strong> — a CPU-bound image
+resize runs long and would monopolize the loop; offload it. <em>Tempting wrong answer:</em> calling (e) safe &ldquo;because it does not do
+I/O&rdquo; — long CPU work stalls the loop just as a blocking syscall does. <strong>Feed-forward:</strong> &sect;42.4.</div>
+
+<div class="solution" id="sol42.10"><span class="sol-label">42.10</span>
+(a) <strong>False</strong> — a blocking <code>read</code> sleeps off the run queue and uses no CPU while waiting. (b) <strong>False</strong> —
+<code>epoll_wait</code>'s cost grows with the number of <em>active</em> descriptors, not the total registered. (c) <strong>False</strong> —
+non-blocking I/O alone forces a busy-poll; you also need readiness notification to sleep until something is ready. (d) <strong>True</strong> —
+one thread drives all its connections, so a blocking call stalls them all. (e) <strong>False</strong> — <code>select</code> cannot handle a
+descriptor at or above <code>FD_SETSIZE</code> (1024 here). <em>Tempting wrong answer:</em> marking (b) true by analogy to
+<code>select</code> — the whole point of <code>epoll</code> is that it does not scale with the total watched.
+<strong>Feed-forward:</strong> &sect;42.1&ndash;&sect;42.4.</div>
+
+<div class="solution" id="sol42.11"><span class="sol-label">42.11</span>
+(a) Blocking gives a CPU-free wait but only on one descriptor; non-blocking lets one thread touch many descriptors but, alone, forces a
+wasteful busy-poll; readiness notification supplies the one missing call that sleeps until some descriptor is ready and returns which —
+together they are the event loop, each supplying what the others lack. (b) Thread-per-connection fails when connections vastly outnumber
+active work (a heavy thread per idle wait); the event loop fails when one handler blocks (a whole thread's connections stalled by one
+operation) — the single principle is to match the resource to the work: a cheap descriptor for a waiting connection, a thread for genuinely
+blocking or CPU-heavy work. (c) Because the I/O model's cost is set by how many descriptors you watch and how many are active per wakeup —
+the exact variables that separate <code>select</code>'s O(N) rescan from <code>epoll</code>'s O(active) delivery — so those two numbers pick
+the model before any code is written. <em>Tempting wrong answer:</em> &ldquo;always use an event loop&rdquo; — at small scale
+thread-per-connection is simpler and fine; the numbers decide. <strong>Feed-forward:</strong> &sect;42.4&ndash;&sect;42.5.</div>
+
+<div class="solution" id="sol42.12"><span class="sol-label">42.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports a minimal kernel-entering syscall as ns/call (a few hundred ns is
+typical, higher under virtualization) and contrasts it with a vDSO call that is several times cheaper because it avoids a real kernel entry;
+(b) shows <code>select</code>'s per-call cost rising with the descriptor count while <code>epoll_wait</code> stays flat, and notes the
+<code>FD_SETSIZE</code> point past which <code>select</code> cannot go; (c) states toolchain and CPU, flags wall-clock timing without
+hardware counters, and notes that absolute syscall cost varies with the environment while the scaling shape is portable. <em>Tempting wrong
+answer:</em> &ldquo;report <code>epoll</code> is faster by a fixed factor&rdquo; — the factor grows with the descriptor count; the
+scaling, not a single ratio, is the result. <strong>Feed-forward:</strong> &sect;42.1&ndash;&sect;42.3.</div>
+
+</section>

@@ -1,0 +1,104 @@
+<section class="solutions" id="sol40">
+<h1>Chapter 40 — Solutions</h1>
+
+<div class="solution" id="sol40.1"><span class="sol-label">40.1</span>
+File descriptor (indexing the open-file description that holds the offset) &rarr; the VFS &rarr; the <strong>page cache</strong> &rarr; the
+filesystem (offset-to-block mapping) &rarr; the block layer &rarr; the device driver and hardware. A cache <strong>hit at the page
+cache</strong> returns the bytes from DRAM without any device I/O; the layers below it are reached only on a miss. <em>Tempting wrong
+answer:</em> &ldquo;<code>read</code> goes straight to the disk&rdquo; — for a regular file it almost never does on a warm system; it goes
+to the page cache first. <strong>Feed-forward:</strong> &sect;40.1.</div>
+
+<div class="solution" id="sol40.2"><span class="sol-label">40.2</span>
+Because per-byte I/O pays two system calls per byte, and the fixed per-call cost (the trap into the kernel and back, VFS dispatch, the copy)
+dwarfs the work of moving a single byte; a 64&nbsp;KiB buffer pays that same per-call cost once per 65,536 bytes, amortizing it to under a
+nanosecond each — so the gap (~1604 vs ~0.53&nbsp;ns/byte, ~3000&times;) is the number of syscalls, not the number of bytes. <em>Tempting
+wrong answer:</em> &ldquo;the disk is the bottleneck&rdquo; — the bytes are identical and (warm) never leave DRAM; the cost is the call
+frequency. <strong>Feed-forward:</strong> &sect;40.2.</div>
+
+<div class="solution" id="sol40.3"><span class="sol-label">40.3</span>
+(1) The <strong>user-space buffer</strong> — owned by the application (stdio's internal buffer, or one you allocate) — turns many small
+logical reads/writes into few large system calls, solving the per-call cost. (2) The <strong>page cache</strong> — owned by the kernel, in
+DRAM — holds recently used file pages so a read that hits it skips the device and a write can return before reaching it, solving the device
+latency for resident data. <em>Tempting wrong answer:</em> &ldquo;there is only the disk cache&rdquo; — there are two independent buffers,
+and defeating the user-space one (per-byte calls) is catastrophic even with a warm page cache. <strong>Feed-forward:</strong> &sect;40.2&ndash;&sect;40.3.</div>
+
+<div class="solution" id="sol40.4"><span class="sol-label">40.4</span>
+(a) It is a region of otherwise-free DRAM in which the kernel keeps recently used file pages. (b) The warm read is ~13&times; faster because
+its pages are resident, so the read is a memory copy; the cold read must fetch from the storage device, which is far slower. (c)
+<em>Readahead</em> is the kernel fetching pages ahead of the current position on a sequential read, overlapping device latency with the
+program's work — so streaming access hides the latency that random access, which cannot be predicted ahead, pays in full. <em>Tempting
+wrong answer:</em> &ldquo;warm is faster because the CPU cache holds the file&rdquo; — 256&nbsp;MiB far exceeds any CPU cache; it is the
+page cache in main memory. <strong>Feed-forward:</strong> &sect;40.3.</div>
+
+<div class="solution" id="sol40.5"><span class="sol-label">40.5</span>
+(a) <code>read</code> returns short at end-of-file or when interrupted by a signal (and always may on a pipe/socket with less data ready);
+<code>write</code> can accept only part of the buffer when a pipe or socket buffer is nearly full. (b) <code>p = buf; left = n; while
+(left &gt; 0) { w = write(fd, p, left); if (w &lt;= 0) handle_error; p += w; left -= w; }</code>. (c) Because on exactly the inputs where
+the count is short — large files, slow pipes, signals — the naive code silently processes only part of the data and reports success, a
+correctness bug, not just a slow path. <em>Tempting wrong answer:</em> &ldquo;one <code>read</code> gives the whole file&rdquo; — it may,
+for small files on a warm cache, which is why the bug hides until it matters. <strong>Feed-forward:</strong> &sect;40.4.</div>
+
+<div class="solution" id="sol40.6"><span class="sol-label">40.6</span>
+(a) The fixed per-call cost <var>s</var> is divided across <var>W</var> bytes, so per-byte cost falls roughly as <var>s</var>/<var>W</var> +
+<var>b</var> — steeply while <var>W</var> is small. (b) Once <var>W</var> is large enough that <var>s</var>/<var>W</var> is negligible next
+to the per-byte term <var>b</var> (and the copy runs at memory bandwidth), further growth cannot remove a cost that is already gone, so the
+curve flattens. (c) &ldquo;Large enough&rdquo; — tens to hundreds of KiB — captures nearly all the win; &ldquo;as large as possible&rdquo;
+wastes memory and cache for no measurable gain. <em>Tempting wrong answer:</em> &ldquo;keep doubling the buffer for more speed&rdquo; — past
+the knee it buys nothing and costs memory. <strong>Feed-forward:</strong> &sect;40.2, &sect;40.4.</div>
+
+<div class="solution" id="sol40.7"><span class="sol-label">40.7</span>
+(a) Total = <var>k</var>&middot;<var>s</var> + <var>B</var>&middot;<var>b</var> (the per-byte term depends on total bytes, not on how they
+are split). (b) Per-byte: <var>k</var>&nbsp;=&nbsp;<var>B</var>, so total = <var>B</var>(<var>s</var>+<var>b</var>) — dominated by
+<var>s</var> when <var>s</var>&nbsp;&gt;&gt;&nbsp;<var>b</var>. Buffered: <var>k</var>&nbsp;=&nbsp;<var>B</var>/<var>W</var>, so total =
+<var>B</var>&middot;<var>s</var>/<var>W</var> + <var>B</var>&middot;<var>b</var>; the syscall term shrinks as 1/<var>W</var> and becomes
+negligible once <var>s</var>/<var>W</var>&nbsp;&lt;&lt;&nbsp;<var>b</var>, i.e. <var>W</var>&nbsp;&gt;&gt;&nbsp;<var>s</var>/<var>b</var> —
+beyond which only the fixed <var>B</var>&middot;<var>b</var> remains and larger <var>W</var> barely helps. <em>Tempting wrong answer:</em>
+writing total as <var>k</var>&middot;<var>s</var> only — the byte-moving term matters once the syscall is amortized.
+<strong>Feed-forward:</strong> &sect;40.2.</div>
+
+<div class="solution" id="sol40.8"><span class="sol-label">40.8</span>
+<strong>Step 4:</strong> 5&nbsp;GiB/s is a memory number because the read was served entirely from the page cache — the pages the write
+left resident — so it measured a DRAM copy, not the storage device, which never saw the read. To measure cold storage the colleague should
+evict the file's pages first (<code>posix_fadvise</code> with <code>POSIX_FADV_DONTNEED</code>, or a cache drop on an administered machine)
+and then time the read, and should report the buffer size, filesystem, and device. The difference can be an order of magnitude — this
+machine showed ~13&times; cold-to-warm and a spinning disk far more — so a warm number can promise throughput that production, which reads
+cold, will never deliver. <em>Tempting wrong answer:</em> &ldquo;run it a few more times and average&rdquo; — every warm run repeats the
+same DRAM measurement; averaging cache hits does not reveal the disk. <strong>Feed-forward:</strong> &sect;40.4.</div>
+
+<div class="solution" id="sol40.9"><span class="sol-label">40.9</span>
+(a) <strong>System-call frequency</strong> — a cache-resident <code>getc</code> loop never touches the device; confirm by buffering and
+watching the time collapse. (b) <strong>Device latency</strong> — ten thousand cold, scattered small files each pay a device access (and
+often a seek); confirm that the same files run far faster warm. (c) <strong>Neither dominates as a problem</strong> — a 1&nbsp;MiB buffer
+amortizes the syscall and the warm data is in DRAM, so it runs near memory speed; confirm the buffer is large and the pages resident.
+(d) <strong>System-call frequency</strong> — one <code>write</code> per event is per-byte I/O in disguise; confirm by batching writes.
+<em>Tempting wrong answer:</em> calling (a) device-bound &ldquo;because it reads a file&rdquo; — the file is already in DRAM.
+<strong>Feed-forward:</strong> &sect;40.2&ndash;&sect;40.4.</div>
+
+<div class="solution" id="sol40.10"><span class="sol-label">40.10</span>
+(a) <strong>False</strong> — <code>read</code> may return a short count when interrupted or on a pipe/socket; correct code loops. (b)
+<strong>False</strong> — a successful <code>write</code> means the bytes are in the page cache, not on the device; durability needs
+<code>fsync</code> (Chapter 41). (c) <strong>False</strong> — stdio buffers in user space (~4&nbsp;KiB) and issues a real syscall only when
+the buffer fills/drains. (d) <strong>True</strong> — a page-cache hit is a DRAM copy with no device access. (e) <strong>False</strong> — the
+per-byte cost flattens past a knee (tens to hundreds of KiB); bigger buffers then waste memory for no gain. <em>Tempting wrong answer:</em>
+marking (b) true — the write-back cache is exactly why a returned <code>write</code> is not yet durable. <strong>Feed-forward:</strong>
+&sect;40.2&ndash;&sect;40.4.</div>
+
+<div class="solution" id="sol40.11"><span class="sol-label">40.11</span>
+(a) Both speedups remove work the machine was doing needlessly, not add hardware: buffering removes redundant <em>system calls</em> (the
+fixed per-call cost, paid per byte in the slow version), and the warm cache removes redundant <em>device accesses</em> (the bytes were
+already in DRAM). (b) As the server runs, the kernel fills the page cache with the file pages it reads, so an increasing fraction of reads
+hit DRAM instead of the device — throughput rises until the working set is resident, then stabilizes. (c) Because I/O time is dominated by
+call frequency and residency, both of which you control in software; disk speed is a fixed lower layer that only matters once the data is
+genuinely cold and the calls are already amortized — so those two questions find the fixable cost first. <em>Tempting wrong answer:</em>
+&ldquo;faster disks are the general fix&rdquo; — they do nothing for a syscall-bound or warm-cache workload. <strong>Feed-forward:</strong>
+&sect;40.2&ndash;&sect;40.5.</div>
+
+<div class="solution" id="sol40.12"><span class="sol-label">40.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports per-byte and 64&nbsp;KiB-buffered copy times as the minimum of several
+trials and their ratio (expect a very large factor); (b) reports cold throughput after an explicit eviction and warm throughput after a
+pre-warm, clearly labelled, with the cold number lower; (c) states toolchain, CPU, filesystem, and buffer size, and notes these are
+wall-clock times without hardware counters, identifying which reads were cold and which warm. <em>Tempting wrong answer:</em> &ldquo;time
+the read twice and report the faster one&rdquo; — that reports the warm cache and hides the storage cost the exercise is about.
+<strong>Feed-forward:</strong> &sect;40.3&ndash;&sect;40.4.</div>
+
+</section>

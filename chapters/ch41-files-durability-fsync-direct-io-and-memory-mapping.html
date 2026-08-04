@@ -1,0 +1,385 @@
+<section class="chapter" id="ch41">
+<h1>Chapter 41 — Files and Durability: fsync, Direct I/O, and Memory Mapping</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch40">Chapter 40</a> (the page cache and write-back — why a
+<code>write</code> returns before the data is on the device), <a href="#ch13">Chapter 13</a> (the system-call boundary),
+<a href="#ch04">Chapter 4</a> (virtual memory and address translation — the machinery <code>mmap</code> reuses),
+<a href="#ch17">Chapter 17</a> (demand paging — a mapped file page is faulted in on first touch). &nbsp;·&nbsp; The last chapter mapped the
+I/O stack and left one thread hanging: a <code>write</code> reaches only the page cache, not the disk. This chapter pulls that thread — how
+you force data to stable storage and what it costs, how to bypass the cache, and how to map a file into memory.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch40">Chapter 40</a> — when a program calls <code>write</code> and it returns success, where is the data, and
+when does it actually reach the storage device? (2) <a href="#ch04">Chapter 4</a> and <a href="#ch17">Chapter 17</a> — what does the MMU do
+on a load to an address whose page is not resident, and what is <em>demand paging</em>? (3) <em>Predict:</em> you append two thousand small
+records to a file. In one version you call <code>fsync</code> (or <code>fdatasync</code>) after every record to make it durable; in the
+other you do not. How much slower is the durable version — 2&times;, 100&times;, more? And separately: you sum every 64th byte of a large
+cached file, once by <code>read</code>-ing it into a buffer and once by <code>mmap</code>-ing it and reading memory directly. Which is
+faster, and why? Write your guesses; &sect;41.2 and &sect;41.4 answer them.</p>
+</aside>
+
+<p>A <code>write</code> that returns success has not written anything to your disk. As Chapter 40 showed, it copied your bytes into the
+kernel's page cache and marked the page dirty; the kernel flushes dirty pages to the device on its own schedule, seconds later, so a crash
+or power loss in the interval loses data the program believes it saved. For a scratch file this is exactly the behaviour you want — it makes
+writes fast. For anything whose survival matters — a database's log, a user's document, a financial record — it is a correctness problem,
+and closing it requires an explicit, expensive act: telling the kernel to force the data all the way to stable storage and to wait until it
+is there. That act is <code>fsync</code>, and its cost is the central number of this chapter, because it is what separates &ldquo;fast&rdquo;
+from &ldquo;durable&rdquo; and drives the design of every storage system in Volume 2. Around it sit two more tools for controlling how file
+data moves: <code>O_DIRECT</code>, which bypasses the page cache entirely for programs that manage their own, and memory-mapped I/O, which
+maps a file into your address space so you read and write it with ordinary loads and stores. This chapter proceeds in five steps: why a
+<code>write</code> is not durable and what a crash can lose (&sect;41.1); <code>fsync</code>, and the price of durability, measured
+(&sect;41.2); bypassing the cache with <code>O_DIRECT</code> (&sect;41.3); memory-mapped I/O and when it beats <code>read</code>/<code>write</code>
+(&sect;41.4); and what to carry forward (&sect;41.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 4&nbsp;KiB pages) against an <code>ext4</code> filesystem, timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as
+the minimum of several trials (Chapter 33). Times are wall-clock. A hardware-counter profiler (<code>perf</code>) is <em>not</em> installed
+here. The storage on this machine is a <em>virtual disk</em>, so the absolute <code>fsync</code> cost below reflects this device's flush
+path and is not a portable constant — published flush latencies for real SSDs and spinning disks, quoted for comparison, are labelled as
+such. The <code>fsync</code> number is stable across runs and shows the <em>shape</em> of the durability cost; the <code>mmap</code>-vs-<code>read</code>
+comparison was deliberately reported with its measured variance, because the two are close and the winner depends on the access pattern and
+page-fault behaviour rather than on a fixed ratio.</p>
+
+<h2>41.1 A write() is not on disk: the durability gap</h2>
+
+<p>The page cache's write-back policy (Chapter 40) is the source of both the speed and the hazard. When you call <code>write</code>, the
+kernel copies your bytes into a page in the cache, marks that page <strong>dirty</strong>, and returns — it does <em>not</em> wait for the
+device. Dirty pages are flushed later by kernel writeback threads, governed by tunables (how many dirty pages may accumulate, how old a
+dirty page may get) that typically let data sit in memory for seconds before it reaches stable storage. In that window the data exists only
+in volatile DRAM, so a power failure, a kernel panic, or a hard reset loses it, even though every <code>write</code> call returned success
+and the program moved on believing the data saved. This is not a bug; it is the deliberate trade that makes the &sect;40.3 write-back cache
+fast, and for most files it is correct — a temporary file, a rebuildable cache, a log you can afford to lose the tail of. The problem is
+specifically <strong>durability</strong>: the guarantee that once an operation is acknowledged, its effect survives a crash. A plain
+<code>write</code> does not provide it, and no amount of retrying or checking the return value adds it, because the return value only tells
+you the kernel accepted the bytes into the cache, not that the device has them. Worse, the order in which dirty pages reach the disk is not
+the order you wrote them, so after a crash a file can be left in a state that never existed in the program's logic — the last record
+half-present, or metadata updated but data not — which is why crash-consistency is a genuine and studied difficulty (Pillai et&nbsp;al.,
+OSDI 2014). Everything in the next section exists to close this gap on demand, for the specific data whose survival you are willing to pay
+for.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>After a <code>write</code> returns success, where exactly is the data, and what event would lose it? Why does checking the return value
+of <code>write</code> not tell you the data is durable? (Answer after the next section.)</p>
+</aside>
+
+<h2>41.2 fsync: the price of durability</h2>
+
+<p>The system call that closes the gap is <code>fsync(fd)</code> — and its variant <code>fdatasync(fd)</code> — which tells the kernel to
+flush all dirty pages of that file to the storage device and to wait until the device confirms they are stable before returning
+(<code>fdatasync</code> skips non-essential metadata like the modification time, so it can avoid an extra metadata write). It converts the
+deferred, asynchronous write-back into a synchronous, durable barrier, and the wait is the cost. Appending two thousand 256-byte records to
+a file, once with no sync and once calling <code>fdatasync</code> after every record, runs here:</p>
+
+<pre><code>append 2,000 records of 256 bytes:
+                              per record      throughput
+write only (no sync)       :   ~0.9 us       ~1,100,000 records/s   (lands in the page cache)
+write + fdatasync each     :   ~8.6 ms       ~116 records/s         (waits for the device to flush)
+                              durability tax: ~9000x slower per record</code></pre>
+
+<p>The difference is not marginal — it is about <strong>9000&times; per record</strong>, because a plain <code>write</code> returns after a
+memory copy (~0.9&nbsp;&micro;s) while <code>fdatasync</code> must push the data through the block layer to the device and wait for the
+device to report it durably stored, which on this machine's virtual disk takes about 8.6&nbsp;ms — a real device-flush round trip, not a CPU
+cost. That absolute number is this device's; a fast NVMe SSD with a power-loss-protected cache can flush in tens to hundreds of
+microseconds, a spinning disk takes on the order of ten milliseconds (a rotation plus a seek) — published figures, cited for scale — but on
+every device the flush is <em>orders of magnitude</em> more expensive than the buffered write, because it is bounded by physical storage,
+not by memory. This one number explains a great deal of systems design. It is why you never <code>fsync</code> per small write in a hot
+path: at ~116 durable records per second, a naive per-record sync is a throughput catastrophe. It is why durable systems <strong>batch</strong>
+— a database groups many transactions into one log flush (<em>group commit</em>), amortizing a single <code>fsync</code> across hundreds of
+records, so the per-record durability cost falls back toward the memory write while the guarantee is kept. And it is why the write-ahead log
+exists at all: append the change to a sequential log and <code>fsync</code> that once, rather than syncing scattered updates to the data
+files — a design Volume 2 builds in full. The rule to carry now: durability has a fixed, large per-flush price, so you pay it as seldom as
+correctness allows, by batching, not by syncing more.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>fsync</code> do that <code>write</code> does not, and why is it roughly 9000&times; slower per record here? Given that
+cost, how do durable systems like databases keep throughput up while still guaranteeing that acknowledged data survives a crash? (Answer
+below the communicate box.)</p>
+</aside>
+
+<h2>41.3 Bypassing the cache: O_DIRECT</h2>
+
+<p>The page cache is a benefit you can decline. Opening a file with the <code>O_DIRECT</code> flag makes reads and writes bypass the page
+cache and transfer data directly between the storage device and your user-space buffer by DMA, with no kernel copy and no caching of the
+file's pages. The cost of this power is strict constraints, verified here against this <code>ext4</code> filesystem: the buffer address, the
+file offset, and the transfer length must all be aligned to the device's block size (commonly 512 or 4096 bytes), so a direct read needs a
+<code>posix_memalign</code>'d buffer, not an arbitrary <code>malloc</code>'d one — an unaligned direct I/O fails with <code>EINVAL</code>.
+Why would anyone give up the free cache? Because sometimes the kernel's cache is redundant or actively harmful. A database maintains its own
+<strong>buffer pool</strong> (Volume 2) — its own cache of pages, sized and evicted by its own policy — and the page cache underneath would
+just hold a second, uncoordinated copy of the same data, doubling memory use and defeating the database's careful replacement decisions;
+with <code>O_DIRECT</code> it manages its cache directly and the kernel stays out of the way. Direct I/O also avoids <strong>cache
+pollution</strong>: a one-pass backup or a large sequential scan that will never reread its data would otherwise evict the working set of
+every other process to cache bytes it does not need, so bypassing the cache keeps the shared cache useful for programs that benefit from it.
+The trade is real and cuts both ways: <code>O_DIRECT</code> gives control and predictability but forfeits readahead, write-back batching,
+and the enormous win of a cache hit (the &sect;40.3 13&times;), so it helps only programs that genuinely manage their own caching or
+deliberately stream past it, and hurts everything else. It is a specialist's tool — the man page (<code>open(2)</code>) is unusually blunt
+that most applications should not use it — and the discipline is the part's discipline: reach for it only when you have measured that the
+page cache is a cost rather than a benefit for your access pattern.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: durability is a device round-trip, so you pay it rarely</span>
+<p><strong>1. In words.</strong> A <code>write</code> is cheap because it is deferred — the bytes sit dirty in the page cache and the call
+returns. Making them <em>durable</em> means <code>fsync</code>: force the dirty pages to the device and wait for the device to confirm. That
+wait is a physical round trip to storage, orders of magnitude slower than the memory write, so durable systems batch many writes behind one
+flush rather than syncing each.</p>
+<p><strong>2. As a picture.</strong> Figure 41.1: a <code>write</code> arrow stopping at the page cache (dirty page, call returns), with a
+dashed &ldquo;later&rdquo; arrow drifting to the device; beside it an <code>fsync</code> arrow going all the way to the device and a clock
+showing the caller blocked until it confirms. Below, two bars: buffered write ~0.9&nbsp;&micro;s/record vs write+<code>fdatasync</code>
+~8.6&nbsp;ms/record.</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, 256-byte records: a buffered <code>write</code> costs ~0.9&nbsp;&micro;s and returns
+~1.1&nbsp;million/s; a <code>write</code> plus <code>fdatasync</code> costs ~8.6&nbsp;ms and returns ~116/s — <strong>~9000&times;</strong>
+(&sect;41.2). Group-commit a batch of, say, 1000 records behind one flush and the per-record durability cost falls back toward the memory
+write while the guarantee is kept — which is why write-ahead logs exist.</p>
+</aside>
+
+<p><em>(Answer to the &sect;41.1 quick check: after <code>write</code> returns, the data is in a dirty page in the kernel's page cache in
+volatile DRAM, scheduled for write-back later; a power loss, kernel panic, or hard reset before the flush loses it. Checking
+<code>write</code>'s return value does not help because it reports only that the kernel accepted the bytes into the cache — not that the
+device has them — so durability requires the separate, synchronous <code>fsync</code>.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 280" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A write() stops at the page cache; fsync() forces the data to the device and waits.</text>
+<rect x="12" y="30" width="70" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="44" font-size="9">write()</text>
+<rect x="150" y="30" width="120" height="20" fill="#fff3d6" stroke="#8a6d1d"/><text x="158" y="44" font-size="9">page cache (dirty page)</text>
+<rect x="360" y="30" width="120" height="20" fill="#f6dcd2" stroke="#8c3a1d"/><text x="368" y="44" font-size="9">storage device</text>
+<path d="M82 40 L 150 40" stroke="#14406b" stroke-width="1" marker-end="url(#b)"/><text x="92" y="26" font-size="8" fill="#2f7d32">returns immediately</text>
+<path d="M270 40 C 320 40, 320 40, 360 40" fill="none" stroke="#8a6d1d" stroke-width="1" stroke-dasharray="3,2"/><text x="282" y="26" font-size="8" fill="#8a6d1d">write-back later (seconds)</text>
+<text x="150" y="66" font-size="8" fill="#8c3a1d">crash here &rarr; data lost (only in DRAM)</text>
+<rect x="12" y="86" width="70" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="100" font-size="9">fsync()</text>
+<path d="M82 96 L 480 96" stroke="#8c3a1d" stroke-width="1.5" marker-end="url(#b)"/><text x="150" y="112" font-size="8" fill="#8c3a1d">force dirty pages to device, then BLOCK until it confirms durable</text>
+<line x1="12" y1="132" x2="620" y2="132" stroke="#b9c2cc"/>
+<text x="12" y="150" font-size="9" fill="#14406b">per-record cost (2000 x 256 B):</text>
+<rect x="200" y="142" width="8" height="10" fill="#cfe6cf" stroke="#2f7d32"/><text x="212" y="151" font-size="8">buffered write ~0.9 us (~1.1 M/s)</text>
+<rect x="200" y="158" width="420" height="10" fill="#efb9a5" stroke="#8c3a1d"/><text x="200" y="180" font-size="8">write + fdatasync each ~8.6 ms (~116/s) &mdash; ~9000&times;</text>
+<text x="12" y="206" font-size="9" fill="#2f7d32">group commit: one fsync behind N records &rarr; per-record durability cost falls back toward the memory write.</text>
+<line x1="12" y1="222" x2="620" y2="222" stroke="#b9c2cc"/>
+<text x="12" y="240" font-size="8" fill="#14406b">Durability is a physical round trip to storage, not a memory copy &mdash; so you pay it as seldom as correctness allows, by batching.</text>
+<text x="12" y="256" font-size="8" fill="#8c3a1d">Absolute fsync cost is this machine's virtual disk; SSDs flush in tens of us, spinning disks in ~10 ms (published, for scale).</text>
+</svg>
+<figcaption>Figure 41.1: The durability gap and its price. A <code>write</code> returns once the data is a dirty page in the page cache
+(lost on a crash); <code>fsync</code>/<code>fdatasync</code> forces those pages to the device and blocks until it confirms — here
+~8.6&nbsp;ms versus ~0.9&nbsp;&micro;s for the buffered write, about <strong>9000&times;</strong> (&sect;41.2). Because durability is a
+device round trip, systems batch many writes behind one flush (group commit). Wall-clock; absolute flush cost reflects this machine's
+virtual disk.</figcaption>
+</figure>
+
+<h2>41.4 Memory-mapped I/O: mapping a file into your address space</h2>
+
+<p>The third tool changes not <em>when</em> data is durable but <em>how</em> you touch it. <code>mmap</code> maps a file (or part of one)
+into the process's virtual address space, so the file's contents appear as an array of bytes in memory: you read the file with ordinary
+loads and write it with ordinary stores, and no <code>read</code>/<code>write</code> system call is made per access. It reuses the virtual
+memory machinery of Chapters 4 and 17 directly — the mapping is lazy, so pages are brought in by <strong>demand paging</strong> on first
+touch (the MMU faults, the kernel fetches the page from the file into the page cache and maps it), and dirtied pages are written back to the
+file by the same write-back path, with <code>msync</code> available to force them like <code>fsync</code>. Its headline advantage is
+avoiding the copy: a <code>read</code> copies file data from the page cache into your buffer, whereas a mapped access reads the page-cache
+page in place, so <code>mmap</code> eliminates that user-space copy. Whether that makes it faster is genuinely a &ldquo;measure it&rdquo;
+question. Summing every 64th byte of a 256&nbsp;MiB cached file, once via <code>read</code> into a buffer and once via <code>mmap</code>,
+ran here:</p>
+
+<pre><code>sum every 64th byte of a 256 MiB warm file:
+read() into a buffer + sum : ~3,000-4,000 MiB/s   (a page-cache copy into the buffer, then the sum)
+mmap() + sum in place      : comparable           (no copy, but a minor page fault per 4 KiB page on first touch)
+                             across runs mmap ranged from ~2x faster to ~3x slower &mdash; the copy it saves
+                             trades against the page-fault cost; the winner depends on the access pattern</code></pre>
+
+<p>The honest result is that the two are <strong>close</strong>, and which wins depends on the workload — exactly the discipline of the
+last part carried into I/O. <code>mmap</code> removes the <code>read</code> copy, which helps most when you touch the data many times or
+randomly (a large index, a shared read-only table), so the one-time page-fault cost of mapping it in is amortized and you get zero-copy
+random access through the address space. <code>read</code>/<code>write</code> tends to win for a single sequential streaming pass, where
+kernel readahead is already optimal and <code>mmap</code>'s per-page minor faults add overhead the streaming copy avoids — and it gives you
+explicit control over exactly when I/O happens, which mapped access hides behind faults. <code>mmap</code> also enables things
+<code>read</code>/<code>write</code> cannot: multiple processes can map the same file and share one set of physical pages (Chapter 19's
+shared memory is the anonymous case of this), and a large file can be treated as a random-access array without a manual seek-and-read. The
+costs are equally real: a page fault on an unmapped page can stall unpredictably, a hard I/O error becomes a <code>SIGBUS</code> at an
+ordinary memory access rather than an error return you can check, and durability still requires an explicit <code>msync</code> plus the same
+<code>fsync</code> physics as &sect;41.2. So the choice is by access pattern, measured: map when you reuse or randomly access data and want
+it as memory; use buffered <code>read</code>/<code>write</code> when you stream once and want control over the I/O (Kerrisk, ch.49; Stevens
+&amp; Rago, ch.14).</p>
+
+<aside class="warning">
+<span class="box-title">Trap: trusting a returned write() for durability &mdash; the data that is only in the page cache</span>
+<p>The most dangerous I/O bug is invisible in testing: treating a successful <code>write</code> (or a flushed stdio buffer, or a
+<code>close</code>) as if the data were on disk. It is not — it is a dirty page in the page cache (&sect;41.1), and it survives every normal
+test because the machine does not crash during a test; it is lost only in the power failure or kernel panic you were writing durable code to
+survive in the first place. <code>fflush</code> does not help: it moves data from the C library's user-space buffer into the kernel's page
+cache, which is still volatile — one buffer down, the durable barrier not yet crossed. Even <code>fsync</code> on the file is not always
+enough: creating or renaming a file also modifies its <em>directory</em>, and if the directory entry is not itself synced, a crash can leave
+the data durable but the file unreachable (the classic write-to-temp-then-rename pattern requires syncing the directory too). Two defenses.
+First, decide explicitly which data must be durable and cross the barrier for exactly that data with <code>fsync</code>/<code>fdatasync</code>
+(and <code>msync</code> for mapped writes), accepting the &sect;41.2 cost and batching to amortize it — durability is never implicit.
+Second, test it honestly: a durability claim is only credible if it survives a real crash — kill the power (or the VM) mid-write and check
+what remains — because the whole failure mode is defined by a crash, and code that only ever ran to completion has never been tested against
+it. Assuming write-back is durability is the I/O version of shipping an optimization measured against nothing (Chapter 39): a guarantee
+asserted, never paid for.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our service writes each event to a file and returns 200 OK, so we are durable — and it is
+fast, a million events a second. If we ever need more safety we can <code>fsync</code> every write.&rdquo; Cover the paragraph and respond in
+four or five sentences, drawing on &sect;41.1&ndash;&sect;41.4.</p>
+<p><em>Model answer.</em> &ldquo;We are fast precisely because we are <em>not</em> durable yet — the <code>write</code> returns when the
+data is in the page cache, so a power loss or kernel panic loses every event we have acknowledged since the last write-back, seconds of
+data. Returning 200 promises the client we kept it, which today is not true across a crash. But <code>fsync</code>-per-write is not the fix
+either: on our numbers a durable flush is about 8.6&nbsp;ms against under a microsecond for the buffered write — roughly 9000&times; — so
+syncing every event would drop us from a million a second to about a hundred. The right design is to batch: append events to a log and
+<code>fsync</code> once per group (group commit), which amortizes the one expensive flush across many events and keeps both the guarantee
+and most of the throughput. Let us decide the actual durability requirement — how much data we may lose on a crash — and size the batch to
+it, then test it by pulling the plug mid-write and seeing what survives.&rdquo; Naming write-back as non-durable, quoting the flush cost,
+and reaching for batching over per-write sync is the senior register — and the seed of the write-ahead log.</p>
+</aside>
+
+<p><em>(Answer to the &sect;41.2 quick check: <code>fsync</code> forces the file's dirty pages out of the page cache to the storage device
+and waits until the device confirms they are durably stored, which a plain <code>write</code> never does; it is ~9000&times; slower per
+record here because that wait is a physical round trip to storage (~8.6&nbsp;ms on this device) versus a memory copy (~0.9&nbsp;&micro;s).
+Durable systems keep throughput up by <strong>batching</strong> — grouping many writes behind a single <code>fsync</code> (group commit, the
+write-ahead log), so the fixed per-flush cost is amortized across hundreds of records while every acknowledged record is still on the device
+before the acknowledgement.)</em></p>
+
+<h2>41.5 What to carry forward</h2>
+
+<p><strong>Durability is not free and not implicit.</strong> A <code>write</code> only reaches the page cache (Chapter 40), so it is fast
+but volatile: a crash before write-back loses acknowledged data, and the return value tells you nothing about the device (&sect;41.1). The
+barrier that makes data durable is <strong><code>fsync</code></strong> (or <code>fdatasync</code>), which forces the file's dirty pages to
+storage and waits — here ~8.6&nbsp;ms per flush against ~0.9&nbsp;&micro;s for the buffered write, about <strong>9000&times;</strong>
+(&sect;41.2) — because it is bounded by the physical device, not by memory. That single fact drives durable-system design: you pay the flush
+as rarely as correctness allows by <strong>batching</strong> many writes behind one sync (group commit, the write-ahead log). Two more
+tools control how file data moves: <strong><code>O_DIRECT</code></strong> bypasses the page cache for programs that manage their own
+(databases with a buffer pool, one-pass scans that would only pollute the cache), at the cost of alignment constraints and forfeited
+readahead and cache hits (&sect;41.3); and <strong>memory-mapped I/O</strong> maps a file into your address space so you touch it with loads
+and stores, avoiding the <code>read</code> copy — a win for reuse and random access, roughly a wash for a single streaming pass, and chosen
+by measured access pattern (&sect;41.4). Above all, the trap: never mistake a returned <code>write</code> for durable data, and test a
+durability claim against a real crash (&sect;41.4).</p>
+
+<p>These are the mechanics Volume 2 builds a database on: the write-ahead log is exactly &ldquo;append and <code>fsync</code> once&rdquo;
+made into a discipline, the buffer pool is exactly &ldquo;manage your own cache with <code>O_DIRECT</code>,&rdquo; and crash recovery is
+exactly &ldquo;reason about what a <code>write</code> had and had not made durable when the power failed.&rdquo; The last two chapters have
+been about a program moving bytes to and from storage, one operation at a time, blocking until each finishes. But a server does not talk to
+one file — it talks to thousands of clients at once, and it cannot afford to stop and wait on each. The next chapter, <a href="#ch42">Chapter
+42</a>, turns to that problem: <strong>blocking versus non-blocking I/O</strong> — what happens to a thread that waits on a slow read, why one thread per connection does
+not scale to ten thousand of them, and how a single thread can watch thousands of descriptors and act only on the ones that are ready. The
+cost model shifts again, from the latency of one operation to the concurrency of many.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a successful <code>write</code> is not durable, and what event loses the data.</li>
+<li>State what <code>fsync</code> does and, to an order of magnitude, how much slower it is than a buffered write.</li>
+<li>Explain why durable systems batch writes behind one flush, and name the design that does so.</li>
+<li>Say what <code>O_DIRECT</code> does, its main constraint, and one kind of program that wants it.</li>
+<li>State what <code>mmap</code> avoids versus <code>read</code>, and when to prefer each.</li>
+<li>Name the durability trap and how you would actually test a durability claim.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> After a <code>write</code> returns, where is the data, and what loses it? (&sect;41.1)</li>
+<li><strong>R2.</strong> What does <code>fsync</code> do, why is it ~9000&times; slower per record here, and how do systems keep throughput? (&sect;41.2)</li>
+<li><strong>R3.</strong> What does <code>O_DIRECT</code> do, what constraint does it impose, and who wants it? (&sect;41.3)</li>
+<li><strong>R4.</strong> What does <code>mmap</code> avoid versus <code>read</code>, and when does each win? (&sect;41.4)</li>
+<li><strong>R5.</strong> Why is trusting a returned <code>write</code> for durability a trap, and how do you test the claim? (&sect;41.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapter 13
+(kernel buffering, <code>fsync</code>/<code>fdatasync</code>, and <code>O_DIRECT</code>) and Chapter 49 (&ldquo;Memory Mappings&rdquo;) are
+the reference for this entire chapter — the durability barrier, direct I/O, and <code>mmap</code>. First author Michael Kerrisk; edition and
+ISBN verified via the publisher.</li>
+<li><strong>W. Richard Stevens &amp; Stephen A. Rago, <em>Advanced Programming in the UNIX Environment</em>, 3rd ed. (Addison-Wesley, 2013),
+ISBN 978-0-321-63773-4.</strong> Chapter 3 (file I/O and synchronized writes) and Chapter 14 (memory-mapped I/O) ground &sect;41.1&ndash;&sect;41.4
+in the POSIX interfaces. First author W. Richard Stevens; edition and ISBN verified via the publisher.</li>
+<li><strong>Thanumalayan S. Pillai, Vijay Chidambaram, Ramnatthan Alagappan, Samer Al-Kiswany, Andrea C. Arpaci-Dusseau &amp; Remzi H.
+Arpaci-Dusseau, &ldquo;All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications,&rdquo; in
+<em>Proceedings of OSDI 2014</em>, pp. 433&ndash;448.</strong> The empirical study behind &sect;41.1's crash-consistency warning — how
+applications get durability and ordering wrong, and why <code>fsync</code> placement matters. First author Thanumalayan Pillai; USENIX
+open-access proceedings (no DOI), cited by venue and page range.</li>
+<li><strong>Marshall K. McKusick, William N. Joy, Samuel J. Leffler &amp; Robert S. Fabry, &ldquo;A Fast File System for UNIX,&rdquo;
+<em>ACM Transactions on Computer Systems</em> 2(3), pp. 181&ndash;197 (1984), DOI 10.1145/989.990.</strong> The classic behind the
+filesystem layer that <code>fsync</code> must push data through — allocation, locality, and on-disk layout. First author Marshall Kirk
+McKusick; DOI verified via the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex41.1"><span class="ex-label">41.1</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, say where the data is after a <code>write</code> returns success, and what single event would cause it to be lost.</div>
+
+<div class="exercise" id="ex41.2"><span class="ex-label">41.2</span> <span class="ex-tag warm">warm-up</span>
+What does <code>fsync</code> do that <code>write</code> does not? What does <code>fdatasync</code> skip that <code>fsync</code> does, and
+why can that make it slightly cheaper?</div>
+
+<div class="exercise" id="ex41.3"><span class="ex-label">41.3</span> <span class="ex-tag warm">warm-up</span>
+Why is <code>fflush</code> on a stdio stream <em>not</em> the same as making the data durable? Which buffer does it empty, and into what?</div>
+
+<div class="exercise" id="ex41.4"><span class="ex-label">41.4</span> <span class="ex-tag core">core</span>
+Durability cost. (a) Explain why <code>fdatasync</code>-per-record ran ~9000&times; slower than the buffered write here. (b) Why is the
+absolute ~8.6&nbsp;ms a property of the device rather than the CPU? (c) A system needs durable acknowledgements but 100 records/s is far too
+slow — describe how group commit gets both the guarantee and the throughput, and what it trades.</div>
+
+<div class="exercise" id="ex41.5"><span class="ex-label">41.5</span> <span class="ex-tag core">core</span>
+<code>O_DIRECT</code>. (a) What does it bypass, and how is the data moved instead? (b) State the alignment constraint it imposes and why an
+ordinary <code>malloc</code>'d buffer can fail. (c) Give one program that genuinely wants <code>O_DIRECT</code> and one that would be harmed
+by it, with the reason in each case.</div>
+
+<div class="exercise" id="ex41.6"><span class="ex-label">41.6</span> <span class="ex-tag core">core</span>
+Memory-mapped I/O. (a) What copy does <code>mmap</code> avoid that <code>read</code> pays? (b) Why did the two come out close in the
+&sect;41.4 measurement — what does <code>mmap</code> pay instead of the copy? (c) Name an access pattern for which <code>mmap</code> clearly
+wins and one for which buffered <code>read</code>/<code>write</code> is the better choice.</div>
+
+<div class="exercise" id="ex41.7"><span class="ex-label">41.7</span> <span class="ex-tag complexity">cost</span>
+A durable log appends records and must <code>fsync</code> to acknowledge them. A buffered write costs <var>w</var> and an <code>fsync</code>
+costs <var>f</var>, with <var>f</var>&nbsp;&gt;&gt;&nbsp;<var>w</var>. (a) Write the per-record cost when you <code>fsync</code> after every
+record, and when you <code>fsync</code> once per batch of <var>k</var> records. (b) Using <var>w</var>&asymp;0.9&nbsp;&micro;s,
+<var>f</var>&asymp;8.6&nbsp;ms, compute the per-record cost at <var>k</var>=1 and <var>k</var>=1000. (c) What does the batch cost the
+application in the event of a crash, and how does that set an upper bound on <var>k</var>?</div>
+
+<div class="exercise" id="ex41.8"><span class="ex-label">41.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague's service writes each record and calls <code>fsync</code> after every one; it is
+correct but only sustains ~100 records/s, and they propose buying faster disks.
+<br><strong>Step 1 (given):</strong> each acknowledgement is bounded by one device-flush round trip (~8.6&nbsp;ms here), not by CPU or the
+buffered write.
+<br><strong>Step 2 (given):</strong> the flush cost is a fixed per-<code>fsync</code> price largely independent of how many bytes it
+covers.
+<br><strong>Step 3 (given):</strong> so one <code>fsync</code> can be shared across many records appended before it (group commit).
+<br><strong>Step 4 (you):</strong> Explain why batching, not faster disks, is the right first move; estimate the throughput at a batch of
+1000; and state precisely what durability the batch still guarantees and what it does not.</div>
+
+<div class="exercise" id="ex41.9"><span class="ex-label">41.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether the data is durable at the marked point, and if not, what to add: (a) <code>write(fd, rec, n)</code> returns success,
+then the machine loses power; (b) the same, but <code>fdatasync(fd)</code> returned before the power loss; (c) a record is written to a new
+temp file, <code>fsync</code>'d, and the temp file renamed over the target, then power is lost — but the directory was never synced; (d) a
+mapped-file store dirties pages via memory writes and the process exits cleanly without <code>msync</code>, then power is lost.</div>
+
+<div class="exercise" id="ex41.10"><span class="ex-label">41.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;If <code>write</code> returns success, the data is on
+the disk.&rdquo; (b) &ldquo;<code>fsync</code> is slow mainly because copying the bytes is expensive.&rdquo; (c) &ldquo;<code>O_DIRECT</code>
+makes I/O faster for every workload.&rdquo; (d) &ldquo;<code>mmap</code> lets several processes share one set of physical pages for the same
+file.&rdquo; (e) &ldquo;A durability guarantee that passes all your tests without a crash is proven.&rdquo;</div>
+
+<div class="exercise" id="ex41.11"><span class="ex-label">41.11</span> <span class="ex-tag stretch">stretch</span>
+Look ahead to Volume 2. (a) Explain why the huge cost of <code>fsync</code> is the reason databases keep a <em>write-ahead log</em> rather
+than syncing their data files directly. (b) Explain why a database using its own buffer pool often opens data files with
+<code>O_DIRECT</code>, in terms of avoiding a redundant second cache. (c) Argue why &ldquo;how often must I cross the durability
+barrier&rdquo; is the first design question for any storage system, tying it to the ~9000&times; number.</div>
+
+<div class="exercise" id="ex41.12"><span class="ex-label">41.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Append many small records to a file, timing a version with no sync against one with
+<code>fdatasync</code> after each record; report per-record cost and the ratio. (b) Repeat with an <code>fsync</code> once per batch of
+<var>k</var> records for a few values of <var>k</var>, and plot per-record cost against <var>k</var>. (c) Sum a large cached file via
+<code>read</code> into a buffer and via <code>mmap</code>, reporting both and their variance. State your toolchain, CPU, filesystem, and
+device, and note these are wall-clock times (no hardware counters) if you lack <code>perf</code>; if your storage is a virtual disk, say
+so, since it sets the absolute <code>fsync</code> cost.</div>
+
+</section>
+</section>

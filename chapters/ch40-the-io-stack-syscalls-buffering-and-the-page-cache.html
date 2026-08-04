@@ -1,0 +1,371 @@
+<section class="chapter" id="ch40">
+<h1>Chapter 40 — The I/O Stack: System Calls, Buffering, and the Page Cache</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch13">Chapter 13</a> (the system-call boundary — why crossing into the
+kernel costs more than a function call), <a href="#ch03">Chapter 3</a> (the memory hierarchy — a fast layer in front of a slow one, which
+is exactly what the page cache is), <a href="#ch17">Chapter 17</a> (demand paging — the same page-fault machinery the page cache rides on),
+<a href="#ch33">Chapter 33</a> (measure first — carried across the boundary into I/O). &nbsp;·&nbsp; The last part measured costs
+<em>inside</em> the machine — cycles, cache lines, the heap. This part crosses the boundary to where the program meets storage and the
+network, and the first cost it meets is the one this chapter is about: the system call, and the two layers of buffering that hide it.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching across the earlier parts: (1) <a href="#ch13">Chapter 13</a> — what is a <em>system call</em>, and why does it
+cost more than an ordinary function call: what has to happen at the boundary? (2) <a href="#ch03">Chapter 3</a> — what is a cache, and why
+does putting a fast layer in front of a slow one speed up <em>repeated</em> access to the same data? (3) <em>Predict:</em> you copy a
+4&nbsp;MiB file two ways — once reading and writing one byte at a time with the <code>read</code>/<code>write</code> system calls, and once
+through a 64&nbsp;KiB buffer. How large is the gap — 2&times;, 20&times;, more? And separately: you read a 256&nbsp;MiB file once when it is
+not in memory and once when it already is. How large is <em>that</em> gap? Write both guesses; &sect;40.2 and &sect;40.3 answer them.</p>
+</aside>
+
+<p>Reading a file looks like the simplest thing a program does — call <code>read</code>, bytes appear — but underneath that call is a stack
+of layers, and where your time goes depends on which of them you hit. Every ordinary file access is a <strong>system call</strong>
+(Chapter 13): <code>read</code> and <code>write</code> are not library routines that touch the disk directly but requests to the kernel,
+which owns the hardware. Crossing into the kernel and back has a fixed cost — a mode switch, argument checking, the kernel's own work — that
+is paid <em>per call</em> regardless of how many bytes the call moves, so the first rule of I/O performance is that the number of system
+calls, not the number of bytes, often decides the speed. That is why <strong>buffering</strong> exists, and it exists twice: the C library
+buffers your bytes in user space so that many small <code>fputc</code>s become one <code>write</code>, and the kernel buffers file data in
+a region of DRAM called the <strong>page cache</strong> so that a read already in memory never touches the disk at all. This chapter is the
+map of that stack. It proceeds in five steps: the layers a <code>read</code> passes through, from the call to the device (&sect;40.1); why
+buffering is the difference between fast and unusably slow, measured (&sect;40.2); the page cache — DRAM standing in front of the disk — and
+what it does to your numbers (&sect;40.3); what this means for how you do and how you <em>measure</em> I/O, with the trap that catches
+everyone (&sect;40.4); and what to carry forward (&sect;40.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 4&nbsp;KiB pages) against an <code>ext4</code> filesystem, timed with <code>clock_gettime(CLOCK_MONOTONIC)</code>
+and reported as the minimum of several trials (Chapter 33). Times are wall-clock and illustrate the <em>shape</em> of each cost, not a
+storage benchmark. A hardware-counter profiler (<code>perf</code>) is <em>not</em> installed here, so the evidence is wall-clock time plus
+what can be read from the system — the page size from <code>getconf</code>, cache eviction forced with <code>posix_fadvise</code>. The
+&ldquo;cold&rdquo; read below is made cold by asking the kernel to drop this file's pages with <code>POSIX_FADV_DONTNEED</code>, not by a
+privileged cache flush; on this machine the backing store is a virtual disk, so the cold number reflects <em>this</em> storage and would
+differ on bare-metal SSD or spinning disk — published device latencies, where quoted, are labelled as such.</p>
+
+<h2>40.1 The I/O stack: from read() to the device</h2>
+
+<p>When a program calls <code>read(fd, buf, n)</code>, the request descends through several layers before any bytes come back, and knowing
+them tells you where a given cost lives. At the top is the <strong>file descriptor</strong>: a small integer that indexes a per-process
+table, each entry pointing at an open-file description that holds the current offset and a reference to the underlying object (Chapter 13).
+The call traps into the kernel and reaches the <strong>virtual filesystem</strong> (VFS), the abstraction layer that lets one
+<code>read</code> work uniformly across <code>ext4</code>, a pipe, a socket, or a device — &ldquo;everything is a file&rdquo; is this layer
+keeping its promise. For a regular file the VFS asks the <strong>page cache</strong> whether the requested bytes are already resident in
+DRAM; if they are, they are copied straight to your buffer and the call returns without any device I/O at all. If they are not, the request
+descends to the <strong>filesystem</strong> proper, which maps the file offset to physical block numbers, and then to the <strong>block
+layer</strong>, which queues and schedules the request to the <strong>device driver</strong> and the hardware — where the real latency
+lives, milliseconds for a spinning disk, tens of microseconds for an SSD, against tens of <em>nanoseconds</em> to reach DRAM. Two facts
+fall out of this picture and organize the rest of the chapter. First, the cost of the <em>call itself</em> — the trap, the VFS dispatch, the
+copy into your buffer — is paid every time regardless of size, so making the call move more bytes amortizes it; that is &sect;40.2. Second,
+the page cache means a &ldquo;disk read&rdquo; is usually not a disk read: the same file read twice hits DRAM the second time, so the number
+you measure depends entirely on whether the data was resident, which is &sect;40.3. The layers are the same for <code>write</code> in
+reverse, with one twist that Chapter 41 turns into its whole subject: a <code>write</code> that reaches the page cache returns
+<em>before</em> the data is on the device.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the layers a <code>read</code> of a regular file passes through, from the file descriptor down to the device. At which layer does a
+read return <em>without</em> touching the disk, and why does that make &ldquo;how long does a read take&rdquo; a question with two very
+different answers? (Answer after the next section.)</p>
+</aside>
+
+<h2>40.2 Why buffering matters: the syscall is the cost</h2>
+
+<p>The cheapest way to see the cost of the system call is to pay it as many times as possible. Copying a 4&nbsp;MiB file one byte per
+<code>read</code> and one byte per <code>write</code> — two system calls for every byte — against copying it through a single 64&nbsp;KiB
+buffer, so each call moves 65,536 bytes, runs in this environment (gcc 11.4.0, minimum of several trials):</p>
+
+<pre><code>copy a 4 MiB file:
+                                      total       per byte      throughput
+per-byte read()/write() (2 syscalls/byte):  6.73 s     1604 ns/byte    0.59 MiB/s
+buffered 64 KiB read()/write()           :  0.0022 s    0.53 ns/byte   1812 MiB/s
+stdio getc/putc (libc buffers ~4 KiB)    :  0.078 s     18.6 ns/byte   51 MiB/s
+                                            buffered vs per-byte: ~3000x faster</code></pre>
+
+<p>The per-byte version is not a little slower — it is about <strong>3000&times; slower</strong>, and the reason is entirely the system
+calls. Each byte costs two round trips into the kernel, and on this machine a trivial system call is on the order of a few hundred
+nanoseconds (measured directly in Chapter 42), so at ~1600&nbsp;ns/byte the copy is doing almost nothing <em>but</em> crossing the boundary.
+The buffered version pays the same per-call cost but amortizes it over 65,536 bytes, dropping the per-byte cost below a nanosecond and
+running at memory speed. Between the two sits <strong>stdio</strong>: <code>getc</code>/<code>putc</code> read and write one character at a
+time in your source, but the C library holds a buffer (about 4&nbsp;KiB by default) and issues a real <code>read</code>/<code>write</code>
+only when it fills or drains — so a million <code>getc</code>s become a few hundred system calls, and the 18.6&nbsp;ns/byte here is the cost
+of the per-character function calls and library bookkeeping, not of the syscall, which stdio has already amortized. This is the crux of I/O
+performance and it is worth stating plainly: <strong>there are two independent buffers in the stack</strong> — the kernel's page cache,
+which you get for free, and the user-space buffer (stdio's, or your own), which turns many small logical operations into few large system
+calls. The per-byte disaster above is what happens when you defeat the second one by calling <code>read</code>/<code>write</code> yourself
+with a size of 1. The fix is never faster hardware; it is a bigger buffer, so the fixed per-call cost is spread across more bytes (Kerrisk,
+ch.13; Bryant &amp; O'Hallaron, ch.10).</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is copying a file one byte per <code>read</code>/<code>write</code> about 3000&times; slower than through a 64&nbsp;KiB buffer, when
+both move the same bytes? Where does stdio's <code>getc</code>/<code>putc</code> sit between the two, and what is it buffering that the raw
+per-byte version is not? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>40.3 The page cache: DRAM in front of the disk</h2>
+
+<p>The second buffer is the kernel's, and it changes the meaning of every I/O number you will ever measure. The <strong>page cache</strong>
+is a region of otherwise-free DRAM in which the kernel keeps recently used file pages: a <code>read</code> whose bytes are already there is
+served from memory with a copy and no device access, and a <code>write</code> lands in the cache (marking the page <em>dirty</em>) and is
+flushed to the device later by kernel writeback threads (Love, ch.16). It is a cache in exactly the Chapter 3 sense — a fast layer standing
+in front of a slow one, betting that data used once will be used again — and its effect is large. Reading a 256&nbsp;MiB file once when its
+pages have been evicted from the cache, and once when they are resident, runs here:</p>
+
+<pre><code>read a 256 MiB file, summing bytes:
+cold (pages evicted with POSIX_FADV_DONTNEED): ~0.59-0.68 s     ~375-440 MiB/s   (goes to the device)
+warm (pages resident in the page cache)      :  0.047 s        ~5450 MiB/s      (a copy from DRAM)
+                                               cold/warm: ~13x on this machine</code></pre>
+
+<p>Same code, same file, same bytes summed — and the warm read is about <strong>13&times; faster</strong> because it never leaves DRAM,
+while the cold read waits on the storage device. The gap is this machine's; on a spinning disk it would be far larger (a seek is
+milliseconds), on a fast NVMe SSD smaller, but the <em>shape</em> is universal: the first touch pays the device, later touches pay only a
+memory copy. Two behaviours of the cache are worth knowing because they shape your numbers. The kernel does <strong>readahead</strong> — on
+a sequential read it fetches pages ahead of your position, so a streaming scan overlaps device latency with your computation and runs faster
+than random access would. And on the write side it does <strong>write-back</strong>, not write-through: <code>write</code> returns as soon
+as the bytes are in the cache, so writes appear far faster than the device could sustain, with the real device cost paid asynchronously
+later — which is convenient for speed and, as Chapter 41 will show, a genuine hazard for durability, because data that a <code>write</code>
+call has &ldquo;accepted&rdquo; is not yet on disk. The page cache is also why free memory is never wasted on a busy machine: the kernel
+fills it with file pages and evicts them under pressure, so a long-running server's I/O gets faster as its working set warms.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: the syscall is the cost, and the cache hides the disk</span>
+<p><strong>1. In words.</strong> A file access descends through the file descriptor, the VFS, the page cache, the filesystem, the block
+layer, and the device. Two costs dominate. The <em>system call</em> is a fixed per-call price, so moving one byte per call is catastrophic
+and moving 64&nbsp;KiB per call is nearly free per byte — buffer to amortize it. The <em>page cache</em> is DRAM in front of the device, so a
+read that hits it never touches the disk, and a read that misses pays the device — the same code times differently depending only on what is
+resident.</p>
+<p><strong>2. As a picture.</strong> Figure 40.1: the stack as a vertical column — <code>read()</code> &rarr; file descriptor &rarr; VFS
+&rarr; page cache (hit: return from DRAM) &rarr; filesystem &rarr; block layer &rarr; device (miss) — with two cost bars beside it: per-byte
+vs 64&nbsp;KiB buffering, and cold vs warm reads.</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, one file. Per-byte <code>read</code>/<code>write</code>: ~1604&nbsp;ns/byte
+(0.59&nbsp;MiB/s); a 64&nbsp;KiB buffer: ~0.53&nbsp;ns/byte (1812&nbsp;MiB/s) — <strong>~3000&times;</strong> (&sect;40.2). Cold read
+~400&nbsp;MiB/s; warm read ~5450&nbsp;MiB/s — <strong>~13&times;</strong> (&sect;40.3). Neither gap is the disk getting faster; one is the
+syscall amortized, the other is the device skipped.</p>
+</aside>
+
+<p><em>(Answer to the &sect;40.1 quick check: a <code>read</code> passes through the file descriptor and its open-file description (holding
+the offset), the VFS, the page cache, and — on a miss — the filesystem, the block layer, the device driver, and the hardware. It returns
+without touching the disk at the page cache, when the requested pages are already resident in DRAM; that is why &ldquo;how long does a read
+take&rdquo; has two answers — tens of nanoseconds per byte for a cache hit, and a device access of microseconds to milliseconds for a
+miss — and why an I/O measurement is meaningless unless you say which case it is.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The I/O stack a read() descends, and the two costs that dominate it.</text>
+<rect x="12" y="28" width="150" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="42" font-size="9">read(fd, buf, n) &mdash; syscall</text>
+<rect x="12" y="52" width="150" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="66" font-size="9">fd table / open-file (offset)</text>
+<rect x="12" y="76" width="150" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="90" font-size="9">VFS (&ldquo;everything is a file&rdquo;)</text>
+<rect x="12" y="100" width="150" height="20" fill="#dfeee0" stroke="#2f7d32"/><text x="20" y="114" font-size="9">page cache &mdash; HIT: return from DRAM</text>
+<rect x="12" y="124" width="150" height="20" fill="#fff3d6" stroke="#8a6d1d"/><text x="20" y="138" font-size="9">filesystem (offset &rarr; blocks)</text>
+<rect x="12" y="148" width="150" height="20" fill="#fff3d6" stroke="#8a6d1d"/><text x="20" y="162" font-size="9">block layer (queue / schedule)</text>
+<rect x="12" y="172" width="150" height="20" fill="#f6dcd2" stroke="#8c3a1d"/><text x="20" y="186" font-size="9">device &mdash; MISS: us to ms</text>
+<path d="M87 48 L 87 52 M87 72 L 87 76 M87 96 L 87 100 M87 120 L 87 124 M87 144 L 87 148 M87 168 L 87 172" stroke="#14406b" stroke-width="1"/>
+<path d="M162 110 C 210 110, 210 110, 214 110" stroke="#2f7d32" stroke-width="1"/><text x="178" y="106" font-size="8" fill="#2f7d32">hit &rarr; no device I/O</text>
+<line x1="330" y1="28" x2="330" y2="196" stroke="#b9c2cc"/>
+<text x="345" y="42" font-size="9" fill="#14406b">cost 1: the syscall (buffer to amortize)</text>
+<rect x="345" y="50" width="270" height="12" fill="#efb9a5" stroke="#8c3a1d"/><text x="345" y="76" font-size="8">per-byte read/write: ~1604 ns/byte (0.59 MiB/s)</text>
+<rect x="345" y="84" width="9" height="12" fill="#cfe6cf" stroke="#2f7d32"/><text x="356" y="94" font-size="8">64 KiB buffer: ~0.53 ns/byte (1812 MiB/s) &mdash; ~3000&times;</text>
+<text x="345" y="126" font-size="9" fill="#14406b">cost 2: the device (cache to skip)</text>
+<rect x="345" y="134" width="230" height="12" fill="#efb9a5" stroke="#8c3a1d"/><text x="345" y="160" font-size="8">cold read (evicted): ~400 MiB/s (goes to device)</text>
+<rect x="345" y="168" width="18" height="12" fill="#cfe6cf" stroke="#2f7d32"/><text x="365" y="178" font-size="8">warm read (page cache): ~5450 MiB/s &mdash; ~13&times;</text>
+<line x1="12" y1="212" x2="620" y2="212" stroke="#b9c2cc"/>
+<text x="12" y="230" font-size="8" fill="#14406b">Two buffers in the stack: the user-space buffer (stdio / your own) turns many small ops into few syscalls;</text>
+<text x="12" y="244" font-size="8" fill="#14406b">the kernel's page cache turns most reads into DRAM copies and lets writes return before they reach the device.</text>
+<text x="12" y="266" font-size="8" fill="#8c3a1d">Neither speedup is faster hardware: one amortizes the call, the other skips the disk. A warm-cache benchmark measures memory, not storage.</text>
+</svg>
+<figcaption>Figure 40.1: The I/O stack (left) and its two dominant costs (right). A <code>read</code> descends from the file descriptor
+through the VFS to the page cache, returning from DRAM on a hit and reaching the device only on a miss. The <em>system call</em> is a fixed
+per-call cost — buffering amortizes it (~3000&times;, &sect;40.2) — and the <em>page cache</em> is DRAM in front of the device — hitting it
+skips the disk (~13&times;, &sect;40.3). Wall-clock, illustrative; cold reads reflect this machine's virtual disk.</figcaption>
+</figure>
+
+<h2>40.4 Doing and measuring I/O: buffer sizes, short counts, and the warm-cache trap</h2>
+
+<p>Three practical facts follow from the stack, and each is a place engineers go wrong. First, <strong>buffer size has a sweet spot,
+not a maximum</strong>: the per-byte cost falls steeply as the buffer grows from 1 byte toward the tens of kilobytes that amortize the
+syscall and match the kernel's readahead, then flattens — a 64&nbsp;KiB buffer already ran at memory speed above, and a 64&nbsp;MiB one
+would not be meaningfully faster while wasting cache and memory. The right size is &ldquo;large enough that the syscall is amortized,&rdquo;
+typically tens to hundreds of KiB, not &ldquo;as large as possible.&rdquo; Second, <strong><code>read</code> and <code>write</code> may
+move fewer bytes than you asked</strong>: a <code>read</code> can return a <em>short count</em> at end-of-file or when interrupted, and a
+<code>write</code> to a pipe or socket can accept only part of your buffer, so correct I/O code loops until the requested count is done or an
+error occurs — the buffered copy above does exactly this, advancing a pointer through the buffer on each partial <code>write</code>. Code
+that assumes one <code>read</code> returns everything, or one <code>write</code> consumes everything, is not merely slow but wrong on the
+inputs where it matters. Third, and most damaging to your numbers, is the <strong>page cache in your measurements</strong>: run an I/O
+benchmark twice and the second run is served from the warm cache, so it reports DRAM throughput (the ~5450&nbsp;MiB/s above) while
+presenting itself as a disk number. This is the trap the &ldquo;On the code&rdquo; note guards against — the cold figures here required
+explicitly evicting the file's pages first. As always the honest number is the one that names its conditions (Chapter 33): a storage
+benchmark must state whether it ran cold or warm, because those are different systems, and a warm-cache time is a measurement of memory
+wearing a disk's name. Where hardware counters exist, they let you see cache-hit rates directly; here, the discipline is to control the
+cache state yourself and to report which state you measured.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: benchmarking I/O against a warm cache &mdash; measuring DRAM, reporting it as disk</span>
+<p>The seductive mistake is to time a read or a copy, see a big number, and believe it describes your storage — when the file was already in
+the page cache from a previous run or from the write that created it, so what you measured was a copy from DRAM. On this machine the same
+read is ~13&times; faster warm than cold; on a spinning disk the gap can be hundreds of times, so a warm-cache benchmark can overstate real
+throughput by orders of magnitude and send you optimizing a bottleneck that will not exist in production, where the data arrives cold. Two
+defenses. First, <em>control the cache state</em>: to measure cold storage, evict the file's pages first — <code>posix_fadvise</code> with
+<code>POSIX_FADV_DONTNEED</code>, or on a machine you administer a cache drop — and to measure warm-cache behaviour, pre-warm deliberately;
+either is fine, but you must know and state which. Second, <em>report the conditions</em>: every I/O number should say cold or warm, the
+buffer size, and the filesystem and device, because those determine it far more than the code does. A throughput figure with no cache state
+is not a measurement of anything — it is the &ldquo;optimizing to a story&rdquo; trap of the last part (Chapter 39) in an I/O costume: a
+plausible number measured against an uncontrolled variable.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our log processor reads the file a character at a time and it is painfully slow — I think
+we are disk-bound, so let us put it on faster SSDs and add a few reader threads.&rdquo; Cover the paragraph and respond in four or five
+sentences, drawing on &sect;40.1&ndash;&sect;40.4.</p>
+<p><em>Model answer.</em> &ldquo;I do not think it is the disk — a character-at-a-time reader is spending its time in system calls, not
+waiting on storage. Every <code>getc</code> or one-byte <code>read</code> is a trip across the kernel boundary, and on our numbers per-byte
+I/O runs about 3000&times; slower than the same copy through a 64&nbsp;KiB buffer, which is nearly free per byte. Faster SSDs and more
+threads will not help, because the bottleneck is the call frequency, not device bandwidth or parallelism — we would just be making more
+syscalls in parallel. The fix is one line of buffering: read into a large buffer and parse from memory, or use buffered stdio instead of
+raw one-byte calls. Let us confirm with a quick before/after — buffer the reads and re-time — and I expect the &lsquo;disk&rsquo; problem to
+vanish without touching the hardware.&rdquo; Naming the syscall as the cost, and reaching for a buffer before hardware or threads, is the
+senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;40.2 quick check: per-byte I/O is ~3000&times; slower because each byte pays two system calls, and the fixed
+per-call cost — the trap into the kernel and back — dwarfs the work of moving one byte; the 64&nbsp;KiB buffer pays the same per-call cost
+once per 65,536 bytes, amortizing it to under a nanosecond each. Stdio's <code>getc</code>/<code>putc</code> sit in between: they present a
+per-character interface but buffer in user space (~4&nbsp;KiB), so they issue few real system calls — what they buffer is exactly what the
+raw per-byte version does not, which is why they run ~86&times; faster than it while still paying per-character function-call overhead.)</em></p>
+
+<h2>40.5 What to carry forward</h2>
+
+<p>An I/O operation is a <strong>descent through layers</strong>, and its cost depends on which layer answers. A file access is a
+<strong>system call</strong> (Chapter 13) into the kernel's VFS, and the call has a fixed per-invocation price paid regardless of size — so
+the dominant lever in I/O performance is <strong>buffering</strong>, amortizing that price over many bytes. Measured here, per-byte
+<code>read</code>/<code>write</code> ran ~1604&nbsp;ns/byte against ~0.53&nbsp;ns/byte through a 64&nbsp;KiB buffer — about
+<strong>3000&times;</strong> (&sect;40.2) — and stdio sits between by buffering in user space so that many small operations become few
+syscalls. Below the VFS sits the <strong>page cache</strong>, DRAM standing in front of the device (Chapter 3's caching idea, applied to
+storage): a read that hits it is a memory copy, a read that misses pays the device, and here a warm read ran ~13&times; faster than a cold
+one (&sect;40.3) — the same code timing differently based only on what was resident. The cache also does readahead for sequential reads and
+write-back for writes, which makes writes look instant. From all of this the working discipline: buffer your I/O to amortize the syscall,
+handle short counts by looping, and — above all — control and report the cache state when you measure, because a warm-cache number is a
+measurement of memory, not storage (&sect;40.4).</p>
+
+<p>This is the same measure-first discipline the last part built, now carried across the boundary into I/O, where the cost model is new —
+syscalls and device latency instead of cycles and cache lines — but the method is unchanged. One feature of the page cache, though, is a
+loose thread this chapter deliberately left hanging: a <code>write</code> returns as soon as the bytes reach the cache, <em>before</em> they
+are on the device, which is wonderful for speed and a real problem the moment you care whether the data survives a crash. That is the
+subject of the next chapter, <a href="#ch41">Chapter 41</a>: files and durability — how to force data to stable storage with
+<code>fsync</code> and what it costs, how <code>O_DIRECT</code> bypasses the cache, and how memory-mapped I/O maps file pages straight into
+your address space. The stack is mapped; now we make it durable, and pay for it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name the layers a <code>read</code> of a regular file descends, and where a cache hit returns without device I/O.</li>
+<li>Explain why per-byte <code>read</code>/<code>write</code> is ~3000&times; slower than a 64&nbsp;KiB buffer, with the order of magnitude.</li>
+<li>Distinguish the two buffers in the stack — user-space (stdio) and the kernel's page cache — and what each does.</li>
+<li>State what the page cache is and why a warm read is much faster than a cold one.</li>
+<li>Explain why <code>read</code>/<code>write</code> can move fewer bytes than requested, and what correct code does about it.</li>
+<li>Say why a warm-cache benchmark is a misleading measurement of storage, and how to run a cold one.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What layers does a <code>read</code> pass through, and at which one can it return without touching the device? (&sect;40.1)</li>
+<li><strong>R2.</strong> Why is per-byte I/O ~3000&times; slower than buffered I/O, and where does stdio fit? (&sect;40.2)</li>
+<li><strong>R3.</strong> What is the page cache, and roughly how much faster was a warm read than a cold one here, and why? (&sect;40.3)</li>
+<li><strong>R4.</strong> Why can <code>read</code>/<code>write</code> return a short count, and what must correct code do? (&sect;40.4)</li>
+<li><strong>R5.</strong> Why is a warm-cache benchmark a misleading storage number, and how do you measure a cold read? (&sect;40.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 10 (&ldquo;System-Level I/O&rdquo;) is the source for &sect;40.1&ndash;&sect;40.2 — Unix I/O,
+file descriptors, the difference between unbuffered system-call I/O and buffered stdio, and short counts. First author Randal Bryant;
+edition and ISBN verified via the publisher.</li>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapter 4
+(&ldquo;File I/O&rdquo;) and Chapter 13 (&ldquo;File I/O Buffering&rdquo;) are the detailed reference for this chapter — the
+<code>read</code>/<code>write</code> system calls, the two levels of buffering (stdio and the kernel), and how buffer size affects
+performance. First author Michael Kerrisk; edition and ISBN verified via the publisher.</li>
+<li><strong>Robert Love, <em>Linux Kernel Development</em>, 3rd ed. (Addison-Wesley, 2010), ISBN 978-0-672-32946-3.</strong> Chapter 16
+(&ldquo;The Page Cache and Page Writeback&rdquo;) is the source for &sect;40.3 — how the kernel caches file pages in DRAM, readahead, and
+the write-back of dirty pages. First author Robert Love; edition and ISBN verified via the publisher.</li>
+<li><strong>Remzi H. Arpaci-Dusseau &amp; Andrea C. Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (Arpaci-Dusseau Books,
+2018).</strong> The &ldquo;Persistence&rdquo; chapters — especially &ldquo;I/O Devices&rdquo; (ch.36) — ground &sect;40.1's device layer:
+how a request reaches the hardware, interrupts, and DMA. Freely available online; first author Remzi Arpaci-Dusseau; cited by author and
+title (an open-access book carrying no ISBN for the online edition).</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex40.1"><span class="ex-label">40.1</span> <span class="ex-tag warm">warm-up</span>
+List, in order, the layers a <code>read</code> of a regular file passes through from the file descriptor down to the device, and mark the
+one at which a cache hit can return without any device I/O.</div>
+
+<div class="exercise" id="ex40.2"><span class="ex-label">40.2</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, explain why copying a file one byte per <code>read</code>/<code>write</code> is roughly 3000&times; slower than copying
+it through a 64&nbsp;KiB buffer, when both move the same number of bytes.</div>
+
+<div class="exercise" id="ex40.3"><span class="ex-label">40.3</span> <span class="ex-tag warm">warm-up</span>
+There are two distinct buffers in the I/O stack. Name each, say who owns it, and say what problem each one solves.</div>
+
+<div class="exercise" id="ex40.4"><span class="ex-label">40.4</span> <span class="ex-tag core">core</span>
+The page cache. (a) What is it, physically, and what does it hold? (b) Explain why the same <code>read</code> ran ~13&times; faster warm
+than cold here. (c) What is <em>readahead</em>, and why does it make a sequential scan faster than random access over the same file?</div>
+
+<div class="exercise" id="ex40.5"><span class="ex-label">40.5</span> <span class="ex-tag core">core</span>
+Short counts. (a) Give two situations in which <code>read</code> returns fewer bytes than requested, and one in which <code>write</code>
+does. (b) Sketch, in pseudocode, the loop that correctly writes an entire buffer despite partial <code>write</code>s. (c) Why is code that
+assumes one <code>read</code> returns the whole file not just slow but incorrect?</div>
+
+<div class="exercise" id="ex40.6"><span class="ex-label">40.6</span> <span class="ex-tag core">core</span>
+Buffer size. Given that per-byte I/O was ~1604&nbsp;ns/byte and a 64&nbsp;KiB buffer was ~0.53&nbsp;ns/byte, explain (a) why the per-byte
+cost falls steeply as the buffer grows from 1 byte to tens of KiB, (b) why it then flattens rather than continuing to fall, and (c) what
+this implies about choosing &ldquo;as large as possible&rdquo; versus &ldquo;large enough.&rdquo;</div>
+
+<div class="exercise" id="ex40.7"><span class="ex-label">40.7</span> <span class="ex-tag complexity">cost</span>
+A program issues <var>k</var> system calls to move a total of <var>B</var> bytes, each call costing a fixed <var>s</var> nanoseconds plus
+<var>b</var> nanoseconds per byte moved. (a) Write the total time in terms of <var>k</var>, <var>B</var>, <var>s</var>, <var>b</var>.
+(b) With per-byte I/O, <var>k</var>&nbsp;=&nbsp;<var>B</var>; with a buffer of size <var>W</var>, <var>k</var>&nbsp;=&nbsp;<var>B</var>/<var>W</var>.
+Show how the total time depends on <var>W</var>, and identify the <var>W</var> beyond which increasing it barely helps.</div>
+
+<div class="exercise" id="ex40.8"><span class="ex-label">40.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague benchmarks a file reader, gets 5&nbsp;GiB/s, and reports &ldquo;our storage does
+5&nbsp;GiB/s.&rdquo;
+<br><strong>Step 1 (given):</strong> the benchmark reads the same file the test harness just wrote.
+<br><strong>Step 2 (given):</strong> the write left every page of the file resident in the page cache.
+<br><strong>Step 3 (given):</strong> so the read was served entirely from DRAM, never reaching the device.
+<br><strong>Step 4 (you):</strong> Explain why 5&nbsp;GiB/s is a memory number, not a storage number; what the colleague should do to
+measure cold-storage throughput; and why the difference could be an order of magnitude in production.</div>
+
+<div class="exercise" id="ex40.9"><span class="ex-label">40.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether the dominant cost is <em>system-call frequency</em> or <em>device latency</em>, and how you would confirm: (a) a
+parser that calls <code>getc</code> in a tight loop over a 1&nbsp;GiB file already in cache; (b) a program that opens ten thousand small
+files scattered across a cold disk and reads each once; (c) a copy that reads and writes through a 1&nbsp;MiB buffer between two files on
+the same warm filesystem; (d) a logger that does a one-byte <code>write</code> per event.</div>
+
+<div class="exercise" id="ex40.10"><span class="ex-label">40.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;<code>read</code> always returns exactly the number of
+bytes you asked for unless the file ends.&rdquo; (b) &ldquo;A <code>write</code> that returns success means the data is on the disk.&rdquo;
+(c) &ldquo;stdio's <code>getc</code> issues one system call per character.&rdquo; (d) &ldquo;A read served from the page cache does not touch
+the storage device.&rdquo; (e) &ldquo;The bigger the I/O buffer, the faster, without limit.&rdquo;</div>
+
+<div class="exercise" id="ex40.11"><span class="ex-label">40.11</span> <span class="ex-tag stretch">stretch</span>
+Tie the chapter together. (a) Explain why both of this chapter's speedups — buffering (~3000&times;) and the warm cache (~13&times;) — are
+described as &ldquo;not faster hardware,&rdquo; and what each one actually removes. (b) A server's I/O throughput improves over the first
+few minutes of running and then stabilizes; explain this in terms of the page cache warming. (c) Argue why &ldquo;how many system calls,
+and is the data resident&rdquo; is a better first question about I/O performance than &ldquo;how fast is the disk.&rdquo;</div>
+
+<div class="exercise" id="ex40.12"><span class="ex-label">40.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Copy a several-MiB file one byte per <code>read</code>/<code>write</code> and again through a
+64&nbsp;KiB buffer; time both as the minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials and report the per-byte cost and
+the ratio. (b) Read a large file twice — once after evicting its pages (<code>posix_fadvise</code> with <code>POSIX_FADV_DONTNEED</code>,
+or a cache drop if you administer the machine) and once warm — and report cold vs warm throughput. (c) State your toolchain, CPU,
+filesystem, and buffer size, and note that these are wall-clock times (no hardware counters) if you lack <code>perf</code>, and which reads
+were cold versus warm.</div>
+
+</section>
+</section>

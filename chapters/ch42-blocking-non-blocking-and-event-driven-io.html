@@ -1,0 +1,391 @@
+<section class="chapter" id="ch42">
+<h1>Chapter 42 — Blocking, Non-Blocking, and Event-Driven I/O</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch41">Chapter 41</a> (a read that must reach the device blocks the
+thread until it finishes), <a href="#ch40">Chapter 40</a> (the I/O syscalls), <a href="#ch13">Chapter 13</a> (the cost of a system call),
+<a href="#ch15">Chapter 15</a> and <a href="#ch16">Chapter 16</a> (threads and scheduling — what a thread costs and what a blocked one
+does), <a href="#ch25">Chapter 25</a> (thread pools — where blocking work belongs). &nbsp;·&nbsp; The last two chapters moved bytes one
+operation at a time, each blocking until it finished. A server does not have that luxury: it faces thousands of connections at once and
+cannot stop on any one. This chapter is how a single thread watches thousands of descriptors and acts only on the ready ones.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch16">Chapter 16</a> — when a thread calls a blocking <code>read</code> on data that has not arrived, what does
+the scheduler do with that thread, and what is a context switch? (2) <a href="#ch15">Chapter 15</a> and <a href="#ch25">Chapter 25</a> — what
+does a thread cost in memory (its stack) and in scheduler pressure, and why does &ldquo;just add threads&rdquo; stop scaling? (3)
+<em>Predict:</em> a server holds 10,000 connections, almost all idle at any instant. Version A dedicates one thread to each, each blocked in
+<code>read</code>. Version B uses one thread that asks the kernel &ldquo;which of these 10,000 are ready?&rdquo; and handles only those. Two
+questions: what does version A cost when 10,000 threads sit blocked? And to answer &ldquo;which are ready,&rdquo; how does the cost of
+<code>select</code> (which scans all of them) compare to <code>epoll</code> as the number grows? Write your guesses; &sect;42.1 and
+&sect;42.3 answer them.</p>
+</aside>
+
+<p>Every I/O call so far has been <strong>blocking</strong>: a <code>read</code> on data that is not ready does not return — it parks the
+calling thread, which the scheduler deschedules until the data arrives (Chapter 16). For a program that talks to one file or one connection,
+this is exactly right and beautifully simple: the code reads as if the data were always there, and the kernel handles the waiting. The
+trouble begins when one program must serve <em>many</em> slow connections at once. If a blocked thread can wait on only one descriptor, then
+handling N connections concurrently needs N threads — and a thread is not free: it holds a stack (often megabytes of address space), it adds
+to the scheduler's run queue, and switching between thousands of them costs context switches that do no useful work (Chapters 15&ndash;16).
+At ten thousand connections — the famous <strong>C10K problem</strong> (Kegel) — the thread-per-connection model spends its resources on
+threads that are almost all just waiting. The escape is to stop dedicating a thread to each wait and instead ask the kernel a different
+question: not &ldquo;block me until <em>this one</em> descriptor is ready,&rdquo; but &ldquo;tell me which of <em>these thousands</em> are
+ready right now,&rdquo; and then do work only for those. That is <strong>event-driven I/O</strong>, and this chapter builds it in five steps:
+blocking I/O and why thread-per-connection does not scale (&sect;42.1); non-blocking I/O and the busy-poll trap it creates (&sect;42.2);
+readiness notification — <code>select</code>, <code>poll</code>, and <code>epoll</code> — and how their costs differ, measured (&sect;42.3);
+the event loop and its own characteristic trap (&sect;42.4); and what to carry forward (&sect;42.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 20 hardware threads), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as the minimum of several trials
+(Chapter 33). Times are wall-clock. A hardware-counter profiler (<code>perf</code>) is <em>not</em> installed here, so the syscall cost below
+is measured as wall-clock time per call, and the <code>select</code>-vs-<code>epoll</code> comparison is measured by monitoring many idle
+pipe descriptors with exactly one ready and timing the readiness scan as the count grows — the absolute nanoseconds are this machine's (on
+WSL2 the syscall floor is higher than on bare metal), but the <em>scaling</em> — <code>select</code> growing with the descriptor count,
+<code>epoll</code> staying flat — is the portable, architectural result the chapter turns on.</p>
+
+<h2>42.1 Blocking I/O and the thread-per-connection model</h2>
+
+<p>A blocking call is the default and, for one stream, the ideal. When a thread calls <code>read</code> on a socket with no data yet, the
+kernel puts the thread to sleep — off the run queue entirely — and wakes it when data arrives, so the thread consumes no CPU while waiting
+and the code reads as a simple sequence (Chapter 16). The natural way to serve many connections with blocking calls is therefore one thread
+(or process) per connection: each thread blocks in <code>read</code> on its own socket, wakes when its client sends something, handles it,
+and blocks again. This model is easy to reason about and fine at small scale. It fails at large scale for reasons that are all about the
+<em>thread</em>, not the I/O. Each thread reserves a stack — commonly a megabyte or more of address space by default — so ten thousand
+threads reserve gigabytes before doing any work. Each runnable thread is an entry the scheduler must consider, and when many wake at once the
+kernel pays <strong>context switches</strong> — saving and restoring registers, switching address-space state, polluting caches — none of
+which moves a byte (Chapters 15&ndash;16). And the system call itself is not free: measured here, a minimal system call that must enter the
+kernel costs about <strong>199&nbsp;ns</strong>, against about 40&nbsp;ns for a <code>clock_gettime</code> that the kernel services in
+user space (the vDSO) without a real kernel entry — so the boundary crossing alone is a real per-operation tax, paid on every blocking call
+that has to sleep and wake. The result is that thread-per-connection spends most of its resources holding threads that are, at any instant,
+almost all asleep: ten thousand connections that are individually idle 99% of the time still cost ten thousand stacks and the scheduler
+churn of waking whichever few become ready. The problem is not that blocking is wrong — it is that <em>one thread per wait</em> ties a heavy,
+scheduler-visible resource to each connection, and connections vastly outnumber the work actually ready at any moment. This is the C10K
+problem, and its solution is to break the one-thread-per-connection assumption while keeping the machine busy only with connections that
+have something to do.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does a blocking <code>read</code> consume no CPU while it waits, yet thread-per-connection still fails to scale to ten thousand mostly
+idle connections? Name two costs of a thread that are paid whether or not the thread is doing work. (Answer after the next section.)</p>
+</aside>
+
+<h2>42.2 Non-blocking I/O and the busy-poll trap</h2>
+
+<p>The first tool for escaping thread-per-connection is to change how the descriptor behaves. Setting the <code>O_NONBLOCK</code> flag on a
+file descriptor makes its I/O calls <strong>non-blocking</strong>: a <code>read</code> with no data ready returns immediately with the error
+<code>EAGAIN</code> (equivalently <code>EWOULDBLOCK</code>) instead of sleeping, and a <code>write</code> that would block because the
+socket's send buffer is full returns having accepted only part, or none, of the data. This means a single thread can attend to many
+descriptors without any of them parking it: try each in turn, handle the ones that return data, and skip the ones that return
+<code>EAGAIN</code>. But non-blocking I/O alone creates a new problem as bad as the one it solved. If the thread simply loops over all N
+descriptors calling <code>read</code> and mostly collecting <code>EAGAIN</code>, it is <strong>busy-polling</strong>: it burns 100% of a CPU
+asking &ldquo;anything yet? anything yet?&rdquo; across thousands of descriptors that are overwhelmingly not ready, turning idle waiting
+(which cost nothing under blocking) into a spinning, power-hungry scan. And it does so at the system-call cost of &sect;42.1 — each
+<code>read</code> that returns <code>EAGAIN</code> is a ~199&nbsp;ns kernel round trip that accomplished nothing — so polling 10,000 idle
+descriptors in a tight loop is millions of wasted syscalls per second. Non-blocking I/O is necessary — an event-driven server must never let
+a single descriptor block its one thread — but it is not sufficient: it removes the blocking, but it does not tell you <em>which</em>
+descriptors are worth calling. What is missing is a way to ask the kernel, in one call, which of a large set of descriptors are ready, so
+the thread can sleep when nothing is ready (consuming no CPU, like blocking) and wake with the exact list of descriptors that now have work
+(handling only those, like non-blocking). That is readiness notification, and it is the mechanism the whole model turns on.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>O_NONBLOCK</code> change about a <code>read</code> that finds no data? Why is looping over thousands of non-blocking
+descriptors calling <code>read</code> on each — busy-polling — nearly as bad as thread-per-connection, and what capability is still missing?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>42.3 Readiness notification: select, poll, and epoll</h2>
+
+<p>The missing capability is a system call that takes a set of descriptors and returns which are ready, sleeping the thread until at least
+one is. Three generations of it exist, and the difference between them is the whole performance story. <code>select</code> (and its
+near-twin <code>poll</code>) takes the entire set of descriptors you care about on <em>every</em> call, and the kernel scans all of them to
+find the ready ones — so its cost grows with the <em>total</em> number of descriptors watched, ready or not. <code>epoll</code> (Linux;
+<code>kqueue</code> is the BSD equivalent) splits this into two steps: you register your interest in each descriptor <em>once</em> with
+<code>epoll_ctl</code>, and then each <code>epoll_wait</code> call returns only the descriptors that have <em>become</em> ready, so its cost
+grows with the number of <em>active</em> descriptors, not the total watched. Timing a readiness scan over many idle pipe descriptors with
+exactly one ready, as the count grows, shows the difference sharply in this environment:</p>
+
+<pre><code>readiness scan, M descriptors watched, exactly 1 ready (min of several trials):
+   M         select()        epoll_wait()
+   10          ~0.7 us          ~0.4 us
+  100          ~2.6 us          ~0.4 us
+  500         ~14.6 us          ~0.4 us
+ 1000     n/a (&gt; FD_SETSIZE)     ~0.4 us
+ 4000     n/a (&gt; FD_SETSIZE)     ~0.4 us
+                select grows ~linearly with M; epoll_wait stays flat</code></pre>
+
+<p>The pattern is unmistakable: <code>select</code>'s cost climbs roughly <strong>linearly</strong> with the number of descriptors watched
+— about 0.7&nbsp;&micro;s at 10, 2.6 at 100, 14.6 at 500 — because it rescans the whole set on every call, while <code>epoll_wait</code>
+stays essentially <strong>flat</strong> at a few hundred nanoseconds no matter how many descriptors are registered, because it returns only
+the one that is ready. This is the O(N)-versus-O(active) distinction made concrete, and it is exactly the cost that matters for a server
+where N is huge and the active fraction per wakeup is tiny. <code>select</code> carries a second, hard limit visible in the table: the
+<code>fd_set</code> it uses is a fixed-size bitmap capped at <code>FD_SETSIZE</code> (1024 on this system), so it simply cannot watch a
+descriptor numbered 1024 or above — a wall the C10K problem hits immediately, and one <code>epoll</code> does not have. One refinement
+matters when you build on <code>epoll</code>: it offers <strong>level-triggered</strong> notification (the default: a descriptor is reported
+ready as long as it has data, matching <code>select</code>'s semantics and forgiving of partial reads) and <strong>edge-triggered</strong>
+notification (reported only on the transition to ready, which is faster but requires you to drain the descriptor fully on each event or you
+will miss data). Level-triggered is the safer default; edge-triggered is an optimization for the last drop of performance. The lesson to
+carry is the scaling, not the nanoseconds: to watch many descriptors, register interest once and let the kernel hand you the ready ones —
+never rescan the whole set on every call (Kerrisk, ch.63; Banga, Mogul &amp; Druschel, 1999).</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: don't wait per connection, and don't rescan everyone — ask once who's ready</span>
+<p><strong>1. In words.</strong> Thread-per-connection ties a heavy thread to each idle wait, so it drowns at C10K. Non-blocking I/O lets one
+thread attend many descriptors but, alone, forces a wasteful busy-poll. Readiness notification supplies the missing piece — one call that
+sleeps until some descriptor is ready and returns which — and <code>epoll</code> makes that call scale by registering interest once and
+returning only the active descriptors, instead of <code>select</code> rescanning the whole set every time.</p>
+<p><strong>2. As a picture.</strong> Figure 42.1: on the left, N threads each blocked on one socket (N stacks, scheduler churn); on the
+right, one thread in an event loop calling <code>epoll_wait</code>, which returns the two ready descriptors out of thousands, dispatched to
+non-blocking handlers. Below, a line plot: <code>select</code> rising with M, <code>epoll_wait</code> flat, and a vertical wall at
+<code>FD_SETSIZE</code> = 1024.</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, one descriptor ready. <code>select</code>: ~0.7&nbsp;&micro;s at 10 descriptors,
+~14.6&nbsp;&micro;s at 500 — and impossible past 1024. <code>epoll_wait</code>: ~0.4&nbsp;&micro;s at 10, at 500, and at 4000 — <strong>flat</strong>
+(&sect;42.3). A minimal kernel-entering syscall costs ~199&nbsp;ns here (&sect;42.1), so a busy-poll of 10,000 idle descriptors is millions
+of those per second doing nothing; one <code>epoll_wait</code> replaces the whole scan.</p>
+</aside>
+
+<p><em>(Answer to the &sect;42.1 quick check: a blocking <code>read</code> consumes no CPU because the kernel takes the thread off the run
+queue entirely and wakes it only when data arrives — waiting is free of CPU. Thread-per-connection still fails to scale because the cost is
+in the <strong>threads</strong>, not the waiting: each thread reserves a stack (often a megabyte or more of address space) and is a scheduler-visible
+entity, so ten thousand mostly-idle connections cost ten thousand stacks plus the context-switch churn of waking whichever few become ready —
+two costs paid regardless of whether any thread is doing work.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Thread-per-connection versus one event loop that asks the kernel who is ready.</text>
+<text x="12" y="36" font-size="9" fill="#8c3a1d">thread per connection: N stacks, N blocked reads, scheduler churn</text>
+<rect x="12" y="44" width="60" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="16" y="56" font-size="8">thr 1 read()</text>
+<rect x="12" y="62" width="60" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="16" y="74" font-size="8">thr 2 read()</text>
+<rect x="12" y="80" width="60" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="16" y="92" font-size="8">thr 3 read()</text>
+<text x="20" y="112" font-size="8" fill="#8c3a1d">... thr 10000 (mostly asleep)</text>
+<text x="360" y="36" font-size="9" fill="#2f7d32">one thread, event loop</text>
+<rect x="360" y="44" width="150" height="18" fill="#eef1f4" stroke="#14406b"/><text x="366" y="57" font-size="8">epoll_wait(...) &mdash; sleeps</text>
+<path d="M510 53 L 545 53" stroke="#14406b" stroke-width="1"/><text x="512" y="50" font-size="7" fill="#2f7d32">ready!</text>
+<rect x="360" y="66" width="150" height="18" fill="#dfeee0" stroke="#2f7d32"/><text x="366" y="79" font-size="8">returns fd 42, fd 87 (of 10000)</text>
+<rect x="360" y="88" width="150" height="18" fill="#dfeee0" stroke="#2f7d32"/><text x="366" y="101" font-size="8">handle non-blocking, loop</text>
+<path d="M435 84 L 435 88 M435 62 L 435 66" stroke="#2f7d32" stroke-width="1"/>
+<line x1="12" y1="128" x2="620" y2="128" stroke="#b9c2cc"/>
+<text x="12" y="144" font-size="9" fill="#14406b">readiness scan cost as descriptors watched grow (1 ready):</text>
+<line x1="60" y1="250" x2="600" y2="250" stroke="#333"/><line x1="60" y1="160" x2="60" y2="250" stroke="#333"/>
+<text x="20" y="164" font-size="7">us</text><text x="300" y="266" font-size="7">descriptors watched (M)</text>
+<text x="60" y="264" font-size="7">10</text><text x="200" y="264" font-size="7">100</text><text x="340" y="264" font-size="7">500</text><text x="480" y="264" font-size="7">1000</text><text x="560" y="264" font-size="7">4000</text>
+<polyline points="60,247 200,240 340,192" fill="none" stroke="#8c3a1d" stroke-width="1.5"/><text x="345" y="188" font-size="8" fill="#8c3a1d">select ~linear</text>
+<line x1="420" y1="160" x2="420" y2="250" stroke="#8c3a1d" stroke-dasharray="3,2"/><text x="392" y="172" font-size="7" fill="#8c3a1d">FD_SETSIZE wall (1024)</text>
+<polyline points="60,248 200,248 340,248 480,248 560,248" fill="none" stroke="#2f7d32" stroke-width="1.5"/><text x="480" y="244" font-size="8" fill="#2f7d32">epoll_wait flat ~0.4 us</text>
+<text x="12" y="286" font-size="8" fill="#14406b">select rescans the whole set each call (O(N)); epoll registers interest once and returns only the ready (O(active)).</text>
+</svg>
+<figcaption>Figure 42.1: Thread-per-connection (left) ties a stack and a scheduler entry to each mostly-idle connection and drowns at C10K;
+an event loop (right) uses one thread that calls <code>epoll_wait</code> and handles only the ready descriptors. <code>select</code>'s cost
+grows linearly with the number watched and hits the <code>FD_SETSIZE</code>=1024 wall; <code>epoll_wait</code> stays flat at ~0.4&nbsp;&micro;s
+to thousands of descriptors (&sect;42.3). Wall-clock; the scaling shape, not the absolute nanoseconds, is the portable result.</figcaption>
+</figure>
+
+<h2>42.4 The event loop, and the blocking call that stalls everything</h2>
+
+<p>Put the pieces together and you have the <strong>event loop</strong> that underlies nearly every high-concurrency server (nginx, Redis,
+Node.js, and the async runtimes of most languages): one thread — or a small pool, one per core — repeatedly calls <code>epoll_wait</code>,
+receives the set of ready descriptors, and for each dispatches a short, non-blocking handler that does the available work (read what is
+there, write what fits) and returns immediately to the loop. The thread sleeps in <code>epoll_wait</code> when nothing is ready (no busy
+CPU, like blocking) and wakes with exactly the ready descriptors (handling only those, like non-blocking) — the two halves the previous
+sections were missing, joined. A handful of threads on this model can hold hundreds of thousands of connections, because a connection now
+costs only a descriptor and a little state, not a thread and a stack. But the model has a sharp and characteristic failure mode that is the
+mirror image of thread-per-connection's: because <em>one</em> thread drives thousands of connections, a single <strong>blocking
+operation inside a handler stalls every connection that thread owns</strong>. If a handler calls a blocking <code>read</code> from disk (an
+un-cached file — recall from Chapter 41 that this can wait milliseconds), performs a synchronous DNS lookup, holds a lock, calls
+<code>fsync</code> (the ~8.6&nbsp;ms of &sect;41.2!), or simply runs a long CPU computation, the event loop cannot make progress on any other
+descriptor for that entire duration — one slow client, or one careless call, freezes them all. The discipline the model demands is
+therefore absolute: <strong>nothing in an event-loop handler may block</strong>. Everything the loop touches — sockets, and increasingly
+files — must be non-blocking, and any operation that must block or compute at length is handed off to a separate <strong>thread pool</strong>
+(Chapter 25), whose result comes back to the loop as another ready event. This is the seam where the two concurrency models meet: the event
+loop for the vast number of waiting connections, a bounded pool of threads for the genuinely blocking or CPU-heavy work, connected by the
+readiness mechanism. (There is a further step this part will reach — <em>completion</em>-based asynchronous interfaces such as
+<code>io_uring</code>, where you submit an operation and are notified when it has finished rather than when a descriptor is ready to be
+tried — which extends the same idea to disk I/O that has no clean readiness signal; the readiness model of this chapter is the foundation it
+builds on.)</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the blocking call inside the event loop &mdash; one slow handler freezes every connection</span>
+<p>The event loop's strength is its weakness: one thread serving thousands of connections means any single blocking or long-running call in a
+handler halts <em>all</em> of them for its full duration. The trap is that this is invisible in light testing — with one client and warm
+caches every operation returns instantly, so the accidental blocking call (a disk read that is usually cached, an occasional
+<code>fsync</code>, a synchronous library call, a lock held under contention, a regex or JSON parse over a huge input) never actually
+blocks — and it surfaces only in production as mysterious, correlated latency spikes across unrelated connections whenever that one path is
+hit cold. The tell is exactly that correlation: in thread-per-connection a slow operation hurts one client, but in an event loop it hurts
+every client the thread holds, so a single cold disk read can spike the tail latency of thousands of requests at once. Two defenses. First,
+make it a rule that <em>no</em> syscall in a handler may block: every socket is <code>O_NONBLOCK</code>, and anything that can wait — disk
+I/O, DNS, <code>fsync</code>, a large computation — is dispatched to a thread pool (Chapter 25) and its completion delivered back to the loop
+as an event, never awaited inline. Second, measure the handler, not just the throughput: the number that matters is the maximum time a
+handler spends before returning to <code>epoll_wait</code>, because that is the latency floor for every other connection — a mean that looks
+fine can hide a handler that occasionally blocks for milliseconds. Assuming a handler is non-blocking because it usually is fast is the
+event-loop version of the part's recurring trap: a property asserted from the common case and never measured against the one that hurts.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;For our new gateway we'll spawn a thread per connection — threads are cheap now, and the
+code is so much simpler than an event loop. We expect maybe fifty thousand mostly-idle long-lived connections.&rdquo; Cover the paragraph
+and respond in four or five sentences, drawing on &sect;42.1&ndash;&sect;42.4.</p>
+<p><em>Model answer.</em> &ldquo;Thread-per-connection is simpler and it is the right call at small scale, but fifty thousand mostly-idle
+connections is exactly where it breaks — that is fifty thousand stacks (tens of gigabytes of address space at a megabyte each) and a
+scheduler holding fifty thousand entities to wake a handful at a time, when almost none have work at any instant. The cost is in the
+threads, not the waiting, so it does not matter that they are idle. The scalable shape is an event loop: a few threads, one per core, each
+calling <code>epoll_wait</code> and handling only the ready descriptors — <code>epoll</code> stays flat as connections grow, where
+<code>select</code> would climb linearly and hit the 1024-descriptor wall. The catch we must respect is that every handler has to be strictly
+non-blocking: one blocking disk read or <code>fsync</code> in a handler stalls every connection on that thread, so anything that can wait
+goes to a thread pool and comes back as an event. If we want the simple code, let us use a language runtime or library that gives us the
+event loop underneath — but let us not put fifty thousand blocking threads in the kernel.&rdquo; Naming the thread cost, reaching for the
+event loop, and flagging the no-blocking-in-handlers rule is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;42.2 quick check: <code>O_NONBLOCK</code> makes a <code>read</code> with no data return immediately with
+<code>EAGAIN</code> instead of parking the thread. Looping over thousands of non-blocking descriptors calling <code>read</code> on each is
+busy-polling: it burns a full CPU issuing millions of ~199&nbsp;ns syscalls per second that mostly return <code>EAGAIN</code>, turning the
+free idle-wait of blocking into a spinning scan — nearly as wasteful as thread-per-connection, in CPU instead of memory. What is still
+missing is a single call that sleeps until some descriptor is ready and returns <strong>which</strong> ones — readiness notification, i.e.
+<code>epoll</code>.)</em></p>
+
+<h2>42.5 What to carry forward</h2>
+
+<p>Serving many connections is a <strong>concurrency</strong> problem, not a latency one, and the cost model is the thread. A
+<strong>blocking</strong> call is simple and consumes no CPU while it waits (Chapter 16), but it can wait on only one descriptor, so
+serving N connections this way needs N threads — and threads cost stacks and scheduler churn whether idle or not, which is why
+thread-per-connection drowns at the <strong>C10K</strong> scale (&sect;42.1). <strong>Non-blocking</strong> I/O (<code>O_NONBLOCK</code>) lets
+one thread attend many descriptors without any parking it, but alone it forces a wasteful <strong>busy-poll</strong> — millions of
+<code>EAGAIN</code> syscalls (~199&nbsp;ns each here) doing nothing (&sect;42.2). The missing piece is <strong>readiness notification</strong>:
+one call that sleeps until some descriptor is ready and returns which. <code>select</code>/<code>poll</code> rescan the whole set each call,
+so their cost grows linearly with the number watched (and <code>select</code> caps at <code>FD_SETSIZE</code>=1024); <code>epoll</code>
+registers interest once and returns only the active descriptors, staying flat — here ~0.4&nbsp;&micro;s from 10 to 4000 descriptors, against
+<code>select</code>'s climb to ~14.6&nbsp;&micro;s at 500 (&sect;42.3). Assembled, these give the <strong>event loop</strong>: one thread
+(or one per core) calling <code>epoll_wait</code> and dispatching short non-blocking handlers, holding hundreds of thousands of connections
+cheaply — with the absolute rule that no handler may block, or it stalls every connection the thread owns, with the genuinely blocking work
+handed to a thread pool (&sect;42.4).</p>
+
+<p>This is the substrate under every scalable service, and it is where the part's threads converge: the OS gave us blocking calls and cheap
+scheduling (Volume 1's Part III), concurrency gave us threads and the pools to bound them (Part IV), and this chapter spends both wisely —
+an event loop for the many waits, a pool for the few blocks. The remaining chapters of this part put this substrate to work on the network
+itself. The next builds the connection the event loop has been watching — <strong>sockets</strong>: how a program opens a network endpoint,
+accepts connections, and moves bytes across the wire, and how the blocking-versus-readiness choice of this chapter plays out on a real
+server. From there the part reaches the completion-based interfaces (<code>io_uring</code>) that extend readiness to disk, and the
+<em>zero-copy</em> techniques that remove even the page-cache copy this part has taken for granted — the last cost between the file and the
+network card. The waiting is solved; now we wire it to the world.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a blocking <code>read</code> uses no CPU, yet thread-per-connection fails to scale to C10K.</li>
+<li>Name two costs of a thread paid whether or not it is doing work.</li>
+<li>Say what <code>O_NONBLOCK</code> does and why non-blocking I/O alone leads to a wasteful busy-poll.</li>
+<li>State how <code>epoll</code> scales differently from <code>select</code>, and why, with the order of magnitude.</li>
+<li>Describe the event loop and the one rule its handlers must obey.</li>
+<li>Explain why a single blocking call in a handler is worse in an event loop than in thread-per-connection.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why does thread-per-connection fail at C10K, when blocking waits are CPU-free? (&sect;42.1)</li>
+<li><strong>R2.</strong> What does <code>O_NONBLOCK</code> change, and what trap does non-blocking I/O create on its own? (&sect;42.2)</li>
+<li><strong>R3.</strong> How do <code>select</code> and <code>epoll</code> scale differently, and why — and what hard limit does <code>select</code> have? (&sect;42.3)</li>
+<li><strong>R4.</strong> What is the event loop, and what is the absolute rule for its handlers? (&sect;42.4)</li>
+<li><strong>R5.</strong> Why does one blocking call in a handler hurt every connection, and where should blocking work go? (&sect;42.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapter 63
+(&ldquo;Alternative I/O Models&rdquo;) is the primary reference for this chapter — non-blocking I/O, I/O multiplexing with
+<code>select</code>/<code>poll</code>, the <code>epoll</code> API, and level- versus edge-triggered notification. First author Michael
+Kerrisk; edition and ISBN verified via the publisher.</li>
+<li><strong>W. Richard Stevens, Bill Fenner &amp; Andrew M. Rudoff, <em>UNIX Network Programming, Volume 1: The Sockets Networking API</em>,
+3rd ed. (Addison-Wesley, 2003), ISBN 978-0-13-141155-5.</strong> Chapter 6 (I/O multiplexing) and Chapter 16 (non-blocking I/O) ground
+&sect;42.2&ndash;&sect;42.3 in the sockets context that Chapter 43 will build. First author W. Richard Stevens; edition and ISBN verified via
+the publisher.</li>
+<li><strong>Gaurav Banga, Jeffrey C. Mogul &amp; Peter Druschel, &ldquo;A Scalable and Explicit Event Delivery Mechanism for UNIX,&rdquo; in
+<em>Proceedings of the USENIX Annual Technical Conference</em>, 1999.</strong> The paper behind &sect;42.3's shift from <code>select</code>'s
+rescan-everything model to explicit, scalable readiness delivery — the idea <code>epoll</code> and <code>kqueue</code> implement. First
+author Gaurav Banga; USENIX open-access proceedings (no DOI), cited by venue and year.</li>
+<li><strong>Dan Kegel, &ldquo;The C10K problem&rdquo; (online, 1999, updated through the 2000s).</strong> The essay that named the
+scaling problem of &sect;42.1 and surveyed the event-driven techniques that answer it. Author Dan Kegel; a web resource carrying no DOI,
+cited by author and title.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex42.1"><span class="ex-label">42.1</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, explain why a blocking <code>read</code> consumes no CPU while it waits, and name two costs a thread carries whether or not
+it is doing work.</div>
+
+<div class="exercise" id="ex42.2"><span class="ex-label">42.2</span> <span class="ex-tag warm">warm-up</span>
+What does setting <code>O_NONBLOCK</code> change about a <code>read</code> that finds no data ready? What error does it return in that
+case?</div>
+
+<div class="exercise" id="ex42.3"><span class="ex-label">42.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, state the essential difference between how <code>select</code> and <code>epoll</code> find the ready descriptors, and
+which one's cost grows with the total number watched.</div>
+
+<div class="exercise" id="ex42.4"><span class="ex-label">42.4</span> <span class="ex-tag core">core</span>
+The C10K problem. (a) Why does dedicating one thread per connection not scale to ten thousand mostly-idle connections — name the two
+dominant costs. (b) Why does it <em>not</em> help that the threads are idle almost all the time? (c) What does the event-loop model tie to
+each connection instead of a thread, and why is that so much cheaper?</div>
+
+<div class="exercise" id="ex42.5"><span class="ex-label">42.5</span> <span class="ex-tag core">core</span>
+Busy-polling. (a) Explain why looping over thousands of non-blocking descriptors calling <code>read</code> on each burns a whole CPU. (b)
+Using the ~199&nbsp;ns syscall cost, estimate the syscalls per second for a tight poll of 10,000 idle descriptors and comment. (c) What does
+readiness notification add that turns this back into a CPU-free wait?</div>
+
+<div class="exercise" id="ex42.6"><span class="ex-label">42.6</span> <span class="ex-tag core">core</span>
+<code>select</code> versus <code>epoll</code>. (a) From the measured table, describe how each scales as the number of descriptors grows from
+10 to 500. (b) Explain the mechanism behind each scaling — what does <code>select</code> do on every call that <code>epoll_wait</code> does
+not? (c) What is <code>FD_SETSIZE</code>, and why is its limit fatal for a C10K server using <code>select</code>?</div>
+
+<div class="exercise" id="ex42.7"><span class="ex-label">42.7</span> <span class="ex-tag complexity">cost</span>
+A server watches <var>M</var> descriptors, of which <var>a</var> are ready per wakeup. Model the readiness-scan cost as
+<var>c</var><sub>s</sub> = <var>p</var>&middot;<var>M</var> for <code>select</code> and <var>c</var><sub>e</sub> = <var>q</var>&middot;<var>a</var> +
+<var>r</var> for <code>epoll</code>. (a) For which regime of <var>M</var> and <var>a</var> is <code>epoll</code> dramatically better, and for
+which are they comparable? (b) Using the measured numbers (<code>select</code> ~14.6&nbsp;&micro;s at <var>M</var>=500;
+<code>epoll_wait</code> ~0.4&nbsp;&micro;s), estimate the ratio at <var>M</var>=500, <var>a</var>=1. (c) Explain why a workload where nearly
+all watched descriptors are ready every wakeup narrows <code>epoll</code>'s advantage.</div>
+
+<div class="exercise" id="ex42.8"><span class="ex-label">42.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team's event-loop server shows fine mean latency in load tests but occasional spikes in
+production where thousands of unrelated requests slow down together.
+<br><strong>Step 1 (given):</strong> one thread drives all those connections via <code>epoll_wait</code> and non-blocking handlers.
+<br><strong>Step 2 (given):</strong> one handler reads a config file that is usually in the page cache, so in testing the read never
+blocks.
+<br><strong>Step 3 (given):</strong> in production the file is occasionally cold, and that <code>read</code> blocks for milliseconds.
+<br><strong>Step 4 (you):</strong> Explain why a single occasionally-blocking handler produces correlated spikes across thousands of
+connections, why the load test missed it, and the fix.</div>
+
+<div class="exercise" id="ex42.9"><span class="ex-label">42.9</span> <span class="ex-tag mixed">mixed</span>
+For each operation inside an event-loop handler, say whether it is safe or must be moved to a thread pool, and why: (a) a non-blocking
+<code>read</code> from a socket returning <code>EAGAIN</code>; (b) an <code>fsync</code> on a log file; (c) parsing a 200-byte JSON body
+already in memory; (d) a synchronous DNS lookup; (e) a CPU-bound image resize on an uploaded photo.</div>
+
+<div class="exercise" id="ex42.10"><span class="ex-label">42.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A blocking <code>read</code> burns CPU while it waits.&rdquo;
+(b) &ldquo;<code>epoll_wait</code>'s cost grows with the total number of descriptors registered.&rdquo; (c) &ldquo;Non-blocking I/O by
+itself is enough to serve ten thousand connections efficiently.&rdquo; (d) &ldquo;One blocking call in an event-loop handler can stall
+every connection that thread serves.&rdquo; (e) &ldquo;<code>select</code> can watch a descriptor with any file-descriptor number.&rdquo;</div>
+
+<div class="exercise" id="ex42.11"><span class="ex-label">42.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the chapter. (a) Explain why blocking, non-blocking, and readiness notification are not three competing choices but three parts
+of one design — what each contributes and what it lacks alone. (b) The event loop and thread-per-connection have mirror-image failure
+modes; describe both and the single principle (match the resource to the work) that explains each. (c) Argue why &ldquo;how many
+descriptors, and how many are active per wakeup&rdquo; is the right first question when choosing an I/O model, tying it to the
+<code>select</code>-vs-<code>epoll</code> scaling.</div>
+
+<div class="exercise" id="ex42.12"><span class="ex-label">42.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Measure the cost of a minimal kernel-entering system call (e.g. <code>syscall(SYS_getpid)</code>)
+as ns/call, the minimum of several trials, and contrast it with a vDSO call like <code>clock_gettime</code>. (b) Create many pipe
+descriptors, mark exactly one ready, and time a readiness scan with <code>select</code> and with <code>epoll_wait</code> as the count grows
+(10, 100, 500, and — for <code>epoll</code> only — 1000+); report how each scales and where <code>select</code> hits
+<code>FD_SETSIZE</code>. (c) State your toolchain and CPU, and note these are wall-clock times (no hardware counters) if you lack
+<code>perf</code>, and that the absolute syscall cost is higher under some virtualized environments while the scaling shape is portable.</div>
+
+</section>
+</section>

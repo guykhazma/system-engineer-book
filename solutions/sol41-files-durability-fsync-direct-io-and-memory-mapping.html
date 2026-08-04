@@ -1,0 +1,107 @@
+<section class="solutions" id="sol41">
+<h1>Chapter 41 — Solutions</h1>
+
+<div class="solution" id="sol41.1"><span class="sol-label">41.1</span>
+After <code>write</code> returns, the data is a <strong>dirty page in the kernel's page cache</strong>, in volatile DRAM, scheduled for
+write-back to the device later. A power loss, kernel panic, or hard reset before that write-back <strong>loses it</strong>, even though the
+call returned success. <em>Tempting wrong answer:</em> &ldquo;it is on the disk&rdquo; — the return only means the kernel accepted the bytes
+into the cache. <strong>Feed-forward:</strong> &sect;41.1.</div>
+
+<div class="solution" id="sol41.2"><span class="sol-label">41.2</span>
+<code>fsync</code> forces the file's dirty pages out of the page cache to the storage device and waits until the device confirms them
+durably stored — a synchronous durability barrier <code>write</code> never provides. <code>fdatasync</code> skips flushing non-essential
+metadata (such as the modification timestamp), so when only the data and size need to be durable it can avoid an extra metadata write and be
+slightly cheaper. <em>Tempting wrong answer:</em> &ldquo;<code>fdatasync</code> skips the data&rdquo; — it skips only inessential metadata,
+never the data. <strong>Feed-forward:</strong> &sect;41.2.</div>
+
+<div class="solution" id="sol41.3"><span class="sol-label">41.3</span>
+<code>fflush</code> empties the C library's <strong>user-space</strong> buffer into the <strong>kernel's page cache</strong> — one buffer
+down, but the data is still in volatile DRAM and not on the device, so it is not durable. Durability requires <code>fsync</code>/<code>fdatasync</code>
+after the flush to cross the device barrier. <em>Tempting wrong answer:</em> &ldquo;<code>fflush</code> writes to disk&rdquo; — it writes to
+the kernel, which writes to disk later. <strong>Feed-forward:</strong> &sect;41.1&ndash;&sect;41.2.</div>
+
+<div class="solution" id="sol41.4"><span class="sol-label">41.4</span>
+(a) A buffered <code>write</code> returns after a memory copy (~0.9&nbsp;&micro;s); <code>fdatasync</code> must push the data through the block
+layer to the device and wait for the device to confirm it durable (~8.6&nbsp;ms here), so the durable version pays a device round trip per
+record. (b) The ~8.6&nbsp;ms is the time for the physical storage to accept and confirm a flush — a device property (media, controller,
+flush path) — not CPU work, which is why it dwarfs the memory-bound write. (c) <strong>Group commit</strong>: append many records, then
+<code>fsync</code> once for the whole batch, so the fixed flush cost is amortized across, say, 1000 records; it trades a small crash-window
+(the records in the current un-synced batch may be lost) for throughput, while every <em>acknowledged</em> record is still on the device
+before its acknowledgement. <em>Tempting wrong answer:</em> &ldquo;sync less often and hope&rdquo; — group commit is precise: acknowledge
+only after the batch's flush returns. <strong>Feed-forward:</strong> &sect;41.2.</div>
+
+<div class="solution" id="sol41.5"><span class="sol-label">41.5</span>
+(a) It bypasses the page cache; data moves directly between the device and the user buffer by DMA, with no kernel copy and no caching. (b)
+The buffer address, file offset, and length must be aligned to the device block size (512 or 4096 bytes), so an arbitrary
+<code>malloc</code>'d buffer can fail with <code>EINVAL</code> — you need <code>posix_memalign</code>. (c) A <strong>database</strong> with
+its own buffer pool wants it (the page cache would just be a redundant, uncoordinated second cache); a <strong>program that rereads a small
+file often</strong> is harmed (it forfeits the huge cache-hit win of &sect;40.3). <em>Tempting wrong answer:</em> &ldquo;<code>O_DIRECT</code>
+is always faster because it is direct&rdquo; — it forfeits readahead, write-back, and cache hits, losing badly for cache-friendly access.
+<strong>Feed-forward:</strong> &sect;41.3.</div>
+
+<div class="solution" id="sol41.6"><span class="sol-label">41.6</span>
+(a) <code>mmap</code> avoids the copy from the page cache into a user buffer; a mapped access reads the page-cache page in place. (b) They
+came out close because <code>mmap</code> trades the saved copy for a <strong>minor page fault per 4&nbsp;KiB page</strong> on first touch
+(and the page-table setup), so for a single pass the two costs roughly cancel. (c) <code>mmap</code> clearly wins for <strong>random or
+repeated access</strong> to a large file (the fault cost is amortized and you get zero-copy in-memory access); buffered
+<code>read</code>/<code>write</code> wins for a <strong>single sequential streaming pass</strong>, where readahead is already optimal and you
+want explicit control of when I/O happens. <em>Tempting wrong answer:</em> &ldquo;<code>mmap</code> is always faster because it is
+zero-copy&rdquo; — the eliminated copy is offset by page-fault cost, so it is workload-dependent. <strong>Feed-forward:</strong> &sect;41.4.</div>
+
+<div class="solution" id="sol41.7"><span class="sol-label">41.7</span>
+(a) Per record with sync-each: <var>w</var>&nbsp;+&nbsp;<var>f</var>. Per record with one <code>fsync</code> per <var>k</var>:
+<var>w</var>&nbsp;+&nbsp;<var>f</var>/<var>k</var>. (b) At <var>k</var>=1: 0.9&nbsp;&micro;s + 8600&nbsp;&micro;s &asymp;
+<strong>8.6&nbsp;ms/record</strong> (~116/s). At <var>k</var>=1000: 0.9&nbsp;&micro;s + 8.6&nbsp;&micro;s &asymp; <strong>9.5&nbsp;&micro;s/record</strong>
+(~105,000/s). (c) The batch risks losing up to the last <var>k</var> un-acknowledged records if a crash happens before their shared flush,
+so the tolerable data-loss window (in records or time) sets the upper bound on <var>k</var> — you make the batch as large as that window
+allows, no larger. <em>Tempting wrong answer:</em> &ldquo;bigger <var>k</var> is strictly better&rdquo; — it is, for throughput, only up to
+the crash-loss tolerance. <strong>Feed-forward:</strong> &sect;41.2.</div>
+
+<div class="solution" id="sol41.8"><span class="sol-label">41.8</span>
+<strong>Step 4:</strong> Faster disks help only marginally because each acknowledgement is one device-flush round trip, and even a fast SSD
+flush is tens to hundreds of microseconds — a modest constant, not the 100&times;&ndash;1000&times; the app needs; the real lever is the
+<em>number</em> of flushes, which batching cuts. Amortizing one ~8.6&nbsp;ms flush across 1000 records gives ~9.5&nbsp;&micro;s/record, on the
+order of 100,000 records/s — a ~1000&times; gain with no hardware change. The batch still guarantees that every <em>acknowledged</em> record
+is durably on the device (the batch is acknowledged only after its flush returns); what it does not guarantee is the survival of records
+written into the current batch but not yet flushed when a crash hits — that bounded tail is the deliberate trade. <em>Tempting wrong
+answer:</em> &ldquo;buy faster disks and keep syncing each&rdquo; — the per-flush floor still caps throughput far below the requirement.
+<strong>Feed-forward:</strong> &sect;41.2, &sect;41.4.</div>
+
+<div class="solution" id="sol41.9"><span class="sol-label">41.9</span>
+(a) <strong>Not durable</strong> — the data was only in the page cache; add <code>fdatasync(fd)</code> before acknowledging. (b)
+<strong>Durable</strong> — <code>fdatasync</code> returned, so the device has the data. (c) <strong>Data durable but possibly
+unreachable</strong> — the file's contents are synced but the directory entry from the rename may not have reached the disk; add an
+<code>fsync</code> on the <em>directory</em> after the rename. (d) <strong>Not durable</strong> — dirtied mapped pages need
+<code>msync</code> (and the underlying <code>fsync</code> physics) to be forced; a clean process exit does not guarantee write-back before
+the power loss. <em>Tempting wrong answer:</em> calling (c) fully durable &ldquo;because the file was fsync'd&rdquo; — the directory entry is
+separate metadata that also needs syncing. <strong>Feed-forward:</strong> &sect;41.1&ndash;&sect;41.4.</div>
+
+<div class="solution" id="sol41.10"><span class="sol-label">41.10</span>
+(a) <strong>False</strong> — it is in the page cache, not on the disk, until write-back or <code>fsync</code>. (b) <strong>False</strong> —
+<code>fsync</code> is slow because it waits for a physical device flush, not because of the byte copy. (c) <strong>False</strong> —
+<code>O_DIRECT</code> forfeits readahead, write-back, and cache hits, so it is slower for cache-friendly workloads. (d) <strong>True</strong>
+— multiple processes can map the same file and share one set of physical pages. (e) <strong>False</strong> — durability is defined by
+surviving a crash, so a claim untested against a real crash is unproven. <em>Tempting wrong answer:</em> marking (a) true from the
+&ldquo;write means written&rdquo; intuition — the write-back cache makes it false. <strong>Feed-forward:</strong> &sect;41.1&ndash;&sect;41.4.</div>
+
+<div class="solution" id="sol41.11"><span class="sol-label">41.11</span>
+(a) Because a single <code>fsync</code> is ~9000&times; a buffered write, syncing every scattered data-file update would be ruinous; a
+write-ahead log turns all the changes of a transaction into one sequential append and <code>fsync</code>s that <em>once</em>, so durability
+costs one flush per transaction (or per group) instead of one per modified page. (b) A database's buffer pool is already a cache of pages
+with its own replacement policy; letting the page cache hold a second copy doubles memory use and lets two uncoordinated caches fight, so
+<code>O_DIRECT</code> removes the redundant kernel cache and gives the database sole control. (c) Because the durability barrier is the one
+step bounded by physical storage (~9000&times; a memory write), the count of barrier crossings dominates a storage system's throughput, so
+&ldquo;how often must I <code>fsync</code>&rdquo; sets the architecture — logging, batching, group commit — before any other choice.
+<em>Tempting wrong answer:</em> &ldquo;optimize the data-file writes first&rdquo; — those are cheap buffered writes; the flush is the cost.
+<strong>Feed-forward:</strong> &sect;41.2&ndash;&sect;41.5.</div>
+
+<div class="solution" id="sol41.12"><span class="sol-label">41.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports per-record cost with and without <code>fdatasync</code> and a large ratio;
+(b) shows per-record cost falling roughly as <var>w</var>&nbsp;+&nbsp;<var>f</var>/<var>k</var> as the batch grows, flattening once the
+per-record flush share is small; (c) reports <code>read</code> and <code>mmap</code> throughput on a warm file with their run-to-run
+variance, noting the two are close and workload-dependent; and states toolchain, CPU, filesystem, and device, flags wall-clock timing
+without hardware counters, and identifies a virtual disk if present since it sets the absolute flush cost. <em>Tempting wrong answer:</em>
+&ldquo;report the single fastest <code>fsync</code> time as the durable throughput&rdquo; — durable throughput is bounded by the flush you
+must do per acknowledgement, not the best case. <strong>Feed-forward:</strong> &sect;41.2, &sect;41.4.</div>
+
+</section>

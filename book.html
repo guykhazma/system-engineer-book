@@ -283,6 +283,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch38">Chapter 38 — The Cost of Dynamic Allocation</a></li>
 <li class="toc-ch"><a href="#ch39">Chapter 39 — Putting It Together: A Performance Workflow</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VII &mdash; I/O & Networking, Low-Level</li>
+<li class="toc-ch"><a href="#ch40">Chapter 40 — The I/O Stack: System Calls, Buffering, and the Page Cache</a></li>
+<li class="toc-ch"><a href="#ch41">Chapter 41 — Files and Durability: fsync, Direct I/O, and Memory Mapping</a></li>
+<li class="toc-ch"><a href="#ch42">Chapter 42 — Blocking, Non-Blocking, and Event-Driven I/O</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part VIII &mdash; Storage & the Disk</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part IX &mdash; Storage Engines</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part X &mdash; Durability & Recovery</li>
@@ -15986,6 +15989,1156 @@ the number or taught you the ceiling was elsewhere; state your toolchain, CPU, a
 </section>
 
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VII</div><h1>I/O & Networking, Low-Level</h1><p class='part-blurb'>Files, sockets, blocking vs async, epoll/io_uring, zero-copy — the systems substrate under every data pipeline and service.</p></div>
+<section class="chapter" id="ch40">
+<h1>Chapter 40 — The I/O Stack: System Calls, Buffering, and the Page Cache</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch13">Chapter 13</a> (the system-call boundary — why crossing into the
+kernel costs more than a function call), <a href="#ch03">Chapter 3</a> (the memory hierarchy — a fast layer in front of a slow one, which
+is exactly what the page cache is), <a href="#ch17">Chapter 17</a> (demand paging — the same page-fault machinery the page cache rides on),
+<a href="#ch33">Chapter 33</a> (measure first — carried across the boundary into I/O). &nbsp;·&nbsp; The last part measured costs
+<em>inside</em> the machine — cycles, cache lines, the heap. This part crosses the boundary to where the program meets storage and the
+network, and the first cost it meets is the one this chapter is about: the system call, and the two layers of buffering that hide it.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching across the earlier parts: (1) <a href="#ch13">Chapter 13</a> — what is a <em>system call</em>, and why does it
+cost more than an ordinary function call: what has to happen at the boundary? (2) <a href="#ch03">Chapter 3</a> — what is a cache, and why
+does putting a fast layer in front of a slow one speed up <em>repeated</em> access to the same data? (3) <em>Predict:</em> you copy a
+4&nbsp;MiB file two ways — once reading and writing one byte at a time with the <code>read</code>/<code>write</code> system calls, and once
+through a 64&nbsp;KiB buffer. How large is the gap — 2&times;, 20&times;, more? And separately: you read a 256&nbsp;MiB file once when it is
+not in memory and once when it already is. How large is <em>that</em> gap? Write both guesses; &sect;40.2 and &sect;40.3 answer them.</p>
+</aside>
+
+<p>Reading a file looks like the simplest thing a program does — call <code>read</code>, bytes appear — but underneath that call is a stack
+of layers, and where your time goes depends on which of them you hit. Every ordinary file access is a <strong>system call</strong>
+(Chapter 13): <code>read</code> and <code>write</code> are not library routines that touch the disk directly but requests to the kernel,
+which owns the hardware. Crossing into the kernel and back has a fixed cost — a mode switch, argument checking, the kernel's own work — that
+is paid <em>per call</em> regardless of how many bytes the call moves, so the first rule of I/O performance is that the number of system
+calls, not the number of bytes, often decides the speed. That is why <strong>buffering</strong> exists, and it exists twice: the C library
+buffers your bytes in user space so that many small <code>fputc</code>s become one <code>write</code>, and the kernel buffers file data in
+a region of DRAM called the <strong>page cache</strong> so that a read already in memory never touches the disk at all. This chapter is the
+map of that stack. It proceeds in five steps: the layers a <code>read</code> passes through, from the call to the device (&sect;40.1); why
+buffering is the difference between fast and unusably slow, measured (&sect;40.2); the page cache — DRAM standing in front of the disk — and
+what it does to your numbers (&sect;40.3); what this means for how you do and how you <em>measure</em> I/O, with the trap that catches
+everyone (&sect;40.4); and what to carry forward (&sect;40.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 4&nbsp;KiB pages) against an <code>ext4</code> filesystem, timed with <code>clock_gettime(CLOCK_MONOTONIC)</code>
+and reported as the minimum of several trials (Chapter 33). Times are wall-clock and illustrate the <em>shape</em> of each cost, not a
+storage benchmark. A hardware-counter profiler (<code>perf</code>) is <em>not</em> installed here, so the evidence is wall-clock time plus
+what can be read from the system — the page size from <code>getconf</code>, cache eviction forced with <code>posix_fadvise</code>. The
+&ldquo;cold&rdquo; read below is made cold by asking the kernel to drop this file's pages with <code>POSIX_FADV_DONTNEED</code>, not by a
+privileged cache flush; on this machine the backing store is a virtual disk, so the cold number reflects <em>this</em> storage and would
+differ on bare-metal SSD or spinning disk — published device latencies, where quoted, are labelled as such.</p>
+
+<h2>40.1 The I/O stack: from read() to the device</h2>
+
+<p>When a program calls <code>read(fd, buf, n)</code>, the request descends through several layers before any bytes come back, and knowing
+them tells you where a given cost lives. At the top is the <strong>file descriptor</strong>: a small integer that indexes a per-process
+table, each entry pointing at an open-file description that holds the current offset and a reference to the underlying object (Chapter 13).
+The call traps into the kernel and reaches the <strong>virtual filesystem</strong> (VFS), the abstraction layer that lets one
+<code>read</code> work uniformly across <code>ext4</code>, a pipe, a socket, or a device — &ldquo;everything is a file&rdquo; is this layer
+keeping its promise. For a regular file the VFS asks the <strong>page cache</strong> whether the requested bytes are already resident in
+DRAM; if they are, they are copied straight to your buffer and the call returns without any device I/O at all. If they are not, the request
+descends to the <strong>filesystem</strong> proper, which maps the file offset to physical block numbers, and then to the <strong>block
+layer</strong>, which queues and schedules the request to the <strong>device driver</strong> and the hardware — where the real latency
+lives, milliseconds for a spinning disk, tens of microseconds for an SSD, against tens of <em>nanoseconds</em> to reach DRAM. Two facts
+fall out of this picture and organize the rest of the chapter. First, the cost of the <em>call itself</em> — the trap, the VFS dispatch, the
+copy into your buffer — is paid every time regardless of size, so making the call move more bytes amortizes it; that is &sect;40.2. Second,
+the page cache means a &ldquo;disk read&rdquo; is usually not a disk read: the same file read twice hits DRAM the second time, so the number
+you measure depends entirely on whether the data was resident, which is &sect;40.3. The layers are the same for <code>write</code> in
+reverse, with one twist that Chapter 41 turns into its whole subject: a <code>write</code> that reaches the page cache returns
+<em>before</em> the data is on the device.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the layers a <code>read</code> of a regular file passes through, from the file descriptor down to the device. At which layer does a
+read return <em>without</em> touching the disk, and why does that make &ldquo;how long does a read take&rdquo; a question with two very
+different answers? (Answer after the next section.)</p>
+</aside>
+
+<h2>40.2 Why buffering matters: the syscall is the cost</h2>
+
+<p>The cheapest way to see the cost of the system call is to pay it as many times as possible. Copying a 4&nbsp;MiB file one byte per
+<code>read</code> and one byte per <code>write</code> — two system calls for every byte — against copying it through a single 64&nbsp;KiB
+buffer, so each call moves 65,536 bytes, runs in this environment (gcc 11.4.0, minimum of several trials):</p>
+
+<pre><code>copy a 4 MiB file:
+                                      total       per byte      throughput
+per-byte read()/write() (2 syscalls/byte):  6.73 s     1604 ns/byte    0.59 MiB/s
+buffered 64 KiB read()/write()           :  0.0022 s    0.53 ns/byte   1812 MiB/s
+stdio getc/putc (libc buffers ~4 KiB)    :  0.078 s     18.6 ns/byte   51 MiB/s
+                                            buffered vs per-byte: ~3000x faster</code></pre>
+
+<p>The per-byte version is not a little slower — it is about <strong>3000&times; slower</strong>, and the reason is entirely the system
+calls. Each byte costs two round trips into the kernel, and on this machine a trivial system call is on the order of a few hundred
+nanoseconds (measured directly in Chapter 42), so at ~1600&nbsp;ns/byte the copy is doing almost nothing <em>but</em> crossing the boundary.
+The buffered version pays the same per-call cost but amortizes it over 65,536 bytes, dropping the per-byte cost below a nanosecond and
+running at memory speed. Between the two sits <strong>stdio</strong>: <code>getc</code>/<code>putc</code> read and write one character at a
+time in your source, but the C library holds a buffer (about 4&nbsp;KiB by default) and issues a real <code>read</code>/<code>write</code>
+only when it fills or drains — so a million <code>getc</code>s become a few hundred system calls, and the 18.6&nbsp;ns/byte here is the cost
+of the per-character function calls and library bookkeeping, not of the syscall, which stdio has already amortized. This is the crux of I/O
+performance and it is worth stating plainly: <strong>there are two independent buffers in the stack</strong> — the kernel's page cache,
+which you get for free, and the user-space buffer (stdio's, or your own), which turns many small logical operations into few large system
+calls. The per-byte disaster above is what happens when you defeat the second one by calling <code>read</code>/<code>write</code> yourself
+with a size of 1. The fix is never faster hardware; it is a bigger buffer, so the fixed per-call cost is spread across more bytes (Kerrisk,
+ch.13; Bryant &amp; O'Hallaron, ch.10).</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is copying a file one byte per <code>read</code>/<code>write</code> about 3000&times; slower than through a 64&nbsp;KiB buffer, when
+both move the same bytes? Where does stdio's <code>getc</code>/<code>putc</code> sit between the two, and what is it buffering that the raw
+per-byte version is not? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>40.3 The page cache: DRAM in front of the disk</h2>
+
+<p>The second buffer is the kernel's, and it changes the meaning of every I/O number you will ever measure. The <strong>page cache</strong>
+is a region of otherwise-free DRAM in which the kernel keeps recently used file pages: a <code>read</code> whose bytes are already there is
+served from memory with a copy and no device access, and a <code>write</code> lands in the cache (marking the page <em>dirty</em>) and is
+flushed to the device later by kernel writeback threads (Love, ch.16). It is a cache in exactly the Chapter 3 sense — a fast layer standing
+in front of a slow one, betting that data used once will be used again — and its effect is large. Reading a 256&nbsp;MiB file once when its
+pages have been evicted from the cache, and once when they are resident, runs here:</p>
+
+<pre><code>read a 256 MiB file, summing bytes:
+cold (pages evicted with POSIX_FADV_DONTNEED): ~0.59-0.68 s     ~375-440 MiB/s   (goes to the device)
+warm (pages resident in the page cache)      :  0.047 s        ~5450 MiB/s      (a copy from DRAM)
+                                               cold/warm: ~13x on this machine</code></pre>
+
+<p>Same code, same file, same bytes summed — and the warm read is about <strong>13&times; faster</strong> because it never leaves DRAM,
+while the cold read waits on the storage device. The gap is this machine's; on a spinning disk it would be far larger (a seek is
+milliseconds), on a fast NVMe SSD smaller, but the <em>shape</em> is universal: the first touch pays the device, later touches pay only a
+memory copy. Two behaviours of the cache are worth knowing because they shape your numbers. The kernel does <strong>readahead</strong> — on
+a sequential read it fetches pages ahead of your position, so a streaming scan overlaps device latency with your computation and runs faster
+than random access would. And on the write side it does <strong>write-back</strong>, not write-through: <code>write</code> returns as soon
+as the bytes are in the cache, so writes appear far faster than the device could sustain, with the real device cost paid asynchronously
+later — which is convenient for speed and, as Chapter 41 will show, a genuine hazard for durability, because data that a <code>write</code>
+call has &ldquo;accepted&rdquo; is not yet on disk. The page cache is also why free memory is never wasted on a busy machine: the kernel
+fills it with file pages and evicts them under pressure, so a long-running server's I/O gets faster as its working set warms.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: the syscall is the cost, and the cache hides the disk</span>
+<p><strong>1. In words.</strong> A file access descends through the file descriptor, the VFS, the page cache, the filesystem, the block
+layer, and the device. Two costs dominate. The <em>system call</em> is a fixed per-call price, so moving one byte per call is catastrophic
+and moving 64&nbsp;KiB per call is nearly free per byte — buffer to amortize it. The <em>page cache</em> is DRAM in front of the device, so a
+read that hits it never touches the disk, and a read that misses pays the device — the same code times differently depending only on what is
+resident.</p>
+<p><strong>2. As a picture.</strong> Figure 40.1: the stack as a vertical column — <code>read()</code> &rarr; file descriptor &rarr; VFS
+&rarr; page cache (hit: return from DRAM) &rarr; filesystem &rarr; block layer &rarr; device (miss) — with two cost bars beside it: per-byte
+vs 64&nbsp;KiB buffering, and cold vs warm reads.</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, one file. Per-byte <code>read</code>/<code>write</code>: ~1604&nbsp;ns/byte
+(0.59&nbsp;MiB/s); a 64&nbsp;KiB buffer: ~0.53&nbsp;ns/byte (1812&nbsp;MiB/s) — <strong>~3000&times;</strong> (&sect;40.2). Cold read
+~400&nbsp;MiB/s; warm read ~5450&nbsp;MiB/s — <strong>~13&times;</strong> (&sect;40.3). Neither gap is the disk getting faster; one is the
+syscall amortized, the other is the device skipped.</p>
+</aside>
+
+<p><em>(Answer to the &sect;40.1 quick check: a <code>read</code> passes through the file descriptor and its open-file description (holding
+the offset), the VFS, the page cache, and — on a miss — the filesystem, the block layer, the device driver, and the hardware. It returns
+without touching the disk at the page cache, when the requested pages are already resident in DRAM; that is why &ldquo;how long does a read
+take&rdquo; has two answers — tens of nanoseconds per byte for a cache hit, and a device access of microseconds to milliseconds for a
+miss — and why an I/O measurement is meaningless unless you say which case it is.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The I/O stack a read() descends, and the two costs that dominate it.</text>
+<rect x="12" y="28" width="150" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="42" font-size="9">read(fd, buf, n) &mdash; syscall</text>
+<rect x="12" y="52" width="150" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="66" font-size="9">fd table / open-file (offset)</text>
+<rect x="12" y="76" width="150" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="90" font-size="9">VFS (&ldquo;everything is a file&rdquo;)</text>
+<rect x="12" y="100" width="150" height="20" fill="#dfeee0" stroke="#2f7d32"/><text x="20" y="114" font-size="9">page cache &mdash; HIT: return from DRAM</text>
+<rect x="12" y="124" width="150" height="20" fill="#fff3d6" stroke="#8a6d1d"/><text x="20" y="138" font-size="9">filesystem (offset &rarr; blocks)</text>
+<rect x="12" y="148" width="150" height="20" fill="#fff3d6" stroke="#8a6d1d"/><text x="20" y="162" font-size="9">block layer (queue / schedule)</text>
+<rect x="12" y="172" width="150" height="20" fill="#f6dcd2" stroke="#8c3a1d"/><text x="20" y="186" font-size="9">device &mdash; MISS: us to ms</text>
+<path d="M87 48 L 87 52 M87 72 L 87 76 M87 96 L 87 100 M87 120 L 87 124 M87 144 L 87 148 M87 168 L 87 172" stroke="#14406b" stroke-width="1"/>
+<path d="M162 110 C 210 110, 210 110, 214 110" stroke="#2f7d32" stroke-width="1"/><text x="178" y="106" font-size="8" fill="#2f7d32">hit &rarr; no device I/O</text>
+<line x1="330" y1="28" x2="330" y2="196" stroke="#b9c2cc"/>
+<text x="345" y="42" font-size="9" fill="#14406b">cost 1: the syscall (buffer to amortize)</text>
+<rect x="345" y="50" width="270" height="12" fill="#efb9a5" stroke="#8c3a1d"/><text x="345" y="76" font-size="8">per-byte read/write: ~1604 ns/byte (0.59 MiB/s)</text>
+<rect x="345" y="84" width="9" height="12" fill="#cfe6cf" stroke="#2f7d32"/><text x="356" y="94" font-size="8">64 KiB buffer: ~0.53 ns/byte (1812 MiB/s) &mdash; ~3000&times;</text>
+<text x="345" y="126" font-size="9" fill="#14406b">cost 2: the device (cache to skip)</text>
+<rect x="345" y="134" width="230" height="12" fill="#efb9a5" stroke="#8c3a1d"/><text x="345" y="160" font-size="8">cold read (evicted): ~400 MiB/s (goes to device)</text>
+<rect x="345" y="168" width="18" height="12" fill="#cfe6cf" stroke="#2f7d32"/><text x="365" y="178" font-size="8">warm read (page cache): ~5450 MiB/s &mdash; ~13&times;</text>
+<line x1="12" y1="212" x2="620" y2="212" stroke="#b9c2cc"/>
+<text x="12" y="230" font-size="8" fill="#14406b">Two buffers in the stack: the user-space buffer (stdio / your own) turns many small ops into few syscalls;</text>
+<text x="12" y="244" font-size="8" fill="#14406b">the kernel's page cache turns most reads into DRAM copies and lets writes return before they reach the device.</text>
+<text x="12" y="266" font-size="8" fill="#8c3a1d">Neither speedup is faster hardware: one amortizes the call, the other skips the disk. A warm-cache benchmark measures memory, not storage.</text>
+</svg>
+<figcaption>Figure 40.1: The I/O stack (left) and its two dominant costs (right). A <code>read</code> descends from the file descriptor
+through the VFS to the page cache, returning from DRAM on a hit and reaching the device only on a miss. The <em>system call</em> is a fixed
+per-call cost — buffering amortizes it (~3000&times;, &sect;40.2) — and the <em>page cache</em> is DRAM in front of the device — hitting it
+skips the disk (~13&times;, &sect;40.3). Wall-clock, illustrative; cold reads reflect this machine's virtual disk.</figcaption>
+</figure>
+
+<h2>40.4 Doing and measuring I/O: buffer sizes, short counts, and the warm-cache trap</h2>
+
+<p>Three practical facts follow from the stack, and each is a place engineers go wrong. First, <strong>buffer size has a sweet spot,
+not a maximum</strong>: the per-byte cost falls steeply as the buffer grows from 1 byte toward the tens of kilobytes that amortize the
+syscall and match the kernel's readahead, then flattens — a 64&nbsp;KiB buffer already ran at memory speed above, and a 64&nbsp;MiB one
+would not be meaningfully faster while wasting cache and memory. The right size is &ldquo;large enough that the syscall is amortized,&rdquo;
+typically tens to hundreds of KiB, not &ldquo;as large as possible.&rdquo; Second, <strong><code>read</code> and <code>write</code> may
+move fewer bytes than you asked</strong>: a <code>read</code> can return a <em>short count</em> at end-of-file or when interrupted, and a
+<code>write</code> to a pipe or socket can accept only part of your buffer, so correct I/O code loops until the requested count is done or an
+error occurs — the buffered copy above does exactly this, advancing a pointer through the buffer on each partial <code>write</code>. Code
+that assumes one <code>read</code> returns everything, or one <code>write</code> consumes everything, is not merely slow but wrong on the
+inputs where it matters. Third, and most damaging to your numbers, is the <strong>page cache in your measurements</strong>: run an I/O
+benchmark twice and the second run is served from the warm cache, so it reports DRAM throughput (the ~5450&nbsp;MiB/s above) while
+presenting itself as a disk number. This is the trap the &ldquo;On the code&rdquo; note guards against — the cold figures here required
+explicitly evicting the file's pages first. As always the honest number is the one that names its conditions (Chapter 33): a storage
+benchmark must state whether it ran cold or warm, because those are different systems, and a warm-cache time is a measurement of memory
+wearing a disk's name. Where hardware counters exist, they let you see cache-hit rates directly; here, the discipline is to control the
+cache state yourself and to report which state you measured.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: benchmarking I/O against a warm cache &mdash; measuring DRAM, reporting it as disk</span>
+<p>The seductive mistake is to time a read or a copy, see a big number, and believe it describes your storage — when the file was already in
+the page cache from a previous run or from the write that created it, so what you measured was a copy from DRAM. On this machine the same
+read is ~13&times; faster warm than cold; on a spinning disk the gap can be hundreds of times, so a warm-cache benchmark can overstate real
+throughput by orders of magnitude and send you optimizing a bottleneck that will not exist in production, where the data arrives cold. Two
+defenses. First, <em>control the cache state</em>: to measure cold storage, evict the file's pages first — <code>posix_fadvise</code> with
+<code>POSIX_FADV_DONTNEED</code>, or on a machine you administer a cache drop — and to measure warm-cache behaviour, pre-warm deliberately;
+either is fine, but you must know and state which. Second, <em>report the conditions</em>: every I/O number should say cold or warm, the
+buffer size, and the filesystem and device, because those determine it far more than the code does. A throughput figure with no cache state
+is not a measurement of anything — it is the &ldquo;optimizing to a story&rdquo; trap of the last part (Chapter 39) in an I/O costume: a
+plausible number measured against an uncontrolled variable.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our log processor reads the file a character at a time and it is painfully slow — I think
+we are disk-bound, so let us put it on faster SSDs and add a few reader threads.&rdquo; Cover the paragraph and respond in four or five
+sentences, drawing on &sect;40.1&ndash;&sect;40.4.</p>
+<p><em>Model answer.</em> &ldquo;I do not think it is the disk — a character-at-a-time reader is spending its time in system calls, not
+waiting on storage. Every <code>getc</code> or one-byte <code>read</code> is a trip across the kernel boundary, and on our numbers per-byte
+I/O runs about 3000&times; slower than the same copy through a 64&nbsp;KiB buffer, which is nearly free per byte. Faster SSDs and more
+threads will not help, because the bottleneck is the call frequency, not device bandwidth or parallelism — we would just be making more
+syscalls in parallel. The fix is one line of buffering: read into a large buffer and parse from memory, or use buffered stdio instead of
+raw one-byte calls. Let us confirm with a quick before/after — buffer the reads and re-time — and I expect the &lsquo;disk&rsquo; problem to
+vanish without touching the hardware.&rdquo; Naming the syscall as the cost, and reaching for a buffer before hardware or threads, is the
+senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;40.2 quick check: per-byte I/O is ~3000&times; slower because each byte pays two system calls, and the fixed
+per-call cost — the trap into the kernel and back — dwarfs the work of moving one byte; the 64&nbsp;KiB buffer pays the same per-call cost
+once per 65,536 bytes, amortizing it to under a nanosecond each. Stdio's <code>getc</code>/<code>putc</code> sit in between: they present a
+per-character interface but buffer in user space (~4&nbsp;KiB), so they issue few real system calls — what they buffer is exactly what the
+raw per-byte version does not, which is why they run ~86&times; faster than it while still paying per-character function-call overhead.)</em></p>
+
+<h2>40.5 What to carry forward</h2>
+
+<p>An I/O operation is a <strong>descent through layers</strong>, and its cost depends on which layer answers. A file access is a
+<strong>system call</strong> (Chapter 13) into the kernel's VFS, and the call has a fixed per-invocation price paid regardless of size — so
+the dominant lever in I/O performance is <strong>buffering</strong>, amortizing that price over many bytes. Measured here, per-byte
+<code>read</code>/<code>write</code> ran ~1604&nbsp;ns/byte against ~0.53&nbsp;ns/byte through a 64&nbsp;KiB buffer — about
+<strong>3000&times;</strong> (&sect;40.2) — and stdio sits between by buffering in user space so that many small operations become few
+syscalls. Below the VFS sits the <strong>page cache</strong>, DRAM standing in front of the device (Chapter 3's caching idea, applied to
+storage): a read that hits it is a memory copy, a read that misses pays the device, and here a warm read ran ~13&times; faster than a cold
+one (&sect;40.3) — the same code timing differently based only on what was resident. The cache also does readahead for sequential reads and
+write-back for writes, which makes writes look instant. From all of this the working discipline: buffer your I/O to amortize the syscall,
+handle short counts by looping, and — above all — control and report the cache state when you measure, because a warm-cache number is a
+measurement of memory, not storage (&sect;40.4).</p>
+
+<p>This is the same measure-first discipline the last part built, now carried across the boundary into I/O, where the cost model is new —
+syscalls and device latency instead of cycles and cache lines — but the method is unchanged. One feature of the page cache, though, is a
+loose thread this chapter deliberately left hanging: a <code>write</code> returns as soon as the bytes reach the cache, <em>before</em> they
+are on the device, which is wonderful for speed and a real problem the moment you care whether the data survives a crash. That is the
+subject of the next chapter, <a href="#ch41">Chapter 41</a>: files and durability — how to force data to stable storage with
+<code>fsync</code> and what it costs, how <code>O_DIRECT</code> bypasses the cache, and how memory-mapped I/O maps file pages straight into
+your address space. The stack is mapped; now we make it durable, and pay for it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name the layers a <code>read</code> of a regular file descends, and where a cache hit returns without device I/O.</li>
+<li>Explain why per-byte <code>read</code>/<code>write</code> is ~3000&times; slower than a 64&nbsp;KiB buffer, with the order of magnitude.</li>
+<li>Distinguish the two buffers in the stack — user-space (stdio) and the kernel's page cache — and what each does.</li>
+<li>State what the page cache is and why a warm read is much faster than a cold one.</li>
+<li>Explain why <code>read</code>/<code>write</code> can move fewer bytes than requested, and what correct code does about it.</li>
+<li>Say why a warm-cache benchmark is a misleading measurement of storage, and how to run a cold one.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What layers does a <code>read</code> pass through, and at which one can it return without touching the device? (&sect;40.1)</li>
+<li><strong>R2.</strong> Why is per-byte I/O ~3000&times; slower than buffered I/O, and where does stdio fit? (&sect;40.2)</li>
+<li><strong>R3.</strong> What is the page cache, and roughly how much faster was a warm read than a cold one here, and why? (&sect;40.3)</li>
+<li><strong>R4.</strong> Why can <code>read</code>/<code>write</code> return a short count, and what must correct code do? (&sect;40.4)</li>
+<li><strong>R5.</strong> Why is a warm-cache benchmark a misleading storage number, and how do you measure a cold read? (&sect;40.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 10 (&ldquo;System-Level I/O&rdquo;) is the source for &sect;40.1&ndash;&sect;40.2 — Unix I/O,
+file descriptors, the difference between unbuffered system-call I/O and buffered stdio, and short counts. First author Randal Bryant;
+edition and ISBN verified via the publisher.</li>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapter 4
+(&ldquo;File I/O&rdquo;) and Chapter 13 (&ldquo;File I/O Buffering&rdquo;) are the detailed reference for this chapter — the
+<code>read</code>/<code>write</code> system calls, the two levels of buffering (stdio and the kernel), and how buffer size affects
+performance. First author Michael Kerrisk; edition and ISBN verified via the publisher.</li>
+<li><strong>Robert Love, <em>Linux Kernel Development</em>, 3rd ed. (Addison-Wesley, 2010), ISBN 978-0-672-32946-3.</strong> Chapter 16
+(&ldquo;The Page Cache and Page Writeback&rdquo;) is the source for &sect;40.3 — how the kernel caches file pages in DRAM, readahead, and
+the write-back of dirty pages. First author Robert Love; edition and ISBN verified via the publisher.</li>
+<li><strong>Remzi H. Arpaci-Dusseau &amp; Andrea C. Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (Arpaci-Dusseau Books,
+2018).</strong> The &ldquo;Persistence&rdquo; chapters — especially &ldquo;I/O Devices&rdquo; (ch.36) — ground &sect;40.1's device layer:
+how a request reaches the hardware, interrupts, and DMA. Freely available online; first author Remzi Arpaci-Dusseau; cited by author and
+title (an open-access book carrying no ISBN for the online edition).</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex40.1"><span class="ex-label">40.1</span> <span class="ex-tag warm">warm-up</span>
+List, in order, the layers a <code>read</code> of a regular file passes through from the file descriptor down to the device, and mark the
+one at which a cache hit can return without any device I/O.</div>
+
+<div class="exercise" id="ex40.2"><span class="ex-label">40.2</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, explain why copying a file one byte per <code>read</code>/<code>write</code> is roughly 3000&times; slower than copying
+it through a 64&nbsp;KiB buffer, when both move the same number of bytes.</div>
+
+<div class="exercise" id="ex40.3"><span class="ex-label">40.3</span> <span class="ex-tag warm">warm-up</span>
+There are two distinct buffers in the I/O stack. Name each, say who owns it, and say what problem each one solves.</div>
+
+<div class="exercise" id="ex40.4"><span class="ex-label">40.4</span> <span class="ex-tag core">core</span>
+The page cache. (a) What is it, physically, and what does it hold? (b) Explain why the same <code>read</code> ran ~13&times; faster warm
+than cold here. (c) What is <em>readahead</em>, and why does it make a sequential scan faster than random access over the same file?</div>
+
+<div class="exercise" id="ex40.5"><span class="ex-label">40.5</span> <span class="ex-tag core">core</span>
+Short counts. (a) Give two situations in which <code>read</code> returns fewer bytes than requested, and one in which <code>write</code>
+does. (b) Sketch, in pseudocode, the loop that correctly writes an entire buffer despite partial <code>write</code>s. (c) Why is code that
+assumes one <code>read</code> returns the whole file not just slow but incorrect?</div>
+
+<div class="exercise" id="ex40.6"><span class="ex-label">40.6</span> <span class="ex-tag core">core</span>
+Buffer size. Given that per-byte I/O was ~1604&nbsp;ns/byte and a 64&nbsp;KiB buffer was ~0.53&nbsp;ns/byte, explain (a) why the per-byte
+cost falls steeply as the buffer grows from 1 byte to tens of KiB, (b) why it then flattens rather than continuing to fall, and (c) what
+this implies about choosing &ldquo;as large as possible&rdquo; versus &ldquo;large enough.&rdquo;</div>
+
+<div class="exercise" id="ex40.7"><span class="ex-label">40.7</span> <span class="ex-tag complexity">cost</span>
+A program issues <var>k</var> system calls to move a total of <var>B</var> bytes, each call costing a fixed <var>s</var> nanoseconds plus
+<var>b</var> nanoseconds per byte moved. (a) Write the total time in terms of <var>k</var>, <var>B</var>, <var>s</var>, <var>b</var>.
+(b) With per-byte I/O, <var>k</var>&nbsp;=&nbsp;<var>B</var>; with a buffer of size <var>W</var>, <var>k</var>&nbsp;=&nbsp;<var>B</var>/<var>W</var>.
+Show how the total time depends on <var>W</var>, and identify the <var>W</var> beyond which increasing it barely helps.</div>
+
+<div class="exercise" id="ex40.8"><span class="ex-label">40.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague benchmarks a file reader, gets 5&nbsp;GiB/s, and reports &ldquo;our storage does
+5&nbsp;GiB/s.&rdquo;
+<br><strong>Step 1 (given):</strong> the benchmark reads the same file the test harness just wrote.
+<br><strong>Step 2 (given):</strong> the write left every page of the file resident in the page cache.
+<br><strong>Step 3 (given):</strong> so the read was served entirely from DRAM, never reaching the device.
+<br><strong>Step 4 (you):</strong> Explain why 5&nbsp;GiB/s is a memory number, not a storage number; what the colleague should do to
+measure cold-storage throughput; and why the difference could be an order of magnitude in production.</div>
+
+<div class="exercise" id="ex40.9"><span class="ex-label">40.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether the dominant cost is <em>system-call frequency</em> or <em>device latency</em>, and how you would confirm: (a) a
+parser that calls <code>getc</code> in a tight loop over a 1&nbsp;GiB file already in cache; (b) a program that opens ten thousand small
+files scattered across a cold disk and reads each once; (c) a copy that reads and writes through a 1&nbsp;MiB buffer between two files on
+the same warm filesystem; (d) a logger that does a one-byte <code>write</code> per event.</div>
+
+<div class="exercise" id="ex40.10"><span class="ex-label">40.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;<code>read</code> always returns exactly the number of
+bytes you asked for unless the file ends.&rdquo; (b) &ldquo;A <code>write</code> that returns success means the data is on the disk.&rdquo;
+(c) &ldquo;stdio's <code>getc</code> issues one system call per character.&rdquo; (d) &ldquo;A read served from the page cache does not touch
+the storage device.&rdquo; (e) &ldquo;The bigger the I/O buffer, the faster, without limit.&rdquo;</div>
+
+<div class="exercise" id="ex40.11"><span class="ex-label">40.11</span> <span class="ex-tag stretch">stretch</span>
+Tie the chapter together. (a) Explain why both of this chapter's speedups — buffering (~3000&times;) and the warm cache (~13&times;) — are
+described as &ldquo;not faster hardware,&rdquo; and what each one actually removes. (b) A server's I/O throughput improves over the first
+few minutes of running and then stabilizes; explain this in terms of the page cache warming. (c) Argue why &ldquo;how many system calls,
+and is the data resident&rdquo; is a better first question about I/O performance than &ldquo;how fast is the disk.&rdquo;</div>
+
+<div class="exercise" id="ex40.12"><span class="ex-label">40.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Copy a several-MiB file one byte per <code>read</code>/<code>write</code> and again through a
+64&nbsp;KiB buffer; time both as the minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials and report the per-byte cost and
+the ratio. (b) Read a large file twice — once after evicting its pages (<code>posix_fadvise</code> with <code>POSIX_FADV_DONTNEED</code>,
+or a cache drop if you administer the machine) and once warm — and report cold vs warm throughput. (c) State your toolchain, CPU,
+filesystem, and buffer size, and note that these are wall-clock times (no hardware counters) if you lack <code>perf</code>, and which reads
+were cold versus warm.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch41">
+<h1>Chapter 41 — Files and Durability: fsync, Direct I/O, and Memory Mapping</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch40">Chapter 40</a> (the page cache and write-back — why a
+<code>write</code> returns before the data is on the device), <a href="#ch13">Chapter 13</a> (the system-call boundary),
+<a href="#ch04">Chapter 4</a> (virtual memory and address translation — the machinery <code>mmap</code> reuses),
+<a href="#ch17">Chapter 17</a> (demand paging — a mapped file page is faulted in on first touch). &nbsp;·&nbsp; The last chapter mapped the
+I/O stack and left one thread hanging: a <code>write</code> reaches only the page cache, not the disk. This chapter pulls that thread — how
+you force data to stable storage and what it costs, how to bypass the cache, and how to map a file into memory.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch40">Chapter 40</a> — when a program calls <code>write</code> and it returns success, where is the data, and
+when does it actually reach the storage device? (2) <a href="#ch04">Chapter 4</a> and <a href="#ch17">Chapter 17</a> — what does the MMU do
+on a load to an address whose page is not resident, and what is <em>demand paging</em>? (3) <em>Predict:</em> you append two thousand small
+records to a file. In one version you call <code>fsync</code> (or <code>fdatasync</code>) after every record to make it durable; in the
+other you do not. How much slower is the durable version — 2&times;, 100&times;, more? And separately: you sum every 64th byte of a large
+cached file, once by <code>read</code>-ing it into a buffer and once by <code>mmap</code>-ing it and reading memory directly. Which is
+faster, and why? Write your guesses; &sect;41.2 and &sect;41.4 answer them.</p>
+</aside>
+
+<p>A <code>write</code> that returns success has not written anything to your disk. As Chapter 40 showed, it copied your bytes into the
+kernel's page cache and marked the page dirty; the kernel flushes dirty pages to the device on its own schedule, seconds later, so a crash
+or power loss in the interval loses data the program believes it saved. For a scratch file this is exactly the behaviour you want — it makes
+writes fast. For anything whose survival matters — a database's log, a user's document, a financial record — it is a correctness problem,
+and closing it requires an explicit, expensive act: telling the kernel to force the data all the way to stable storage and to wait until it
+is there. That act is <code>fsync</code>, and its cost is the central number of this chapter, because it is what separates &ldquo;fast&rdquo;
+from &ldquo;durable&rdquo; and drives the design of every storage system in Volume 2. Around it sit two more tools for controlling how file
+data moves: <code>O_DIRECT</code>, which bypasses the page cache entirely for programs that manage their own, and memory-mapped I/O, which
+maps a file into your address space so you read and write it with ordinary loads and stores. This chapter proceeds in five steps: why a
+<code>write</code> is not durable and what a crash can lose (&sect;41.1); <code>fsync</code>, and the price of durability, measured
+(&sect;41.2); bypassing the cache with <code>O_DIRECT</code> (&sect;41.3); memory-mapped I/O and when it beats <code>read</code>/<code>write</code>
+(&sect;41.4); and what to carry forward (&sect;41.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 4&nbsp;KiB pages) against an <code>ext4</code> filesystem, timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as
+the minimum of several trials (Chapter 33). Times are wall-clock. A hardware-counter profiler (<code>perf</code>) is <em>not</em> installed
+here. The storage on this machine is a <em>virtual disk</em>, so the absolute <code>fsync</code> cost below reflects this device's flush
+path and is not a portable constant — published flush latencies for real SSDs and spinning disks, quoted for comparison, are labelled as
+such. The <code>fsync</code> number is stable across runs and shows the <em>shape</em> of the durability cost; the <code>mmap</code>-vs-<code>read</code>
+comparison was deliberately reported with its measured variance, because the two are close and the winner depends on the access pattern and
+page-fault behaviour rather than on a fixed ratio.</p>
+
+<h2>41.1 A write() is not on disk: the durability gap</h2>
+
+<p>The page cache's write-back policy (Chapter 40) is the source of both the speed and the hazard. When you call <code>write</code>, the
+kernel copies your bytes into a page in the cache, marks that page <strong>dirty</strong>, and returns — it does <em>not</em> wait for the
+device. Dirty pages are flushed later by kernel writeback threads, governed by tunables (how many dirty pages may accumulate, how old a
+dirty page may get) that typically let data sit in memory for seconds before it reaches stable storage. In that window the data exists only
+in volatile DRAM, so a power failure, a kernel panic, or a hard reset loses it, even though every <code>write</code> call returned success
+and the program moved on believing the data saved. This is not a bug; it is the deliberate trade that makes the &sect;40.3 write-back cache
+fast, and for most files it is correct — a temporary file, a rebuildable cache, a log you can afford to lose the tail of. The problem is
+specifically <strong>durability</strong>: the guarantee that once an operation is acknowledged, its effect survives a crash. A plain
+<code>write</code> does not provide it, and no amount of retrying or checking the return value adds it, because the return value only tells
+you the kernel accepted the bytes into the cache, not that the device has them. Worse, the order in which dirty pages reach the disk is not
+the order you wrote them, so after a crash a file can be left in a state that never existed in the program's logic — the last record
+half-present, or metadata updated but data not — which is why crash-consistency is a genuine and studied difficulty (Pillai et&nbsp;al.,
+OSDI 2014). Everything in the next section exists to close this gap on demand, for the specific data whose survival you are willing to pay
+for.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>After a <code>write</code> returns success, where exactly is the data, and what event would lose it? Why does checking the return value
+of <code>write</code> not tell you the data is durable? (Answer after the next section.)</p>
+</aside>
+
+<h2>41.2 fsync: the price of durability</h2>
+
+<p>The system call that closes the gap is <code>fsync(fd)</code> — and its variant <code>fdatasync(fd)</code> — which tells the kernel to
+flush all dirty pages of that file to the storage device and to wait until the device confirms they are stable before returning
+(<code>fdatasync</code> skips non-essential metadata like the modification time, so it can avoid an extra metadata write). It converts the
+deferred, asynchronous write-back into a synchronous, durable barrier, and the wait is the cost. Appending two thousand 256-byte records to
+a file, once with no sync and once calling <code>fdatasync</code> after every record, runs here:</p>
+
+<pre><code>append 2,000 records of 256 bytes:
+                              per record      throughput
+write only (no sync)       :   ~0.9 us       ~1,100,000 records/s   (lands in the page cache)
+write + fdatasync each     :   ~8.6 ms       ~116 records/s         (waits for the device to flush)
+                              durability tax: ~9000x slower per record</code></pre>
+
+<p>The difference is not marginal — it is about <strong>9000&times; per record</strong>, because a plain <code>write</code> returns after a
+memory copy (~0.9&nbsp;&micro;s) while <code>fdatasync</code> must push the data through the block layer to the device and wait for the
+device to report it durably stored, which on this machine's virtual disk takes about 8.6&nbsp;ms — a real device-flush round trip, not a CPU
+cost. That absolute number is this device's; a fast NVMe SSD with a power-loss-protected cache can flush in tens to hundreds of
+microseconds, a spinning disk takes on the order of ten milliseconds (a rotation plus a seek) — published figures, cited for scale — but on
+every device the flush is <em>orders of magnitude</em> more expensive than the buffered write, because it is bounded by physical storage,
+not by memory. This one number explains a great deal of systems design. It is why you never <code>fsync</code> per small write in a hot
+path: at ~116 durable records per second, a naive per-record sync is a throughput catastrophe. It is why durable systems <strong>batch</strong>
+— a database groups many transactions into one log flush (<em>group commit</em>), amortizing a single <code>fsync</code> across hundreds of
+records, so the per-record durability cost falls back toward the memory write while the guarantee is kept. And it is why the write-ahead log
+exists at all: append the change to a sequential log and <code>fsync</code> that once, rather than syncing scattered updates to the data
+files — a design Volume 2 builds in full. The rule to carry now: durability has a fixed, large per-flush price, so you pay it as seldom as
+correctness allows, by batching, not by syncing more.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>fsync</code> do that <code>write</code> does not, and why is it roughly 9000&times; slower per record here? Given that
+cost, how do durable systems like databases keep throughput up while still guaranteeing that acknowledged data survives a crash? (Answer
+below the communicate box.)</p>
+</aside>
+
+<h2>41.3 Bypassing the cache: O_DIRECT</h2>
+
+<p>The page cache is a benefit you can decline. Opening a file with the <code>O_DIRECT</code> flag makes reads and writes bypass the page
+cache and transfer data directly between the storage device and your user-space buffer by DMA, with no kernel copy and no caching of the
+file's pages. The cost of this power is strict constraints, verified here against this <code>ext4</code> filesystem: the buffer address, the
+file offset, and the transfer length must all be aligned to the device's block size (commonly 512 or 4096 bytes), so a direct read needs a
+<code>posix_memalign</code>'d buffer, not an arbitrary <code>malloc</code>'d one — an unaligned direct I/O fails with <code>EINVAL</code>.
+Why would anyone give up the free cache? Because sometimes the kernel's cache is redundant or actively harmful. A database maintains its own
+<strong>buffer pool</strong> (Volume 2) — its own cache of pages, sized and evicted by its own policy — and the page cache underneath would
+just hold a second, uncoordinated copy of the same data, doubling memory use and defeating the database's careful replacement decisions;
+with <code>O_DIRECT</code> it manages its cache directly and the kernel stays out of the way. Direct I/O also avoids <strong>cache
+pollution</strong>: a one-pass backup or a large sequential scan that will never reread its data would otherwise evict the working set of
+every other process to cache bytes it does not need, so bypassing the cache keeps the shared cache useful for programs that benefit from it.
+The trade is real and cuts both ways: <code>O_DIRECT</code> gives control and predictability but forfeits readahead, write-back batching,
+and the enormous win of a cache hit (the &sect;40.3 13&times;), so it helps only programs that genuinely manage their own caching or
+deliberately stream past it, and hurts everything else. It is a specialist's tool — the man page (<code>open(2)</code>) is unusually blunt
+that most applications should not use it — and the discipline is the part's discipline: reach for it only when you have measured that the
+page cache is a cost rather than a benefit for your access pattern.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: durability is a device round-trip, so you pay it rarely</span>
+<p><strong>1. In words.</strong> A <code>write</code> is cheap because it is deferred — the bytes sit dirty in the page cache and the call
+returns. Making them <em>durable</em> means <code>fsync</code>: force the dirty pages to the device and wait for the device to confirm. That
+wait is a physical round trip to storage, orders of magnitude slower than the memory write, so durable systems batch many writes behind one
+flush rather than syncing each.</p>
+<p><strong>2. As a picture.</strong> Figure 41.1: a <code>write</code> arrow stopping at the page cache (dirty page, call returns), with a
+dashed &ldquo;later&rdquo; arrow drifting to the device; beside it an <code>fsync</code> arrow going all the way to the device and a clock
+showing the caller blocked until it confirms. Below, two bars: buffered write ~0.9&nbsp;&micro;s/record vs write+<code>fdatasync</code>
+~8.6&nbsp;ms/record.</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, 256-byte records: a buffered <code>write</code> costs ~0.9&nbsp;&micro;s and returns
+~1.1&nbsp;million/s; a <code>write</code> plus <code>fdatasync</code> costs ~8.6&nbsp;ms and returns ~116/s — <strong>~9000&times;</strong>
+(&sect;41.2). Group-commit a batch of, say, 1000 records behind one flush and the per-record durability cost falls back toward the memory
+write while the guarantee is kept — which is why write-ahead logs exist.</p>
+</aside>
+
+<p><em>(Answer to the &sect;41.1 quick check: after <code>write</code> returns, the data is in a dirty page in the kernel's page cache in
+volatile DRAM, scheduled for write-back later; a power loss, kernel panic, or hard reset before the flush loses it. Checking
+<code>write</code>'s return value does not help because it reports only that the kernel accepted the bytes into the cache — not that the
+device has them — so durability requires the separate, synchronous <code>fsync</code>.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 280" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A write() stops at the page cache; fsync() forces the data to the device and waits.</text>
+<rect x="12" y="30" width="70" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="44" font-size="9">write()</text>
+<rect x="150" y="30" width="120" height="20" fill="#fff3d6" stroke="#8a6d1d"/><text x="158" y="44" font-size="9">page cache (dirty page)</text>
+<rect x="360" y="30" width="120" height="20" fill="#f6dcd2" stroke="#8c3a1d"/><text x="368" y="44" font-size="9">storage device</text>
+<path d="M82 40 L 150 40" stroke="#14406b" stroke-width="1" marker-end="url(#b)"/><text x="92" y="26" font-size="8" fill="#2f7d32">returns immediately</text>
+<path d="M270 40 C 320 40, 320 40, 360 40" fill="none" stroke="#8a6d1d" stroke-width="1" stroke-dasharray="3,2"/><text x="282" y="26" font-size="8" fill="#8a6d1d">write-back later (seconds)</text>
+<text x="150" y="66" font-size="8" fill="#8c3a1d">crash here &rarr; data lost (only in DRAM)</text>
+<rect x="12" y="86" width="70" height="20" fill="#eef1f4" stroke="#14406b"/><text x="20" y="100" font-size="9">fsync()</text>
+<path d="M82 96 L 480 96" stroke="#8c3a1d" stroke-width="1.5" marker-end="url(#b)"/><text x="150" y="112" font-size="8" fill="#8c3a1d">force dirty pages to device, then BLOCK until it confirms durable</text>
+<line x1="12" y1="132" x2="620" y2="132" stroke="#b9c2cc"/>
+<text x="12" y="150" font-size="9" fill="#14406b">per-record cost (2000 x 256 B):</text>
+<rect x="200" y="142" width="8" height="10" fill="#cfe6cf" stroke="#2f7d32"/><text x="212" y="151" font-size="8">buffered write ~0.9 us (~1.1 M/s)</text>
+<rect x="200" y="158" width="420" height="10" fill="#efb9a5" stroke="#8c3a1d"/><text x="200" y="180" font-size="8">write + fdatasync each ~8.6 ms (~116/s) &mdash; ~9000&times;</text>
+<text x="12" y="206" font-size="9" fill="#2f7d32">group commit: one fsync behind N records &rarr; per-record durability cost falls back toward the memory write.</text>
+<line x1="12" y1="222" x2="620" y2="222" stroke="#b9c2cc"/>
+<text x="12" y="240" font-size="8" fill="#14406b">Durability is a physical round trip to storage, not a memory copy &mdash; so you pay it as seldom as correctness allows, by batching.</text>
+<text x="12" y="256" font-size="8" fill="#8c3a1d">Absolute fsync cost is this machine's virtual disk; SSDs flush in tens of us, spinning disks in ~10 ms (published, for scale).</text>
+</svg>
+<figcaption>Figure 41.1: The durability gap and its price. A <code>write</code> returns once the data is a dirty page in the page cache
+(lost on a crash); <code>fsync</code>/<code>fdatasync</code> forces those pages to the device and blocks until it confirms — here
+~8.6&nbsp;ms versus ~0.9&nbsp;&micro;s for the buffered write, about <strong>9000&times;</strong> (&sect;41.2). Because durability is a
+device round trip, systems batch many writes behind one flush (group commit). Wall-clock; absolute flush cost reflects this machine's
+virtual disk.</figcaption>
+</figure>
+
+<h2>41.4 Memory-mapped I/O: mapping a file into your address space</h2>
+
+<p>The third tool changes not <em>when</em> data is durable but <em>how</em> you touch it. <code>mmap</code> maps a file (or part of one)
+into the process's virtual address space, so the file's contents appear as an array of bytes in memory: you read the file with ordinary
+loads and write it with ordinary stores, and no <code>read</code>/<code>write</code> system call is made per access. It reuses the virtual
+memory machinery of Chapters 4 and 17 directly — the mapping is lazy, so pages are brought in by <strong>demand paging</strong> on first
+touch (the MMU faults, the kernel fetches the page from the file into the page cache and maps it), and dirtied pages are written back to the
+file by the same write-back path, with <code>msync</code> available to force them like <code>fsync</code>. Its headline advantage is
+avoiding the copy: a <code>read</code> copies file data from the page cache into your buffer, whereas a mapped access reads the page-cache
+page in place, so <code>mmap</code> eliminates that user-space copy. Whether that makes it faster is genuinely a &ldquo;measure it&rdquo;
+question. Summing every 64th byte of a 256&nbsp;MiB cached file, once via <code>read</code> into a buffer and once via <code>mmap</code>,
+ran here:</p>
+
+<pre><code>sum every 64th byte of a 256 MiB warm file:
+read() into a buffer + sum : ~3,000-4,000 MiB/s   (a page-cache copy into the buffer, then the sum)
+mmap() + sum in place      : comparable           (no copy, but a minor page fault per 4 KiB page on first touch)
+                             across runs mmap ranged from ~2x faster to ~3x slower &mdash; the copy it saves
+                             trades against the page-fault cost; the winner depends on the access pattern</code></pre>
+
+<p>The honest result is that the two are <strong>close</strong>, and which wins depends on the workload — exactly the discipline of the
+last part carried into I/O. <code>mmap</code> removes the <code>read</code> copy, which helps most when you touch the data many times or
+randomly (a large index, a shared read-only table), so the one-time page-fault cost of mapping it in is amortized and you get zero-copy
+random access through the address space. <code>read</code>/<code>write</code> tends to win for a single sequential streaming pass, where
+kernel readahead is already optimal and <code>mmap</code>'s per-page minor faults add overhead the streaming copy avoids — and it gives you
+explicit control over exactly when I/O happens, which mapped access hides behind faults. <code>mmap</code> also enables things
+<code>read</code>/<code>write</code> cannot: multiple processes can map the same file and share one set of physical pages (Chapter 19's
+shared memory is the anonymous case of this), and a large file can be treated as a random-access array without a manual seek-and-read. The
+costs are equally real: a page fault on an unmapped page can stall unpredictably, a hard I/O error becomes a <code>SIGBUS</code> at an
+ordinary memory access rather than an error return you can check, and durability still requires an explicit <code>msync</code> plus the same
+<code>fsync</code> physics as &sect;41.2. So the choice is by access pattern, measured: map when you reuse or randomly access data and want
+it as memory; use buffered <code>read</code>/<code>write</code> when you stream once and want control over the I/O (Kerrisk, ch.49; Stevens
+&amp; Rago, ch.14).</p>
+
+<aside class="warning">
+<span class="box-title">Trap: trusting a returned write() for durability &mdash; the data that is only in the page cache</span>
+<p>The most dangerous I/O bug is invisible in testing: treating a successful <code>write</code> (or a flushed stdio buffer, or a
+<code>close</code>) as if the data were on disk. It is not — it is a dirty page in the page cache (&sect;41.1), and it survives every normal
+test because the machine does not crash during a test; it is lost only in the power failure or kernel panic you were writing durable code to
+survive in the first place. <code>fflush</code> does not help: it moves data from the C library's user-space buffer into the kernel's page
+cache, which is still volatile — one buffer down, the durable barrier not yet crossed. Even <code>fsync</code> on the file is not always
+enough: creating or renaming a file also modifies its <em>directory</em>, and if the directory entry is not itself synced, a crash can leave
+the data durable but the file unreachable (the classic write-to-temp-then-rename pattern requires syncing the directory too). Two defenses.
+First, decide explicitly which data must be durable and cross the barrier for exactly that data with <code>fsync</code>/<code>fdatasync</code>
+(and <code>msync</code> for mapped writes), accepting the &sect;41.2 cost and batching to amortize it — durability is never implicit.
+Second, test it honestly: a durability claim is only credible if it survives a real crash — kill the power (or the VM) mid-write and check
+what remains — because the whole failure mode is defined by a crash, and code that only ever ran to completion has never been tested against
+it. Assuming write-back is durability is the I/O version of shipping an optimization measured against nothing (Chapter 39): a guarantee
+asserted, never paid for.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our service writes each event to a file and returns 200 OK, so we are durable — and it is
+fast, a million events a second. If we ever need more safety we can <code>fsync</code> every write.&rdquo; Cover the paragraph and respond in
+four or five sentences, drawing on &sect;41.1&ndash;&sect;41.4.</p>
+<p><em>Model answer.</em> &ldquo;We are fast precisely because we are <em>not</em> durable yet — the <code>write</code> returns when the
+data is in the page cache, so a power loss or kernel panic loses every event we have acknowledged since the last write-back, seconds of
+data. Returning 200 promises the client we kept it, which today is not true across a crash. But <code>fsync</code>-per-write is not the fix
+either: on our numbers a durable flush is about 8.6&nbsp;ms against under a microsecond for the buffered write — roughly 9000&times; — so
+syncing every event would drop us from a million a second to about a hundred. The right design is to batch: append events to a log and
+<code>fsync</code> once per group (group commit), which amortizes the one expensive flush across many events and keeps both the guarantee
+and most of the throughput. Let us decide the actual durability requirement — how much data we may lose on a crash — and size the batch to
+it, then test it by pulling the plug mid-write and seeing what survives.&rdquo; Naming write-back as non-durable, quoting the flush cost,
+and reaching for batching over per-write sync is the senior register — and the seed of the write-ahead log.</p>
+</aside>
+
+<p><em>(Answer to the &sect;41.2 quick check: <code>fsync</code> forces the file's dirty pages out of the page cache to the storage device
+and waits until the device confirms they are durably stored, which a plain <code>write</code> never does; it is ~9000&times; slower per
+record here because that wait is a physical round trip to storage (~8.6&nbsp;ms on this device) versus a memory copy (~0.9&nbsp;&micro;s).
+Durable systems keep throughput up by <strong>batching</strong> — grouping many writes behind a single <code>fsync</code> (group commit, the
+write-ahead log), so the fixed per-flush cost is amortized across hundreds of records while every acknowledged record is still on the device
+before the acknowledgement.)</em></p>
+
+<h2>41.5 What to carry forward</h2>
+
+<p><strong>Durability is not free and not implicit.</strong> A <code>write</code> only reaches the page cache (Chapter 40), so it is fast
+but volatile: a crash before write-back loses acknowledged data, and the return value tells you nothing about the device (&sect;41.1). The
+barrier that makes data durable is <strong><code>fsync</code></strong> (or <code>fdatasync</code>), which forces the file's dirty pages to
+storage and waits — here ~8.6&nbsp;ms per flush against ~0.9&nbsp;&micro;s for the buffered write, about <strong>9000&times;</strong>
+(&sect;41.2) — because it is bounded by the physical device, not by memory. That single fact drives durable-system design: you pay the flush
+as rarely as correctness allows by <strong>batching</strong> many writes behind one sync (group commit, the write-ahead log). Two more
+tools control how file data moves: <strong><code>O_DIRECT</code></strong> bypasses the page cache for programs that manage their own
+(databases with a buffer pool, one-pass scans that would only pollute the cache), at the cost of alignment constraints and forfeited
+readahead and cache hits (&sect;41.3); and <strong>memory-mapped I/O</strong> maps a file into your address space so you touch it with loads
+and stores, avoiding the <code>read</code> copy — a win for reuse and random access, roughly a wash for a single streaming pass, and chosen
+by measured access pattern (&sect;41.4). Above all, the trap: never mistake a returned <code>write</code> for durable data, and test a
+durability claim against a real crash (&sect;41.4).</p>
+
+<p>These are the mechanics Volume 2 builds a database on: the write-ahead log is exactly &ldquo;append and <code>fsync</code> once&rdquo;
+made into a discipline, the buffer pool is exactly &ldquo;manage your own cache with <code>O_DIRECT</code>,&rdquo; and crash recovery is
+exactly &ldquo;reason about what a <code>write</code> had and had not made durable when the power failed.&rdquo; The last two chapters have
+been about a program moving bytes to and from storage, one operation at a time, blocking until each finishes. But a server does not talk to
+one file — it talks to thousands of clients at once, and it cannot afford to stop and wait on each. The next chapter, <a href="#ch42">Chapter
+42</a>, turns to that problem: <strong>blocking versus non-blocking I/O</strong> — what happens to a thread that waits on a slow read, why one thread per connection does
+not scale to ten thousand of them, and how a single thread can watch thousands of descriptors and act only on the ones that are ready. The
+cost model shifts again, from the latency of one operation to the concurrency of many.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a successful <code>write</code> is not durable, and what event loses the data.</li>
+<li>State what <code>fsync</code> does and, to an order of magnitude, how much slower it is than a buffered write.</li>
+<li>Explain why durable systems batch writes behind one flush, and name the design that does so.</li>
+<li>Say what <code>O_DIRECT</code> does, its main constraint, and one kind of program that wants it.</li>
+<li>State what <code>mmap</code> avoids versus <code>read</code>, and when to prefer each.</li>
+<li>Name the durability trap and how you would actually test a durability claim.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> After a <code>write</code> returns, where is the data, and what loses it? (&sect;41.1)</li>
+<li><strong>R2.</strong> What does <code>fsync</code> do, why is it ~9000&times; slower per record here, and how do systems keep throughput? (&sect;41.2)</li>
+<li><strong>R3.</strong> What does <code>O_DIRECT</code> do, what constraint does it impose, and who wants it? (&sect;41.3)</li>
+<li><strong>R4.</strong> What does <code>mmap</code> avoid versus <code>read</code>, and when does each win? (&sect;41.4)</li>
+<li><strong>R5.</strong> Why is trusting a returned <code>write</code> for durability a trap, and how do you test the claim? (&sect;41.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapter 13
+(kernel buffering, <code>fsync</code>/<code>fdatasync</code>, and <code>O_DIRECT</code>) and Chapter 49 (&ldquo;Memory Mappings&rdquo;) are
+the reference for this entire chapter — the durability barrier, direct I/O, and <code>mmap</code>. First author Michael Kerrisk; edition and
+ISBN verified via the publisher.</li>
+<li><strong>W. Richard Stevens &amp; Stephen A. Rago, <em>Advanced Programming in the UNIX Environment</em>, 3rd ed. (Addison-Wesley, 2013),
+ISBN 978-0-321-63773-4.</strong> Chapter 3 (file I/O and synchronized writes) and Chapter 14 (memory-mapped I/O) ground &sect;41.1&ndash;&sect;41.4
+in the POSIX interfaces. First author W. Richard Stevens; edition and ISBN verified via the publisher.</li>
+<li><strong>Thanumalayan S. Pillai, Vijay Chidambaram, Ramnatthan Alagappan, Samer Al-Kiswany, Andrea C. Arpaci-Dusseau &amp; Remzi H.
+Arpaci-Dusseau, &ldquo;All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications,&rdquo; in
+<em>Proceedings of OSDI 2014</em>, pp. 433&ndash;448.</strong> The empirical study behind &sect;41.1's crash-consistency warning — how
+applications get durability and ordering wrong, and why <code>fsync</code> placement matters. First author Thanumalayan Pillai; USENIX
+open-access proceedings (no DOI), cited by venue and page range.</li>
+<li><strong>Marshall K. McKusick, William N. Joy, Samuel J. Leffler &amp; Robert S. Fabry, &ldquo;A Fast File System for UNIX,&rdquo;
+<em>ACM Transactions on Computer Systems</em> 2(3), pp. 181&ndash;197 (1984), DOI 10.1145/989.990.</strong> The classic behind the
+filesystem layer that <code>fsync</code> must push data through — allocation, locality, and on-disk layout. First author Marshall Kirk
+McKusick; DOI verified via the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex41.1"><span class="ex-label">41.1</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, say where the data is after a <code>write</code> returns success, and what single event would cause it to be lost.</div>
+
+<div class="exercise" id="ex41.2"><span class="ex-label">41.2</span> <span class="ex-tag warm">warm-up</span>
+What does <code>fsync</code> do that <code>write</code> does not? What does <code>fdatasync</code> skip that <code>fsync</code> does, and
+why can that make it slightly cheaper?</div>
+
+<div class="exercise" id="ex41.3"><span class="ex-label">41.3</span> <span class="ex-tag warm">warm-up</span>
+Why is <code>fflush</code> on a stdio stream <em>not</em> the same as making the data durable? Which buffer does it empty, and into what?</div>
+
+<div class="exercise" id="ex41.4"><span class="ex-label">41.4</span> <span class="ex-tag core">core</span>
+Durability cost. (a) Explain why <code>fdatasync</code>-per-record ran ~9000&times; slower than the buffered write here. (b) Why is the
+absolute ~8.6&nbsp;ms a property of the device rather than the CPU? (c) A system needs durable acknowledgements but 100 records/s is far too
+slow — describe how group commit gets both the guarantee and the throughput, and what it trades.</div>
+
+<div class="exercise" id="ex41.5"><span class="ex-label">41.5</span> <span class="ex-tag core">core</span>
+<code>O_DIRECT</code>. (a) What does it bypass, and how is the data moved instead? (b) State the alignment constraint it imposes and why an
+ordinary <code>malloc</code>'d buffer can fail. (c) Give one program that genuinely wants <code>O_DIRECT</code> and one that would be harmed
+by it, with the reason in each case.</div>
+
+<div class="exercise" id="ex41.6"><span class="ex-label">41.6</span> <span class="ex-tag core">core</span>
+Memory-mapped I/O. (a) What copy does <code>mmap</code> avoid that <code>read</code> pays? (b) Why did the two come out close in the
+&sect;41.4 measurement — what does <code>mmap</code> pay instead of the copy? (c) Name an access pattern for which <code>mmap</code> clearly
+wins and one for which buffered <code>read</code>/<code>write</code> is the better choice.</div>
+
+<div class="exercise" id="ex41.7"><span class="ex-label">41.7</span> <span class="ex-tag complexity">cost</span>
+A durable log appends records and must <code>fsync</code> to acknowledge them. A buffered write costs <var>w</var> and an <code>fsync</code>
+costs <var>f</var>, with <var>f</var>&nbsp;&gt;&gt;&nbsp;<var>w</var>. (a) Write the per-record cost when you <code>fsync</code> after every
+record, and when you <code>fsync</code> once per batch of <var>k</var> records. (b) Using <var>w</var>&asymp;0.9&nbsp;&micro;s,
+<var>f</var>&asymp;8.6&nbsp;ms, compute the per-record cost at <var>k</var>=1 and <var>k</var>=1000. (c) What does the batch cost the
+application in the event of a crash, and how does that set an upper bound on <var>k</var>?</div>
+
+<div class="exercise" id="ex41.8"><span class="ex-label">41.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague's service writes each record and calls <code>fsync</code> after every one; it is
+correct but only sustains ~100 records/s, and they propose buying faster disks.
+<br><strong>Step 1 (given):</strong> each acknowledgement is bounded by one device-flush round trip (~8.6&nbsp;ms here), not by CPU or the
+buffered write.
+<br><strong>Step 2 (given):</strong> the flush cost is a fixed per-<code>fsync</code> price largely independent of how many bytes it
+covers.
+<br><strong>Step 3 (given):</strong> so one <code>fsync</code> can be shared across many records appended before it (group commit).
+<br><strong>Step 4 (you):</strong> Explain why batching, not faster disks, is the right first move; estimate the throughput at a batch of
+1000; and state precisely what durability the batch still guarantees and what it does not.</div>
+
+<div class="exercise" id="ex41.9"><span class="ex-label">41.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether the data is durable at the marked point, and if not, what to add: (a) <code>write(fd, rec, n)</code> returns success,
+then the machine loses power; (b) the same, but <code>fdatasync(fd)</code> returned before the power loss; (c) a record is written to a new
+temp file, <code>fsync</code>'d, and the temp file renamed over the target, then power is lost — but the directory was never synced; (d) a
+mapped-file store dirties pages via memory writes and the process exits cleanly without <code>msync</code>, then power is lost.</div>
+
+<div class="exercise" id="ex41.10"><span class="ex-label">41.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;If <code>write</code> returns success, the data is on
+the disk.&rdquo; (b) &ldquo;<code>fsync</code> is slow mainly because copying the bytes is expensive.&rdquo; (c) &ldquo;<code>O_DIRECT</code>
+makes I/O faster for every workload.&rdquo; (d) &ldquo;<code>mmap</code> lets several processes share one set of physical pages for the same
+file.&rdquo; (e) &ldquo;A durability guarantee that passes all your tests without a crash is proven.&rdquo;</div>
+
+<div class="exercise" id="ex41.11"><span class="ex-label">41.11</span> <span class="ex-tag stretch">stretch</span>
+Look ahead to Volume 2. (a) Explain why the huge cost of <code>fsync</code> is the reason databases keep a <em>write-ahead log</em> rather
+than syncing their data files directly. (b) Explain why a database using its own buffer pool often opens data files with
+<code>O_DIRECT</code>, in terms of avoiding a redundant second cache. (c) Argue why &ldquo;how often must I cross the durability
+barrier&rdquo; is the first design question for any storage system, tying it to the ~9000&times; number.</div>
+
+<div class="exercise" id="ex41.12"><span class="ex-label">41.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Append many small records to a file, timing a version with no sync against one with
+<code>fdatasync</code> after each record; report per-record cost and the ratio. (b) Repeat with an <code>fsync</code> once per batch of
+<var>k</var> records for a few values of <var>k</var>, and plot per-record cost against <var>k</var>. (c) Sum a large cached file via
+<code>read</code> into a buffer and via <code>mmap</code>, reporting both and their variance. State your toolchain, CPU, filesystem, and
+device, and note these are wall-clock times (no hardware counters) if you lack <code>perf</code>; if your storage is a virtual disk, say
+so, since it sets the absolute <code>fsync</code> cost.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch42">
+<h1>Chapter 42 — Blocking, Non-Blocking, and Event-Driven I/O</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch41">Chapter 41</a> (a read that must reach the device blocks the
+thread until it finishes), <a href="#ch40">Chapter 40</a> (the I/O syscalls), <a href="#ch13">Chapter 13</a> (the cost of a system call),
+<a href="#ch15">Chapter 15</a> and <a href="#ch16">Chapter 16</a> (threads and scheduling — what a thread costs and what a blocked one
+does), <a href="#ch25">Chapter 25</a> (thread pools — where blocking work belongs). &nbsp;·&nbsp; The last two chapters moved bytes one
+operation at a time, each blocking until it finished. A server does not have that luxury: it faces thousands of connections at once and
+cannot stop on any one. This chapter is how a single thread watches thousands of descriptors and acts only on the ready ones.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch16">Chapter 16</a> — when a thread calls a blocking <code>read</code> on data that has not arrived, what does
+the scheduler do with that thread, and what is a context switch? (2) <a href="#ch15">Chapter 15</a> and <a href="#ch25">Chapter 25</a> — what
+does a thread cost in memory (its stack) and in scheduler pressure, and why does &ldquo;just add threads&rdquo; stop scaling? (3)
+<em>Predict:</em> a server holds 10,000 connections, almost all idle at any instant. Version A dedicates one thread to each, each blocked in
+<code>read</code>. Version B uses one thread that asks the kernel &ldquo;which of these 10,000 are ready?&rdquo; and handles only those. Two
+questions: what does version A cost when 10,000 threads sit blocked? And to answer &ldquo;which are ready,&rdquo; how does the cost of
+<code>select</code> (which scans all of them) compare to <code>epoll</code> as the number grows? Write your guesses; &sect;42.1 and
+&sect;42.3 answer them.</p>
+</aside>
+
+<p>Every I/O call so far has been <strong>blocking</strong>: a <code>read</code> on data that is not ready does not return — it parks the
+calling thread, which the scheduler deschedules until the data arrives (Chapter 16). For a program that talks to one file or one connection,
+this is exactly right and beautifully simple: the code reads as if the data were always there, and the kernel handles the waiting. The
+trouble begins when one program must serve <em>many</em> slow connections at once. If a blocked thread can wait on only one descriptor, then
+handling N connections concurrently needs N threads — and a thread is not free: it holds a stack (often megabytes of address space), it adds
+to the scheduler's run queue, and switching between thousands of them costs context switches that do no useful work (Chapters 15&ndash;16).
+At ten thousand connections — the famous <strong>C10K problem</strong> (Kegel) — the thread-per-connection model spends its resources on
+threads that are almost all just waiting. The escape is to stop dedicating a thread to each wait and instead ask the kernel a different
+question: not &ldquo;block me until <em>this one</em> descriptor is ready,&rdquo; but &ldquo;tell me which of <em>these thousands</em> are
+ready right now,&rdquo; and then do work only for those. That is <strong>event-driven I/O</strong>, and this chapter builds it in five steps:
+blocking I/O and why thread-per-connection does not scale (&sect;42.1); non-blocking I/O and the busy-poll trap it creates (&sect;42.2);
+readiness notification — <code>select</code>, <code>poll</code>, and <code>epoll</code> — and how their costs differ, measured (&sect;42.3);
+the event loop and its own characteristic trap (&sect;42.4); and what to carry forward (&sect;42.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 20 hardware threads), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as the minimum of several trials
+(Chapter 33). Times are wall-clock. A hardware-counter profiler (<code>perf</code>) is <em>not</em> installed here, so the syscall cost below
+is measured as wall-clock time per call, and the <code>select</code>-vs-<code>epoll</code> comparison is measured by monitoring many idle
+pipe descriptors with exactly one ready and timing the readiness scan as the count grows — the absolute nanoseconds are this machine's (on
+WSL2 the syscall floor is higher than on bare metal), but the <em>scaling</em> — <code>select</code> growing with the descriptor count,
+<code>epoll</code> staying flat — is the portable, architectural result the chapter turns on.</p>
+
+<h2>42.1 Blocking I/O and the thread-per-connection model</h2>
+
+<p>A blocking call is the default and, for one stream, the ideal. When a thread calls <code>read</code> on a socket with no data yet, the
+kernel puts the thread to sleep — off the run queue entirely — and wakes it when data arrives, so the thread consumes no CPU while waiting
+and the code reads as a simple sequence (Chapter 16). The natural way to serve many connections with blocking calls is therefore one thread
+(or process) per connection: each thread blocks in <code>read</code> on its own socket, wakes when its client sends something, handles it,
+and blocks again. This model is easy to reason about and fine at small scale. It fails at large scale for reasons that are all about the
+<em>thread</em>, not the I/O. Each thread reserves a stack — commonly a megabyte or more of address space by default — so ten thousand
+threads reserve gigabytes before doing any work. Each runnable thread is an entry the scheduler must consider, and when many wake at once the
+kernel pays <strong>context switches</strong> — saving and restoring registers, switching address-space state, polluting caches — none of
+which moves a byte (Chapters 15&ndash;16). And the system call itself is not free: measured here, a minimal system call that must enter the
+kernel costs about <strong>199&nbsp;ns</strong>, against about 40&nbsp;ns for a <code>clock_gettime</code> that the kernel services in
+user space (the vDSO) without a real kernel entry — so the boundary crossing alone is a real per-operation tax, paid on every blocking call
+that has to sleep and wake. The result is that thread-per-connection spends most of its resources holding threads that are, at any instant,
+almost all asleep: ten thousand connections that are individually idle 99% of the time still cost ten thousand stacks and the scheduler
+churn of waking whichever few become ready. The problem is not that blocking is wrong — it is that <em>one thread per wait</em> ties a heavy,
+scheduler-visible resource to each connection, and connections vastly outnumber the work actually ready at any moment. This is the C10K
+problem, and its solution is to break the one-thread-per-connection assumption while keeping the machine busy only with connections that
+have something to do.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does a blocking <code>read</code> consume no CPU while it waits, yet thread-per-connection still fails to scale to ten thousand mostly
+idle connections? Name two costs of a thread that are paid whether or not the thread is doing work. (Answer after the next section.)</p>
+</aside>
+
+<h2>42.2 Non-blocking I/O and the busy-poll trap</h2>
+
+<p>The first tool for escaping thread-per-connection is to change how the descriptor behaves. Setting the <code>O_NONBLOCK</code> flag on a
+file descriptor makes its I/O calls <strong>non-blocking</strong>: a <code>read</code> with no data ready returns immediately with the error
+<code>EAGAIN</code> (equivalently <code>EWOULDBLOCK</code>) instead of sleeping, and a <code>write</code> that would block because the
+socket's send buffer is full returns having accepted only part, or none, of the data. This means a single thread can attend to many
+descriptors without any of them parking it: try each in turn, handle the ones that return data, and skip the ones that return
+<code>EAGAIN</code>. But non-blocking I/O alone creates a new problem as bad as the one it solved. If the thread simply loops over all N
+descriptors calling <code>read</code> and mostly collecting <code>EAGAIN</code>, it is <strong>busy-polling</strong>: it burns 100% of a CPU
+asking &ldquo;anything yet? anything yet?&rdquo; across thousands of descriptors that are overwhelmingly not ready, turning idle waiting
+(which cost nothing under blocking) into a spinning, power-hungry scan. And it does so at the system-call cost of &sect;42.1 — each
+<code>read</code> that returns <code>EAGAIN</code> is a ~199&nbsp;ns kernel round trip that accomplished nothing — so polling 10,000 idle
+descriptors in a tight loop is millions of wasted syscalls per second. Non-blocking I/O is necessary — an event-driven server must never let
+a single descriptor block its one thread — but it is not sufficient: it removes the blocking, but it does not tell you <em>which</em>
+descriptors are worth calling. What is missing is a way to ask the kernel, in one call, which of a large set of descriptors are ready, so
+the thread can sleep when nothing is ready (consuming no CPU, like blocking) and wake with the exact list of descriptors that now have work
+(handling only those, like non-blocking). That is readiness notification, and it is the mechanism the whole model turns on.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>O_NONBLOCK</code> change about a <code>read</code> that finds no data? Why is looping over thousands of non-blocking
+descriptors calling <code>read</code> on each — busy-polling — nearly as bad as thread-per-connection, and what capability is still missing?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>42.3 Readiness notification: select, poll, and epoll</h2>
+
+<p>The missing capability is a system call that takes a set of descriptors and returns which are ready, sleeping the thread until at least
+one is. Three generations of it exist, and the difference between them is the whole performance story. <code>select</code> (and its
+near-twin <code>poll</code>) takes the entire set of descriptors you care about on <em>every</em> call, and the kernel scans all of them to
+find the ready ones — so its cost grows with the <em>total</em> number of descriptors watched, ready or not. <code>epoll</code> (Linux;
+<code>kqueue</code> is the BSD equivalent) splits this into two steps: you register your interest in each descriptor <em>once</em> with
+<code>epoll_ctl</code>, and then each <code>epoll_wait</code> call returns only the descriptors that have <em>become</em> ready, so its cost
+grows with the number of <em>active</em> descriptors, not the total watched. Timing a readiness scan over many idle pipe descriptors with
+exactly one ready, as the count grows, shows the difference sharply in this environment:</p>
+
+<pre><code>readiness scan, M descriptors watched, exactly 1 ready (min of several trials):
+   M         select()        epoll_wait()
+   10          ~0.7 us          ~0.4 us
+  100          ~2.6 us          ~0.4 us
+  500         ~14.6 us          ~0.4 us
+ 1000     n/a (&gt; FD_SETSIZE)     ~0.4 us
+ 4000     n/a (&gt; FD_SETSIZE)     ~0.4 us
+                select grows ~linearly with M; epoll_wait stays flat</code></pre>
+
+<p>The pattern is unmistakable: <code>select</code>'s cost climbs roughly <strong>linearly</strong> with the number of descriptors watched
+— about 0.7&nbsp;&micro;s at 10, 2.6 at 100, 14.6 at 500 — because it rescans the whole set on every call, while <code>epoll_wait</code>
+stays essentially <strong>flat</strong> at a few hundred nanoseconds no matter how many descriptors are registered, because it returns only
+the one that is ready. This is the O(N)-versus-O(active) distinction made concrete, and it is exactly the cost that matters for a server
+where N is huge and the active fraction per wakeup is tiny. <code>select</code> carries a second, hard limit visible in the table: the
+<code>fd_set</code> it uses is a fixed-size bitmap capped at <code>FD_SETSIZE</code> (1024 on this system), so it simply cannot watch a
+descriptor numbered 1024 or above — a wall the C10K problem hits immediately, and one <code>epoll</code> does not have. One refinement
+matters when you build on <code>epoll</code>: it offers <strong>level-triggered</strong> notification (the default: a descriptor is reported
+ready as long as it has data, matching <code>select</code>'s semantics and forgiving of partial reads) and <strong>edge-triggered</strong>
+notification (reported only on the transition to ready, which is faster but requires you to drain the descriptor fully on each event or you
+will miss data). Level-triggered is the safer default; edge-triggered is an optimization for the last drop of performance. The lesson to
+carry is the scaling, not the nanoseconds: to watch many descriptors, register interest once and let the kernel hand you the ready ones —
+never rescan the whole set on every call (Kerrisk, ch.63; Banga, Mogul &amp; Druschel, 1999).</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: don't wait per connection, and don't rescan everyone — ask once who's ready</span>
+<p><strong>1. In words.</strong> Thread-per-connection ties a heavy thread to each idle wait, so it drowns at C10K. Non-blocking I/O lets one
+thread attend many descriptors but, alone, forces a wasteful busy-poll. Readiness notification supplies the missing piece — one call that
+sleeps until some descriptor is ready and returns which — and <code>epoll</code> makes that call scale by registering interest once and
+returning only the active descriptors, instead of <code>select</code> rescanning the whole set every time.</p>
+<p><strong>2. As a picture.</strong> Figure 42.1: on the left, N threads each blocked on one socket (N stacks, scheduler churn); on the
+right, one thread in an event loop calling <code>epoll_wait</code>, which returns the two ready descriptors out of thousands, dispatched to
+non-blocking handlers. Below, a line plot: <code>select</code> rising with M, <code>epoll_wait</code> flat, and a vertical wall at
+<code>FD_SETSIZE</code> = 1024.</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, one descriptor ready. <code>select</code>: ~0.7&nbsp;&micro;s at 10 descriptors,
+~14.6&nbsp;&micro;s at 500 — and impossible past 1024. <code>epoll_wait</code>: ~0.4&nbsp;&micro;s at 10, at 500, and at 4000 — <strong>flat</strong>
+(&sect;42.3). A minimal kernel-entering syscall costs ~199&nbsp;ns here (&sect;42.1), so a busy-poll of 10,000 idle descriptors is millions
+of those per second doing nothing; one <code>epoll_wait</code> replaces the whole scan.</p>
+</aside>
+
+<p><em>(Answer to the &sect;42.1 quick check: a blocking <code>read</code> consumes no CPU because the kernel takes the thread off the run
+queue entirely and wakes it only when data arrives — waiting is free of CPU. Thread-per-connection still fails to scale because the cost is
+in the <strong>threads</strong>, not the waiting: each thread reserves a stack (often a megabyte or more of address space) and is a scheduler-visible
+entity, so ten thousand mostly-idle connections cost ten thousand stacks plus the context-switch churn of waking whichever few become ready —
+two costs paid regardless of whether any thread is doing work.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Thread-per-connection versus one event loop that asks the kernel who is ready.</text>
+<text x="12" y="36" font-size="9" fill="#8c3a1d">thread per connection: N stacks, N blocked reads, scheduler churn</text>
+<rect x="12" y="44" width="60" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="16" y="56" font-size="8">thr 1 read()</text>
+<rect x="12" y="62" width="60" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="16" y="74" font-size="8">thr 2 read()</text>
+<rect x="12" y="80" width="60" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="16" y="92" font-size="8">thr 3 read()</text>
+<text x="20" y="112" font-size="8" fill="#8c3a1d">... thr 10000 (mostly asleep)</text>
+<text x="360" y="36" font-size="9" fill="#2f7d32">one thread, event loop</text>
+<rect x="360" y="44" width="150" height="18" fill="#eef1f4" stroke="#14406b"/><text x="366" y="57" font-size="8">epoll_wait(...) &mdash; sleeps</text>
+<path d="M510 53 L 545 53" stroke="#14406b" stroke-width="1"/><text x="512" y="50" font-size="7" fill="#2f7d32">ready!</text>
+<rect x="360" y="66" width="150" height="18" fill="#dfeee0" stroke="#2f7d32"/><text x="366" y="79" font-size="8">returns fd 42, fd 87 (of 10000)</text>
+<rect x="360" y="88" width="150" height="18" fill="#dfeee0" stroke="#2f7d32"/><text x="366" y="101" font-size="8">handle non-blocking, loop</text>
+<path d="M435 84 L 435 88 M435 62 L 435 66" stroke="#2f7d32" stroke-width="1"/>
+<line x1="12" y1="128" x2="620" y2="128" stroke="#b9c2cc"/>
+<text x="12" y="144" font-size="9" fill="#14406b">readiness scan cost as descriptors watched grow (1 ready):</text>
+<line x1="60" y1="250" x2="600" y2="250" stroke="#333"/><line x1="60" y1="160" x2="60" y2="250" stroke="#333"/>
+<text x="20" y="164" font-size="7">us</text><text x="300" y="266" font-size="7">descriptors watched (M)</text>
+<text x="60" y="264" font-size="7">10</text><text x="200" y="264" font-size="7">100</text><text x="340" y="264" font-size="7">500</text><text x="480" y="264" font-size="7">1000</text><text x="560" y="264" font-size="7">4000</text>
+<polyline points="60,247 200,240 340,192" fill="none" stroke="#8c3a1d" stroke-width="1.5"/><text x="345" y="188" font-size="8" fill="#8c3a1d">select ~linear</text>
+<line x1="420" y1="160" x2="420" y2="250" stroke="#8c3a1d" stroke-dasharray="3,2"/><text x="392" y="172" font-size="7" fill="#8c3a1d">FD_SETSIZE wall (1024)</text>
+<polyline points="60,248 200,248 340,248 480,248 560,248" fill="none" stroke="#2f7d32" stroke-width="1.5"/><text x="480" y="244" font-size="8" fill="#2f7d32">epoll_wait flat ~0.4 us</text>
+<text x="12" y="286" font-size="8" fill="#14406b">select rescans the whole set each call (O(N)); epoll registers interest once and returns only the ready (O(active)).</text>
+</svg>
+<figcaption>Figure 42.1: Thread-per-connection (left) ties a stack and a scheduler entry to each mostly-idle connection and drowns at C10K;
+an event loop (right) uses one thread that calls <code>epoll_wait</code> and handles only the ready descriptors. <code>select</code>'s cost
+grows linearly with the number watched and hits the <code>FD_SETSIZE</code>=1024 wall; <code>epoll_wait</code> stays flat at ~0.4&nbsp;&micro;s
+to thousands of descriptors (&sect;42.3). Wall-clock; the scaling shape, not the absolute nanoseconds, is the portable result.</figcaption>
+</figure>
+
+<h2>42.4 The event loop, and the blocking call that stalls everything</h2>
+
+<p>Put the pieces together and you have the <strong>event loop</strong> that underlies nearly every high-concurrency server (nginx, Redis,
+Node.js, and the async runtimes of most languages): one thread — or a small pool, one per core — repeatedly calls <code>epoll_wait</code>,
+receives the set of ready descriptors, and for each dispatches a short, non-blocking handler that does the available work (read what is
+there, write what fits) and returns immediately to the loop. The thread sleeps in <code>epoll_wait</code> when nothing is ready (no busy
+CPU, like blocking) and wakes with exactly the ready descriptors (handling only those, like non-blocking) — the two halves the previous
+sections were missing, joined. A handful of threads on this model can hold hundreds of thousands of connections, because a connection now
+costs only a descriptor and a little state, not a thread and a stack. But the model has a sharp and characteristic failure mode that is the
+mirror image of thread-per-connection's: because <em>one</em> thread drives thousands of connections, a single <strong>blocking
+operation inside a handler stalls every connection that thread owns</strong>. If a handler calls a blocking <code>read</code> from disk (an
+un-cached file — recall from Chapter 41 that this can wait milliseconds), performs a synchronous DNS lookup, holds a lock, calls
+<code>fsync</code> (the ~8.6&nbsp;ms of &sect;41.2!), or simply runs a long CPU computation, the event loop cannot make progress on any other
+descriptor for that entire duration — one slow client, or one careless call, freezes them all. The discipline the model demands is
+therefore absolute: <strong>nothing in an event-loop handler may block</strong>. Everything the loop touches — sockets, and increasingly
+files — must be non-blocking, and any operation that must block or compute at length is handed off to a separate <strong>thread pool</strong>
+(Chapter 25), whose result comes back to the loop as another ready event. This is the seam where the two concurrency models meet: the event
+loop for the vast number of waiting connections, a bounded pool of threads for the genuinely blocking or CPU-heavy work, connected by the
+readiness mechanism. (There is a further step this part will reach — <em>completion</em>-based asynchronous interfaces such as
+<code>io_uring</code>, where you submit an operation and are notified when it has finished rather than when a descriptor is ready to be
+tried — which extends the same idea to disk I/O that has no clean readiness signal; the readiness model of this chapter is the foundation it
+builds on.)</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the blocking call inside the event loop &mdash; one slow handler freezes every connection</span>
+<p>The event loop's strength is its weakness: one thread serving thousands of connections means any single blocking or long-running call in a
+handler halts <em>all</em> of them for its full duration. The trap is that this is invisible in light testing — with one client and warm
+caches every operation returns instantly, so the accidental blocking call (a disk read that is usually cached, an occasional
+<code>fsync</code>, a synchronous library call, a lock held under contention, a regex or JSON parse over a huge input) never actually
+blocks — and it surfaces only in production as mysterious, correlated latency spikes across unrelated connections whenever that one path is
+hit cold. The tell is exactly that correlation: in thread-per-connection a slow operation hurts one client, but in an event loop it hurts
+every client the thread holds, so a single cold disk read can spike the tail latency of thousands of requests at once. Two defenses. First,
+make it a rule that <em>no</em> syscall in a handler may block: every socket is <code>O_NONBLOCK</code>, and anything that can wait — disk
+I/O, DNS, <code>fsync</code>, a large computation — is dispatched to a thread pool (Chapter 25) and its completion delivered back to the loop
+as an event, never awaited inline. Second, measure the handler, not just the throughput: the number that matters is the maximum time a
+handler spends before returning to <code>epoll_wait</code>, because that is the latency floor for every other connection — a mean that looks
+fine can hide a handler that occasionally blocks for milliseconds. Assuming a handler is non-blocking because it usually is fast is the
+event-loop version of the part's recurring trap: a property asserted from the common case and never measured against the one that hurts.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;For our new gateway we'll spawn a thread per connection — threads are cheap now, and the
+code is so much simpler than an event loop. We expect maybe fifty thousand mostly-idle long-lived connections.&rdquo; Cover the paragraph
+and respond in four or five sentences, drawing on &sect;42.1&ndash;&sect;42.4.</p>
+<p><em>Model answer.</em> &ldquo;Thread-per-connection is simpler and it is the right call at small scale, but fifty thousand mostly-idle
+connections is exactly where it breaks — that is fifty thousand stacks (tens of gigabytes of address space at a megabyte each) and a
+scheduler holding fifty thousand entities to wake a handful at a time, when almost none have work at any instant. The cost is in the
+threads, not the waiting, so it does not matter that they are idle. The scalable shape is an event loop: a few threads, one per core, each
+calling <code>epoll_wait</code> and handling only the ready descriptors — <code>epoll</code> stays flat as connections grow, where
+<code>select</code> would climb linearly and hit the 1024-descriptor wall. The catch we must respect is that every handler has to be strictly
+non-blocking: one blocking disk read or <code>fsync</code> in a handler stalls every connection on that thread, so anything that can wait
+goes to a thread pool and comes back as an event. If we want the simple code, let us use a language runtime or library that gives us the
+event loop underneath — but let us not put fifty thousand blocking threads in the kernel.&rdquo; Naming the thread cost, reaching for the
+event loop, and flagging the no-blocking-in-handlers rule is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;42.2 quick check: <code>O_NONBLOCK</code> makes a <code>read</code> with no data return immediately with
+<code>EAGAIN</code> instead of parking the thread. Looping over thousands of non-blocking descriptors calling <code>read</code> on each is
+busy-polling: it burns a full CPU issuing millions of ~199&nbsp;ns syscalls per second that mostly return <code>EAGAIN</code>, turning the
+free idle-wait of blocking into a spinning scan — nearly as wasteful as thread-per-connection, in CPU instead of memory. What is still
+missing is a single call that sleeps until some descriptor is ready and returns <strong>which</strong> ones — readiness notification, i.e.
+<code>epoll</code>.)</em></p>
+
+<h2>42.5 What to carry forward</h2>
+
+<p>Serving many connections is a <strong>concurrency</strong> problem, not a latency one, and the cost model is the thread. A
+<strong>blocking</strong> call is simple and consumes no CPU while it waits (Chapter 16), but it can wait on only one descriptor, so
+serving N connections this way needs N threads — and threads cost stacks and scheduler churn whether idle or not, which is why
+thread-per-connection drowns at the <strong>C10K</strong> scale (&sect;42.1). <strong>Non-blocking</strong> I/O (<code>O_NONBLOCK</code>) lets
+one thread attend many descriptors without any parking it, but alone it forces a wasteful <strong>busy-poll</strong> — millions of
+<code>EAGAIN</code> syscalls (~199&nbsp;ns each here) doing nothing (&sect;42.2). The missing piece is <strong>readiness notification</strong>:
+one call that sleeps until some descriptor is ready and returns which. <code>select</code>/<code>poll</code> rescan the whole set each call,
+so their cost grows linearly with the number watched (and <code>select</code> caps at <code>FD_SETSIZE</code>=1024); <code>epoll</code>
+registers interest once and returns only the active descriptors, staying flat — here ~0.4&nbsp;&micro;s from 10 to 4000 descriptors, against
+<code>select</code>'s climb to ~14.6&nbsp;&micro;s at 500 (&sect;42.3). Assembled, these give the <strong>event loop</strong>: one thread
+(or one per core) calling <code>epoll_wait</code> and dispatching short non-blocking handlers, holding hundreds of thousands of connections
+cheaply — with the absolute rule that no handler may block, or it stalls every connection the thread owns, with the genuinely blocking work
+handed to a thread pool (&sect;42.4).</p>
+
+<p>This is the substrate under every scalable service, and it is where the part's threads converge: the OS gave us blocking calls and cheap
+scheduling (Volume 1's Part III), concurrency gave us threads and the pools to bound them (Part IV), and this chapter spends both wisely —
+an event loop for the many waits, a pool for the few blocks. The remaining chapters of this part put this substrate to work on the network
+itself. The next builds the connection the event loop has been watching — <strong>sockets</strong>: how a program opens a network endpoint,
+accepts connections, and moves bytes across the wire, and how the blocking-versus-readiness choice of this chapter plays out on a real
+server. From there the part reaches the completion-based interfaces (<code>io_uring</code>) that extend readiness to disk, and the
+<em>zero-copy</em> techniques that remove even the page-cache copy this part has taken for granted — the last cost between the file and the
+network card. The waiting is solved; now we wire it to the world.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a blocking <code>read</code> uses no CPU, yet thread-per-connection fails to scale to C10K.</li>
+<li>Name two costs of a thread paid whether or not it is doing work.</li>
+<li>Say what <code>O_NONBLOCK</code> does and why non-blocking I/O alone leads to a wasteful busy-poll.</li>
+<li>State how <code>epoll</code> scales differently from <code>select</code>, and why, with the order of magnitude.</li>
+<li>Describe the event loop and the one rule its handlers must obey.</li>
+<li>Explain why a single blocking call in a handler is worse in an event loop than in thread-per-connection.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why does thread-per-connection fail at C10K, when blocking waits are CPU-free? (&sect;42.1)</li>
+<li><strong>R2.</strong> What does <code>O_NONBLOCK</code> change, and what trap does non-blocking I/O create on its own? (&sect;42.2)</li>
+<li><strong>R3.</strong> How do <code>select</code> and <code>epoll</code> scale differently, and why — and what hard limit does <code>select</code> have? (&sect;42.3)</li>
+<li><strong>R4.</strong> What is the event loop, and what is the absolute rule for its handlers? (&sect;42.4)</li>
+<li><strong>R5.</strong> Why does one blocking call in a handler hurt every connection, and where should blocking work go? (&sect;42.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapter 63
+(&ldquo;Alternative I/O Models&rdquo;) is the primary reference for this chapter — non-blocking I/O, I/O multiplexing with
+<code>select</code>/<code>poll</code>, the <code>epoll</code> API, and level- versus edge-triggered notification. First author Michael
+Kerrisk; edition and ISBN verified via the publisher.</li>
+<li><strong>W. Richard Stevens, Bill Fenner &amp; Andrew M. Rudoff, <em>UNIX Network Programming, Volume 1: The Sockets Networking API</em>,
+3rd ed. (Addison-Wesley, 2003), ISBN 978-0-13-141155-5.</strong> Chapter 6 (I/O multiplexing) and Chapter 16 (non-blocking I/O) ground
+&sect;42.2&ndash;&sect;42.3 in the sockets context that Chapter 43 will build. First author W. Richard Stevens; edition and ISBN verified via
+the publisher.</li>
+<li><strong>Gaurav Banga, Jeffrey C. Mogul &amp; Peter Druschel, &ldquo;A Scalable and Explicit Event Delivery Mechanism for UNIX,&rdquo; in
+<em>Proceedings of the USENIX Annual Technical Conference</em>, 1999.</strong> The paper behind &sect;42.3's shift from <code>select</code>'s
+rescan-everything model to explicit, scalable readiness delivery — the idea <code>epoll</code> and <code>kqueue</code> implement. First
+author Gaurav Banga; USENIX open-access proceedings (no DOI), cited by venue and year.</li>
+<li><strong>Dan Kegel, &ldquo;The C10K problem&rdquo; (online, 1999, updated through the 2000s).</strong> The essay that named the
+scaling problem of &sect;42.1 and surveyed the event-driven techniques that answer it. Author Dan Kegel; a web resource carrying no DOI,
+cited by author and title.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex42.1"><span class="ex-label">42.1</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, explain why a blocking <code>read</code> consumes no CPU while it waits, and name two costs a thread carries whether or not
+it is doing work.</div>
+
+<div class="exercise" id="ex42.2"><span class="ex-label">42.2</span> <span class="ex-tag warm">warm-up</span>
+What does setting <code>O_NONBLOCK</code> change about a <code>read</code> that finds no data ready? What error does it return in that
+case?</div>
+
+<div class="exercise" id="ex42.3"><span class="ex-label">42.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, state the essential difference between how <code>select</code> and <code>epoll</code> find the ready descriptors, and
+which one's cost grows with the total number watched.</div>
+
+<div class="exercise" id="ex42.4"><span class="ex-label">42.4</span> <span class="ex-tag core">core</span>
+The C10K problem. (a) Why does dedicating one thread per connection not scale to ten thousand mostly-idle connections — name the two
+dominant costs. (b) Why does it <em>not</em> help that the threads are idle almost all the time? (c) What does the event-loop model tie to
+each connection instead of a thread, and why is that so much cheaper?</div>
+
+<div class="exercise" id="ex42.5"><span class="ex-label">42.5</span> <span class="ex-tag core">core</span>
+Busy-polling. (a) Explain why looping over thousands of non-blocking descriptors calling <code>read</code> on each burns a whole CPU. (b)
+Using the ~199&nbsp;ns syscall cost, estimate the syscalls per second for a tight poll of 10,000 idle descriptors and comment. (c) What does
+readiness notification add that turns this back into a CPU-free wait?</div>
+
+<div class="exercise" id="ex42.6"><span class="ex-label">42.6</span> <span class="ex-tag core">core</span>
+<code>select</code> versus <code>epoll</code>. (a) From the measured table, describe how each scales as the number of descriptors grows from
+10 to 500. (b) Explain the mechanism behind each scaling — what does <code>select</code> do on every call that <code>epoll_wait</code> does
+not? (c) What is <code>FD_SETSIZE</code>, and why is its limit fatal for a C10K server using <code>select</code>?</div>
+
+<div class="exercise" id="ex42.7"><span class="ex-label">42.7</span> <span class="ex-tag complexity">cost</span>
+A server watches <var>M</var> descriptors, of which <var>a</var> are ready per wakeup. Model the readiness-scan cost as
+<var>c</var><sub>s</sub> = <var>p</var>&middot;<var>M</var> for <code>select</code> and <var>c</var><sub>e</sub> = <var>q</var>&middot;<var>a</var> +
+<var>r</var> for <code>epoll</code>. (a) For which regime of <var>M</var> and <var>a</var> is <code>epoll</code> dramatically better, and for
+which are they comparable? (b) Using the measured numbers (<code>select</code> ~14.6&nbsp;&micro;s at <var>M</var>=500;
+<code>epoll_wait</code> ~0.4&nbsp;&micro;s), estimate the ratio at <var>M</var>=500, <var>a</var>=1. (c) Explain why a workload where nearly
+all watched descriptors are ready every wakeup narrows <code>epoll</code>'s advantage.</div>
+
+<div class="exercise" id="ex42.8"><span class="ex-label">42.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team's event-loop server shows fine mean latency in load tests but occasional spikes in
+production where thousands of unrelated requests slow down together.
+<br><strong>Step 1 (given):</strong> one thread drives all those connections via <code>epoll_wait</code> and non-blocking handlers.
+<br><strong>Step 2 (given):</strong> one handler reads a config file that is usually in the page cache, so in testing the read never
+blocks.
+<br><strong>Step 3 (given):</strong> in production the file is occasionally cold, and that <code>read</code> blocks for milliseconds.
+<br><strong>Step 4 (you):</strong> Explain why a single occasionally-blocking handler produces correlated spikes across thousands of
+connections, why the load test missed it, and the fix.</div>
+
+<div class="exercise" id="ex42.9"><span class="ex-label">42.9</span> <span class="ex-tag mixed">mixed</span>
+For each operation inside an event-loop handler, say whether it is safe or must be moved to a thread pool, and why: (a) a non-blocking
+<code>read</code> from a socket returning <code>EAGAIN</code>; (b) an <code>fsync</code> on a log file; (c) parsing a 200-byte JSON body
+already in memory; (d) a synchronous DNS lookup; (e) a CPU-bound image resize on an uploaded photo.</div>
+
+<div class="exercise" id="ex42.10"><span class="ex-label">42.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A blocking <code>read</code> burns CPU while it waits.&rdquo;
+(b) &ldquo;<code>epoll_wait</code>'s cost grows with the total number of descriptors registered.&rdquo; (c) &ldquo;Non-blocking I/O by
+itself is enough to serve ten thousand connections efficiently.&rdquo; (d) &ldquo;One blocking call in an event-loop handler can stall
+every connection that thread serves.&rdquo; (e) &ldquo;<code>select</code> can watch a descriptor with any file-descriptor number.&rdquo;</div>
+
+<div class="exercise" id="ex42.11"><span class="ex-label">42.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the chapter. (a) Explain why blocking, non-blocking, and readiness notification are not three competing choices but three parts
+of one design — what each contributes and what it lacks alone. (b) The event loop and thread-per-connection have mirror-image failure
+modes; describe both and the single principle (match the resource to the work) that explains each. (c) Argue why &ldquo;how many
+descriptors, and how many are active per wakeup&rdquo; is the right first question when choosing an I/O model, tying it to the
+<code>select</code>-vs-<code>epoll</code> scaling.</div>
+
+<div class="exercise" id="ex42.12"><span class="ex-label">42.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Measure the cost of a minimal kernel-entering system call (e.g. <code>syscall(SYS_getpid)</code>)
+as ns/call, the minimum of several trials, and contrast it with a vDSO call like <code>clock_gettime</code>. (b) Create many pipe
+descriptors, mark exactly one ready, and time a readiness scan with <code>select</code> and with <code>epoll_wait</code> as the count grows
+(10, 100, 500, and — for <code>epoll</code> only — 1000+); report how each scales and where <code>select</code> hits
+<code>FD_SETSIZE</code>. (c) State your toolchain and CPU, and note these are wall-clock times (no hardware counters) if you lack
+<code>perf</code>, and that the absolute syscall cost is higher under some virtualized environments while the scaling shape is portable.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part VIII</div><h1>Storage & the Disk</h1><p class='part-blurb'>Pages, files, the buffer pool, and the storage manager — the foundation you build a database on.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part IX</div><h1>Storage Engines</h1><p class='part-blurb'>B-trees and LSM-trees implemented and analyzed — the two families and when each wins.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part X</div><h1>Durability & Recovery</h1><p class='part-blurb'>Write-ahead logging, ARIES, checkpoints, and crash recovery — how a database keeps its promises across failures.</p></div>
@@ -20585,6 +21738,324 @@ applies only the matching tool and re-measures; (c) reports before/after honestl
 change did <em>not</em> move the number and the ceiling was elsewhere, plus toolchain, CPU, and the note that these are wall-clock times if
 <code>perf</code> is unavailable. <em>Tempting wrong answer:</em> &ldquo;apply SIMD and report the speedup&rdquo; — that skips the
 diagnosis and may raise a ceiling the loop is not under. <strong>Feed-forward:</strong> &sect;39.1&ndash;&sect;39.2.</div>
+
+</section>
+
+<section class="solutions" id="sol40">
+<h1>Chapter 40 — Solutions</h1>
+
+<div class="solution" id="sol40.1"><span class="sol-label">40.1</span>
+File descriptor (indexing the open-file description that holds the offset) &rarr; the VFS &rarr; the <strong>page cache</strong> &rarr; the
+filesystem (offset-to-block mapping) &rarr; the block layer &rarr; the device driver and hardware. A cache <strong>hit at the page
+cache</strong> returns the bytes from DRAM without any device I/O; the layers below it are reached only on a miss. <em>Tempting wrong
+answer:</em> &ldquo;<code>read</code> goes straight to the disk&rdquo; — for a regular file it almost never does on a warm system; it goes
+to the page cache first. <strong>Feed-forward:</strong> &sect;40.1.</div>
+
+<div class="solution" id="sol40.2"><span class="sol-label">40.2</span>
+Because per-byte I/O pays two system calls per byte, and the fixed per-call cost (the trap into the kernel and back, VFS dispatch, the copy)
+dwarfs the work of moving a single byte; a 64&nbsp;KiB buffer pays that same per-call cost once per 65,536 bytes, amortizing it to under a
+nanosecond each — so the gap (~1604 vs ~0.53&nbsp;ns/byte, ~3000&times;) is the number of syscalls, not the number of bytes. <em>Tempting
+wrong answer:</em> &ldquo;the disk is the bottleneck&rdquo; — the bytes are identical and (warm) never leave DRAM; the cost is the call
+frequency. <strong>Feed-forward:</strong> &sect;40.2.</div>
+
+<div class="solution" id="sol40.3"><span class="sol-label">40.3</span>
+(1) The <strong>user-space buffer</strong> — owned by the application (stdio's internal buffer, or one you allocate) — turns many small
+logical reads/writes into few large system calls, solving the per-call cost. (2) The <strong>page cache</strong> — owned by the kernel, in
+DRAM — holds recently used file pages so a read that hits it skips the device and a write can return before reaching it, solving the device
+latency for resident data. <em>Tempting wrong answer:</em> &ldquo;there is only the disk cache&rdquo; — there are two independent buffers,
+and defeating the user-space one (per-byte calls) is catastrophic even with a warm page cache. <strong>Feed-forward:</strong> &sect;40.2&ndash;&sect;40.3.</div>
+
+<div class="solution" id="sol40.4"><span class="sol-label">40.4</span>
+(a) It is a region of otherwise-free DRAM in which the kernel keeps recently used file pages. (b) The warm read is ~13&times; faster because
+its pages are resident, so the read is a memory copy; the cold read must fetch from the storage device, which is far slower. (c)
+<em>Readahead</em> is the kernel fetching pages ahead of the current position on a sequential read, overlapping device latency with the
+program's work — so streaming access hides the latency that random access, which cannot be predicted ahead, pays in full. <em>Tempting
+wrong answer:</em> &ldquo;warm is faster because the CPU cache holds the file&rdquo; — 256&nbsp;MiB far exceeds any CPU cache; it is the
+page cache in main memory. <strong>Feed-forward:</strong> &sect;40.3.</div>
+
+<div class="solution" id="sol40.5"><span class="sol-label">40.5</span>
+(a) <code>read</code> returns short at end-of-file or when interrupted by a signal (and always may on a pipe/socket with less data ready);
+<code>write</code> can accept only part of the buffer when a pipe or socket buffer is nearly full. (b) <code>p = buf; left = n; while
+(left &gt; 0) { w = write(fd, p, left); if (w &lt;= 0) handle_error; p += w; left -= w; }</code>. (c) Because on exactly the inputs where
+the count is short — large files, slow pipes, signals — the naive code silently processes only part of the data and reports success, a
+correctness bug, not just a slow path. <em>Tempting wrong answer:</em> &ldquo;one <code>read</code> gives the whole file&rdquo; — it may,
+for small files on a warm cache, which is why the bug hides until it matters. <strong>Feed-forward:</strong> &sect;40.4.</div>
+
+<div class="solution" id="sol40.6"><span class="sol-label">40.6</span>
+(a) The fixed per-call cost <var>s</var> is divided across <var>W</var> bytes, so per-byte cost falls roughly as <var>s</var>/<var>W</var> +
+<var>b</var> — steeply while <var>W</var> is small. (b) Once <var>W</var> is large enough that <var>s</var>/<var>W</var> is negligible next
+to the per-byte term <var>b</var> (and the copy runs at memory bandwidth), further growth cannot remove a cost that is already gone, so the
+curve flattens. (c) &ldquo;Large enough&rdquo; — tens to hundreds of KiB — captures nearly all the win; &ldquo;as large as possible&rdquo;
+wastes memory and cache for no measurable gain. <em>Tempting wrong answer:</em> &ldquo;keep doubling the buffer for more speed&rdquo; — past
+the knee it buys nothing and costs memory. <strong>Feed-forward:</strong> &sect;40.2, &sect;40.4.</div>
+
+<div class="solution" id="sol40.7"><span class="sol-label">40.7</span>
+(a) Total = <var>k</var>&middot;<var>s</var> + <var>B</var>&middot;<var>b</var> (the per-byte term depends on total bytes, not on how they
+are split). (b) Per-byte: <var>k</var>&nbsp;=&nbsp;<var>B</var>, so total = <var>B</var>(<var>s</var>+<var>b</var>) — dominated by
+<var>s</var> when <var>s</var>&nbsp;&gt;&gt;&nbsp;<var>b</var>. Buffered: <var>k</var>&nbsp;=&nbsp;<var>B</var>/<var>W</var>, so total =
+<var>B</var>&middot;<var>s</var>/<var>W</var> + <var>B</var>&middot;<var>b</var>; the syscall term shrinks as 1/<var>W</var> and becomes
+negligible once <var>s</var>/<var>W</var>&nbsp;&lt;&lt;&nbsp;<var>b</var>, i.e. <var>W</var>&nbsp;&gt;&gt;&nbsp;<var>s</var>/<var>b</var> —
+beyond which only the fixed <var>B</var>&middot;<var>b</var> remains and larger <var>W</var> barely helps. <em>Tempting wrong answer:</em>
+writing total as <var>k</var>&middot;<var>s</var> only — the byte-moving term matters once the syscall is amortized.
+<strong>Feed-forward:</strong> &sect;40.2.</div>
+
+<div class="solution" id="sol40.8"><span class="sol-label">40.8</span>
+<strong>Step 4:</strong> 5&nbsp;GiB/s is a memory number because the read was served entirely from the page cache — the pages the write
+left resident — so it measured a DRAM copy, not the storage device, which never saw the read. To measure cold storage the colleague should
+evict the file's pages first (<code>posix_fadvise</code> with <code>POSIX_FADV_DONTNEED</code>, or a cache drop on an administered machine)
+and then time the read, and should report the buffer size, filesystem, and device. The difference can be an order of magnitude — this
+machine showed ~13&times; cold-to-warm and a spinning disk far more — so a warm number can promise throughput that production, which reads
+cold, will never deliver. <em>Tempting wrong answer:</em> &ldquo;run it a few more times and average&rdquo; — every warm run repeats the
+same DRAM measurement; averaging cache hits does not reveal the disk. <strong>Feed-forward:</strong> &sect;40.4.</div>
+
+<div class="solution" id="sol40.9"><span class="sol-label">40.9</span>
+(a) <strong>System-call frequency</strong> — a cache-resident <code>getc</code> loop never touches the device; confirm by buffering and
+watching the time collapse. (b) <strong>Device latency</strong> — ten thousand cold, scattered small files each pay a device access (and
+often a seek); confirm that the same files run far faster warm. (c) <strong>Neither dominates as a problem</strong> — a 1&nbsp;MiB buffer
+amortizes the syscall and the warm data is in DRAM, so it runs near memory speed; confirm the buffer is large and the pages resident.
+(d) <strong>System-call frequency</strong> — one <code>write</code> per event is per-byte I/O in disguise; confirm by batching writes.
+<em>Tempting wrong answer:</em> calling (a) device-bound &ldquo;because it reads a file&rdquo; — the file is already in DRAM.
+<strong>Feed-forward:</strong> &sect;40.2&ndash;&sect;40.4.</div>
+
+<div class="solution" id="sol40.10"><span class="sol-label">40.10</span>
+(a) <strong>False</strong> — <code>read</code> may return a short count when interrupted or on a pipe/socket; correct code loops. (b)
+<strong>False</strong> — a successful <code>write</code> means the bytes are in the page cache, not on the device; durability needs
+<code>fsync</code> (Chapter 41). (c) <strong>False</strong> — stdio buffers in user space (~4&nbsp;KiB) and issues a real syscall only when
+the buffer fills/drains. (d) <strong>True</strong> — a page-cache hit is a DRAM copy with no device access. (e) <strong>False</strong> — the
+per-byte cost flattens past a knee (tens to hundreds of KiB); bigger buffers then waste memory for no gain. <em>Tempting wrong answer:</em>
+marking (b) true — the write-back cache is exactly why a returned <code>write</code> is not yet durable. <strong>Feed-forward:</strong>
+&sect;40.2&ndash;&sect;40.4.</div>
+
+<div class="solution" id="sol40.11"><span class="sol-label">40.11</span>
+(a) Both speedups remove work the machine was doing needlessly, not add hardware: buffering removes redundant <em>system calls</em> (the
+fixed per-call cost, paid per byte in the slow version), and the warm cache removes redundant <em>device accesses</em> (the bytes were
+already in DRAM). (b) As the server runs, the kernel fills the page cache with the file pages it reads, so an increasing fraction of reads
+hit DRAM instead of the device — throughput rises until the working set is resident, then stabilizes. (c) Because I/O time is dominated by
+call frequency and residency, both of which you control in software; disk speed is a fixed lower layer that only matters once the data is
+genuinely cold and the calls are already amortized — so those two questions find the fixable cost first. <em>Tempting wrong answer:</em>
+&ldquo;faster disks are the general fix&rdquo; — they do nothing for a syscall-bound or warm-cache workload. <strong>Feed-forward:</strong>
+&sect;40.2&ndash;&sect;40.5.</div>
+
+<div class="solution" id="sol40.12"><span class="sol-label">40.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports per-byte and 64&nbsp;KiB-buffered copy times as the minimum of several
+trials and their ratio (expect a very large factor); (b) reports cold throughput after an explicit eviction and warm throughput after a
+pre-warm, clearly labelled, with the cold number lower; (c) states toolchain, CPU, filesystem, and buffer size, and notes these are
+wall-clock times without hardware counters, identifying which reads were cold and which warm. <em>Tempting wrong answer:</em> &ldquo;time
+the read twice and report the faster one&rdquo; — that reports the warm cache and hides the storage cost the exercise is about.
+<strong>Feed-forward:</strong> &sect;40.3&ndash;&sect;40.4.</div>
+
+</section>
+
+<section class="solutions" id="sol41">
+<h1>Chapter 41 — Solutions</h1>
+
+<div class="solution" id="sol41.1"><span class="sol-label">41.1</span>
+After <code>write</code> returns, the data is a <strong>dirty page in the kernel's page cache</strong>, in volatile DRAM, scheduled for
+write-back to the device later. A power loss, kernel panic, or hard reset before that write-back <strong>loses it</strong>, even though the
+call returned success. <em>Tempting wrong answer:</em> &ldquo;it is on the disk&rdquo; — the return only means the kernel accepted the bytes
+into the cache. <strong>Feed-forward:</strong> &sect;41.1.</div>
+
+<div class="solution" id="sol41.2"><span class="sol-label">41.2</span>
+<code>fsync</code> forces the file's dirty pages out of the page cache to the storage device and waits until the device confirms them
+durably stored — a synchronous durability barrier <code>write</code> never provides. <code>fdatasync</code> skips flushing non-essential
+metadata (such as the modification timestamp), so when only the data and size need to be durable it can avoid an extra metadata write and be
+slightly cheaper. <em>Tempting wrong answer:</em> &ldquo;<code>fdatasync</code> skips the data&rdquo; — it skips only inessential metadata,
+never the data. <strong>Feed-forward:</strong> &sect;41.2.</div>
+
+<div class="solution" id="sol41.3"><span class="sol-label">41.3</span>
+<code>fflush</code> empties the C library's <strong>user-space</strong> buffer into the <strong>kernel's page cache</strong> — one buffer
+down, but the data is still in volatile DRAM and not on the device, so it is not durable. Durability requires <code>fsync</code>/<code>fdatasync</code>
+after the flush to cross the device barrier. <em>Tempting wrong answer:</em> &ldquo;<code>fflush</code> writes to disk&rdquo; — it writes to
+the kernel, which writes to disk later. <strong>Feed-forward:</strong> &sect;41.1&ndash;&sect;41.2.</div>
+
+<div class="solution" id="sol41.4"><span class="sol-label">41.4</span>
+(a) A buffered <code>write</code> returns after a memory copy (~0.9&nbsp;&micro;s); <code>fdatasync</code> must push the data through the block
+layer to the device and wait for the device to confirm it durable (~8.6&nbsp;ms here), so the durable version pays a device round trip per
+record. (b) The ~8.6&nbsp;ms is the time for the physical storage to accept and confirm a flush — a device property (media, controller,
+flush path) — not CPU work, which is why it dwarfs the memory-bound write. (c) <strong>Group commit</strong>: append many records, then
+<code>fsync</code> once for the whole batch, so the fixed flush cost is amortized across, say, 1000 records; it trades a small crash-window
+(the records in the current un-synced batch may be lost) for throughput, while every <em>acknowledged</em> record is still on the device
+before its acknowledgement. <em>Tempting wrong answer:</em> &ldquo;sync less often and hope&rdquo; — group commit is precise: acknowledge
+only after the batch's flush returns. <strong>Feed-forward:</strong> &sect;41.2.</div>
+
+<div class="solution" id="sol41.5"><span class="sol-label">41.5</span>
+(a) It bypasses the page cache; data moves directly between the device and the user buffer by DMA, with no kernel copy and no caching. (b)
+The buffer address, file offset, and length must be aligned to the device block size (512 or 4096 bytes), so an arbitrary
+<code>malloc</code>'d buffer can fail with <code>EINVAL</code> — you need <code>posix_memalign</code>. (c) A <strong>database</strong> with
+its own buffer pool wants it (the page cache would just be a redundant, uncoordinated second cache); a <strong>program that rereads a small
+file often</strong> is harmed (it forfeits the huge cache-hit win of &sect;40.3). <em>Tempting wrong answer:</em> &ldquo;<code>O_DIRECT</code>
+is always faster because it is direct&rdquo; — it forfeits readahead, write-back, and cache hits, losing badly for cache-friendly access.
+<strong>Feed-forward:</strong> &sect;41.3.</div>
+
+<div class="solution" id="sol41.6"><span class="sol-label">41.6</span>
+(a) <code>mmap</code> avoids the copy from the page cache into a user buffer; a mapped access reads the page-cache page in place. (b) They
+came out close because <code>mmap</code> trades the saved copy for a <strong>minor page fault per 4&nbsp;KiB page</strong> on first touch
+(and the page-table setup), so for a single pass the two costs roughly cancel. (c) <code>mmap</code> clearly wins for <strong>random or
+repeated access</strong> to a large file (the fault cost is amortized and you get zero-copy in-memory access); buffered
+<code>read</code>/<code>write</code> wins for a <strong>single sequential streaming pass</strong>, where readahead is already optimal and you
+want explicit control of when I/O happens. <em>Tempting wrong answer:</em> &ldquo;<code>mmap</code> is always faster because it is
+zero-copy&rdquo; — the eliminated copy is offset by page-fault cost, so it is workload-dependent. <strong>Feed-forward:</strong> &sect;41.4.</div>
+
+<div class="solution" id="sol41.7"><span class="sol-label">41.7</span>
+(a) Per record with sync-each: <var>w</var>&nbsp;+&nbsp;<var>f</var>. Per record with one <code>fsync</code> per <var>k</var>:
+<var>w</var>&nbsp;+&nbsp;<var>f</var>/<var>k</var>. (b) At <var>k</var>=1: 0.9&nbsp;&micro;s + 8600&nbsp;&micro;s &asymp;
+<strong>8.6&nbsp;ms/record</strong> (~116/s). At <var>k</var>=1000: 0.9&nbsp;&micro;s + 8.6&nbsp;&micro;s &asymp; <strong>9.5&nbsp;&micro;s/record</strong>
+(~105,000/s). (c) The batch risks losing up to the last <var>k</var> un-acknowledged records if a crash happens before their shared flush,
+so the tolerable data-loss window (in records or time) sets the upper bound on <var>k</var> — you make the batch as large as that window
+allows, no larger. <em>Tempting wrong answer:</em> &ldquo;bigger <var>k</var> is strictly better&rdquo; — it is, for throughput, only up to
+the crash-loss tolerance. <strong>Feed-forward:</strong> &sect;41.2.</div>
+
+<div class="solution" id="sol41.8"><span class="sol-label">41.8</span>
+<strong>Step 4:</strong> Faster disks help only marginally because each acknowledgement is one device-flush round trip, and even a fast SSD
+flush is tens to hundreds of microseconds — a modest constant, not the 100&times;&ndash;1000&times; the app needs; the real lever is the
+<em>number</em> of flushes, which batching cuts. Amortizing one ~8.6&nbsp;ms flush across 1000 records gives ~9.5&nbsp;&micro;s/record, on the
+order of 100,000 records/s — a ~1000&times; gain with no hardware change. The batch still guarantees that every <em>acknowledged</em> record
+is durably on the device (the batch is acknowledged only after its flush returns); what it does not guarantee is the survival of records
+written into the current batch but not yet flushed when a crash hits — that bounded tail is the deliberate trade. <em>Tempting wrong
+answer:</em> &ldquo;buy faster disks and keep syncing each&rdquo; — the per-flush floor still caps throughput far below the requirement.
+<strong>Feed-forward:</strong> &sect;41.2, &sect;41.4.</div>
+
+<div class="solution" id="sol41.9"><span class="sol-label">41.9</span>
+(a) <strong>Not durable</strong> — the data was only in the page cache; add <code>fdatasync(fd)</code> before acknowledging. (b)
+<strong>Durable</strong> — <code>fdatasync</code> returned, so the device has the data. (c) <strong>Data durable but possibly
+unreachable</strong> — the file's contents are synced but the directory entry from the rename may not have reached the disk; add an
+<code>fsync</code> on the <em>directory</em> after the rename. (d) <strong>Not durable</strong> — dirtied mapped pages need
+<code>msync</code> (and the underlying <code>fsync</code> physics) to be forced; a clean process exit does not guarantee write-back before
+the power loss. <em>Tempting wrong answer:</em> calling (c) fully durable &ldquo;because the file was fsync'd&rdquo; — the directory entry is
+separate metadata that also needs syncing. <strong>Feed-forward:</strong> &sect;41.1&ndash;&sect;41.4.</div>
+
+<div class="solution" id="sol41.10"><span class="sol-label">41.10</span>
+(a) <strong>False</strong> — it is in the page cache, not on the disk, until write-back or <code>fsync</code>. (b) <strong>False</strong> —
+<code>fsync</code> is slow because it waits for a physical device flush, not because of the byte copy. (c) <strong>False</strong> —
+<code>O_DIRECT</code> forfeits readahead, write-back, and cache hits, so it is slower for cache-friendly workloads. (d) <strong>True</strong>
+— multiple processes can map the same file and share one set of physical pages. (e) <strong>False</strong> — durability is defined by
+surviving a crash, so a claim untested against a real crash is unproven. <em>Tempting wrong answer:</em> marking (a) true from the
+&ldquo;write means written&rdquo; intuition — the write-back cache makes it false. <strong>Feed-forward:</strong> &sect;41.1&ndash;&sect;41.4.</div>
+
+<div class="solution" id="sol41.11"><span class="sol-label">41.11</span>
+(a) Because a single <code>fsync</code> is ~9000&times; a buffered write, syncing every scattered data-file update would be ruinous; a
+write-ahead log turns all the changes of a transaction into one sequential append and <code>fsync</code>s that <em>once</em>, so durability
+costs one flush per transaction (or per group) instead of one per modified page. (b) A database's buffer pool is already a cache of pages
+with its own replacement policy; letting the page cache hold a second copy doubles memory use and lets two uncoordinated caches fight, so
+<code>O_DIRECT</code> removes the redundant kernel cache and gives the database sole control. (c) Because the durability barrier is the one
+step bounded by physical storage (~9000&times; a memory write), the count of barrier crossings dominates a storage system's throughput, so
+&ldquo;how often must I <code>fsync</code>&rdquo; sets the architecture — logging, batching, group commit — before any other choice.
+<em>Tempting wrong answer:</em> &ldquo;optimize the data-file writes first&rdquo; — those are cheap buffered writes; the flush is the cost.
+<strong>Feed-forward:</strong> &sect;41.2&ndash;&sect;41.5.</div>
+
+<div class="solution" id="sol41.12"><span class="sol-label">41.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports per-record cost with and without <code>fdatasync</code> and a large ratio;
+(b) shows per-record cost falling roughly as <var>w</var>&nbsp;+&nbsp;<var>f</var>/<var>k</var> as the batch grows, flattening once the
+per-record flush share is small; (c) reports <code>read</code> and <code>mmap</code> throughput on a warm file with their run-to-run
+variance, noting the two are close and workload-dependent; and states toolchain, CPU, filesystem, and device, flags wall-clock timing
+without hardware counters, and identifies a virtual disk if present since it sets the absolute flush cost. <em>Tempting wrong answer:</em>
+&ldquo;report the single fastest <code>fsync</code> time as the durable throughput&rdquo; — durable throughput is bounded by the flush you
+must do per acknowledgement, not the best case. <strong>Feed-forward:</strong> &sect;41.2, &sect;41.4.</div>
+
+</section>
+
+<section class="solutions" id="sol42">
+<h1>Chapter 42 — Solutions</h1>
+
+<div class="solution" id="sol42.1"><span class="sol-label">42.1</span>
+A blocking <code>read</code> uses no CPU because the kernel takes the thread off the run queue entirely and wakes it only when data
+arrives — waiting is not spinning. Two costs a thread carries regardless of activity: its <strong>stack</strong> (often a megabyte or more of
+reserved address space) and its presence as a <strong>scheduler-visible entity</strong> (run-queue bookkeeping and context-switch cost when
+it wakes). <em>Tempting wrong answer:</em> &ldquo;idle threads are free&rdquo; — they hold memory and scheduler state whether or not they
+run. <strong>Feed-forward:</strong> &sect;42.1.</div>
+
+<div class="solution" id="sol42.2"><span class="sol-label">42.2</span>
+It makes the <code>read</code> return immediately instead of parking the thread, reporting the error <code>EAGAIN</code> (equivalently
+<code>EWOULDBLOCK</code>) to mean &ldquo;nothing ready now, try later.&rdquo; <em>Tempting wrong answer:</em> &ldquo;it returns 0 bytes / EOF&rdquo;
+— 0 means end-of-stream; not-ready is the distinct <code>EAGAIN</code>. <strong>Feed-forward:</strong> &sect;42.2.</div>
+
+<div class="solution" id="sol42.3"><span class="sol-label">42.3</span>
+<code>select</code> passes the whole descriptor set on every call and the kernel scans all of them to find the ready ones; <code>epoll</code>
+registers interest once and each <code>epoll_wait</code> returns only the descriptors that have become ready. <strong><code>select</code>'s</strong>
+cost grows with the total number watched. <em>Tempting wrong answer:</em> &ldquo;<code>epoll</code> is just a faster <code>select</code>&rdquo;
+— it is a different model (register-once, return-active), not merely a tuned scan. <strong>Feed-forward:</strong> &sect;42.3.</div>
+
+<div class="solution" id="sol42.4"><span class="sol-label">42.4</span>
+(a) Each connection needs its own thread, and each thread costs a <strong>stack</strong> (gigabytes of address space across ten thousand)
+and <strong>scheduler churn</strong> (context switches to wake the few that become ready). (b) The costs are properties of having the thread,
+not of running it — an idle thread still reserves its stack and still sits in the scheduler's structures. (c) The event loop ties only a
+<strong>descriptor and a little state</strong> to each connection, not a thread and a stack, so a few threads can hold hundreds of thousands
+of connections. <em>Tempting wrong answer:</em> &ldquo;shrink the stacks and it scales&rdquo; — smaller stacks help a little, but the
+scheduler cost and the fundamental one-thread-per-wait mismatch remain. <strong>Feed-forward:</strong> &sect;42.1, &sect;42.4.</div>
+
+<div class="solution" id="sol42.5"><span class="sol-label">42.5</span>
+(a) Because the thread never sleeps: it spins issuing <code>read</code> after <code>read</code>, mostly collecting <code>EAGAIN</code>, so
+it uses a full core asking &ldquo;ready yet?&rdquo; instead of waiting for free. (b) A tight scan of 10,000 descriptors at ~199&nbsp;ns/syscall
+is ~1.99&nbsp;ms per full pass, so a single thread does on the order of <strong>~500 passes/s = ~5&nbsp;million syscalls/s</strong>, nearly
+all returning <code>EAGAIN</code> — a whole core burned to discover that almost nothing is ready. (c) Readiness notification lets the thread
+<strong>sleep in one call</strong> until at least one descriptor is ready and wake with the list of ready ones, restoring the CPU-free wait
+of blocking while still serving many descriptors. <em>Tempting wrong answer:</em> &ldquo;add a small sleep between passes&rdquo; — that trades
+CPU for latency and still scans everything; readiness notification removes the scan. <strong>Feed-forward:</strong> &sect;42.2&ndash;&sect;42.3.</div>
+
+<div class="solution" id="sol42.6"><span class="sol-label">42.6</span>
+(a) <code>select</code> climbs roughly linearly — ~0.7&nbsp;&micro;s at 10, ~2.6 at 100, ~14.6 at 500 — while <code>epoll_wait</code> stays
+flat at ~0.4&nbsp;&micro;s. (b) On every call <code>select</code> copies and scans the entire descriptor set to find the ready ones (O(N));
+<code>epoll</code> already holds the registered interest and returns only the descriptors that became ready (O(active)), doing no full scan.
+(c) <code>FD_SETSIZE</code> (1024 here) is the fixed size of the <code>fd_set</code> bitmap, so <code>select</code> cannot watch a descriptor
+numbered at or above it — fatal for a server needing tens of thousands of descriptors. <em>Tempting wrong answer:</em> &ldquo;raise
+<code>FD_SETSIZE</code> and <code>select</code> scales&rdquo; — even ignoring the cap, the O(N) rescan still dominates at large N.
+<strong>Feed-forward:</strong> &sect;42.3.</div>
+
+<div class="solution" id="sol42.7"><span class="sol-label">42.7</span>
+(a) <code>epoll</code> is dramatically better when <var>M</var> is large but <var>a</var> is small — many watched, few ready per wakeup (the
+typical server), so <var>p</var>&middot;<var>M</var> is huge while <var>q</var>&middot;<var>a</var>+<var>r</var> is tiny; they are comparable
+when <var>a</var> &asymp; <var>M</var> (nearly all ready every wakeup), since both then do work proportional to <var>M</var>. (b) At
+<var>M</var>=500, <var>a</var>=1: ~14.6&nbsp;&micro;s vs ~0.4&nbsp;&micro;s, about <strong>35&ndash;40&times;</strong>. (c) When almost every
+watched descriptor is ready each wakeup, <code>epoll</code> must return them all, so its cost rises toward <code>select</code>'s — the
+advantage comes from the active set being much smaller than the watched set. <em>Tempting wrong answer:</em> &ldquo;<code>epoll</code> is
+always O(1)&rdquo; — it is O(active), which equals O(N) when everything is active. <strong>Feed-forward:</strong> &sect;42.3.</div>
+
+<div class="solution" id="sol42.8"><span class="sol-label">42.8</span>
+<strong>Step 4:</strong> The one thread runs all handlers in sequence, so while that handler is blocked in the cold <code>read</code> for
+milliseconds it cannot call <code>epoll_wait</code> or service any other ready descriptor — every connection that thread owns waits the same
+milliseconds, which is why the spikes are correlated across thousands of unrelated requests. The load test missed it because the config file
+was warm in the page cache, so the read returned instantly and never actually blocked — the bug only appears when the file is cold, a
+condition the test did not create. The fix is to remove all blocking from handlers: read the config once at startup (or via a thread pool)
+rather than in a request handler, and generally dispatch any potentially-blocking operation to a thread pool whose completion returns to the
+loop as an event. <em>Tempting wrong answer:</em> &ldquo;add more event-loop threads&rdquo; — that reduces but does not remove the blast
+radius; the blocking call must leave the loop entirely. <strong>Feed-forward:</strong> &sect;42.4.</div>
+
+<div class="solution" id="sol42.9"><span class="sol-label">42.9</span>
+(a) <strong>Safe</strong> — a non-blocking <code>read</code> returning <code>EAGAIN</code> is exactly the model; it returns at once. (b)
+<strong>Move to a pool</strong> — <code>fsync</code> blocks on a device flush (~8.6&nbsp;ms, &sect;41.2) and would stall the loop. (c)
+<strong>Safe</strong> — parsing 200 bytes already in memory is a trivial, bounded CPU cost. (d) <strong>Move to a pool</strong> — a
+synchronous DNS lookup blocks on the network (use an async resolver or a pool). (e) <strong>Move to a pool</strong> — a CPU-bound image
+resize runs long and would monopolize the loop; offload it. <em>Tempting wrong answer:</em> calling (e) safe &ldquo;because it does not do
+I/O&rdquo; — long CPU work stalls the loop just as a blocking syscall does. <strong>Feed-forward:</strong> &sect;42.4.</div>
+
+<div class="solution" id="sol42.10"><span class="sol-label">42.10</span>
+(a) <strong>False</strong> — a blocking <code>read</code> sleeps off the run queue and uses no CPU while waiting. (b) <strong>False</strong> —
+<code>epoll_wait</code>'s cost grows with the number of <em>active</em> descriptors, not the total registered. (c) <strong>False</strong> —
+non-blocking I/O alone forces a busy-poll; you also need readiness notification to sleep until something is ready. (d) <strong>True</strong> —
+one thread drives all its connections, so a blocking call stalls them all. (e) <strong>False</strong> — <code>select</code> cannot handle a
+descriptor at or above <code>FD_SETSIZE</code> (1024 here). <em>Tempting wrong answer:</em> marking (b) true by analogy to
+<code>select</code> — the whole point of <code>epoll</code> is that it does not scale with the total watched.
+<strong>Feed-forward:</strong> &sect;42.1&ndash;&sect;42.4.</div>
+
+<div class="solution" id="sol42.11"><span class="sol-label">42.11</span>
+(a) Blocking gives a CPU-free wait but only on one descriptor; non-blocking lets one thread touch many descriptors but, alone, forces a
+wasteful busy-poll; readiness notification supplies the one missing call that sleeps until some descriptor is ready and returns which —
+together they are the event loop, each supplying what the others lack. (b) Thread-per-connection fails when connections vastly outnumber
+active work (a heavy thread per idle wait); the event loop fails when one handler blocks (a whole thread's connections stalled by one
+operation) — the single principle is to match the resource to the work: a cheap descriptor for a waiting connection, a thread for genuinely
+blocking or CPU-heavy work. (c) Because the I/O model's cost is set by how many descriptors you watch and how many are active per wakeup —
+the exact variables that separate <code>select</code>'s O(N) rescan from <code>epoll</code>'s O(active) delivery — so those two numbers pick
+the model before any code is written. <em>Tempting wrong answer:</em> &ldquo;always use an event loop&rdquo; — at small scale
+thread-per-connection is simpler and fine; the numbers decide. <strong>Feed-forward:</strong> &sect;42.4&ndash;&sect;42.5.</div>
+
+<div class="solution" id="sol42.12"><span class="sol-label">42.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports a minimal kernel-entering syscall as ns/call (a few hundred ns is
+typical, higher under virtualization) and contrasts it with a vDSO call that is several times cheaper because it avoids a real kernel entry;
+(b) shows <code>select</code>'s per-call cost rising with the descriptor count while <code>epoll_wait</code> stays flat, and notes the
+<code>FD_SETSIZE</code> point past which <code>select</code> cannot go; (c) states toolchain and CPU, flags wall-clock timing without
+hardware counters, and notes that absolute syscall cost varies with the environment while the scaling shape is portable. <em>Tempting wrong
+answer:</em> &ldquo;report <code>epoll</code> is faster by a fixed factor&rdquo; — the factor grows with the descriptor count; the
+scaling, not a single ratio, is the result. <strong>Feed-forward:</strong> &sect;42.1&ndash;&sect;42.3.</div>
 
 </section>
 </body></html>

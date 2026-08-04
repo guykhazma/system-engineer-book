@@ -293,7 +293,10 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch46">Chapter 46 — Storage &amp; the Disk: How Devices Really Work</a></li>
 <li class="toc-ch"><a href="#ch47">Chapter 47 — Files and Pages: The Database on Disk</a></li>
 <li class="toc-ch"><a href="#ch48">Chapter 48 — The Buffer Pool</a></li>
+<li class="toc-ch"><a href="#ch49">Chapter 49 — Heap Files: Organizing a Table's Pages</a></li>
+<li class="toc-ch"><a href="#ch50">Chapter 50 — The Storage Manager: The Interface Under Everything</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part IX &mdash; Storage Engines</li>
+<li class="toc-ch"><a href="#ch51">Chapter 51 — The B-Tree: A Search Tree on Disk</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part X &mdash; Durability & Recovery</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XI &mdash; Transactions & Concurrency Control</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XII &mdash; Query Processing & Execution</li>
@@ -19377,7 +19380,1099 @@ results are measurements and which are a reproducible simulation — and why tha
 </section>
 </section>
 
+<section class="chapter" id="ch49">
+<h1>Chapter 49 — Heap Files: Organizing a Table's Pages</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch47">Chapter 47</a> (the file is a linear space of pages and a page is a
+slotted collection of records — this chapter organizes those pages into a table), <a href="#ch48">Chapter 48</a> (every page a heap file touches is
+fetched, pinned, and evicted through the buffer pool — a page touch is a buffer-pool lookup that may fall to disk), <a href="#ch46">Chapter 46</a>
+(sequential reads are cheap and random reads pay the seek/latency cliff — the difference a table scan lives or dies by), <a href="#ch40">Chapter 40</a>
+(the page is the unit of I/O). &nbsp;·&nbsp; Chapter 47 gave you one page and the records inside it; this chapter answers the next question — how
+thousands of those pages become a <em>table</em> you can insert into, delete from, and scan, and where finding room for one more record quietly
+becomes the cost that dominates.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch47">Chapter 47</a> — inside a slotted page, what does the slot array let you do that a packed array of records
+cannot, and why does that matter when a record is deleted? (2) <a href="#ch46">Chapter 46</a> — reading a run of adjacent pages versus reading the
+same number of pages at random offsets: which was dramatically cheaper on this machine, and by roughly what factor? (3) <em>Predict:</em> a table
+is a pile of pages, and to insert a record you must find a page with enough free bytes. If the table's pages are threaded together as a simple
+linked list and you walk it from the front looking for room, how many pages do you think you touch per insert once the table has grown to thousands
+of pages — a constant few, or a number that grows with the table? And when you scan the whole table, is that read sequential or random? Write your
+guesses; &sect;49.2 and &sect;49.4 answer them.</p>
+</aside>
+
+<p>A table is not a page; it is a great many pages, and the layer that turns &ldquo;a pile of pages&rdquo; into &ldquo;a thing you can insert into,
+delete from, and read back&rdquo; is the <strong>heap file</strong> — the simplest and most common physical organization for a table's rows. It is a
+<em>heap</em> in the plain English sense: an unordered collection. The records live wherever there was room; the file makes no promise about the
+order in which a scan returns them, only that every record inserted and not yet deleted will be returned exactly once. That modest contract is
+enough to build a database on, because ordering and fast lookup are the job of the <em>indexes</em> built in the next part — the heap file's job is
+to store the rows compactly and hand them back. Everything it does reduces to three operations over the pages of <a href="#ch47">Chapter 47</a>,
+fetched through the buffer pool of <a href="#ch48">Chapter 48</a>: <strong>insert</strong> a record (find a page with room, place it, record its
+identifier), <strong>delete</strong> a record (mark its slot free), and <strong>scan</strong> the file (read every page and yield its live records).
+The whole chapter is the observation that the hard part of that list is the parenthetical in <em>insert</em> — <strong>find a page with room</strong>
+— because how the file tracks free space decides whether an insert touches one page or thousands. This chapter builds it in five steps: the heap
+file as an unordered collection of pages and the record identifier that names a row (&sect;49.1); the two classic ways to find free space — a linked
+list of pages versus a page directory — and the enormous gap between them (&sect;49.2); insert, delete, and the update that grows a record past its
+slot, with its named trap (&sect;49.3); the full table scan and why the heap file is built for sequential I/O (&sect;49.4); and what the heap file
+hands up to the indexes and the storage manager (&sect;49.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The free-space result is a <strong>deterministic simulation</strong>, not a timing: a C program
+(compiled with gcc 11.4.0 on this machine's Intel Core i7-12700H, glibc 2.35) inserts 200,000 variable-size records — sizes drawn from a fixed,
+seeded pseudo-random sequence so the run is exactly reproducible — into a heap of 4&nbsp;KiB pages, and <em>counts</em> how many data-page fetches
+each free-space scheme performs. It reports counts, not wall-clock, precisely because the point is a structural comparison that does not depend on
+the disk's speed; where the cost of those page fetches matters, it is the <a href="#ch48">Chapter 48</a> buffer-pool hit/miss cost and the
+<a href="#ch46">Chapter 46</a> sequential-versus-random figures measured earlier, which this chapter cites rather than re-measures. The
+sequential-scan argument of &sect;49.4 rests on those earlier measurements (a hardware-counter profiler, <code>perf</code>, is <em>not</em> installed
+here, and the disk is a WSL2 virtual disk, both noted where relevant).</p>
+
+<h2>49.1 The heap file: an unordered collection of pages</h2>
+
+<p>A <strong>heap file</strong> is a set of pages holding the records of one table, with no ordering imposed on the records: a row goes wherever
+there is space, and a scan returns rows in whatever physical order they happen to sit. This is the default table storage in real systems — a
+PostgreSQL table with no clustering, an unindexed table anywhere — because it is the cheapest thing that works: inserts do not have to maintain any
+sorted position, so they are fast, and the ordering that queries need is supplied separately by indexes (the next part) that point <em>into</em> the
+heap. The unit the file deals in is the page of <a href="#ch47">Chapter 47</a>; the unit a query deals in is the record; and the bridge between them
+is the <strong>record identifier</strong> (the <strong>RID</strong>, also called a tuple id or row id): the pair <em>(page number, slot number)</em>
+that names exactly where a record lives — which page in the file, and which slot within that page's slot array. The RID is the address a heap file
+hands back when you insert a record and the address an index stores so it can find the record again; it is stable as long as the record does not
+move, and &sect;49.3 is about the moment it might. Because the page number is an index into the file's linear page space and the slot number is an
+index into the page's slot array (both from <a href="#ch47">Chapter 47</a>), resolving a RID to bytes is two array indexings and one page fetch:
+compute the byte offset of page <var>p</var>, fetch that page through the buffer pool, read slot <var>s</var> of its slot array to get the record's
+offset and length within the page, and there is the row. No search — a RID is a direct address. That directness is what makes indexes possible: an
+index does the searching in its own structure and stores a RID at the leaf, so following an index entry to the actual row is one page fetch, not a
+scan. The heap file, then, is deliberately dumb: it stores rows and names them, and delegates <em>order</em> and <em>fast lookup</em> upward. Its one
+genuine problem is the one the plain-English word &ldquo;heap&rdquo; hides — when you insert, where do you put the row?</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What is a record identifier (RID), what two numbers is it made of, and why does resolving a RID to the actual record bytes require no searching?
+Why does a heap file make no promise about the order a scan returns rows? (Answer after the next section.)</p>
+</aside>
+
+<h2>49.2 Finding free space: the linked list versus the page directory</h2>
+
+<p>To insert a record of <var>b</var> bytes, the heap file must find a page with at least <var>b</var> bytes free (plus a slot). How it finds one
+is the single decision that separates a heap file that scales from one that does not, and there are two classic schemes. The first is the
+<strong>linked list of pages</strong>: the file's header points at a chain of pages, and to find room you walk the chain from the front, fetching
+each page and inspecting its header's free-space count, stopping at the first page that fits (or appending a new page if none does). It is trivial to
+implement and needs no extra structure — but every page it inspects is a <em>page fetch</em> through the buffer pool (&sect;48), and as the file fills
+with mostly-full pages the walk grows longer, so the cost of an insert climbs with the size of the file. The second scheme is the <strong>page
+directory</strong>: the file keeps a small separate structure — an array with one compact entry per page recording that page's free space — and to
+find room you scan the <em>directory</em> (a sequence of a few bytes per page, held in memory and cached) rather than the pages themselves, then
+fetch exactly one data page: the one you have chosen to write into. The directory turns an <em>O(pages)</em> chain of expensive page fetches into an
+in-memory scan plus a single write. The difference is not subtle. In the simulation — 200,000 variable-size records inserted into a heap that grew
+to 7,075 pages of 4&nbsp;KiB — the two schemes cost:</p>
+
+<pre><code>insert 200,000 records into a heap of 7,075 4-KiB pages (deterministic sim):
+  linked-list heap : ~708,000,000 DATA-PAGE fetches to locate room  (~3,542 per insert)
+  page-directory   : 0 data-page fetches to locate room; the search is an
+                     in-memory directory scan, then ONE page fetch to write
+</code></pre>
+
+<p>Read the first line carefully: the linked-list heap averaged about <strong>3,542 data-page fetches per insert</strong>, and that number is not a
+constant — it grew as the file grew, because a longer chain of fuller pages means a longer walk before finding room. Each of those fetches is a
+buffer-pool lookup that, on a miss, is the <a href="#ch46">Chapter 46</a> disk read; multiply 3,542 by even a small miss rate and an insert that
+should be nearly free becomes hundreds of disk I/Os. The page directory does <strong>zero</strong> data-page fetches to <em>locate</em> free space —
+the entire search happens in the compact directory array in memory — and then fetches the one page it decided to write. This is why real heap files
+are directory-organized (or use an equivalent free-space map): the naive linked list is correct but its insert cost is a function of table size, which
+is unacceptable for a table that grows. The lesson is the recurring storage lesson: keep the metadata you search often small and separate from the
+data, so that searching it is a memory operation and touching the data is a single, deliberate act.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: finding room to insert is a search, and where you search decides its cost</span>
+<p><strong>1. In words.</strong> An insert must find a page with enough free space. A linked-list heap searches by <em>fetching pages</em> and reading
+each one's free-space header, so its search cost is measured in page fetches and grows with the file. A page-directory heap searches a small in-memory
+array of per-page free-space counts, so its search cost is a cheap memory scan and it touches exactly one data page — the one it writes.</p>
+<p><strong>2. As a picture.</strong> Figure 49.1: on the left, an insert arrow walking a chain of pages P0&rarr;P1&rarr;P2&rarr;&hellip;, each a
+buffer-pool fetch, until one has room; on the right, an insert arrow reading a compact directory array (bytes of free-space per page) in memory,
+landing on the chosen page, and fetching only that one.</p>
+<p><strong>3. As numbers.</strong> Simulated here (200,000 inserts, 7,075 pages): linked list ~<strong>3,542 data-page fetches per insert</strong>
+and rising with file size; page directory <strong>0</strong> data-page fetches to locate room plus one write. The difference is not a constant
+factor — it is <em>O(pages)</em> page fetches versus <em>O(1)</em>, which is why the directory (or a free-space map) is what real systems use.</p>
+</aside>
+
+<p><em>(Answer to the &sect;49.1 quick check: a RID is a record identifier, the pair <strong>(page number, slot number)</strong> — the page number
+indexes the file's linear page space and the slot number indexes that page's slot array. Resolving it needs no search because both are direct array
+indices: fetch page <var>p</var>, read slot <var>s</var> for the record's in-page offset and length, done. A heap file promises no scan order because
+records are placed wherever there was free space, not in any key order — ordering is the indexes' job, not the heap's.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 250" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Insert: linked-list heap fetches page after page; page-directory scans a small array in memory, then fetches one page.</text>
+<text x="20" y="44" font-size="9" fill="#8c3a1d">LINKED LIST (fetch each page)</text>
+<rect x="20" y="52" width="52" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="30" y="71" font-size="8">P0 full</text>
+<rect x="92" y="52" width="52" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="102" y="71" font-size="8">P1 full</text>
+<rect x="164" y="52" width="52" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="174" y="71" font-size="8">P2 full</text>
+<rect x="236" y="52" width="52" height="30" fill="#dff0df" stroke="#2f7d32"/><text x="246" y="71" font-size="8">P3 room</text>
+<path d="M72 67 L92 67" stroke="#8c3a1d" stroke-width="1.5"/><path d="M144 67 L164 67" stroke="#8c3a1d" stroke-width="1.5"/><path d="M216 67 L236 67" stroke="#8c3a1d" stroke-width="1.5"/>
+<text x="20" y="100" font-size="8" fill="#8c3a1d">each hop is a buffer-pool fetch &rarr; cost grows with file size</text>
+<text x="20" y="140" font-size="9" fill="#2f7d32">PAGE DIRECTORY (scan array in memory)</text>
+<rect x="20" y="150" width="270" height="22" fill="#dfe8f4" stroke="#14406b"/>
+<text x="26" y="165" font-size="8">dir: [P0:0][P1:0][P2:0][P3:900][P4:40]&hellip;  (a few bytes/page, cached)</text>
+<rect x="236" y="188" width="52" height="30" fill="#dff0df" stroke="#2f7d32"/><text x="246" y="207" font-size="8">P3 room</text>
+<path d="M262 172 L262 188" stroke="#2f7d32" stroke-width="1.5"/>
+<text x="300" y="203" font-size="8" fill="#2f7d32">one data-page fetch, to write</text>
+<text x="330" y="100" font-size="8" fill="#14406b">Simulated: ~3,542 fetches/insert (list) vs 0-to-locate + 1 write (directory).</text>
+</svg>
+<figcaption>Figure 49.1: finding room for an insert. The linked-list heap fetches page after page until one fits, so its cost grows with the file; the
+page directory scans a compact in-memory array of per-page free space and then fetches exactly the one page it will write. Simulated here at ~3,542
+data-page fetches per insert for the list versus zero-to-locate for the directory.</figcaption>
+</figure>
+
+<h2>49.3 Insert, delete, and the update that no longer fits</h2>
+
+<p>With free space handled, the three operations are almost simple. <strong>Insert</strong>: find a page with room (&sect;49.2), write the record
+into free space, add a slot pointing at it, update the page's and directory's free-space counts, and return the RID. <strong>Delete</strong>: fetch
+the page, mark the record's slot free (a slotted page can leave a hole and compact later — <a href="#ch47">Chapter 47</a>), and add the reclaimed
+bytes back to the free-space count. A subtlety: the deleted record's slot is usually <em>not</em> immediately reused for a different record, because
+some index may still hold its RID; systems either leave the slot as a tombstone until a later cleanup confirms no references remain, or reuse it and
+accept that indexes must be maintained in lockstep. The genuinely awkward operation is <strong>update</strong>. If the new version of the record is
+the same size or smaller, it is easy: overwrite in place, adjust the slot's length, keep the same RID. But if the update makes the record
+<em>larger</em> — a variable-length field grew, a null became a long string — and the page no longer has room for it, the record cannot stay where it
+is, and the heap file faces a dilemma with no free answer. Moving the record to a page that does have room changes its physical location, which would
+change its RID — and every index entry pointing at the old RID would now be dangling. The standard escape is a <strong>forwarding pointer</strong> (a
+<strong>tombstone</strong> or forwarding RID): the record's original slot is left in place but, instead of the record, it now holds a pointer to the
+record's new location on another page. The old RID stays valid — indexes are undisturbed — but reading the record now costs <em>two</em> page
+fetches: one to the original page to find the forwarding pointer, a second to the page where the record actually lives. This is the named trap of the
+chapter, and it compounds: a workload that repeatedly grows records can leave a heap file littered with forwarding pointers, so that rows an index
+should reach in one fetch take two, and a table that was once dense with data becomes a maze of redirections — <strong>row migration</strong>, and the
+read amplification it causes, is a real and common source of a heap file quietly getting slower over its lifetime.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the growing update that migrates a row and leaves a forwarding pointer behind</span>
+<p>An update that makes a record too big for its current page cannot move the record freely, because its RID is an address stored in every index that
+covers the table — move the record and those index entries dangle. The near-universal fix is a <strong>forwarding pointer</strong>: leave a tombstone
+at the old RID pointing to the record's new home. Correct, but not free — <strong>every read of that row now costs two page fetches</strong> instead
+of one (old page &rarr; forwarding pointer &rarr; new page), and a fetch that misses the buffer pool is the <a href="#ch46">Chapter 46</a> disk cliff.
+The trap is that this degradation is <em>invisible until it accumulates</em>: a table loaded once and read is fine; a table whose rows are updated to
+grow — a status field that lengthens, a JSON blob that gains keys — slowly fills with forwarding pointers, and reads that were one I/O become two with
+no schema change and no obvious cause. Worse, a page can forward to a record that is itself later updated and forwarded again; naive implementations
+allow chains of forwards, turning one logical read into several. Real systems bound this by never forwarding a forward (they update the original
+tombstone to point to the final location) and by <em>compacting</em> or <em>reorganizing</em> the heap (PostgreSQL's <code>VACUUM</code> and
+<code>pg_repack</code>, Oracle's row-chaining rebuilds) to collapse the redirections. &ldquo;Updates are in place and cheap&rdquo; and &ldquo;rows
+can grow&rdquo; are, in a heap file, not both true at once — a growing update is a move in disguise.</p>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why can't a heap file simply relocate a record that has outgrown its page? What does a forwarding pointer buy, and what does it cost on every
+subsequent read of that row? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>49.4 The full table scan: why heap files love sequential I/O</h2>
+
+<p>The operation a heap file is <em>best</em> at is the one that touches everything: the <strong>full table scan</strong>, which reads every page of
+the file in order and yields each page's live records. Because a heap file's pages sit in the file's linear page space (&sect;47) and a scan reads
+them front to back, a table scan is a <strong>sequential</strong> read — exactly the access pattern <a href="#ch46">Chapter 46</a> measured as
+dramatically cheaper than random access, because it lets the device stream (no per-page seek on a spinning disk; large, prefetchable requests on an
+SSD) and lets the buffer pool and OS read ahead. This is the heap file's structural strength and the reason it survives as the default organization:
+for any query that must examine most of a table — an aggregate over all rows, a filter with no useful index, the build side of a large join — reading
+the heap sequentially is the <em>cheapest possible</em> way to get the bytes off the device, and the total cost is close to (number of pages) &times;
+(sequential page read), with the device running near its streaming bandwidth. Two consequences follow. First, <strong>tuple density matters</strong>:
+the fewer bytes of overhead and dead space per page, the more live records each sequential page read returns, so the same scan bandwidth yields more
+useful rows — which is exactly why a heap littered with tombstones and half-empty pages (from the deletes and migrations of &sect;49.3) scans slowly
+even though the device is streaming, and why periodic compaction pays off. Second, the scan is the fallback the whole system leans on: when no index
+helps, the planner scans the heap, and it can afford to because the scan is sequential. The heap file thus embodies a clean division of labor with the
+indexes of the next part: the <em>index</em> is what you use to find a few rows without reading everything (random access, one RID at a time); the
+<em>heap scan</em> is what you use to read many rows cheaply (sequential access, every page once). A database that understands its own cost model
+chooses between them per query — and it can, because the heap file makes the &ldquo;read everything&rdquo; path as cheap as the device allows.</p>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our <code>orders</code> table has gotten slow. Point look-ups by id are fine, but the reads that
+fetch a single order jumped from about one disk read to two over the last few months, and nobody changed the schema or the indexes.&rdquo; Cover the
+paragraph and respond in four or five sentences, drawing on &sect;49.3.</p>
+<p><em>Model answer.</em> &ldquo;That two-fetch pattern with no schema change is the signature of row migration. When an update makes a row too big
+for its page, the heap can't move it freely — its RID is stored in the indexes — so it leaves a forwarding pointer at the old location and puts the
+row on another page; every read then costs two fetches, the tombstone plus the real row. If your orders grow after insert — a status field that
+lengthens, line items appended, a JSON column that gains keys — you'll accumulate forwarding pointers steadily, which is exactly a gradual one-to-two
+I/O drift with no code change. The fix isn't a new index; it's to reduce migration and collapse the redirects: reorganize or compact the table
+(<code>VACUUM FULL</code> / <code>pg_repack</code> in Postgres) to rewrite rows into fresh pages, and if rows are known to grow, leave fill-factor
+headroom on each page so an update stays in place. So let's measure the forwarding-pointer rate and reorganize, rather than assume the storage got
+mysteriously slow.&rdquo; Naming row migration, tying it to the two-fetch cost, and prescribing compaction plus fill-factor headroom is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;49.3 quick check: a heap file cannot freely relocate an outgrown record because its RID — its (page, slot) address — is
+stored in every index that covers the table, so moving it would leave those index entries dangling. A forwarding pointer keeps the old RID valid by
+leaving a tombstone that redirects to the record's new page, so indexes are undisturbed; the cost is that every subsequent read of that row is
+<strong>two page fetches</strong> — the original page to find the pointer, then the page where the record now lives — and each miss is a disk
+read.)</em></p>
+
+<h2>49.5 What to carry forward</h2>
+
+<p>A <strong>heap file</strong> stores a table's rows as an unordered collection of pages, promising only that every live record is returned once by a
+scan; order and fast lookup are delegated upward to indexes (&sect;49.1). Each record is named by a <strong>record identifier (RID)</strong> — the pair
+(page number, slot number) — which resolves to bytes with no search: two array indices and one page fetch, which is exactly what makes an index's
+&ldquo;follow the pointer to the row&rdquo; a single fetch (&sect;49.1). The one hard operation is finding free space to insert: a <strong>linked list
+of pages</strong> searches by fetching pages and so costs <em>O(pages)</em> fetches per insert (~3,542 per insert in the simulation, and rising with
+file size), while a <strong>page directory</strong> (or free-space map) searches a compact in-memory array and touches one data page — zero fetches to
+locate room — which is why real systems use it (&sect;49.2). Insert and delete are cheap, but an <strong>update that grows a record past its page</strong>
+must leave a <strong>forwarding pointer</strong> to avoid changing the RID, turning every later read of that row into two fetches — <strong>row
+migration</strong>, a slow, invisible degradation defended against by compaction and fill-factor headroom (&sect;49.3). The heap file's great strength
+is the <strong>full table scan</strong>: reading every page in order is <em>sequential</em> I/O, the cheap access pattern of Chapter 46, which is why
+scanning is the affordable fallback when no index helps and why tuple density is worth defending (&sect;49.4).</p>
+
+<p>The heap file is the second of the storage foundation's two data organizations — the page and its records (Chapter 47) turned into a table you can
+insert into, scan, and address by RID. Its two loose threads point straight ahead. The free-space directory is the first hint of a recurring pattern:
+a small, searchable structure kept beside the data so you do not have to scan the data to find something — which is precisely what an <em>index</em>
+is, generalized from &ldquo;which page has room&rdquo; to &ldquo;which page holds key <var>k</var>,&rdquo; and the next part builds exactly that. And
+the RID — a stable address that indexes store and the heap resolves in one fetch — is the currency those indexes trade in: every index leaf ultimately
+holds a RID, and following it lands on the row through the heap file built here. The heap gives you cheap storage and cheap full scans; the index will
+give you cheap selective lookups; and the storage manager built next is the module that ties the pages, the buffer pool, the heap file, and the
+values too big to fit a page into the single interface the rest of the database calls. On the heap file, a table becomes real; on the index, it
+becomes fast.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Define a heap file and state the one promise it makes about a scan.</li>
+<li>Say what a RID is made of and why resolving it needs no search.</li>
+<li>Explain why a linked-list heap's insert cost grows with the file, and how a page directory fixes it (with the simulated numbers).</li>
+<li>Describe what happens when an update grows a record past its page, and what a forwarding pointer costs on every later read.</li>
+<li>Explain row migration, why it is invisible until it accumulates, and two defenses.</li>
+<li>Explain why a full table scan is sequential I/O and why that makes it the affordable fallback.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a heap file, and how does it divide labor with indexes? (&sect;49.1)</li>
+<li><strong>R2.</strong> What is a RID, and why is resolving one to a record a single page fetch with no search? (&sect;49.1)</li>
+<li><strong>R3.</strong> Why does a linked-list heap's insert cost grow with the table, and what did the page directory cost instead in the simulation? (&sect;49.2)</li>
+<li><strong>R4.</strong> Why can't a heap relocate an outgrown record, and what does a forwarding pointer cost on every later read? (&sect;49.3)</li>
+<li><strong>R5.</strong> Why is a full table scan sequential, and why does that make it the affordable fallback when no index helps? (&sect;49.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003 (ISBN 978-0072465631),
+Chapter 9, &ldquo;Storing Data: Disks and Files.&rdquo;</strong> The direct textbook treatment of &sect;49.1&ndash;&sect;49.2: heap files, the two
+free-space schemes (linked list of pages versus page directory), and page and record formats. First authors Raghu Ramakrishnan and Johannes Gehrke;
+edition, publisher, year, and ISBN verified via the publisher and retailer listings.</li>
+<li><strong>Hector Garcia-Molina, Jeffrey D. Ullman &amp; Jennifer Widom, <em>Database Systems: The Complete Book</em>, 2nd ed., Pearson/Prentice
+Hall, 2008 (ISBN 978-0131873254).</strong> Its storage chapters cover how records, blocks, and files are represented on disk, including
+variable-length records and the record-address (RID) abstraction underpinning &sect;49.1. First author Hector Garcia-Molina; edition, year, and ISBN
+verified via the publisher listing.</li>
+<li><strong>Abraham Silberschatz, Henry F. Korth &amp; S. Sudarshan, <em>Database System Concepts</em>, 7th ed., McGraw-Hill, 2019
+(ISBN 978-0078022159).</strong> Its storage-and-file-structure chapter treats variable-length records, free-space management, and the update that no
+longer fits — the source material behind &sect;49.3's migration problem. First author Abraham Silberschatz; edition, year, and ISBN verified via the
+publisher listing.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, DOI 10.1561/1900000002.</strong> Its storage-and-access-methods sections situate the heap file within the whole
+engine — how the storage manager exposes pages and records to the layers above. First author Joseph M. Hellerstein; venue, year, and DOI verified via
+the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex49.1"><span class="ex-label">49.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is the only promise a heap file makes about a full scan, and what does it deliberately <em>not</em> promise?</div>
+
+<div class="exercise" id="ex49.2"><span class="ex-label">49.2</span> <span class="ex-tag warm">warm-up</span>
+A RID is the pair (page number, slot number). Explain in one or two sentences why resolving a RID to the actual record bytes requires no search,
+naming the two array indexings and the one page fetch involved.</div>
+
+<div class="exercise" id="ex49.3"><span class="ex-label">49.3</span> <span class="ex-tag warm">warm-up</span>
+Roughly how many data-page fetches per insert did the linked-list heap cost in the simulation, and how many did the page directory cost to
+<em>locate</em> free space? Why is the linked-list number not a constant?</div>
+
+<div class="exercise" id="ex49.4"><span class="ex-label">49.4</span> <span class="ex-tag core">core</span>
+Free-space schemes. (a) Explain why a linked-list heap file's insert cost grows with the number of pages in the file. (b) Explain how a page
+directory reduces the cost of <em>locating</em> free space to zero data-page fetches. (c) State the asymptotic insert cost (in page fetches to find
+room) of each scheme as a function of the number of pages, and why that difference is decisive for a growing table.</div>
+
+<div class="exercise" id="ex49.5"><span class="ex-label">49.5</span> <span class="ex-tag core">core</span>
+The growing update. (a) Why can a heap file overwrite a record in place when an update keeps it the same size or smaller, but not when the update
+makes it larger than the page's remaining room? (b) Why can't it simply move the record to a page with room? (c) What is a forwarding pointer, and
+what does it cost on every subsequent read of that row?</div>
+
+<div class="exercise" id="ex49.6"><span class="ex-label">49.6</span> <span class="ex-tag core">core</span>
+Row migration over time. (a) Describe a workload that steadily fills a heap file with forwarding pointers. (b) Explain why the resulting slowdown is
+invisible until it accumulates and appears without any schema or index change. (c) Give two defenses and say how each reduces the two-fetch cost.</div>
+
+<div class="exercise" id="ex49.7"><span class="ex-label">49.7</span> <span class="ex-tag complexity">cost</span>
+A table has <var>P</var> pages, each holding on average <var>r</var> live records. (a) Give the cost of a full table scan in page reads, and state
+whether those reads are sequential or random and why that matters (cite the Chapter 46 result qualitatively). (b) A point look-up by RID costs how
+many page fetches when the row has not migrated, and how many when it has? (c) If a fraction <var>m</var> of rows have migrated, write the average
+page-fetch cost of a random point look-up and explain why raising tuple density (compaction) helps both the scan and the look-up.</div>
+
+<div class="exercise" id="ex49.8"><span class="ex-label">49.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A reporting query aggregates over an entire 2-million-row table and is slower than its raw data size
+suggests it should be; the table has been heavily updated in place over a year.
+<br><strong>Step 1 (given):</strong> the query has no useful index, so the planner does a full heap scan — sequential I/O over every page.
+<br><strong>Step 2 (given):</strong> a year of growing updates has left many pages half-empty (deleted/migrated rows) and scattered forwarding pointers.
+<br><strong>Step 3 (given):</strong> the scan reads every page whether or not it is dense, so low tuple density means more pages read per live row.
+<br><strong>Step 4 (you):</strong> Explain why the scan is slow despite the device streaming sequentially, and give one operation that would speed it
+up without adding an index — and say what it does to the pages.</div>
+
+<div class="exercise" id="ex49.9"><span class="ex-label">49.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the heap-file mechanism or property responsible — <em>RID</em>, <em>page directory</em>, <em>forwarding pointer</em>, <em>slot array</em>,
+or <em>sequential scan</em> — and why: (a) an index finds a row in one page fetch after its search; (b) an insert locates free space without touching
+data pages; (c) a grown record keeps its old address valid after moving; (d) a deleted record can leave a hole that is compacted later; (e) reading
+every row of an unindexed table is affordable.</div>
+
+<div class="exercise" id="ex49.10"><span class="ex-label">49.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A heap file returns rows in insertion order.&rdquo; (b) &ldquo;A
+page directory makes the cost of finding free space independent of the number of data pages fetched.&rdquo; (c) &ldquo;An in-place update that
+shrinks a record must relocate it.&rdquo; (d) &ldquo;A forwarding pointer makes a row's reads cheaper.&rdquo; (e) &ldquo;A full table scan is random
+I/O.&rdquo;</div>
+
+<div class="exercise" id="ex49.11"><span class="ex-label">49.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the storage layers. (a) Trace an insert of one record end to end: finding free space via the directory (&sect;49.2), writing the record
+and slot into a page (&sect;47), through the buffer pool (&sect;48), and what RID is returned. (b) Argue that the free-space directory and an index are
+the same idea — a small searchable structure beside the data — applied to different questions, and state each question. (c) Explain why a heap file
+plus indexes is a better division of labor than a single always-sorted file, using the insert cost of &sect;49.2 and the scan cost of &sect;49.4.</div>
+
+<div class="exercise" id="ex49.12"><span class="ex-label">49.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Write a deterministic simulation that inserts many variable-size records into a heap of fixed-size pages
+under two free-space schemes — a linked-list walk from the head and a page-directory scan — and count the data-page fetches each performs to locate
+room; report both and their ratio, and how the linked-list number changes as the file grows. (b) Extend it with a fraction of updates that grow a
+record past its page, inserting a forwarding pointer, and report the resulting two-fetch read rate. (c) State your toolchain and CPU, and explain
+which of your results are exact counts from a deterministic simulation (reproducible, hardware-independent) versus anything you timed — and why the
+counts are the claim that travels.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch50">
+<h1>Chapter 50 — The Storage Manager: The Interface Under Everything</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (the device and its cost model — the floor everything
+rests on), <a href="#ch47">Chapter 47</a> (the page and the records inside it — the unit and the currency), <a href="#ch48">Chapter 48</a> (the
+buffer pool — how a page becomes memory you can touch, pinned and evictable), <a href="#ch49">Chapter 49</a> (the heap file — pages organized into a
+table, records named by RID). &nbsp;·&nbsp; The four chapters before this each built one slab of the storage foundation. This chapter names the seam
+that joins them — the <em>storage manager</em>, the single interface the rest of the database calls — and handles the one thing a fixed-size page
+cannot: a value bigger than the page itself.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch48">Chapter 48</a> — what does <code>fetchPage(p)</code> do on a hit versus a miss, and what does the caller promise
+to do when it is finished with the page? (2) <a href="#ch49">Chapter 49</a> — a record is named by a RID of (page number, slot number); what happens
+to that RID when a record grows too big for its page? (3) <em>Predict:</em> a page is 4&nbsp;KiB, but a column might hold a 1&nbsp;MiB document or a
+10&nbsp;MiB image. It plainly cannot fit in one page. Two questions: roughly how many 4&nbsp;KiB pages would a 1&nbsp;MiB value need if you chain
+overflow pages, and — the subtler one — what happens to a <em>table scan</em> if you instead try to cram that big value <em>inline</em> in the row,
+next to the small columns queries actually read? Write your guesses; &sect;50.3 answers them.</p>
+</aside>
+
+<p>Four chapters have each built one part of a storage engine: the device and its cost model (Chapter 46), the page and its records (Chapter 47), the
+buffer pool that turns pages into memory (Chapter 48), and the heap file that turns pages into a table (Chapter 49). What has not yet been named is the
+thing that joins them — the <strong>storage manager</strong>, the module that presents all of this to the rest of the database as one coherent
+interface. The layers above it — the indexes and access methods of the next part, the query executor after that — must not each know about disk
+geometry, buffer frames, slot arrays, and free-space directories; they need a small, stable vocabulary: <em>give me page <var>P</var></em>, <em>here
+is a page, make it durable</em>, <em>allocate a new page</em>, <em>free this page</em>, <em>read the record at this RID</em>. The storage manager is
+the layer that provides exactly that vocabulary and hides everything below it, so that a B-tree can be written as &ldquo;a tree whose nodes are
+pages&rdquo; without the B-tree code ever issuing a <code>pread</code> or choosing an eviction victim. This chapter does two jobs. It makes the
+interface explicit — what the storage manager exposes and what it hides (&sect;50.1), and how it names a page across many files with a
+<strong>page identifier</strong> so the address space scales beyond one file (&sect;50.2). And it handles the one case the fixed-size page of Chapter
+47 cannot: a <strong>value larger than a page</strong>, stored out-of-line in a chain of overflow pages, with the named trap of storing it inline
+instead (&sect;50.3). Then it composes the whole foundation into a single end-to-end trace of one record read (&sect;50.4), and hands the finished
+interface up to the storage engines the next part builds on it (&sect;50.5). This is the capstone of the storage part: after it, &ldquo;fetch a
+page&rdquo; and &ldquo;read a record&rdquo; are primitives the rest of the book may simply assume.</p>
+
+<p><strong>On the code in this chapter.</strong> The overflow-page counts of &sect;50.3 are <strong>exact arithmetic</strong>, not measurements: a short
+program computes the ceiling-division page counts for values of various sizes given a 4&nbsp;KiB page and a fixed per-page overhead, so the numbers
+are reproducible and hardware-independent (they depend only on the page size and overhead stated, not on this machine's disk). Where those page
+counts turn into a cost, the cost is the <a href="#ch48">Chapter 48</a> buffer-pool fetch and the <a href="#ch46">Chapter 46</a> device figures
+measured earlier in this part, which this chapter cites rather than re-measures. The arithmetic itself was run on this machine's Intel Core
+i7-12700H (glibc 2.35, gcc 11.4.0 available). The C in &sect;50.1 is an <em>interface sketch</em> — function signatures illustrating the vocabulary,
+with types like <code>PageId</code> left abstract — not a compiled, timed program; no wall-clock claim is made about it, and a hardware-counter
+profiler (<code>perf</code>) is not installed here.</p>
+
+<h2>50.1 What the storage manager is: the interface between access methods and pages</h2>
+
+<p>The <strong>storage manager</strong> is the database module that owns physical storage and exposes it to everyone above as a narrow interface. Its
+whole reason to exist is <em>encapsulation</em>: the layers above — indexes, the table/heap layer, the executor — should reason about pages and
+records, never about how a page reaches memory or which frame it lands in. Concretely, the storage manager sits on top of the buffer pool (Chapter
+48) and the on-disk files (Chapter 47) and offers roughly this vocabulary. To read, <code>fetchPage(pid)</code> returns a pinned pointer to the page's
+frame (a buffer-pool hit or a disk read, invisibly), and <code>unpinPage(pid, dirty)</code> releases it, flagging whether it was modified. To grow
+and shrink storage, <code>allocatePage()</code> extends a file and returns a new page identifier, and <code>freePage(pid)</code> returns a page to the
+free list. To find records, <code>readRecord(rid)</code> resolves a RID to bytes (the heap-file resolution of Chapter 49), and
+<code>insertRecord(bytes)</code> finds room (the free-space directory of Chapter 49), writes, and returns a new RID. In C the shape is small:</p>
+
+<pre><code>/* the storage-manager interface the layers above see -- pages and records,
+   nothing about disks, frames, or eviction */
+Page *fetchPage(PageId pid);              /* pin + return frame pointer (hit or disk read) */
+void  unpinPage(PageId pid, bool dirty);  /* release; 'dirty' -&gt; must be written back before reuse */
+PageId allocatePage(FileId f);            /* extend file f, return new page id */
+void  freePage(PageId pid);               /* return page to the free list */
+Record readRecord(Rid rid);              /* (page,slot) -&gt; bytes: one fetchPage + slot index */
+Rid    insertRecord(FileId f, Bytes rec); /* find room (free-space dir), write, return rid */
+</code></pre>
+
+<p>Everything the previous four chapters built is <em>behind</em> these six calls. <code>fetchPage</code> hides the buffer pool's page table, pin
+counts, dirty bits, and replacement policy, and hides the device beneath them — the caller sees only a pointer that is valid until it unpins.
+<code>insertRecord</code> hides the free-space directory and the slotted-page write. The layers above are written entirely in this vocabulary: a
+B-tree node <em>is</em> a page fetched with <code>fetchPage</code>; a table scan <em>is</em> a loop over page identifiers calling <code>fetchPage</code>
+and yielding records; an index leaf stores a <em>RID</em> and calls <code>readRecord</code> to reach the row. This is the layering that makes a database
+buildable at all: each layer depends only on the interface below it, so the B-tree does not break when the buffer pool changes its eviction policy,
+and the executor does not break when the heap file changes its free-space scheme. The storage manager is where &ldquo;the database on disk&rdquo; stops
+being about disks and starts being about pages and records — the exact abstraction the rest of the book stands on.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name two things the storage manager's <code>fetchPage</code> hides from the layers above it. Why does this encapsulation let a B-tree be written
+without any knowledge of disks or buffer frames? (Answer after the next section.)</p>
+</aside>
+
+<h2>50.2 The page identifier and the address space</h2>
+
+<p>Chapter 49's RID named a record by (page number, slot number), taking &ldquo;page number&rdquo; for granted. The storage manager must make that
+concrete, because a real database is not one file — it is many: one or more per table, more for indexes, still more for the log. So a page is named
+not by a bare number but by a <strong>page identifier</strong> (a <strong>PageId</strong>): typically a pair <em>(file identifier, page number
+within that file)</em>, sometimes packed into a single integer. The PageId is the address the whole storage manager turns on:
+<code>fetchPage(pid)</code> uses the file id to pick the file and the page number to compute the byte offset within it (page number &times; page size),
+then reads that page through the buffer pool. This is the storage layer's <em>address space</em> — a two-level address, file then offset, exactly
+analogous to the virtual-memory address translation of the operating-system part, and for the same reason: a flat global page number would tie every
+page to one file and one growth path, whereas (file, page) lets each table and index grow in its own file independently while still being named by a
+single, comparable identifier. The RID of Chapter 49 is thus properly a <em>(PageId, slot)</em>: file, page, slot — enough to locate any record in the
+database with no search, across any number of files. Two properties make the PageId the right currency for everything above. It is <strong>small and
+comparable</strong>: a few bytes, cheap to store by the million in index leaves and cheap to compare and sort, which is what lets an index hold RIDs
+densely. And it is <strong>stable</strong>: a page keeps its identifier for its lifetime, so a stored PageId remains valid — the property Chapter 49's
+forwarding pointers worked so hard to preserve for records is guaranteed for pages by construction. The address space is deliberately boring, and
+that is its virtue: a stable, small, comparable name for every page means every layer above can refer to storage by identifier and let the storage
+manager do the translation to bytes.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a value bigger than a page must live out-of-line, in a chain of pages</span>
+<p><strong>1. In words.</strong> A page is fixed at 4&nbsp;KiB, so a value larger than a page cannot be a single slotted record. The storage manager
+stores it <em>out-of-line</em>: it writes the value across a chain of dedicated overflow pages and leaves, in the row itself, only a small pointer to
+the head of that chain. The row stays small; the big value lives elsewhere and is fetched only when actually needed.</p>
+<p><strong>2. As a picture.</strong> Figure 50.1: a heap page with a normal-sized row whose large column is not the bytes but a pointer, an arrow
+leading to overflow page O0, which chains O0&rarr;O1&rarr;O2&rarr;&hellip; each holding a slice of the value; the small columns stay inline, dense on
+the heap page.</p>
+<p><strong>3. As numbers.</strong> Computed here with a 4&nbsp;KiB page and ~24&nbsp;bytes of per-page overhead (usable ~4,072&nbsp;B): a 8&nbsp;KiB
+value needs <strong>3</strong> overflow pages; 64&nbsp;KiB needs <strong>17</strong>; 1&nbsp;MiB needs <strong>258</strong>; 10&nbsp;MiB needs
+<strong>2,576</strong>. A linked chain also means random access to a byte deep in the value may walk up to the whole chain — which is why large
+values are read whole or sequentially, not seeked into.</p>
+</aside>
+
+<p><em>(Answer to the &sect;50.1 quick check: <code>fetchPage</code> hides, among other things, the <strong>buffer pool</strong> — its page table,
+pin counts, dirty bits, and eviction policy — and the <strong>device</strong> beneath it: the caller cannot tell a hit from a disk read, and never
+issues a <code>pread</code> or picks a victim. This encapsulation lets a B-tree be written as &ldquo;a tree of pages&rdquo; using only
+<code>fetchPage</code>/<code>unpinPage</code>, so it neither knows nor cares how a page reaches memory — the storage manager owns that, and can change
+it without touching the B-tree.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A large value lives out-of-line: the row holds a pointer; the bytes chain across overflow pages.</text>
+<rect x="20" y="40" width="180" height="60" fill="#eef1f4" stroke="#333"/>
+<text x="28" y="56" font-size="8">heap page (row stays small)</text>
+<rect x="28" y="64" width="40" height="28" fill="#dff0df" stroke="#2f7d32"/><text x="33" y="81" font-size="7">id</text>
+<rect x="70" y="64" width="40" height="28" fill="#dff0df" stroke="#2f7d32"/><text x="75" y="81" font-size="7">name</text>
+<rect x="112" y="64" width="80" height="28" fill="#f6dcd2" stroke="#8c3a1d"/><text x="117" y="81" font-size="7">doc: ptr&rarr;O0</text>
+<rect x="280" y="34" width="70" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="292" y="53" font-size="8">O0</text>
+<rect x="370" y="34" width="70" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="382" y="53" font-size="8">O1</text>
+<rect x="460" y="34" width="70" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="472" y="53" font-size="8">O2 &hellip;</text>
+<path d="M192 78 L280 52" stroke="#8c3a1d" stroke-width="1.5"/>
+<path d="M350 49 L370 49" stroke="#8c3a1d" stroke-width="1.5"/><path d="M440 49 L460 49" stroke="#8c3a1d" stroke-width="1.5"/>
+<text x="280" y="82" font-size="8" fill="#8c3a1d">value chained across overflow pages (1 MiB &rarr; ~258 pages)</text>
+<text x="20" y="130" font-size="8" fill="#2f7d32">Small columns stay dense on the heap page &rarr; scans that ignore 'doc' read few pages per row.</text>
+<text x="20" y="150" font-size="8" fill="#8c3a1d">Inlining 'doc' instead would bloat the row, so few rows fit a page and every scan drags the big value.</text>
+</svg>
+<figcaption>Figure 50.1: out-of-line storage for a large value. The row keeps small columns inline and stores only a pointer to a chain of overflow
+pages holding the big value, so scans that do not read the big column stay dense and cheap; inlining the value instead would bloat every row and slow
+every scan.</figcaption>
+</figure>
+
+<h2>50.3 Values too big for a page: overflow and out-of-line storage</h2>
+
+<p>A page is fixed-size — 4&nbsp;KiB here — but a column is not: a text document, a JSON blob, an image, a serialized vector can be kilobytes or
+megabytes, far larger than any single page. The storage manager cannot store such a value as one slotted record, so it stores it <strong>out-of-line
+(overflow storage)</strong>: the large value is written across a chain of dedicated <strong>overflow pages</strong>, and the row keeps only a small
+pointer to the head of the chain in place of the value. The arithmetic is a ceiling division — a value of <var>S</var> bytes, on pages of <var>P</var>
+bytes with per-page overhead <var>h</var>, needs &lceil;<var>S</var> / (<var>P</var>&minus;<var>h</var>)&rceil; overflow pages — and it grows exactly
+as you would expect:</p>
+
+<pre><code>out-of-line storage, 4-KiB pages, ~24 B/page overhead (usable ~4072 B):
+  value    8 KiB  -&gt;    3 overflow pages
+  value   64 KiB  -&gt;   17 overflow pages
+  value    1 MiB  -&gt;  258 overflow pages
+  value   10 MiB  -&gt; 2576 overflow pages
+</code></pre>
+
+<p>Out-of-line storage buys two things. It keeps the <strong>row small</strong>, so many rows still fit a heap page and scans stay dense (&sect;49.4);
+and it makes the big value <strong>pay-per-use</strong>, fetched only when a query actually reads that column, not dragged through memory every time
+the row is touched for its small fields. The cost is that reading the value is a walk of the overflow chain — sequential and fine when you want the
+whole value, but poor for random access into the middle of it, since a linked chain must be walked to reach a deep offset (real systems that need
+random access into large values use a tree or a chunk index over the overflow pages rather than a bare chain). This is exactly the mechanism behind
+PostgreSQL's TOAST (&ldquo;The Oversized-Attribute Storage Technique&rdquo;), Oracle's and SQL Server's out-of-line LOB storage, and every system's
+BLOB handling: a large value is moved off the row and pointed at. The decision of <em>when</em> to push a value out-of-line is usually a threshold —
+a value beyond some fraction of the page (a common heuristic is roughly a quarter of the page, so several rows still fit) becomes a candidate for
+out-of-line storage — and getting it wrong is the named trap: storing a large value <em>inline</em> bloats every row so that only one or a few fit per
+page, which does not just waste space but destroys the tuple density that made the heap scan of &sect;49.4 cheap. Every full scan then drags the big
+value through the buffer pool even for queries that never read it, turning a cheap scan of the small columns into an expensive scan of megabytes of
+document — a self-inflicted collapse of the storage engine's central advantage.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: storing a large value inline and collapsing tuple density</span>
+<p>A page is fixed-size, so the number of rows it holds is <em>(usable page bytes) / (row size)</em>. Put a large value inline — a multi-kilobyte JSON
+document, a serialized blob, a base64 image — and the row size balloons, so a page holds <strong>one or a handful of rows instead of dozens</strong>.
+The damage is not mainly wasted space; it is that <strong>every full scan now reads that big value for every row, even queries that never touch that
+column</strong>. A scan that should stream the small columns densely (Chapter 49) instead reads megabytes of document per row, so a report over
+<code>customer_id</code> and <code>total</code> is dragging the 1&nbsp;MiB <code>notes</code> field of every row through the buffer pool — the tuple
+density that made the scan cheap is gone, and with it the storage engine's central advantage. The trap is seductive because inline &ldquo;just
+works&rdquo; on small data and only bites when values grow: a <code>text</code> column that held short strings in testing holds novels in production,
+and scans that were fast quietly become I/O-bound with no query change. The fix is to store large values out-of-line above a size threshold (roughly
+a quarter of a page is a common cutoff) so the row stays small and the big value is fetched only when read — exactly what TOAST/LOB storage does
+automatically, and what a hand-rolled engine must do deliberately. &ldquo;It's just a column&rdquo; and &ldquo;scans are cheap&rdquo; are not both
+true once that column holds a value larger than a fraction of the page.</p>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does storing a 1&nbsp;MiB value inline in a row hurt a scan that never reads that value? Roughly how many 4&nbsp;KiB pages does a 1&nbsp;MiB
+value need out-of-line, and what does keeping only a pointer in the row preserve? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>50.4 Composing the layers: one record read, end to end</h2>
+
+<p>The storage part is now complete enough to trace a single operation through every layer it built — the clearest way to see the interface doing its
+job. Suppose the executor holds a RID (from an index leaf or a scan) and wants the row. It calls the storage manager's <code>readRecord(rid)</code>,
+and here is the whole descent. The RID is <em>(PageId, slot)</em> = (file id, page number, slot) (&sect;50.2). The storage manager calls
+<code>fetchPage(pid)</code> (&sect;50.1); the buffer pool looks the PageId up in its page table (&sect;48): on a <strong>hit</strong> the page is
+already in a frame — a memory access, about 36&nbsp;ns measured earlier — and on a <strong>miss</strong> the pool evicts a victim (writing it back if
+dirty), computes the byte offset (page number &times; page size) in the file, and reads the 4&nbsp;KiB page from the device (&sect;46) — about
+350&nbsp;&micro;s on this machine's virtual disk, four orders of magnitude slower. The page is pinned; the storage manager indexes its slot array at
+<em>slot</em> to get the record's in-page offset and length (&sect;47, &sect;49), and reads the record's bytes. If the record is a forwarding pointer
+(the row migrated, &sect;49.3), it follows it with a second <code>fetchPage</code>. If a column is stored out-of-line and the query reads it, the
+pointer in the row is followed into the overflow chain (&sect;50.3) with further fetches. Finally the storage manager <code>unpinPage</code>s and
+returns the bytes; the executor never saw a frame, a slot, or a byte offset — only &ldquo;here is the record.&rdquo; That single trace is the entire
+storage foundation in motion: the RID and page identifier that name the data (&sect;49, &sect;50.2), the heap file and slotted page that lay it out
+(&sect;47, &sect;49), the buffer pool that turns a page into memory and decides hit or miss (&sect;48), the device that is the floor and the cliff
+(&sect;46), and the storage manager that composes them into one call. Everything the next part builds — every B-tree node, every index lookup, every
+log write — is made of exactly this call.</p>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Let's store each document's full JSON — often a megabyte — directly in a <code>data</code> column
+on the main table, so we don't need a second lookup. Simpler, and one row is one read.&rdquo; The table is also scanned nightly for a report that
+reads only two small columns. Cover the paragraph and respond in four or five sentences, drawing on &sect;50.3 and &sect;49.4.</p>
+<p><em>Model answer.</em> &ldquo;One row being one read is only true for the point look-up; for the nightly scan, inlining a megabyte per row is the
+expensive choice. A page is fixed at a few kilobytes, so if the row carries a 1&nbsp;MiB JSON blob, a page holds essentially one row, and the scan
+that needs only two small columns now reads a megabyte per row through the buffer pool anyway — the tuple density that makes a scan cheap is gone. If
+we store the JSON out-of-line and keep a pointer in the row, the row stays small, dozens fit per page, the nightly scan stays dense and fast, and we
+fetch the megabyte only for the queries that actually read it — which is exactly what TOAST or LOB storage does for us automatically. So the blob
+should live out-of-line above a size threshold; the point look-up still gets its data in a follow-the-pointer fetch, and the scan keeps its
+density.&rdquo; Naming tuple density, the scan-versus-point-lookup asymmetry, and out-of-line storage as the standard fix is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;50.3 quick check: storing a 1&nbsp;MiB value inline balloons the row so a fixed-size page holds only one or a few rows,
+and a full scan then reads that megabyte for every row even when the query never touches that column — the tuple density that made the scan cheap
+collapses. A 1&nbsp;MiB value needs about <strong>258</strong> 4&nbsp;KiB overflow pages out-of-line; keeping only a pointer in the row preserves the
+row's small size, so scans of the other columns stay dense and the big value is fetched only when actually read.)</em></p>
+
+<h2>50.5 What to carry forward</h2>
+
+<p>The <strong>storage manager</strong> is the module that owns physical storage and exposes it as a narrow interface — <code>fetchPage</code>/
+<code>unpinPage</code>, <code>allocatePage</code>/<code>freePage</code>, <code>readRecord</code>/<code>insertRecord</code> — hiding the buffer pool,
+the slotted page, the free-space directory, and the device, so the layers above reason only about pages and records (&sect;50.1). A page is named by
+a <strong>page identifier (PageId)</strong> — (file id, page number) — a small, comparable, stable address; the RID of Chapter 49 is properly
+(PageId, slot), enough to locate any record across any number of files with no search (&sect;50.2). A value larger than a page is stored
+<strong>out-of-line</strong> across a chain of overflow pages with only a pointer left in the row — a 1&nbsp;MiB value needing ~258 4&nbsp;KiB pages —
+which keeps rows small and makes big values pay-per-use; storing them <strong>inline</strong> instead collapses tuple density and makes every scan
+drag the big value, the named trap (&sect;50.3). One <code>readRecord</code> composes the whole foundation: RID &rarr; PageId &rarr; buffer-pool
+fetch (hit ~36&nbsp;ns / miss ~350&nbsp;&micro;s) &rarr; slot index &rarr; bytes, following forwarding pointers and overflow chains as needed
+(&sect;50.4).</p>
+
+<p>With this, the storage part is finished, and finished as an <em>interface</em>, not just a pile of mechanisms. The device, the page, the buffer
+pool, the heap file, and the values too big to fit have all been folded behind a handful of calls that speak only of pages and records — and that
+interface is precisely the ground the rest of the volume stands on. The next part builds the <strong>storage engines</strong> — the access methods
+that give a table fast, selective access rather than only the sequential scan of the heap. The first, the <strong>B-tree</strong>, is nothing but a
+tree whose nodes are pages fetched through <code>fetchPage</code>, whose leaves store the RIDs this part defined, and whose shallow height turns a
+key look-up into a handful of page fetches; the second family, the <strong>log-structured merge tree</strong>, is runs of sorted pages written and
+merged through this same interface. Neither needs to know a thing about disks or frames, because the storage manager built here has already hidden
+them. The heap gave you a table; the storage manager gave you the interface; the access methods will give you speed. From here up, &ldquo;fetch a
+page&rdquo; is a primitive — and on that primitive, a database is built.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>State what the storage manager exposes and name three things it hides.</li>
+<li>Say what a PageId is made of and why (file, page) beats a flat global page number.</li>
+<li>Explain why the RID is properly (PageId, slot) and why that locates any record with no search.</li>
+<li>Explain out-of-line storage, why it keeps rows small, and roughly how many pages a 1&nbsp;MiB value needs.</li>
+<li>Explain why storing a large value inline collapses tuple density and slows scans that never read it.</li>
+<li>Trace one <code>readRecord</code> from RID to bytes, naming the layer and cost at each step.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What interface does the storage manager expose, and what does it hide from the layers above? (&sect;50.1)</li>
+<li><strong>R2.</strong> What is a PageId, and why is a two-level (file, page) address better than a flat global page number? (&sect;50.2)</li>
+<li><strong>R3.</strong> How is a value larger than a page stored, and roughly how many 4&nbsp;KiB pages does a 1&nbsp;MiB value need? (&sect;50.3)</li>
+<li><strong>R4.</strong> Why does storing a large value inline collapse tuple density and slow scans? (&sect;50.3)</li>
+<li><strong>R5.</strong> Trace one <code>readRecord</code> from a RID to the record bytes, naming each layer and the hit/miss cost. (&sect;50.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, DOI 10.1561/1900000002.</strong> Its storage-manager and access-method sections are the direct source for
+&sect;50.1&ndash;&sect;50.2: the interface the storage manager presents and the layering above it. First author Joseph M. Hellerstein; venue, year,
+and DOI verified via the ACM Digital Library.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992 (ISBN 978-1558601901).</strong>
+Its storage-structures chapters cover the file/page abstraction, large-object handling, and how the storage layer presents pages and records to the
+transaction manager above — the framing behind &sect;50.1 and &sect;50.3. First author Jim Gray; publisher, year, and ISBN verified via the publisher
+and library listings.</li>
+<li><strong>Abraham Silberschatz, Henry F. Korth &amp; S. Sudarshan, <em>Database System Concepts</em>, 7th ed., McGraw-Hill, 2019
+(ISBN 978-0078022159).</strong> Its storage-and-file-structure chapter covers large-object (LOB) storage and out-of-line representation of oversized
+values — the mechanism of &sect;50.3. First author Abraham Silberschatz; edition, year, and ISBN verified via the publisher listing.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003 (ISBN 978-0072465631),
+Chapter 9, &ldquo;Storing Data: Disks and Files.&rdquo;</strong> The page/record formats and file API that the storage manager wraps (&sect;50.1&ndash;
+&sect;50.2). First authors Raghu Ramakrishnan and Johannes Gehrke; edition, publisher, year, and ISBN verified via the publisher and retailer
+listings.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex50.1"><span class="ex-label">50.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is the storage manager's job, and name two of the six interface calls it exposes.</div>
+
+<div class="exercise" id="ex50.2"><span class="ex-label">50.2</span> <span class="ex-tag warm">warm-up</span>
+What is a PageId made of, and why is the RID of Chapter 49 properly a (PageId, slot) rather than just (page number, slot)?</div>
+
+<div class="exercise" id="ex50.3"><span class="ex-label">50.3</span> <span class="ex-tag warm">warm-up</span>
+Roughly how many 4&nbsp;KiB overflow pages does a 1&nbsp;MiB value need out-of-line, and what does the row keep in place of the value?</div>
+
+<div class="exercise" id="ex50.4"><span class="ex-label">50.4</span> <span class="ex-tag core">core</span>
+Encapsulation. (a) Name three things <code>fetchPage</code> hides from the layer that calls it. (b) Explain why this lets a B-tree be written without
+any knowledge of disks or buffer frames. (c) Give one concrete change to a lower layer (e.g. the buffer pool's eviction policy or the heap's
+free-space scheme) that the layers above do <em>not</em> have to know about, and why the interface protects them.</div>
+
+<div class="exercise" id="ex50.5"><span class="ex-label">50.5</span> <span class="ex-tag core">core</span>
+Out-of-line storage. (a) Write the formula for the number of overflow pages a value of <var>S</var> bytes needs on pages of <var>P</var> bytes with
+per-page overhead <var>h</var>. (b) Evaluate it for <var>S</var> = 64&nbsp;KiB and 1&nbsp;MiB with <var>P</var> = 4096, <var>h</var> = 24. (c) Explain
+the two benefits of out-of-line storage (small rows, pay-per-use) and the one cost (walking the chain for deep random access).</div>
+
+<div class="exercise" id="ex50.6"><span class="ex-label">50.6</span> <span class="ex-tag core">core</span>
+The inline trap. (a) If a page has <var>U</var> usable bytes and rows are <var>R</var> bytes, how many rows fit a page, and what happens to that count
+when a 1&nbsp;MiB value is inlined into each row? (b) Explain why a scan that reads only two small columns is nonetheless slowed by an inlined large
+column. (c) State the threshold rule that avoids the trap and what it preserves.</div>
+
+<div class="exercise" id="ex50.7"><span class="ex-label">50.7</span> <span class="ex-tag complexity">cost</span>
+A table has <var>N</var> rows; a query reads only two small columns via a full scan. (a) Give the number of pages the scan reads when the rows are
+small (density <var>d</var> rows/page) versus when a 1&nbsp;MiB value is inlined (one row/page). (b) Using the Chapter 46/48 sequential-read cost per
+page qualitatively, express how many times more data the inlined scan moves. (c) Explain why out-of-line storage makes the scan cost depend on the
+columns read, not on the size of the unread large column.</div>
+
+<div class="exercise" id="ex50.8"><span class="ex-label">50.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> An index look-up returns a RID for a row whose large <code>body</code> column is stored out-of-line; the
+query selects only <code>id</code> and <code>title</code>.
+<br><strong>Step 1 (given):</strong> the RID is (PageId, slot); one <code>fetchPage</code> brings in the heap page (hit ~36&nbsp;ns, miss ~350&nbsp;&micro;s).
+<br><strong>Step 2 (given):</strong> the slot array gives the row's offset; <code>id</code> and <code>title</code> are inline, so they are read directly.
+<br><strong>Step 3 (given):</strong> <code>body</code> is a pointer to an overflow chain; the query does not read it.
+<br><strong>Step 4 (you):</strong> State how many page fetches this look-up performs and why the size of <code>body</code> does not affect it, then say
+what would change if the query <em>did</em> select <code>body</code>.</div>
+
+<div class="exercise" id="ex50.9"><span class="ex-label">50.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the storage-manager concept responsible — <em>fetchPage</em>, <em>PageId</em>, <em>out-of-line storage</em>, <em>RID</em>, or <em>the
+interface (encapsulation)</em> — and why: (a) a B-tree is written without a single <code>pread</code>; (b) a row keeps only a pointer to its 1&nbsp;MiB
+document; (c) a page is named across many files by a small comparable value; (d) an index leaf stores a row's address; (e) the caller cannot tell a
+buffer-pool hit from a disk read.</div>
+
+<div class="exercise" id="ex50.10"><span class="ex-label">50.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;The storage manager exposes disk offsets and frame indices to the
+executor.&rdquo; (b) &ldquo;A PageId is stable for a page's lifetime.&rdquo; (c) &ldquo;A 10&nbsp;MiB value fits in one page if the page is
+compressed.&rdquo; (d) &ldquo;Inlining a large value speeds up scans that never read it.&rdquo; (e) &ldquo;Out-of-line storage lets a big value be
+fetched only when the query reads that column.&rdquo;</div>
+
+<div class="exercise" id="ex50.11"><span class="ex-label">50.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the storage foundation. (a) Trace one <code>readRecord(rid)</code> from RID to bytes, naming every layer (Chapters 46&ndash;50) and the
+cost at each. (b) Argue that the storage manager's interface is what makes the next part's B-tree buildable, using the fact that a B-tree node is a
+page and a leaf holds a RID. (c) Explain why the two-level address space (file, page) and out-of-line storage are the same design instinct — put a
+small stable name in front of variable, growing data — applied to pages and to values respectively.</div>
+
+<div class="exercise" id="ex50.12"><span class="ex-label">50.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Sketch, in code or pseudocode, the six-call storage-manager interface over a buffer pool and a heap file,
+and implement <code>readRecord(rid)</code> as one <code>fetchPage</code> plus a slot index. (b) Compute (exact arithmetic) the overflow-page count for
+several value sizes given your page size and per-page overhead, and confirm it is a ceiling division. (c) Optionally measure the density effect:
+build one table with a large value inline and one with it out-of-line, scan both reading only the small columns, and report pages read; state your
+toolchain and CPU and which results are exact arithmetic versus timed measurements.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part IX</div><h1>Storage Engines</h1><p class='part-blurb'>B-trees and LSM-trees implemented and analyzed — the two families and when each wins.</p></div>
+<section class="chapter" id="ch51">
+<h1>Chapter 51 — The B-Tree: A Search Tree on Disk</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (a random page read is the disk cliff, ~350&nbsp;&micro;s here;
+the number of page fetches, not comparisons, is what a disk structure pays), <a href="#ch47">Chapter 47</a> (the page — a B-tree node <em>is</em> a
+page), <a href="#ch48">Chapter 48</a> (nodes are fetched through the buffer pool; a shallow tree keeps its upper levels resident),
+<a href="#ch49">Chapter 49</a> (the RID a leaf stores to point at a heap row), <a href="#ch50">Chapter 50</a> (the storage-manager interface a B-tree
+is built entirely on — <code>fetchPage</code> and nothing lower). &nbsp;·&nbsp; The storage part gave you a table you can store and scan. This chapter
+opens the storage-engines part with the structure that gives a table <em>selective</em> access — find a few rows out of billions in a handful of page
+fetches — and it does so by being shaped for the disk, not the CPU.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch46">Chapter 46</a> — a random 4&nbsp;KiB page read cost about how long on this machine, and how does that compare to
+an in-memory comparison of two keys (nanoseconds)? (2) <a href="#ch49">Chapter 49</a> — the only way a heap file finds a specific row without an index
+is what, and what does it cost on a large table? (3) <em>Predict:</em> a balanced binary search tree over a billion keys is about 30 levels deep, and
+on disk each level is a separate page fetch. If instead you pack <em>hundreds</em> of keys into each node — one node per page — so the tree branches
+hundreds of ways at each level, roughly how many levels deep is the tree over a billion keys: still ~30, or a single-digit number? And what does that
+do to the number of disk reads for one look-up? Write your guesses; &sect;51.3 answers them.</p>
+</aside>
+
+<p>The heap file gives a table cheap storage and a cheap full scan, but only one way to find a specific row without reading everything: it has none —
+an unindexed look-up is a full scan (Chapter 49). What a database needs is <strong>selective</strong> access: find the handful of rows matching a key,
+or the range of rows between two keys, without touching the rest. That is the job of an <strong>index</strong>, and the dominant index structure in
+every relational database for fifty years is the <strong>B-tree</strong> — more precisely its variant the <strong>B+-tree</strong> — invented by Bayer
+and McCreight in 1972 and so pervasive that Comer's 1979 survey could already call it &ldquo;ubiquitous.&rdquo; The reason a B-tree, and not the
+balanced binary search tree every algorithms course teaches, is the entire point of this chapter: a binary tree is optimal when a node access is a
+memory operation, but on disk a node access is a <em>page fetch</em>, and the structure that wins is the one that minimizes page fetches, not
+comparisons. The B-tree wins by being <strong>wide and shallow</strong> — each node is a full page holding hundreds of keys, so the tree branches
+hundreds of ways per level and reaches billions of keys in three or four levels, which means three or four page fetches per look-up instead of the
+thirty a binary tree would pay. This chapter builds it in five steps: why the disk rules out the binary tree and demands high fanout (&sect;51.1); the
+B+-tree's shape — nodes are pages, internal nodes route, leaves hold the data and link together (&sect;51.2); the fanout-and-height arithmetic that
+makes three or four levels index billions, reproduced here (&sect;51.3); search, insert, and the node split that keeps the tree balanced, with its
+named trap of monotonically increasing keys (&sect;51.4); and what the B-tree carries into the rest of the storage-engines part (&sect;51.5).</p>
+
+<p><strong>On the code in this chapter.</strong> Two C programs, compiled with gcc 11.4.0 on this machine's Intel Core i7-12700H (glibc 2.35). The
+first computes <strong>fanout and height</strong> arithmetically — exact functions of the page size, key size, and pointer size stated — so its numbers
+are reproducible and hardware-independent (they describe the structure, not this machine). The second is a <strong>working in-memory B-tree</strong>
+that inserts keys in a fixed, seeded order and reports the resulting tree <em>height</em> and split count; the height is a structural result of the
+insertions, not a timing, and it is reported to confirm the arithmetic of &sect;51.3, not to clock anything. Where a page fetch's cost appears, it is
+the <a href="#ch48">Chapter 48</a> buffer-pool hit/miss and <a href="#ch46">Chapter 46</a> device figures measured earlier in this volume, cited here
+rather than re-measured (a hardware-counter profiler, <code>perf</code>, is not installed on this machine).</p>
+
+<h2>51.1 Why not a binary tree: the disk changes the calculus</h2>
+
+<p>Every algorithms course teaches the balanced binary search tree as the way to search: <em>O(log&nbsp;N)</em> comparisons, halving the search space
+at each step. That analysis is correct and, on disk, nearly useless — because it counts <em>comparisons</em>, and on disk the cost that matters is
+<em>page fetches</em>. A binary tree over a billion keys is about <strong>30 levels</strong> deep (log&#8322; of a billion), and if the tree does not
+fit in memory, each level you descend is a pointer to a different node on a different page — a separate page fetch, each one potentially the
+~350&nbsp;&micro;s disk read of <a href="#ch46">Chapter 46</a>. Thirty page fetches to find one key is a catastrophe: it is the disk cliff paid thirty
+times over. The comparisons themselves — thirty of them, tens of nanoseconds each — are free by comparison; the entire cost is in the page fetches,
+and a binary tree maximizes them by putting only one key (one branch decision) in each node, so each node visited advances the search by a single
+comparison. The fix is to invert that ratio: put <em>as many keys as fit in a page</em> into each node, so that a single page fetch advances the
+search by a <em>whole page's worth</em> of branching. If a node holds 254 keys and so has 255 children, then one page fetch narrows the search
+255-fold instead of 2-fold — and the number of fetches to reach any key falls from log&#8322;(N) to log&#8322;&#8325;&#8325;(N). This is the governing
+insight of on-disk data structures and the reason the B-tree exists: <strong>match the node to the page, and make the fanout as high as the page
+allows</strong>, because the unit of cost is the page fetch and a fat node amortizes each fetch over hundreds of branch decisions. The binary tree is
+not wrong; it is tuned for the wrong cost model — the RAM model of <a href="#ch01">Chapter 1</a>, where every access is unit cost — and the disk's
+cost model demands a wide, shallow tree instead.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>On disk, what is the unit of cost a search structure must minimize, and why does that make a binary search tree a poor choice despite its optimal
+comparison count? What single change turns it into a B-tree? (Answer after the next section.)</p>
+</aside>
+
+<h2>51.2 The B+-tree: nodes are pages, keys route, leaves hold the data</h2>
+
+<p>A <strong>B+-tree</strong> is a balanced search tree in which <strong>every node is one page</strong> (Chapter 47) and the tree is kept both sorted
+and balanced. It has two kinds of node. <strong>Internal nodes</strong> hold sorted keys and child pointers, and they exist only to <em>route</em>: a
+node with <var>m</var> sorted keys has <var>m</var>+1 child pointers, and to search for a
+key you find which of the <var>m</var>+1 gaps between the keys it falls into and follow that child. Internal nodes store no data, only keys-as-signposts and pointers to lower nodes.
+<strong>Leaf nodes</strong> sit at the bottom, hold the actual index entries — each a key together with a <strong>RID</strong> pointing at the heap row
+(Chapter 49), or the row itself in a clustered index — and, crucially, are <strong>linked together</strong> in key order: each leaf points to the next,
+so once a search reaches the correct leaf, a <em>range scan</em> can walk the linked leaves in sorted order without ever returning to the root. (This
+leaf-linking and the &ldquo;all data in the leaves&rdquo; rule are exactly what distinguish the B+-tree from the original B-tree, which stored data in
+internal nodes too; the B+-tree's design is what makes range scans efficient, which is why it, not the plain B-tree, is what real databases build —
+the two names are often used interchangeably, and this chapter means the B+-tree.) The whole structure obeys the <strong>B-tree balance
+invariant</strong>: every node except the root is kept at least half full, and <em>all leaves are at the same depth</em> — the tree is perfectly
+height-balanced at all times, so every look-up costs exactly the height in page fetches, no matter which key. That invariant is not free; it is
+maintained by the splitting of &sect;51.4. But its payoff is total: a B+-tree gives you exact-match look-up (descend to a leaf), range scan (descend
+once, then walk linked leaves), and ordered iteration (walk the leaf chain from the start) — all three of the accesses a heap file could not give
+cheaply — on a structure whose height, the next section shows, is astonishingly small.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: high fanout makes the tree shallow, so a look-up is a handful of page fetches</span>
+<p><strong>1. In words.</strong> Each node is a page holding hundreds of keys, so the tree branches by its fanout at every level; the height is
+therefore the fanout-base logarithm of the key count, which for a fanout in the hundreds is a single-digit number even for billions of keys. Height
+equals page fetches per look-up, so a shallow tree is a fast one.</p>
+<p><strong>2. As a picture.</strong> Figure 51.1: a three-level B+-tree — one root, a middle level fanning out by ~254, a leaf level fanning out again —
+drawn beside a tall thin binary tree of the same key count, the B+-tree three boxes tall and the binary tree running off the page at ~30.</p>
+<p><strong>3. As numbers.</strong> Computed here for a 4&nbsp;KiB page with 8-byte keys and 8-byte pointers: fanout <strong>254</strong>. Height to index
+a billion keys: <strong>4 levels</strong> (so 4 page fetches per look-up), against a binary tree's <strong>~30</strong> — the upper levels of the
+B-tree stay cached in the buffer pool (&sect;48), so in practice only the leaf fetch usually touches the disk.</p>
+</aside>
+
+<p><em>(Answer to the &sect;51.1 quick check: on disk the unit of cost is the <strong>page fetch</strong>, not the comparison. A binary search tree
+minimizes comparisons but puts one key per node, so it has ~log&#8322;(N) levels and pays one page fetch per level — ~30 for a billion keys, i.e. the
+disk cliff thirty times. The single change is to make each node a full page holding hundreds of keys, so one fetch branches hundreds of ways and the
+height collapses to log&#8322;&#8325;&#8325;(N) — that is a B-tree.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 230" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A B+-tree: each node is a page of ~254 keys, so 3-4 levels reach billions. Internal nodes route; linked leaves hold RIDs.</text>
+<rect x="270" y="30" width="100" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="276" y="44" font-size="8">root (page, ~254 keys)</text>
+<rect x="120" y="80" width="100" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="126" y="94" font-size="8">internal</text>
+<rect x="300" y="80" width="40" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="306" y="94" font-size="8">&hellip;</text>
+<rect x="420" y="80" width="100" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="426" y="94" font-size="8">internal</text>
+<path d="M300 50 L170 80" stroke="#333"/><path d="M320 50 L320 80" stroke="#333"/><path d="M340 50 L470 80" stroke="#333"/>
+<rect x="40" y="140" width="70" height="20" fill="#dff0df" stroke="#2f7d32"/><text x="46" y="154" font-size="7">leaf: k,RID</text>
+<rect x="120" y="140" width="70" height="20" fill="#dff0df" stroke="#2f7d32"/><text x="126" y="154" font-size="7">leaf: k,RID</text>
+<rect x="430" y="140" width="70" height="20" fill="#dff0df" stroke="#2f7d32"/><text x="436" y="154" font-size="7">leaf: k,RID</text>
+<rect x="520" y="140" width="70" height="20" fill="#dff0df" stroke="#2f7d32"/><text x="526" y="154" font-size="7">leaf: k,RID</text>
+<path d="M110 150 L120 150" stroke="#2f7d32" stroke-width="1.5"/><path d="M190 150 L200 150" stroke="#2f7d32" stroke-dasharray="3 3"/><path d="M500 150 L520 150" stroke="#2f7d32" stroke-width="1.5"/>
+<text x="40" y="180" font-size="8" fill="#2f7d32">leaves linked in key order &rarr; a range scan walks the chain without returning to the root</text>
+<text x="40" y="205" font-size="8" fill="#8c3a1d">fanout 254, height 4 for 1e9 keys = 4 page fetches; a binary tree would be ~30 levels.</text>
+</svg>
+<figcaption>Figure 51.1: a B+-tree. Every node is a page; internal nodes hold sorted keys and child pointers and only route; leaves hold (key, RID)
+entries and are linked in key order so a range scan walks the chain. With fanout ~254, four levels index a billion keys — four page fetches per
+look-up against a binary tree's ~30.</figcaption>
+</figure>
+
+<h2>51.3 Fanout and height: why three or four levels index billions</h2>
+
+<p>The B-tree's whole advantage is quantitative, so it is worth deriving. The <strong>fanout</strong> of an internal node is how many children it has,
+which is how many (key + child-pointer) pairs fit in a page: fanout &asymp; (page size &minus; header) / (key size + pointer size). For a 4&nbsp;KiB
+page with a small header, 8-byte keys, and 8-byte child pointers, that is (4096 &minus; 24) / 16 &asymp; <strong>254</strong>. The <strong>height</strong>
+— the number of levels, which equals the page fetches per look-up — is then the fanout-base logarithm of the number of keys: a leaf holds some entries,
+and each level up multiplies the reach by the fanout, so height &asymp; ceil(log-base-fanout of (N / leaf-entries)).
+Computed here across a few node sizes:</p>
+
+<pre><code>4-KiB page, exact fanout/height arithmetic:
+  8B key + 8B ptr : fanout=254, leaf entries=254
+     N = 1,000            -> height 2
+     N = 1,000,000        -> height 3
+     N = 1,000,000,000    -> height 4
+     N = 1,000,000,000,000-> height 5
+  16B key + 8B ptr: fanout=169 ->  N=1e9 -> height 5
+  32B key + 8B ptr: fanout=101 ->  N=1e9 -> height 5
+
+contrast: a balanced BINARY tree over 1e9 keys is ceil(log2) = 30 levels
+</code></pre>
+
+<p>This is the number that makes databases possible: with a fanout of 254, <strong>a billion keys are indexed in four levels</strong> — four page
+fetches to find any key, against a binary tree's thirty. And it is better than even four fetches suggests, because the tree is fetched through the
+buffer pool (Chapter 48): the root is one page and is essentially always resident; the second level is a few hundred pages and easily cached; so in
+steady state only the <em>leaf</em> fetch — the last level — actually reaches the disk, and a B-tree look-up on a billion-row table is, in practice,
+often a single disk read. The height grows with the logarithm, so it is extraordinarily flat: going from a billion keys to a trillion adds
+<em>one</em> level (height 5). This is why the B-tree scales — the cost of a look-up grows like the logarithm of the data with a base in the hundreds,
+which is to say it barely grows at all. A working B-tree confirms the arithmetic. An in-memory B-tree of order 8 (max 7 keys per node), inserting keys
+in a scrambled seeded order, produced these heights, each bracketed by the theoretical bounds ceil(log-base-<var>m</var> of N) &le; height &le;
+ceil(log-base-&lceil;<var>m</var>/2&rceil; of N) that a B-tree of order <var>m</var> guarantees:</p>
+
+<pre><code>working B-tree, order m=8 (max 7 keys/node), seeded insert order:
+  N =     1,000 : measured height 4   (bounds: log_8=4  .. log_4=5)
+  N =   100,000 : measured height 7   (bounds: log_8=6  .. log_4=9)
+  N = 10,000,000: measured height 10  (bounds: log_8=8  .. log_4=12)
+</code></pre>
+
+<p>Every measured height lands inside the bracket the invariant guarantees — the tree is provably balanced, its height logarithmic in the key count
+with the fanout as the base. (The measured heights sit above the full-node bound because randomly inserted nodes are on average only about 69% full,
+so the effective fanout is a little below the maximum — which is exactly why real systems care about node occupancy, the subject of the next section's
+trap.) Change <var>m</var> from 8 to 254 and the same logarithm gives the four-levels-for-a-billion result: the working tree and the arithmetic are the
+same claim at different fanouts.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>With a fanout of 254, why does a billion-key B-tree have height 4, and why in practice does a look-up often cost only one disk read rather than
+four? Roughly how many extra levels do you add going from a billion keys to a trillion? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>51.4 Search, insert, and the split that keeps it balanced</h2>
+
+<p><strong>Search</strong> is the easy operation and the one everything is arranged for: start at the root, in each internal node binary-search the
+sorted keys to find which child covers the target, follow it, and repeat until a leaf; then binary-search the leaf for the key and read its RID (or
+report absent). Exactly <em>height</em> page fetches, every time. <strong>Insert</strong> begins the same way — descend to the leaf where the key
+belongs — and then must add the entry while preserving the balance invariant, which is where the B-tree earns its keep. If the target leaf has room,
+the entry is inserted in sorted position and the job is done. If the leaf is <strong>full</strong>, it <strong>splits</strong>: the leaf's entries are
+divided into two half-full leaves, the new leaf is linked into the leaf chain, and the <em>separator key</em> (the first key of the new right leaf) is
+pushed <strong>up</strong> into the parent as a new routing key with a pointer to the new leaf. If that push fills the parent, the parent splits too,
+by the same rule, and the split can propagate up the tree. If it propagates all the way to the root and the root splits, a <strong>new root</strong> is
+created above the old one — and this is the only way a B-tree's height ever increases. That single detail is the source of the balance invariant: the
+tree grows <em>at the root</em>, upward, not at the leaves, so all leaves always stay at the same depth and the tree is never lopsided. Splitting is
+what pays for search's simplicity: because inserts do the work of keeping every path the same length, search never has to handle an unbalanced tree.
+Deletion is the mirror image — remove the entry, and if a node falls below half full, borrow from or merge with a sibling — though many real systems
+simplify deletion by tolerating under-full nodes and reclaiming them lazily. The costly case is the one where inserts arrive in a pattern that makes
+splitting pathological, and that is the named trap.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: monotonically increasing keys create a right-edge hotspot and half-empty pages</span>
+<p>Insert keys in <strong>monotonically increasing order</strong> — an auto-increment id, an appended timestamp, a sequence — and every insert lands
+in the <em>same</em> place: the rightmost leaf, because each new key is the largest so far. Two costs follow. First, a <strong>write hotspot</strong>:
+all inserts hit one leaf and its path to the root, so under concurrency every inserter contends on the same few pages and their latches, and the
+buffer pool churns that one hot path — the opposite of spreading load. Second, and subtler, <strong>space waste from naive splitting</strong>: when the
+rightmost leaf fills and splits 50/50, the left half is left half-full and, because all future keys are larger, it is <em>never inserted into
+again</em> — so a naive B-tree built by sequential insertion tends toward <strong>~50% page utilization</strong>, nearly doubling the tree's size and
+halving the effective fanout (which adds height, the very thing &sect;51.3 worked to avoid). Real systems defend against both: they detect append
+patterns and do an <em>unbalanced right-edge split</em> (keep the full left page, start a fresh nearly-empty right page) so sequential loads reach
+~100% fill, and they bulk-load sorted data bottom-up rather than by repeated insert. The counter-trap is over-correcting: switching a primary key to a
+<em>random</em> value (a UUID v4) to spread inserts destroys the locality that made range scans and cache residency cheap — now every insert lands on a
+random leaf, so the working set of dirty leaves is the whole tree instead of one hot page, and inserts miss the buffer pool constantly. &ldquo;Just use
+an auto-increment key&rdquo; and &ldquo;the index packs densely and inserts spread out&rdquo; are not both true under naive splitting; and &ldquo;use
+a random key to spread load&rdquo; trades a write hotspot for a cache-thrashing insert pattern. The honest answer is append-aware splitting (or sorted
+bulk-load), keeping both density and locality.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our primary key is an auto-increment integer and the index is fine, but someone suggested switching
+to random UUIDs so inserts spread across the tree and we avoid a hotspot on the last page. Should we?&rdquo; Cover the paragraph and respond in four
+or five sentences, drawing on &sect;51.3 and &sect;51.4.</p>
+<p><em>Model answer.</em> &ldquo;Be careful — that trades one problem for a worse one. An auto-increment key does put all inserts on the rightmost
+leaf, which is a contention hotspot and, with naive 50/50 splits, leaves the left pages half-full; but the fix for that is append-aware splitting,
+which most engines already do, so sequential keys actually pack densely and stay cache-friendly. Switching to random UUIDs scatters every insert to a
+random leaf, so instead of one hot page you now dirty leaves all over the tree — the working set of pages you're writing becomes the whole index
+rather than one page, and inserts start missing the buffer pool constantly, which is often slower overall. Random keys also throw away range-scan
+locality: rows inserted together no longer sit together. So keep the sequential key and rely on append-aware splitting (or bulk-load sorted), or if you
+genuinely need to spread writes, use a scheme that keeps locality — not a fully random key.&rdquo; Naming the right-edge hotspot, the density cost of
+naive splitting, and the cache-thrashing counter-trap of random keys is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;51.3 quick check: with fanout 254 the tree's height is &lceil;log&#8322;&#8325;&#8324;(1e9)&rceil; = 4, so four page
+fetches reach any key. In practice a look-up often costs one disk read because the root and the second level are few enough pages to stay resident in
+the buffer pool, so only the leaf fetch actually reaches the disk. Going from a billion to a trillion keys adds just one level — height 5 — because the
+height grows as the logarithm base 254.)</em></p>
+
+<h2>51.5 What to carry forward</h2>
+
+<p>On disk the unit of cost is the <strong>page fetch</strong>, not the comparison, so the balanced binary tree — optimal in comparisons but ~30
+levels and thus ~30 fetches over a billion keys — is the wrong structure; the <strong>B-tree</strong> makes each node a full page of hundreds of keys
+so one fetch branches hundreds of ways (&sect;51.1). A <strong>B+-tree</strong> is a balanced tree of pages: internal nodes hold sorted keys and child
+pointers and only route, leaves hold (key, RID) entries and are linked in key order for range scans, and the balance invariant keeps every node at
+least half full with all leaves at the same depth (&sect;51.2). <strong>Fanout</strong> &asymp; page/(key+pointer) &asymp; 254 for an 8-byte key on a
+4&nbsp;KiB page, giving <strong>height 4 for a billion keys</strong> — four page fetches, often just one disk read after caching, and only one extra
+level per thousandfold more data; a working B-tree's measured heights sit inside the guaranteed logarithmic bracket (&sect;51.3). <strong>Search</strong>
+is <em>height</em> fetches; <strong>insert</strong> descends and, if the leaf is full, <strong>splits</strong>, pushing a separator key up and growing
+the tree only at the root — which is what keeps it balanced — while <strong>monotonic keys</strong> create a right-edge hotspot and, under naive
+splitting, ~50% fill, defended by append-aware splitting rather than random keys (&sect;51.4).</p>
+
+<p>The B-tree is the first storage engine, and it is the workhorse: the default index in PostgreSQL, MySQL/InnoDB (whose tables <em>are</em> a
+B+-tree on the primary key), Oracle, SQL Server, and SQLite, and the structure most look-ups in most databases go through. It is built entirely on the
+storage manager of the previous part — a node is a page from <code>fetchPage</code>, a leaf stores a RID from the heap file — which is exactly why that
+interface was worth building. Its one structural bias is worth carrying forward as the setup for the next engine: the B-tree updates <em>in place</em>,
+splitting and rewriting pages where the keys belong, which makes look-ups and range scans excellent but makes a write a random page update — and a
+workload of many small random writes pays the random-write cost of Chapter 46 on every one. That bias is precisely the opening for the other great
+storage-engine family, the <strong>log-structured merge tree</strong>, which inverts the trade: it turns random writes into sequential ones by buffering
+in memory and flushing sorted runs, paying instead at read time to merge them. The B-tree optimizes reads and range scans; the LSM-tree optimizes
+writes; and the choice between them is the central storage-engine decision the rest of this part unfolds. The heap gave you a table; the storage
+manager gave you the interface; the B-tree gives you the first fast, selective, ordered access to a table — a handful of page fetches to find any row
+among billions.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Explain why a binary search tree is the wrong structure on disk despite its optimal comparison count.</li>
+<li>Describe a B+-tree's two node types, what each holds, and why leaves are linked.</li>
+<li>State the fanout formula and compute it for an 8-byte key on a 4&nbsp;KiB page.</li>
+<li>Explain why a billion-key B-tree has height 4 and often costs one disk read per look-up.</li>
+<li>Describe a node split, why it pushes a key up, and why the tree grows only at the root.</li>
+<li>Explain the monotonic-key trap — hotspot and ~50% fill — and why random keys are the wrong fix.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> On disk, what cost must a search structure minimize, and why does that rule out the binary search tree? (&sect;51.1)</li>
+<li><strong>R2.</strong> What do a B+-tree's internal nodes and leaves each hold, and why are the leaves linked? (&sect;51.2)</li>
+<li><strong>R3.</strong> Write the fanout formula and explain why height 4 indexes a billion keys with fanout ~254. (&sect;51.3)</li>
+<li><strong>R4.</strong> Walk through a leaf split: what is divided, what is pushed up, and how does the tree's height ever grow? (&sect;51.4)</li>
+<li><strong>R5.</strong> Why do monotonically increasing keys cause a hotspot and ~50% fill, and why is a random key the wrong fix? (&sect;51.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Rudolf Bayer &amp; Edward M. McCreight, &ldquo;Organization and Maintenance of Large Ordered Indexes,&rdquo; <em>Acta Informatica</em>
+1(3), 1972, pp. 173&ndash;189, DOI 10.1007/BF00288683.</strong> The original paper introducing the B-tree and the split-and-grow-at-the-root
+maintenance of &sect;51.4. First author Rudolf Bayer; venue, volume, pages, year, and DOI verified via SpringerLink.</li>
+<li><strong>Douglas Comer, &ldquo;The Ubiquitous B-Tree,&rdquo; <em>ACM Computing Surveys</em> 11(2), 1979, pp. 121&ndash;137, DOI 10.1145/356770.356776.</strong>
+The classic survey behind &sect;51.1&ndash;&sect;51.2: the B-tree versus B+-tree distinction, the leaf-linking that makes range scans efficient, and
+why the structure is everywhere. Sole author Douglas Comer; venue, volume, pages, year, and DOI verified via the ACM Digital Library.</li>
+<li><strong>Goetz Graefe, &ldquo;Modern B-Tree Techniques,&rdquo; <em>Foundations and Trends in Databases</em> 3(4), 2011, pp. 203&ndash;402,
+DOI 10.1561/1900000028.</strong> The comprehensive modern survey: fanout and occupancy, splitting and bulk-loading (the &sect;51.4 trap and its
+fixes), and the transactional and concurrency techniques real B-trees use. Sole author Goetz Graefe; venue, volume, pages, year, and DOI verified via
+the ACM Digital Library and publisher.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003 (ISBN 978-0072465631),
+Chapter 10, &ldquo;Tree-Structured Indexing.&rdquo;</strong> The textbook development of the B+-tree, its search/insert/split, and the fanout/height
+arithmetic of &sect;51.3. First authors Raghu Ramakrishnan and Johannes Gehrke; edition, publisher, year, and ISBN verified via the publisher and
+retailer listings.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex51.1"><span class="ex-label">51.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is the unit of cost a disk search structure minimizes, and why does that favor a wide, shallow tree over a binary one?</div>
+
+<div class="exercise" id="ex51.2"><span class="ex-label">51.2</span> <span class="ex-tag warm">warm-up</span>
+In a B+-tree, what do internal nodes hold and what do leaves hold, and why are the leaves linked together in key order?</div>
+
+<div class="exercise" id="ex51.3"><span class="ex-label">51.3</span> <span class="ex-tag warm">warm-up</span>
+For a 4&nbsp;KiB page with 8-byte keys and 8-byte pointers, roughly what is the fanout, and how many levels index a billion keys? How many page
+fetches is a look-up?</div>
+
+<div class="exercise" id="ex51.4"><span class="ex-label">51.4</span> <span class="ex-tag core">core</span>
+Fanout and height. (a) Write the fanout formula in terms of page size, header, key size, and pointer size. (b) Compute the fanout for 16-byte keys
+and 8-byte pointers on a 4&nbsp;KiB page. (c) Using that fanout, estimate the height needed to index a billion keys, and explain why doubling the key
+size does not double the height.</div>
+
+<div class="exercise" id="ex51.5"><span class="ex-label">51.5</span> <span class="ex-tag core">core</span>
+The split. (a) Describe what happens when an insert lands in a full leaf: what is divided, what is created, and what is pushed up. (b) Explain why a
+split can propagate up the tree, and what happens when it reaches the root. (c) Explain how &ldquo;grow only at the root&rdquo; keeps all leaves at
+the same depth.</div>
+
+<div class="exercise" id="ex51.6"><span class="ex-label">51.6</span> <span class="ex-tag core">core</span>
+Binary tree versus B-tree on disk. (a) How many levels does a balanced binary tree over a billion keys have, and how many page fetches would a
+look-up cost if the tree does not fit in memory? (b) How many does a fanout-254 B-tree cost? (c) Explain why the comparison count (both ~30 for the
+binary tree's descent) is irrelevant to the on-disk cost.</div>
+
+<div class="exercise" id="ex51.7"><span class="ex-label">51.7</span> <span class="ex-tag complexity">cost</span>
+Caching the upper levels. (a) A fanout-254 B-tree over a billion keys has height 4; estimate how many pages the root and second level together
+occupy, and argue they stay resident in a reasonable buffer pool. (b) Given that, how many of the 4 page fetches typically reach the disk? (c) Using
+the Chapter 48 hit (~36&nbsp;ns) and miss (~350&nbsp;&micro;s) costs, estimate the effective cost of a look-up when only the leaf misses.</div>
+
+<div class="exercise" id="ex51.8"><span class="ex-label">51.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team loads a billion rows into a table whose primary-key index is a B+-tree, inserting rows in
+increasing key order, and finds the index is nearly twice the size they expected.
+<br><strong>Step 1 (given):</strong> increasing keys always land in the rightmost leaf, which fills and splits.
+<br><strong>Step 2 (given):</strong> a naive 50/50 split leaves the left half half-full, and no future (larger) key is ever inserted into it.
+<br><strong>Step 3 (given):</strong> so pages settle near 50% utilization, roughly doubling the page count.
+<br><strong>Step 4 (you):</strong> Explain why the index is about twice the expected size and what effect the lower fill has on height and look-up
+cost, then name the fix that keeps sequential loads dense.</div>
+
+<div class="exercise" id="ex51.9"><span class="ex-label">51.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the B+-tree concept responsible — <em>fanout</em>, <em>leaf linking</em>, <em>node split</em>, <em>the balance invariant</em>, or
+<em>the RID in the leaf</em> — and why: (a) a range scan walks in sorted order without returning to the root; (b) every look-up costs the same number
+of fetches regardless of key; (c) hundreds of keys fit in one node; (d) the tree stays balanced as it grows; (e) a leaf entry points at the actual
+heap row.</div>
+
+<div class="exercise" id="ex51.10"><span class="ex-label">51.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A B+-tree stores data in its internal nodes.&rdquo; (b) &ldquo;A
+B-tree's height grows when a leaf splits.&rdquo; (c) &ldquo;Doubling the number of keys roughly doubles a B-tree's height.&rdquo; (d) &ldquo;Sequential
+key insertion, split naively, tends toward ~50% page fill.&rdquo; (e) &ldquo;On disk, the binary search tree is preferred because it makes the fewest
+comparisons.&rdquo;</div>
+
+<div class="exercise" id="ex51.11"><span class="ex-label">51.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the access path. (a) Trace a point look-up by key end to end: descend the B-tree (&sect;51.4) fetching each node via the storage manager
+(&sect;50) through the buffer pool (&sect;48), reach the leaf, read the RID, and fetch the heap row (&sect;49) — count the page fetches and say which
+usually hit versus miss. (b) Explain why the B-tree is built entirely on the previous part's <code>fetchPage</code> interface and what that bought.
+(c) Argue that the B-tree's in-place update bias is exactly what motivates the log-structured alternative, using the Chapter 46 random-write cost.</div>
+
+<div class="exercise" id="ex51.12"><span class="ex-label">51.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Write a program that computes fanout and B-tree height for a page size, key size, and pointer size, and
+tabulate the height for N from a thousand to a trillion. (b) Implement a working in-memory B-tree (choose an order <var>m</var>), insert keys in a
+seeded order, and report the measured height and split count, checking it against the bracket ceil(log-base-<var>m</var> of N) &le; height &le;
+ceil(log-base-&lceil;<var>m</var>/2&rceil; of N). (c) State your toolchain and CPU, and explain which results are exact arithmetic and which are
+structural outcomes of a deterministic insert order — and why neither is a wall-clock timing.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part X</div><h1>Durability & Recovery</h1><p class='part-blurb'>Write-ahead logging, ARIES, checkpoints, and crash recovery — how a database keeps its promises across failures.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XI</div><h1>Transactions & Concurrency Control</h1><p class='part-blurb'>ACID, isolation levels and their anomalies, 2PL, MVCC, and OCC — correctness under concurrency, implemented.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XII</div><h1>Query Processing & Execution</h1><p class='part-blurb'>Parser, planner, physical operators, and execution models (Volcano/vectorized/codegen) — turning SQL into work.</p></div>
@@ -24891,6 +25986,285 @@ and distinguishes the <em>measured</em> latencies (device- and machine-dependent
 comparison of policies) — the distinction matters because only the simulation is a claim independent of hardware. <em>Tempting wrong answer:</em>
 presenting simulated hit rates as timed measurements — they are a deterministic policy comparison, not a clock reading. <strong>Feed-forward:</strong>
 &sect;48.3&ndash;&sect;48.4.</div>
+
+</section>
+
+<section class="solutions" id="sol49">
+<h1>Chapter 49 — Solutions</h1>
+
+<div class="solution" id="sol49.1"><span class="sol-label">49.1</span>
+It promises only that every record inserted and not yet deleted is returned exactly once by a scan. It deliberately does <em>not</em> promise any
+order — rows come back in whatever physical order they happen to occupy, because they were placed wherever there was free space. <em>Tempting wrong
+answer:</em> &ldquo;rows come back sorted by key&rdquo; — that ordering is an index's job, not the heap's. <strong>Feed-forward:</strong> &sect;49.1.</div>
+
+<div class="solution" id="sol49.2"><span class="sol-label">49.2</span>
+The page number is a direct index into the file's linear page space and the slot number is a direct index into that page's slot array, so no search
+is needed: index the file to compute the byte offset of the page, fetch that one page through the buffer pool, and index the slot array to read the
+record's in-page offset and length. Two array indexings, one page fetch. <em>Tempting wrong answer:</em> &ldquo;you scan the page for the
+record&rdquo; — the slot array gives the offset directly. <strong>Feed-forward:</strong> &sect;49.1.</div>
+
+<div class="solution" id="sol49.3"><span class="sol-label">49.3</span>
+The linked-list heap cost about 3,542 data-page fetches per insert; the page directory cost zero data-page fetches to <em>locate</em> free space (the
+search is an in-memory scan of the directory array), plus one fetch to write. The linked-list number is not a constant because it walks the chain of
+pages until one has room, and as the file fills with mostly-full pages that walk gets longer — the cost grows with file size. <em>Tempting wrong
+answer:</em> &ldquo;both are roughly constant&rdquo; — only the directory is; the list is <em>O(pages)</em>. <strong>Feed-forward:</strong> &sect;49.2.</div>
+
+<div class="solution" id="sol49.4"><span class="sol-label">49.4</span>
+(a) A linked-list heap finds room by fetching each page and reading its free-space header, walking from the front; more pages (and fuller ones) mean
+a longer walk, so cost rises with the file. (b) A page directory keeps a compact per-page free-space entry in a separate in-memory array; the search
+scans that array (a memory op) and touches no data page until it fetches the single chosen page to write. (c) Linked list: <em>O(pages)</em> page
+fetches to find room; page directory: <em>O(1)</em> data-page fetches (an in-memory scan plus one write). For a growing table the first is
+unbounded and the second is flat — decisive. <em>Tempting wrong answer:</em> &ldquo;the directory is a constant-factor win&rdquo; — it changes the
+asymptotics, not just a constant. <strong>Feed-forward:</strong> &sect;49.2.</div>
+
+<div class="solution" id="sol49.5"><span class="sol-label">49.5</span>
+(a) Same-size-or-smaller fits in the record's existing space, so the heap overwrites in place and only adjusts the slot length; a larger record may
+exceed the page's remaining free bytes, so it cannot stay. (b) Moving it would change its physical location — its (page, slot) RID — and every index
+entry storing that RID would dangle. (c) A forwarding pointer leaves a tombstone at the old RID redirecting to the record's new page, keeping the RID
+valid; the cost is two page fetches on every later read — the original page for the pointer, then the page where the row now lives. <em>Tempting
+wrong answer:</em> &ldquo;just move it and update the indexes&rdquo; — that requires touching every index and is what the forwarding pointer avoids.
+<strong>Feed-forward:</strong> &sect;49.3.</div>
+
+<div class="solution" id="sol49.6"><span class="sol-label">49.6</span>
+(a) A workload that repeatedly grows rows after insertion — a status field that lengthens, a JSON/array column that gains elements, a null filled with
+a long string — so updates keep outgrowing their pages. (b) Each migration adds one forwarding pointer, turning one row's reads from one fetch to two;
+the aggregate is a slow one-to-two I/O drift that appears with no schema or index change and is easy to misattribute. (c) Compaction/reorganization
+(rewrite rows into fresh dense pages, collapsing redirects) and fill-factor headroom (leave free space per page so a grown update stays in place) — the
+first removes existing forwards, the second prevents new ones. <em>Tempting wrong answer:</em> &ldquo;add an index&rdquo; — an index does not remove
+forwarding pointers; the RID it stores still lands on the tombstone. <strong>Feed-forward:</strong> &sect;49.3.</div>
+
+<div class="solution" id="sol49.7"><span class="sol-label">49.7</span>
+(a) A full scan reads all <var>P</var> pages, cost <em>O(P)</em> page reads, and they are sequential — front-to-back over the file's page space — which
+Chapter 46 measured as far cheaper than random because the device streams and the system reads ahead. (b) A point look-up by RID is one page fetch if
+the row has not migrated, two if it has (tombstone then real page). (c) Average cost &asymp; (1&minus;<var>m</var>)&nbsp;&times;&nbsp;1&nbsp;+&nbsp;<var>m</var>&nbsp;&times;&nbsp;2
+&nbsp;=&nbsp;1&nbsp;+&nbsp;<var>m</var> fetches; compaction lowers <var>m</var> (fewer forwards, cheaper look-ups) and raises tuple density (more live
+rows per sequential page, cheaper scans). <em>Tempting wrong answer:</em> &ldquo;the scan is random because rows are unordered&rdquo; — the pages are
+read in file order, which is sequential regardless of record order within them. <strong>Feed-forward:</strong> &sect;49.4.</div>
+
+<div class="solution" id="sol49.8"><span class="sol-label">49.8</span>
+<strong>Step 4:</strong> The scan is slow because it reads every page whether dense or not, and a year of updates has left pages half-empty and
+dotted with forwarding pointers, so the scan streams many pages that carry few live rows — the device is fast but it is moving mostly dead space and
+overhead. The fix without an index is to <strong>reorganize/compact</strong> the table (e.g. <code>VACUUM FULL</code> / a table rewrite), which packs
+live rows densely into fresh pages and collapses the forwards, so the same sequential bandwidth now returns far more live rows per page and the scan
+touches fewer pages. <em>Tempting wrong answer:</em> &ldquo;buy faster storage&rdquo; — the device is already streaming; the waste is low density,
+which compaction, not bandwidth, fixes. <strong>Feed-forward:</strong> &sect;49.4.</div>
+
+<div class="solution" id="sol49.9"><span class="sol-label">49.9</span>
+(a) <strong>RID</strong> — the index stores the (page, slot) address, so following it is one direct fetch. (b) <strong>Page directory</strong> — the
+free-space search is an in-memory array scan, no data-page fetches. (c) <strong>Forwarding pointer</strong> — the tombstone at the old RID keeps the
+address valid after the row moves. (d) <strong>Slot array</strong> — indirection lets a deleted record leave a hole reclaimed at compaction. (e)
+<strong>Sequential scan</strong> — reading all pages in file order is cheap sequential I/O. <em>Tempting wrong answer:</em> attributing (a) to the
+page directory — the directory is for free space, the RID is the row address. <strong>Feed-forward:</strong> &sect;49.1&ndash;&sect;49.4.</div>
+
+<div class="solution" id="sol49.10"><span class="sol-label">49.10</span>
+(a) <strong>False</strong> — a heap file returns rows in physical order, which need not be insertion order (deletes and reuse scramble it). (b)
+<strong>True</strong> — the directory search is in memory, so locating free space costs zero data-page fetches. (c) <strong>False</strong> — a shrink
+fits in place; only a grow past the page needs relocation. (d) <strong>False</strong> — a forwarding pointer makes reads <em>more</em> expensive (two
+fetches), not cheaper; it only preserves the RID. (e) <strong>False</strong> — a full table scan reads pages in file order, which is sequential I/O.
+<em>Tempting wrong answer:</em> marking (a) true because inserts append — reuse of freed slots breaks insertion order. <strong>Feed-forward:</strong>
+&sect;49.1&ndash;&sect;49.4.</div>
+
+<div class="solution" id="sol49.11"><span class="sol-label">49.11</span>
+(a) Insert: scan the free-space <em>directory</em> in memory to pick a page with room (&sect;49.2); fetch that page through the buffer pool (&sect;48);
+write the record into free space and add a slot pointing at it (&sect;47); update the page and directory free-space counts; return the RID (page,
+slot). (b) Both a free-space directory and an index are a small, searchable structure kept beside the data so you need not scan the data to answer a
+question: the directory answers &ldquo;which page has room for a record of size <var>b</var>?&rdquo; and an index answers &ldquo;which page (RID)
+holds key <var>k</var>?&rdquo; (c) A single always-sorted file would make inserts expensive (shifting to maintain order) while a heap keeps inserts
+cheap (&sect;49.2) and cheap sequential scans (&sect;49.4), and lets indexes supply order/selectivity separately — so the heap-plus-index split gives
+cheap writes, cheap full reads, and cheap selective reads at once. <em>Tempting wrong answer:</em> &ldquo;a sorted file is strictly better because
+lookups are fast&rdquo; — it pays for that with costly ordered inserts the heap avoids. <strong>Feed-forward:</strong> &sect;49.1&ndash;&sect;49.5.</div>
+
+<div class="solution" id="sol49.12"><span class="sol-label">49.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports data-page-fetch counts to locate room for a linked-list walk versus a page-directory
+scan over the same seeded reference string, their ratio, and how the linked-list count rises as the file grows (the directory stays flat); (b) reports
+the two-fetch read rate after injecting growing updates that leave forwarding pointers; (c) states toolchain and CPU and distinguishes these
+<em>exact counts</em> from a deterministic simulation (reproducible and hardware-independent — the claim that travels) from any wall-clock timing
+(machine- and disk-dependent). <em>Tempting wrong answer:</em> presenting the fetch counts as timings — they are structural counts, not clock
+readings, which is exactly why they are portable. <strong>Feed-forward:</strong> &sect;49.2&ndash;&sect;49.4.</div>
+
+</section>
+
+<section class="solutions" id="sol50">
+<h1>Chapter 50 — Solutions</h1>
+
+<div class="solution" id="sol50.1"><span class="sol-label">50.1</span>
+The storage manager owns physical storage and exposes it as a narrow interface of pages and records, hiding the buffer pool, slotted pages, free-space
+directory, and device. Two of its calls: <code>fetchPage</code>/<code>unpinPage</code> (read a page), <code>allocatePage</code>/<code>freePage</code>
+(grow/shrink), <code>readRecord</code>/<code>insertRecord</code> (records). <em>Tempting wrong answer:</em> &ldquo;it manages the disk hardware&rdquo; —
+it manages the abstraction of pages and records <em>over</em> storage, hiding the hardware. <strong>Feed-forward:</strong> &sect;50.1.</div>
+
+<div class="solution" id="sol50.2"><span class="sol-label">50.2</span>
+A PageId is (file identifier, page number within that file). The RID is properly (PageId, slot) because a real database has many files — tables,
+indexes, log — so a bare page number is ambiguous; the file id disambiguates, and page number &times; page size gives the offset. <em>Tempting wrong
+answer:</em> &ldquo;a global page number is enough&rdquo; — it ties every page to one file and one growth path. <strong>Feed-forward:</strong> &sect;50.2.</div>
+
+<div class="solution" id="sol50.3"><span class="sol-label">50.3</span>
+About 258 overflow pages (&lceil;1&nbsp;MiB / ~4072&nbsp;B&rceil;). In place of the value the row keeps a small pointer to the head of the overflow
+chain. <em>Tempting wrong answer:</em> &ldquo;256&rdquo; from 1&nbsp;MiB / 4&nbsp;KiB exactly — per-page overhead reduces the usable bytes, so it is
+258, not 256. <strong>Feed-forward:</strong> &sect;50.3.</div>
+
+<div class="solution" id="sol50.4"><span class="sol-label">50.4</span>
+(a) The buffer pool (page table, pin counts, dirty bits, eviction), the device beneath it, and whether the access was a hit or a disk read. (b) The
+B-tree calls only <code>fetchPage</code>/<code>unpinPage</code> and treats a node as a page, so it never issues a <code>pread</code> or picks a victim
+— it can be written purely in terms of pages. (c) Example: the buffer pool switching from clock to LRU-K eviction, or the heap switching from a
+linked list to a page directory — the layers above call the same interface and are unaffected, because the interface names pages/records, not
+mechanisms. <em>Tempting wrong answer:</em> &ldquo;the B-tree still needs to know the eviction policy for correctness&rdquo; — it does not; pinning is
+the only guarantee it needs, and the interface provides it. <strong>Feed-forward:</strong> &sect;50.1.</div>
+
+<div class="solution" id="sol50.5"><span class="sol-label">50.5</span>
+(a) &lceil;<var>S</var> / (<var>P</var>&minus;<var>h</var>)&rceil; overflow pages. (b) With <var>P</var>&minus;<var>h</var> = 4072:
+64&nbsp;KiB &rarr; &lceil;65536/4072&rceil; = 17; 1&nbsp;MiB &rarr; &lceil;1048576/4072&rceil; = 258. (c) Benefits: the row stays small (many rows per
+heap page, dense scans) and the value is pay-per-use (fetched only when its column is read). Cost: a linked overflow chain must be walked to reach a
+deep offset, so random access into the middle of a large value is <em>O(chain)</em>. <em>Tempting wrong answer:</em> using <var>P</var> not
+<var>P</var>&minus;<var>h</var> — the per-page overhead reduces usable bytes. <strong>Feed-forward:</strong> &sect;50.3.</div>
+
+<div class="solution" id="sol50.6"><span class="sol-label">50.6</span>
+(a) &lfloor;<var>U</var>/<var>R</var>&rfloor; rows fit a page; inlining a 1&nbsp;MiB value makes <var>R</var> &gt; a page, so the count drops to one row
+per page (or fewer, with its own overflow). (b) A full scan reads whole pages; if each page holds one bloated row, the scan reads a megabyte per row
+regardless of which columns the query wants — it cannot skip the inline bytes. (c) Store values beyond a threshold (roughly a quarter of a page)
+out-of-line; this keeps rows small so density — and the cheap scan — is preserved. <em>Tempting wrong answer:</em> &ldquo;the scan reads only the
+requested columns&rdquo; — I/O is by page, so inlined bytes are read whether wanted or not. <strong>Feed-forward:</strong> &sect;50.3.</div>
+
+<div class="solution" id="sol50.7"><span class="sol-label">50.7</span>
+(a) Small rows: about &lceil;<var>N</var>/<var>d</var>&rceil; pages; inlined 1&nbsp;MiB value: about <var>N</var> pages (one row each), each ~256&times;
+larger. (b) The inlined scan moves on the order of <var>d</var>&nbsp;&times;&nbsp;(1&nbsp;MiB / small-row-size) times more bytes — many hundreds of
+times — all at the sequential per-page cost of Chapters 46/48, so the scan is I/O-bound on data it never uses. (c) Out-of-line storage puts only a
+pointer in the row, so the scanned page size depends on the inline columns; the large value's bytes are elsewhere and are read only if that column is
+selected. <em>Tempting wrong answer:</em> &ldquo;sequential reads are cheap, so size doesn't matter&rdquo; — cheap per byte, but hundreds of times
+more bytes is still hundreds of times more time. <strong>Feed-forward:</strong> &sect;50.3&ndash;&sect;50.4.</div>
+
+<div class="solution" id="sol50.8"><span class="sol-label">50.8</span>
+<strong>Step 4:</strong> One page fetch. <code>readRecord</code> does a single <code>fetchPage</code> for the heap page, indexes the slot, and reads
+the inline <code>id</code> and <code>title</code>; <code>body</code> is only a pointer in the row, so its size is irrelevant — the overflow chain is
+never touched. If the query <em>did</em> select <code>body</code>, the storage manager would follow the pointer and fetch the overflow chain — about
+&lceil;|body| / usable-bytes&rceil; further page fetches — so the cost would then scale with the value's size. <em>Tempting wrong answer:</em>
+&ldquo;the big value is always read with the row&rdquo; — out-of-line means it is fetched only when its column is selected. <strong>Feed-forward:</strong>
+&sect;50.3&ndash;&sect;50.4.</div>
+
+<div class="solution" id="sol50.9"><span class="sol-label">50.9</span>
+(a) <strong>The interface (encapsulation)</strong> — the B-tree uses <code>fetchPage</code>, never raw I/O. (b) <strong>Out-of-line storage</strong> —
+the row holds a pointer to the document's overflow chain. (c) <strong>PageId</strong> — a small comparable (file, page) name across files. (d)
+<strong>RID</strong> — the (PageId, slot) row address stored in the index leaf. (e) <strong>fetchPage</strong> — it returns a pinned frame pointer
+whether the page was resident or read from disk. <em>Tempting wrong answer:</em> attributing (a) to <code>fetchPage</code> alone — it is the interface
+abstraction, of which <code>fetchPage</code> is one call, that provides the independence. <strong>Feed-forward:</strong> &sect;50.1&ndash;&sect;50.3.</div>
+
+<div class="solution" id="sol50.10"><span class="sol-label">50.10</span>
+(a) <strong>False</strong> — it exposes pages and records; disk offsets and frame indices are exactly what it hides. (b) <strong>True</strong> — a page
+keeps its PageId for its lifetime, which is why stored PageIds stay valid. (c) <strong>False</strong> — compression may shrink it but a 10&nbsp;MiB
+value generally still exceeds a page and needs out-of-line storage. (d) <strong>False</strong> — inlining a large value <em>slows</em> scans that never
+read it, by reading its bytes on every page. (e) <strong>True</strong> — the value lives elsewhere and is fetched only when its column is read.
+<em>Tempting wrong answer:</em> marking (c) true because &ldquo;compression fixes size&rdquo; — it reduces but does not remove the need for overflow.
+<strong>Feed-forward:</strong> &sect;50.1&ndash;&sect;50.3.</div>
+
+<div class="solution" id="sol50.11"><span class="sol-label">50.11</span>
+(a) RID = (file, page, slot) &rarr; <code>fetchPage(PageId)</code> &rarr; buffer-pool page-table lookup: hit = frame in DRAM (~36&nbsp;ns), miss =
+evict a victim (write back if dirty), compute offset, read the 4&nbsp;KiB page from the device (~350&nbsp;&micro;s, Chapters 46/48) &rarr; pin, index
+the slot array (Chapters 47/49) &rarr; read bytes, following a forwarding pointer (&sect;49.3) or overflow chain (&sect;50.3) if present &rarr; unpin,
+return. (b) A B-tree node <em>is</em> a page reached by <code>fetchPage</code> and a leaf stores a <em>RID</em>; both are exactly what this part
+defined, so the B-tree is buildable purely on the interface, with no I/O code of its own. (c) Both put a small, stable name in front of variable,
+growing data: a PageId names a page across growing files; an out-of-line pointer names a value that outgrew its page — the same instinct at two
+scales. <em>Tempting wrong answer:</em> &ldquo;the B-tree needs its own disk layer&rdquo; — the storage manager already is that layer.
+<strong>Feed-forward:</strong> &sect;50.1&ndash;&sect;50.5.</div>
+
+<div class="solution" id="sol50.12"><span class="sol-label">50.12</span>
+Open-ended and platform-specific. A correct write-up: (a) sketches the six-call interface and implements <code>readRecord</code> as one
+<code>fetchPage</code> plus a slot index (no raw I/O above the interface); (b) computes overflow-page counts as an exact ceiling division
+&lceil;<var>S</var>/(<var>P</var>&minus;<var>h</var>)&rceil; for several sizes and confirms the pattern; (c) if it measures the density effect, states
+toolchain and CPU and separates the <em>exact arithmetic</em> (page counts, reproducible and hardware-independent) from any <em>timed</em> scan
+(machine- and disk-dependent). <em>Tempting wrong answer:</em> reporting the overflow-page arithmetic as a measurement — it is exact arithmetic, not a
+clock reading. <strong>Feed-forward:</strong> &sect;50.1&ndash;&sect;50.4.</div>
+
+</section>
+
+<section class="solutions" id="sol51">
+<h1>Chapter 51 — Solutions</h1>
+
+<div class="solution" id="sol51.1"><span class="sol-label">51.1</span>
+The page fetch. A wide, shallow tree is favored because each page fetch is enormously expensive (the disk cliff), so the structure that minimizes
+fetches wins; a binary tree makes the fewest <em>comparisons</em> but one page fetch per level, ~30 levels over a billion keys, which is 30 fetches.
+<em>Tempting wrong answer:</em> &ldquo;minimize comparisons&rdquo; — that is the RAM-model cost; on disk comparisons are free and fetches are the
+cost. <strong>Feed-forward:</strong> &sect;51.1.</div>
+
+<div class="solution" id="sol51.2"><span class="sol-label">51.2</span>
+Internal nodes hold sorted keys and child pointers and only route (no data); leaves hold the index entries — (key, RID) pairs pointing at heap rows —
+and are linked in key order. The linking lets a range scan, once it reaches the first matching leaf, walk the leaf chain in sorted order without
+returning to the root. <em>Tempting wrong answer:</em> &ldquo;internal nodes store the data too&rdquo; — that is the plain B-tree; the B+-tree keeps
+all data in the leaves, which is what makes range scans efficient. <strong>Feed-forward:</strong> &sect;51.2.</div>
+
+<div class="solution" id="sol51.3"><span class="sol-label">51.3</span>
+Fanout &asymp; (4096&minus;24)/(8+8) &asymp; 254; a billion keys need 4 levels, so a look-up is 4 page fetches. <em>Tempting wrong answer:</em>
+&ldquo;a few dozen fetches&rdquo; — that is the binary-tree figure; the B-tree's high fanout makes it single digits. <strong>Feed-forward:</strong>
+&sect;51.3.</div>
+
+<div class="solution" id="sol51.4"><span class="sol-label">51.4</span>
+(a) fanout &asymp; (page size &minus; header) / (key size + pointer size). (b) (4096&minus;24)/(16+8) &asymp; 169. (c) With fanout 169, a billion keys
+need height &asymp; ceil(log-base-169 of (1e9/169)) which is about 5 levels; doubling the key size only lowers the fanout (here 254&rarr;169), and
+since height is a <em>logarithm</em> of N in that base, a modest base change adds at most a level — it does not double the height. <em>Tempting wrong
+answer:</em> &ldquo;bigger keys double the height&rdquo; — height depends on log-base-fanout, so it changes slowly. <strong>Feed-forward:</strong>
+&sect;51.3.</div>
+
+<div class="solution" id="sol51.5"><span class="sol-label">51.5</span>
+(a) The full leaf's entries are divided into two half-full leaves; a new leaf node is created and linked into the leaf chain; the separator key (the
+first key of the new right leaf) is pushed up into the parent with a pointer to the new leaf. (b) If the push fills the parent, the parent splits by
+the same rule, and so on up; if it reaches and splits the root, a new root is created above the old one. (c) Because growth happens only by adding a
+new root on top, every existing leaf keeps its depth and a whole new level is added uniformly — so all leaves stay at the same depth. <em>Tempting
+wrong answer:</em> &ldquo;the tree grows by making a leaf deeper&rdquo; — leaves never deepen individually; the tree grows at the root.
+<strong>Feed-forward:</strong> &sect;51.4.</div>
+
+<div class="solution" id="sol51.6"><span class="sol-label">51.6</span>
+(a) About 30 levels (log&#8322; of a billion), so ~30 page fetches if the tree is not resident. (b) 4 fetches (height 4). (c) The ~30 comparisons on
+the binary descent cost tens of nanoseconds total and are irrelevant; the on-disk cost is entirely the ~30 page fetches versus 4, each fetch being
+potentially a ~350&nbsp;&micro;s disk read. <em>Tempting wrong answer:</em> &ldquo;both do ~30 comparisons so they're similar&rdquo; — comparisons are
+free; the fetch count differs 30 vs 4. <strong>Feed-forward:</strong> &sect;51.1&ndash;&sect;51.3.</div>
+
+<div class="solution" id="sol51.7"><span class="sol-label">51.7</span>
+(a) The root is 1 page; the second level is at most ~254 pages (one per root child) — together a few hundred pages, a fraction of a megabyte, trivially
+held resident in any real buffer pool. (b) Given that, typically only the leaf fetch (the 4th level) reaches the disk. (c) Effective cost &asymp;
+3&nbsp;hits&nbsp;+&nbsp;1&nbsp;miss &asymp; 3&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;350&nbsp;&micro;s &asymp; ~350&nbsp;&micro;s — dominated by the single
+leaf miss, essentially one disk read. <em>Tempting wrong answer:</em> &ldquo;4 disk reads&rdquo; — the upper levels are cached, so it is ~1.
+<strong>Feed-forward:</strong> &sect;51.3.</div>
+
+<div class="solution" id="sol51.8"><span class="sol-label">51.8</span>
+<strong>Step 4:</strong> Because increasing keys always split the rightmost leaf 50/50 and the left half is never revisited, pages settle near 50%
+full, so the index needs roughly twice as many pages as a densely packed one — about twice the expected size. Lower fill also means lower effective
+fanout, which can add a level to the height and thus a page fetch to some look-ups, and it wastes buffer-pool space on half-empty pages. The fix that
+keeps sequential loads dense is <strong>append-aware (unbalanced) splitting</strong> — keep the full left page and start a fresh right page — or a
+bottom-up sorted <strong>bulk load</strong>, both of which reach near-100% fill. <em>Tempting wrong answer:</em> &ldquo;switch to random keys&rdquo; —
+that spreads inserts but thrashes the cache and destroys locality; the fix is the split policy, not the key. <strong>Feed-forward:</strong> &sect;51.4.</div>
+
+<div class="solution" id="sol51.9"><span class="sol-label">51.9</span>
+(a) <strong>Leaf linking</strong> — a range scan walks the linked leaves in order. (b) <strong>The balance invariant</strong> — all leaves at the same
+depth, so every look-up is the same height. (c) <strong>Fanout</strong> — hundreds of (key, pointer) pairs per page. (d) <strong>Node split</strong> —
+splitting and growing at the root keeps the tree balanced as it grows. (e) <strong>The RID in the leaf</strong> — the leaf entry points at the heap
+row. <em>Tempting wrong answer:</em> attributing (b) to fanout — fanout sets width, the balance invariant sets uniform depth. <strong>Feed-forward:</strong>
+&sect;51.2&ndash;&sect;51.4.</div>
+
+<div class="solution" id="sol51.10"><span class="sol-label">51.10</span>
+(a) <strong>False</strong> — a B+-tree stores data only in the leaves; internal nodes hold routing keys and pointers. (b) <strong>False</strong> — a
+leaf split pushes a key up but does not itself add a level; height grows only when the root splits. (c) <strong>False</strong> — height is
+log-base-fanout of N, so doubling N adds far less than a level. (d) <strong>True</strong> — naive 50/50 splits on sorted inserts leave left pages
+half-full forever. (e) <strong>False</strong> — on disk the binary tree is a poor choice; the cost is page fetches, not comparisons. <em>Tempting
+wrong answer:</em> marking (b) true because a split &ldquo;made the tree bigger&rdquo; — only a root split adds height. <strong>Feed-forward:</strong>
+&sect;51.1&ndash;&sect;51.4.</div>
+
+<div class="solution" id="sol51.11"><span class="sol-label">51.11</span>
+(a) Descend root &rarr; internal &rarr; &hellip; &rarr; leaf, each node a <code>fetchPage</code> (&sect;50) through the buffer pool (&sect;48): for a
+height-4 tree that is 4 fetches, of which the upper 3 usually hit (cached) and the leaf usually misses; read the RID at the leaf, then one more
+<code>fetchPage</code> for the heap row (&sect;49) — so ~5 fetches, ~1&ndash;2 disk misses. (b) A B-tree node <em>is</em> a page from
+<code>fetchPage</code> and a leaf stores a RID, both defined by the storage manager, so the B-tree needs no I/O code of its own — that interface is
+exactly what let it be written as &ldquo;a tree of pages.&rdquo; (c) A B-tree updates in place, so each small write is a random page update paying
+Chapter 46's random-write cost; a write-heavy workload of many such updates is expensive, which is precisely what motivates a log-structured engine
+that turns those random writes into sequential ones. <em>Tempting wrong answer:</em> &ldquo;the look-up is one fetch&rdquo; — it is the height plus
+the heap fetch; caching reduces the <em>misses</em>, not the fetch count. <strong>Feed-forward:</strong> &sect;51.1&ndash;&sect;51.5.</div>
+
+<div class="solution" id="sol51.12"><span class="sol-label">51.12</span>
+Open-ended and platform-specific. A correct write-up: (a) computes fanout &asymp; (page&minus;header)/(key+pointer) and tabulates height across N,
+showing single-digit heights even at a trillion keys; (b) implements a working B-tree of some order <var>m</var>, inserts in a seeded order, reports
+measured height and split count, and checks height against the bracket ceil(log-base-<var>m</var> of N) &le; height &le; ceil(log-base-&lceil;<var>m</var>/2&rceil;
+of N); (c) states toolchain and CPU and notes the fanout table is <em>exact arithmetic</em> and the tree height is a <em>structural outcome</em> of a
+deterministic insert order — neither is a wall-clock timing, so both are reproducible and hardware-independent. <em>Tempting wrong answer:</em>
+reporting the tree height as a performance measurement — it is a structural property, not a clock reading. <strong>Feed-forward:</strong>
+&sect;51.3&ndash;&sect;51.4.</div>
 
 </section>
 </body></html>

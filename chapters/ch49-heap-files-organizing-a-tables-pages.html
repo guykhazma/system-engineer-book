@@ -1,0 +1,361 @@
+<section class="chapter" id="ch49">
+<h1>Chapter 49 — Heap Files: Organizing a Table's Pages</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch47">Chapter 47</a> (the file is a linear space of pages and a page is a
+slotted collection of records — this chapter organizes those pages into a table), <a href="#ch48">Chapter 48</a> (every page a heap file touches is
+fetched, pinned, and evicted through the buffer pool — a page touch is a buffer-pool lookup that may fall to disk), <a href="#ch46">Chapter 46</a>
+(sequential reads are cheap and random reads pay the seek/latency cliff — the difference a table scan lives or dies by), <a href="#ch40">Chapter 40</a>
+(the page is the unit of I/O). &nbsp;·&nbsp; Chapter 47 gave you one page and the records inside it; this chapter answers the next question — how
+thousands of those pages become a <em>table</em> you can insert into, delete from, and scan, and where finding room for one more record quietly
+becomes the cost that dominates.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch47">Chapter 47</a> — inside a slotted page, what does the slot array let you do that a packed array of records
+cannot, and why does that matter when a record is deleted? (2) <a href="#ch46">Chapter 46</a> — reading a run of adjacent pages versus reading the
+same number of pages at random offsets: which was dramatically cheaper on this machine, and by roughly what factor? (3) <em>Predict:</em> a table
+is a pile of pages, and to insert a record you must find a page with enough free bytes. If the table's pages are threaded together as a simple
+linked list and you walk it from the front looking for room, how many pages do you think you touch per insert once the table has grown to thousands
+of pages — a constant few, or a number that grows with the table? And when you scan the whole table, is that read sequential or random? Write your
+guesses; &sect;49.2 and &sect;49.4 answer them.</p>
+</aside>
+
+<p>A table is not a page; it is a great many pages, and the layer that turns &ldquo;a pile of pages&rdquo; into &ldquo;a thing you can insert into,
+delete from, and read back&rdquo; is the <strong>heap file</strong> — the simplest and most common physical organization for a table's rows. It is a
+<em>heap</em> in the plain English sense: an unordered collection. The records live wherever there was room; the file makes no promise about the
+order in which a scan returns them, only that every record inserted and not yet deleted will be returned exactly once. That modest contract is
+enough to build a database on, because ordering and fast lookup are the job of the <em>indexes</em> built in the next part — the heap file's job is
+to store the rows compactly and hand them back. Everything it does reduces to three operations over the pages of <a href="#ch47">Chapter 47</a>,
+fetched through the buffer pool of <a href="#ch48">Chapter 48</a>: <strong>insert</strong> a record (find a page with room, place it, record its
+identifier), <strong>delete</strong> a record (mark its slot free), and <strong>scan</strong> the file (read every page and yield its live records).
+The whole chapter is the observation that the hard part of that list is the parenthetical in <em>insert</em> — <strong>find a page with room</strong>
+— because how the file tracks free space decides whether an insert touches one page or thousands. This chapter builds it in five steps: the heap
+file as an unordered collection of pages and the record identifier that names a row (&sect;49.1); the two classic ways to find free space — a linked
+list of pages versus a page directory — and the enormous gap between them (&sect;49.2); insert, delete, and the update that grows a record past its
+slot, with its named trap (&sect;49.3); the full table scan and why the heap file is built for sequential I/O (&sect;49.4); and what the heap file
+hands up to the indexes and the storage manager (&sect;49.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The free-space result is a <strong>deterministic simulation</strong>, not a timing: a C program
+(compiled with gcc 11.4.0 on this machine's Intel Core i7-12700H, glibc 2.35) inserts 200,000 variable-size records — sizes drawn from a fixed,
+seeded pseudo-random sequence so the run is exactly reproducible — into a heap of 4&nbsp;KiB pages, and <em>counts</em> how many data-page fetches
+each free-space scheme performs. It reports counts, not wall-clock, precisely because the point is a structural comparison that does not depend on
+the disk's speed; where the cost of those page fetches matters, it is the <a href="#ch48">Chapter 48</a> buffer-pool hit/miss cost and the
+<a href="#ch46">Chapter 46</a> sequential-versus-random figures measured earlier, which this chapter cites rather than re-measures. The
+sequential-scan argument of &sect;49.4 rests on those earlier measurements (a hardware-counter profiler, <code>perf</code>, is <em>not</em> installed
+here, and the disk is a WSL2 virtual disk, both noted where relevant).</p>
+
+<h2>49.1 The heap file: an unordered collection of pages</h2>
+
+<p>A <strong>heap file</strong> is a set of pages holding the records of one table, with no ordering imposed on the records: a row goes wherever
+there is space, and a scan returns rows in whatever physical order they happen to sit. This is the default table storage in real systems — a
+PostgreSQL table with no clustering, an unindexed table anywhere — because it is the cheapest thing that works: inserts do not have to maintain any
+sorted position, so they are fast, and the ordering that queries need is supplied separately by indexes (the next part) that point <em>into</em> the
+heap. The unit the file deals in is the page of <a href="#ch47">Chapter 47</a>; the unit a query deals in is the record; and the bridge between them
+is the <strong>record identifier</strong> (the <strong>RID</strong>, also called a tuple id or row id): the pair <em>(page number, slot number)</em>
+that names exactly where a record lives — which page in the file, and which slot within that page's slot array. The RID is the address a heap file
+hands back when you insert a record and the address an index stores so it can find the record again; it is stable as long as the record does not
+move, and &sect;49.3 is about the moment it might. Because the page number is an index into the file's linear page space and the slot number is an
+index into the page's slot array (both from <a href="#ch47">Chapter 47</a>), resolving a RID to bytes is two array indexings and one page fetch:
+compute the byte offset of page <var>p</var>, fetch that page through the buffer pool, read slot <var>s</var> of its slot array to get the record's
+offset and length within the page, and there is the row. No search — a RID is a direct address. That directness is what makes indexes possible: an
+index does the searching in its own structure and stores a RID at the leaf, so following an index entry to the actual row is one page fetch, not a
+scan. The heap file, then, is deliberately dumb: it stores rows and names them, and delegates <em>order</em> and <em>fast lookup</em> upward. Its one
+genuine problem is the one the plain-English word &ldquo;heap&rdquo; hides — when you insert, where do you put the row?</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What is a record identifier (RID), what two numbers is it made of, and why does resolving a RID to the actual record bytes require no searching?
+Why does a heap file make no promise about the order a scan returns rows? (Answer after the next section.)</p>
+</aside>
+
+<h2>49.2 Finding free space: the linked list versus the page directory</h2>
+
+<p>To insert a record of <var>b</var> bytes, the heap file must find a page with at least <var>b</var> bytes free (plus a slot). How it finds one
+is the single decision that separates a heap file that scales from one that does not, and there are two classic schemes. The first is the
+<strong>linked list of pages</strong>: the file's header points at a chain of pages, and to find room you walk the chain from the front, fetching
+each page and inspecting its header's free-space count, stopping at the first page that fits (or appending a new page if none does). It is trivial to
+implement and needs no extra structure — but every page it inspects is a <em>page fetch</em> through the buffer pool (&sect;48), and as the file fills
+with mostly-full pages the walk grows longer, so the cost of an insert climbs with the size of the file. The second scheme is the <strong>page
+directory</strong>: the file keeps a small separate structure — an array with one compact entry per page recording that page's free space — and to
+find room you scan the <em>directory</em> (a sequence of a few bytes per page, held in memory and cached) rather than the pages themselves, then
+fetch exactly one data page: the one you have chosen to write into. The directory turns an <em>O(pages)</em> chain of expensive page fetches into an
+in-memory scan plus a single write. The difference is not subtle. In the simulation — 200,000 variable-size records inserted into a heap that grew
+to 7,075 pages of 4&nbsp;KiB — the two schemes cost:</p>
+
+<pre><code>insert 200,000 records into a heap of 7,075 4-KiB pages (deterministic sim):
+  linked-list heap : ~708,000,000 DATA-PAGE fetches to locate room  (~3,542 per insert)
+  page-directory   : 0 data-page fetches to locate room; the search is an
+                     in-memory directory scan, then ONE page fetch to write
+</code></pre>
+
+<p>Read the first line carefully: the linked-list heap averaged about <strong>3,542 data-page fetches per insert</strong>, and that number is not a
+constant — it grew as the file grew, because a longer chain of fuller pages means a longer walk before finding room. Each of those fetches is a
+buffer-pool lookup that, on a miss, is the <a href="#ch46">Chapter 46</a> disk read; multiply 3,542 by even a small miss rate and an insert that
+should be nearly free becomes hundreds of disk I/Os. The page directory does <strong>zero</strong> data-page fetches to <em>locate</em> free space —
+the entire search happens in the compact directory array in memory — and then fetches the one page it decided to write. This is why real heap files
+are directory-organized (or use an equivalent free-space map): the naive linked list is correct but its insert cost is a function of table size, which
+is unacceptable for a table that grows. The lesson is the recurring storage lesson: keep the metadata you search often small and separate from the
+data, so that searching it is a memory operation and touching the data is a single, deliberate act.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: finding room to insert is a search, and where you search decides its cost</span>
+<p><strong>1. In words.</strong> An insert must find a page with enough free space. A linked-list heap searches by <em>fetching pages</em> and reading
+each one's free-space header, so its search cost is measured in page fetches and grows with the file. A page-directory heap searches a small in-memory
+array of per-page free-space counts, so its search cost is a cheap memory scan and it touches exactly one data page — the one it writes.</p>
+<p><strong>2. As a picture.</strong> Figure 49.1: on the left, an insert arrow walking a chain of pages P0&rarr;P1&rarr;P2&rarr;&hellip;, each a
+buffer-pool fetch, until one has room; on the right, an insert arrow reading a compact directory array (bytes of free-space per page) in memory,
+landing on the chosen page, and fetching only that one.</p>
+<p><strong>3. As numbers.</strong> Simulated here (200,000 inserts, 7,075 pages): linked list ~<strong>3,542 data-page fetches per insert</strong>
+and rising with file size; page directory <strong>0</strong> data-page fetches to locate room plus one write. The difference is not a constant
+factor — it is <em>O(pages)</em> page fetches versus <em>O(1)</em>, which is why the directory (or a free-space map) is what real systems use.</p>
+</aside>
+
+<p><em>(Answer to the &sect;49.1 quick check: a RID is a record identifier, the pair <strong>(page number, slot number)</strong> — the page number
+indexes the file's linear page space and the slot number indexes that page's slot array. Resolving it needs no search because both are direct array
+indices: fetch page <var>p</var>, read slot <var>s</var> for the record's in-page offset and length, done. A heap file promises no scan order because
+records are placed wherever there was free space, not in any key order — ordering is the indexes' job, not the heap's.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 250" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Insert: linked-list heap fetches page after page; page-directory scans a small array in memory, then fetches one page.</text>
+<text x="20" y="44" font-size="9" fill="#8c3a1d">LINKED LIST (fetch each page)</text>
+<rect x="20" y="52" width="52" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="30" y="71" font-size="8">P0 full</text>
+<rect x="92" y="52" width="52" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="102" y="71" font-size="8">P1 full</text>
+<rect x="164" y="52" width="52" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="174" y="71" font-size="8">P2 full</text>
+<rect x="236" y="52" width="52" height="30" fill="#dff0df" stroke="#2f7d32"/><text x="246" y="71" font-size="8">P3 room</text>
+<path d="M72 67 L92 67" stroke="#8c3a1d" stroke-width="1.5"/><path d="M144 67 L164 67" stroke="#8c3a1d" stroke-width="1.5"/><path d="M216 67 L236 67" stroke="#8c3a1d" stroke-width="1.5"/>
+<text x="20" y="100" font-size="8" fill="#8c3a1d">each hop is a buffer-pool fetch &rarr; cost grows with file size</text>
+<text x="20" y="140" font-size="9" fill="#2f7d32">PAGE DIRECTORY (scan array in memory)</text>
+<rect x="20" y="150" width="270" height="22" fill="#dfe8f4" stroke="#14406b"/>
+<text x="26" y="165" font-size="8">dir: [P0:0][P1:0][P2:0][P3:900][P4:40]&hellip;  (a few bytes/page, cached)</text>
+<rect x="236" y="188" width="52" height="30" fill="#dff0df" stroke="#2f7d32"/><text x="246" y="207" font-size="8">P3 room</text>
+<path d="M262 172 L262 188" stroke="#2f7d32" stroke-width="1.5"/>
+<text x="300" y="203" font-size="8" fill="#2f7d32">one data-page fetch, to write</text>
+<text x="330" y="100" font-size="8" fill="#14406b">Simulated: ~3,542 fetches/insert (list) vs 0-to-locate + 1 write (directory).</text>
+</svg>
+<figcaption>Figure 49.1: finding room for an insert. The linked-list heap fetches page after page until one fits, so its cost grows with the file; the
+page directory scans a compact in-memory array of per-page free space and then fetches exactly the one page it will write. Simulated here at ~3,542
+data-page fetches per insert for the list versus zero-to-locate for the directory.</figcaption>
+</figure>
+
+<h2>49.3 Insert, delete, and the update that no longer fits</h2>
+
+<p>With free space handled, the three operations are almost simple. <strong>Insert</strong>: find a page with room (&sect;49.2), write the record
+into free space, add a slot pointing at it, update the page's and directory's free-space counts, and return the RID. <strong>Delete</strong>: fetch
+the page, mark the record's slot free (a slotted page can leave a hole and compact later — <a href="#ch47">Chapter 47</a>), and add the reclaimed
+bytes back to the free-space count. A subtlety: the deleted record's slot is usually <em>not</em> immediately reused for a different record, because
+some index may still hold its RID; systems either leave the slot as a tombstone until a later cleanup confirms no references remain, or reuse it and
+accept that indexes must be maintained in lockstep. The genuinely awkward operation is <strong>update</strong>. If the new version of the record is
+the same size or smaller, it is easy: overwrite in place, adjust the slot's length, keep the same RID. But if the update makes the record
+<em>larger</em> — a variable-length field grew, a null became a long string — and the page no longer has room for it, the record cannot stay where it
+is, and the heap file faces a dilemma with no free answer. Moving the record to a page that does have room changes its physical location, which would
+change its RID — and every index entry pointing at the old RID would now be dangling. The standard escape is a <strong>forwarding pointer</strong> (a
+<strong>tombstone</strong> or forwarding RID): the record's original slot is left in place but, instead of the record, it now holds a pointer to the
+record's new location on another page. The old RID stays valid — indexes are undisturbed — but reading the record now costs <em>two</em> page
+fetches: one to the original page to find the forwarding pointer, a second to the page where the record actually lives. This is the named trap of the
+chapter, and it compounds: a workload that repeatedly grows records can leave a heap file littered with forwarding pointers, so that rows an index
+should reach in one fetch take two, and a table that was once dense with data becomes a maze of redirections — <strong>row migration</strong>, and the
+read amplification it causes, is a real and common source of a heap file quietly getting slower over its lifetime.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the growing update that migrates a row and leaves a forwarding pointer behind</span>
+<p>An update that makes a record too big for its current page cannot move the record freely, because its RID is an address stored in every index that
+covers the table — move the record and those index entries dangle. The near-universal fix is a <strong>forwarding pointer</strong>: leave a tombstone
+at the old RID pointing to the record's new home. Correct, but not free — <strong>every read of that row now costs two page fetches</strong> instead
+of one (old page &rarr; forwarding pointer &rarr; new page), and a fetch that misses the buffer pool is the <a href="#ch46">Chapter 46</a> disk cliff.
+The trap is that this degradation is <em>invisible until it accumulates</em>: a table loaded once and read is fine; a table whose rows are updated to
+grow — a status field that lengthens, a JSON blob that gains keys — slowly fills with forwarding pointers, and reads that were one I/O become two with
+no schema change and no obvious cause. Worse, a page can forward to a record that is itself later updated and forwarded again; naive implementations
+allow chains of forwards, turning one logical read into several. Real systems bound this by never forwarding a forward (they update the original
+tombstone to point to the final location) and by <em>compacting</em> or <em>reorganizing</em> the heap (PostgreSQL's <code>VACUUM</code> and
+<code>pg_repack</code>, Oracle's row-chaining rebuilds) to collapse the redirections. &ldquo;Updates are in place and cheap&rdquo; and &ldquo;rows
+can grow&rdquo; are, in a heap file, not both true at once — a growing update is a move in disguise.</p>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why can't a heap file simply relocate a record that has outgrown its page? What does a forwarding pointer buy, and what does it cost on every
+subsequent read of that row? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>49.4 The full table scan: why heap files love sequential I/O</h2>
+
+<p>The operation a heap file is <em>best</em> at is the one that touches everything: the <strong>full table scan</strong>, which reads every page of
+the file in order and yields each page's live records. Because a heap file's pages sit in the file's linear page space (&sect;47) and a scan reads
+them front to back, a table scan is a <strong>sequential</strong> read — exactly the access pattern <a href="#ch46">Chapter 46</a> measured as
+dramatically cheaper than random access, because it lets the device stream (no per-page seek on a spinning disk; large, prefetchable requests on an
+SSD) and lets the buffer pool and OS read ahead. This is the heap file's structural strength and the reason it survives as the default organization:
+for any query that must examine most of a table — an aggregate over all rows, a filter with no useful index, the build side of a large join — reading
+the heap sequentially is the <em>cheapest possible</em> way to get the bytes off the device, and the total cost is close to (number of pages) &times;
+(sequential page read), with the device running near its streaming bandwidth. Two consequences follow. First, <strong>tuple density matters</strong>:
+the fewer bytes of overhead and dead space per page, the more live records each sequential page read returns, so the same scan bandwidth yields more
+useful rows — which is exactly why a heap littered with tombstones and half-empty pages (from the deletes and migrations of &sect;49.3) scans slowly
+even though the device is streaming, and why periodic compaction pays off. Second, the scan is the fallback the whole system leans on: when no index
+helps, the planner scans the heap, and it can afford to because the scan is sequential. The heap file thus embodies a clean division of labor with the
+indexes of the next part: the <em>index</em> is what you use to find a few rows without reading everything (random access, one RID at a time); the
+<em>heap scan</em> is what you use to read many rows cheaply (sequential access, every page once). A database that understands its own cost model
+chooses between them per query — and it can, because the heap file makes the &ldquo;read everything&rdquo; path as cheap as the device allows.</p>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our <code>orders</code> table has gotten slow. Point look-ups by id are fine, but the reads that
+fetch a single order jumped from about one disk read to two over the last few months, and nobody changed the schema or the indexes.&rdquo; Cover the
+paragraph and respond in four or five sentences, drawing on &sect;49.3.</p>
+<p><em>Model answer.</em> &ldquo;That two-fetch pattern with no schema change is the signature of row migration. When an update makes a row too big
+for its page, the heap can't move it freely — its RID is stored in the indexes — so it leaves a forwarding pointer at the old location and puts the
+row on another page; every read then costs two fetches, the tombstone plus the real row. If your orders grow after insert — a status field that
+lengthens, line items appended, a JSON column that gains keys — you'll accumulate forwarding pointers steadily, which is exactly a gradual one-to-two
+I/O drift with no code change. The fix isn't a new index; it's to reduce migration and collapse the redirects: reorganize or compact the table
+(<code>VACUUM FULL</code> / <code>pg_repack</code> in Postgres) to rewrite rows into fresh pages, and if rows are known to grow, leave fill-factor
+headroom on each page so an update stays in place. So let's measure the forwarding-pointer rate and reorganize, rather than assume the storage got
+mysteriously slow.&rdquo; Naming row migration, tying it to the two-fetch cost, and prescribing compaction plus fill-factor headroom is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;49.3 quick check: a heap file cannot freely relocate an outgrown record because its RID — its (page, slot) address — is
+stored in every index that covers the table, so moving it would leave those index entries dangling. A forwarding pointer keeps the old RID valid by
+leaving a tombstone that redirects to the record's new page, so indexes are undisturbed; the cost is that every subsequent read of that row is
+<strong>two page fetches</strong> — the original page to find the pointer, then the page where the record now lives — and each miss is a disk
+read.)</em></p>
+
+<h2>49.5 What to carry forward</h2>
+
+<p>A <strong>heap file</strong> stores a table's rows as an unordered collection of pages, promising only that every live record is returned once by a
+scan; order and fast lookup are delegated upward to indexes (&sect;49.1). Each record is named by a <strong>record identifier (RID)</strong> — the pair
+(page number, slot number) — which resolves to bytes with no search: two array indices and one page fetch, which is exactly what makes an index's
+&ldquo;follow the pointer to the row&rdquo; a single fetch (&sect;49.1). The one hard operation is finding free space to insert: a <strong>linked list
+of pages</strong> searches by fetching pages and so costs <em>O(pages)</em> fetches per insert (~3,542 per insert in the simulation, and rising with
+file size), while a <strong>page directory</strong> (or free-space map) searches a compact in-memory array and touches one data page — zero fetches to
+locate room — which is why real systems use it (&sect;49.2). Insert and delete are cheap, but an <strong>update that grows a record past its page</strong>
+must leave a <strong>forwarding pointer</strong> to avoid changing the RID, turning every later read of that row into two fetches — <strong>row
+migration</strong>, a slow, invisible degradation defended against by compaction and fill-factor headroom (&sect;49.3). The heap file's great strength
+is the <strong>full table scan</strong>: reading every page in order is <em>sequential</em> I/O, the cheap access pattern of Chapter 46, which is why
+scanning is the affordable fallback when no index helps and why tuple density is worth defending (&sect;49.4).</p>
+
+<p>The heap file is the second of the storage foundation's two data organizations — the page and its records (Chapter 47) turned into a table you can
+insert into, scan, and address by RID. Its two loose threads point straight ahead. The free-space directory is the first hint of a recurring pattern:
+a small, searchable structure kept beside the data so you do not have to scan the data to find something — which is precisely what an <em>index</em>
+is, generalized from &ldquo;which page has room&rdquo; to &ldquo;which page holds key <var>k</var>,&rdquo; and the next part builds exactly that. And
+the RID — a stable address that indexes store and the heap resolves in one fetch — is the currency those indexes trade in: every index leaf ultimately
+holds a RID, and following it lands on the row through the heap file built here. The heap gives you cheap storage and cheap full scans; the index will
+give you cheap selective lookups; and the storage manager built next is the module that ties the pages, the buffer pool, the heap file, and the
+values too big to fit a page into the single interface the rest of the database calls. On the heap file, a table becomes real; on the index, it
+becomes fast.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Define a heap file and state the one promise it makes about a scan.</li>
+<li>Say what a RID is made of and why resolving it needs no search.</li>
+<li>Explain why a linked-list heap's insert cost grows with the file, and how a page directory fixes it (with the simulated numbers).</li>
+<li>Describe what happens when an update grows a record past its page, and what a forwarding pointer costs on every later read.</li>
+<li>Explain row migration, why it is invisible until it accumulates, and two defenses.</li>
+<li>Explain why a full table scan is sequential I/O and why that makes it the affordable fallback.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a heap file, and how does it divide labor with indexes? (&sect;49.1)</li>
+<li><strong>R2.</strong> What is a RID, and why is resolving one to a record a single page fetch with no search? (&sect;49.1)</li>
+<li><strong>R3.</strong> Why does a linked-list heap's insert cost grow with the table, and what did the page directory cost instead in the simulation? (&sect;49.2)</li>
+<li><strong>R4.</strong> Why can't a heap relocate an outgrown record, and what does a forwarding pointer cost on every later read? (&sect;49.3)</li>
+<li><strong>R5.</strong> Why is a full table scan sequential, and why does that make it the affordable fallback when no index helps? (&sect;49.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003 (ISBN 978-0072465631),
+Chapter 9, &ldquo;Storing Data: Disks and Files.&rdquo;</strong> The direct textbook treatment of &sect;49.1&ndash;&sect;49.2: heap files, the two
+free-space schemes (linked list of pages versus page directory), and page and record formats. First authors Raghu Ramakrishnan and Johannes Gehrke;
+edition, publisher, year, and ISBN verified via the publisher and retailer listings.</li>
+<li><strong>Hector Garcia-Molina, Jeffrey D. Ullman &amp; Jennifer Widom, <em>Database Systems: The Complete Book</em>, 2nd ed., Pearson/Prentice
+Hall, 2008 (ISBN 978-0131873254).</strong> Its storage chapters cover how records, blocks, and files are represented on disk, including
+variable-length records and the record-address (RID) abstraction underpinning &sect;49.1. First author Hector Garcia-Molina; edition, year, and ISBN
+verified via the publisher listing.</li>
+<li><strong>Abraham Silberschatz, Henry F. Korth &amp; S. Sudarshan, <em>Database System Concepts</em>, 7th ed., McGraw-Hill, 2019
+(ISBN 978-0078022159).</strong> Its storage-and-file-structure chapter treats variable-length records, free-space management, and the update that no
+longer fits — the source material behind &sect;49.3's migration problem. First author Abraham Silberschatz; edition, year, and ISBN verified via the
+publisher listing.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, DOI 10.1561/1900000002.</strong> Its storage-and-access-methods sections situate the heap file within the whole
+engine — how the storage manager exposes pages and records to the layers above. First author Joseph M. Hellerstein; venue, year, and DOI verified via
+the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex49.1"><span class="ex-label">49.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is the only promise a heap file makes about a full scan, and what does it deliberately <em>not</em> promise?</div>
+
+<div class="exercise" id="ex49.2"><span class="ex-label">49.2</span> <span class="ex-tag warm">warm-up</span>
+A RID is the pair (page number, slot number). Explain in one or two sentences why resolving a RID to the actual record bytes requires no search,
+naming the two array indexings and the one page fetch involved.</div>
+
+<div class="exercise" id="ex49.3"><span class="ex-label">49.3</span> <span class="ex-tag warm">warm-up</span>
+Roughly how many data-page fetches per insert did the linked-list heap cost in the simulation, and how many did the page directory cost to
+<em>locate</em> free space? Why is the linked-list number not a constant?</div>
+
+<div class="exercise" id="ex49.4"><span class="ex-label">49.4</span> <span class="ex-tag core">core</span>
+Free-space schemes. (a) Explain why a linked-list heap file's insert cost grows with the number of pages in the file. (b) Explain how a page
+directory reduces the cost of <em>locating</em> free space to zero data-page fetches. (c) State the asymptotic insert cost (in page fetches to find
+room) of each scheme as a function of the number of pages, and why that difference is decisive for a growing table.</div>
+
+<div class="exercise" id="ex49.5"><span class="ex-label">49.5</span> <span class="ex-tag core">core</span>
+The growing update. (a) Why can a heap file overwrite a record in place when an update keeps it the same size or smaller, but not when the update
+makes it larger than the page's remaining room? (b) Why can't it simply move the record to a page with room? (c) What is a forwarding pointer, and
+what does it cost on every subsequent read of that row?</div>
+
+<div class="exercise" id="ex49.6"><span class="ex-label">49.6</span> <span class="ex-tag core">core</span>
+Row migration over time. (a) Describe a workload that steadily fills a heap file with forwarding pointers. (b) Explain why the resulting slowdown is
+invisible until it accumulates and appears without any schema or index change. (c) Give two defenses and say how each reduces the two-fetch cost.</div>
+
+<div class="exercise" id="ex49.7"><span class="ex-label">49.7</span> <span class="ex-tag complexity">cost</span>
+A table has <var>P</var> pages, each holding on average <var>r</var> live records. (a) Give the cost of a full table scan in page reads, and state
+whether those reads are sequential or random and why that matters (cite the Chapter 46 result qualitatively). (b) A point look-up by RID costs how
+many page fetches when the row has not migrated, and how many when it has? (c) If a fraction <var>m</var> of rows have migrated, write the average
+page-fetch cost of a random point look-up and explain why raising tuple density (compaction) helps both the scan and the look-up.</div>
+
+<div class="exercise" id="ex49.8"><span class="ex-label">49.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A reporting query aggregates over an entire 2-million-row table and is slower than its raw data size
+suggests it should be; the table has been heavily updated in place over a year.
+<br><strong>Step 1 (given):</strong> the query has no useful index, so the planner does a full heap scan — sequential I/O over every page.
+<br><strong>Step 2 (given):</strong> a year of growing updates has left many pages half-empty (deleted/migrated rows) and scattered forwarding pointers.
+<br><strong>Step 3 (given):</strong> the scan reads every page whether or not it is dense, so low tuple density means more pages read per live row.
+<br><strong>Step 4 (you):</strong> Explain why the scan is slow despite the device streaming sequentially, and give one operation that would speed it
+up without adding an index — and say what it does to the pages.</div>
+
+<div class="exercise" id="ex49.9"><span class="ex-label">49.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the heap-file mechanism or property responsible — <em>RID</em>, <em>page directory</em>, <em>forwarding pointer</em>, <em>slot array</em>,
+or <em>sequential scan</em> — and why: (a) an index finds a row in one page fetch after its search; (b) an insert locates free space without touching
+data pages; (c) a grown record keeps its old address valid after moving; (d) a deleted record can leave a hole that is compacted later; (e) reading
+every row of an unindexed table is affordable.</div>
+
+<div class="exercise" id="ex49.10"><span class="ex-label">49.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A heap file returns rows in insertion order.&rdquo; (b) &ldquo;A
+page directory makes the cost of finding free space independent of the number of data pages fetched.&rdquo; (c) &ldquo;An in-place update that
+shrinks a record must relocate it.&rdquo; (d) &ldquo;A forwarding pointer makes a row's reads cheaper.&rdquo; (e) &ldquo;A full table scan is random
+I/O.&rdquo;</div>
+
+<div class="exercise" id="ex49.11"><span class="ex-label">49.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the storage layers. (a) Trace an insert of one record end to end: finding free space via the directory (&sect;49.2), writing the record
+and slot into a page (&sect;47), through the buffer pool (&sect;48), and what RID is returned. (b) Argue that the free-space directory and an index are
+the same idea — a small searchable structure beside the data — applied to different questions, and state each question. (c) Explain why a heap file
+plus indexes is a better division of labor than a single always-sorted file, using the insert cost of &sect;49.2 and the scan cost of &sect;49.4.</div>
+
+<div class="exercise" id="ex49.12"><span class="ex-label">49.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Write a deterministic simulation that inserts many variable-size records into a heap of fixed-size pages
+under two free-space schemes — a linked-list walk from the head and a page-directory scan — and count the data-page fetches each performs to locate
+room; report both and their ratio, and how the linked-list number changes as the file grows. (b) Extend it with a fraction of updates that grow a
+record past its page, inserting a forwarding pointer, and report the resulting two-fetch read rate. (c) State your toolchain and CPU, and explain
+which of your results are exact counts from a deterministic simulation (reproducible, hardware-independent) versus anything you timed — and why the
+counts are the claim that travels.</div>
+
+</section>
+</section>

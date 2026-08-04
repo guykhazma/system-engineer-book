@@ -1,0 +1,364 @@
+<section class="chapter" id="ch51">
+<h1>Chapter 51 — The B-Tree: A Search Tree on Disk</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (a random page read is the disk cliff, ~350&nbsp;&micro;s here;
+the number of page fetches, not comparisons, is what a disk structure pays), <a href="#ch47">Chapter 47</a> (the page — a B-tree node <em>is</em> a
+page), <a href="#ch48">Chapter 48</a> (nodes are fetched through the buffer pool; a shallow tree keeps its upper levels resident),
+<a href="#ch49">Chapter 49</a> (the RID a leaf stores to point at a heap row), <a href="#ch50">Chapter 50</a> (the storage-manager interface a B-tree
+is built entirely on — <code>fetchPage</code> and nothing lower). &nbsp;·&nbsp; The storage part gave you a table you can store and scan. This chapter
+opens the storage-engines part with the structure that gives a table <em>selective</em> access — find a few rows out of billions in a handful of page
+fetches — and it does so by being shaped for the disk, not the CPU.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch46">Chapter 46</a> — a random 4&nbsp;KiB page read cost about how long on this machine, and how does that compare to
+an in-memory comparison of two keys (nanoseconds)? (2) <a href="#ch49">Chapter 49</a> — the only way a heap file finds a specific row without an index
+is what, and what does it cost on a large table? (3) <em>Predict:</em> a balanced binary search tree over a billion keys is about 30 levels deep, and
+on disk each level is a separate page fetch. If instead you pack <em>hundreds</em> of keys into each node — one node per page — so the tree branches
+hundreds of ways at each level, roughly how many levels deep is the tree over a billion keys: still ~30, or a single-digit number? And what does that
+do to the number of disk reads for one look-up? Write your guesses; &sect;51.3 answers them.</p>
+</aside>
+
+<p>The heap file gives a table cheap storage and a cheap full scan, but only one way to find a specific row without reading everything: it has none —
+an unindexed look-up is a full scan (Chapter 49). What a database needs is <strong>selective</strong> access: find the handful of rows matching a key,
+or the range of rows between two keys, without touching the rest. That is the job of an <strong>index</strong>, and the dominant index structure in
+every relational database for fifty years is the <strong>B-tree</strong> — more precisely its variant the <strong>B+-tree</strong> — invented by Bayer
+and McCreight in 1972 and so pervasive that Comer's 1979 survey could already call it &ldquo;ubiquitous.&rdquo; The reason a B-tree, and not the
+balanced binary search tree every algorithms course teaches, is the entire point of this chapter: a binary tree is optimal when a node access is a
+memory operation, but on disk a node access is a <em>page fetch</em>, and the structure that wins is the one that minimizes page fetches, not
+comparisons. The B-tree wins by being <strong>wide and shallow</strong> — each node is a full page holding hundreds of keys, so the tree branches
+hundreds of ways per level and reaches billions of keys in three or four levels, which means three or four page fetches per look-up instead of the
+thirty a binary tree would pay. This chapter builds it in five steps: why the disk rules out the binary tree and demands high fanout (&sect;51.1); the
+B+-tree's shape — nodes are pages, internal nodes route, leaves hold the data and link together (&sect;51.2); the fanout-and-height arithmetic that
+makes three or four levels index billions, reproduced here (&sect;51.3); search, insert, and the node split that keeps the tree balanced, with its
+named trap of monotonically increasing keys (&sect;51.4); and what the B-tree carries into the rest of the storage-engines part (&sect;51.5).</p>
+
+<p><strong>On the code in this chapter.</strong> Two C programs, compiled with gcc 11.4.0 on this machine's Intel Core i7-12700H (glibc 2.35). The
+first computes <strong>fanout and height</strong> arithmetically — exact functions of the page size, key size, and pointer size stated — so its numbers
+are reproducible and hardware-independent (they describe the structure, not this machine). The second is a <strong>working in-memory B-tree</strong>
+that inserts keys in a fixed, seeded order and reports the resulting tree <em>height</em> and split count; the height is a structural result of the
+insertions, not a timing, and it is reported to confirm the arithmetic of &sect;51.3, not to clock anything. Where a page fetch's cost appears, it is
+the <a href="#ch48">Chapter 48</a> buffer-pool hit/miss and <a href="#ch46">Chapter 46</a> device figures measured earlier in this volume, cited here
+rather than re-measured (a hardware-counter profiler, <code>perf</code>, is not installed on this machine).</p>
+
+<h2>51.1 Why not a binary tree: the disk changes the calculus</h2>
+
+<p>Every algorithms course teaches the balanced binary search tree as the way to search: <em>O(log&nbsp;N)</em> comparisons, halving the search space
+at each step. That analysis is correct and, on disk, nearly useless — because it counts <em>comparisons</em>, and on disk the cost that matters is
+<em>page fetches</em>. A binary tree over a billion keys is about <strong>30 levels</strong> deep (log&#8322; of a billion), and if the tree does not
+fit in memory, each level you descend is a pointer to a different node on a different page — a separate page fetch, each one potentially the
+~350&nbsp;&micro;s disk read of <a href="#ch46">Chapter 46</a>. Thirty page fetches to find one key is a catastrophe: it is the disk cliff paid thirty
+times over. The comparisons themselves — thirty of them, tens of nanoseconds each — are free by comparison; the entire cost is in the page fetches,
+and a binary tree maximizes them by putting only one key (one branch decision) in each node, so each node visited advances the search by a single
+comparison. The fix is to invert that ratio: put <em>as many keys as fit in a page</em> into each node, so that a single page fetch advances the
+search by a <em>whole page's worth</em> of branching. If a node holds 254 keys and so has 255 children, then one page fetch narrows the search
+255-fold instead of 2-fold — and the number of fetches to reach any key falls from log&#8322;(N) to log&#8322;&#8325;&#8325;(N). This is the governing
+insight of on-disk data structures and the reason the B-tree exists: <strong>match the node to the page, and make the fanout as high as the page
+allows</strong>, because the unit of cost is the page fetch and a fat node amortizes each fetch over hundreds of branch decisions. The binary tree is
+not wrong; it is tuned for the wrong cost model — the RAM model of <a href="#ch01">Chapter 1</a>, where every access is unit cost — and the disk's
+cost model demands a wide, shallow tree instead.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>On disk, what is the unit of cost a search structure must minimize, and why does that make a binary search tree a poor choice despite its optimal
+comparison count? What single change turns it into a B-tree? (Answer after the next section.)</p>
+</aside>
+
+<h2>51.2 The B+-tree: nodes are pages, keys route, leaves hold the data</h2>
+
+<p>A <strong>B+-tree</strong> is a balanced search tree in which <strong>every node is one page</strong> (Chapter 47) and the tree is kept both sorted
+and balanced. It has two kinds of node. <strong>Internal nodes</strong> hold sorted keys and child pointers, and they exist only to <em>route</em>: a
+node with <var>m</var> sorted keys has <var>m</var>+1 child pointers, and to search for a
+key you find which of the <var>m</var>+1 gaps between the keys it falls into and follow that child. Internal nodes store no data, only keys-as-signposts and pointers to lower nodes.
+<strong>Leaf nodes</strong> sit at the bottom, hold the actual index entries — each a key together with a <strong>RID</strong> pointing at the heap row
+(Chapter 49), or the row itself in a clustered index — and, crucially, are <strong>linked together</strong> in key order: each leaf points to the next,
+so once a search reaches the correct leaf, a <em>range scan</em> can walk the linked leaves in sorted order without ever returning to the root. (This
+leaf-linking and the &ldquo;all data in the leaves&rdquo; rule are exactly what distinguish the B+-tree from the original B-tree, which stored data in
+internal nodes too; the B+-tree's design is what makes range scans efficient, which is why it, not the plain B-tree, is what real databases build —
+the two names are often used interchangeably, and this chapter means the B+-tree.) The whole structure obeys the <strong>B-tree balance
+invariant</strong>: every node except the root is kept at least half full, and <em>all leaves are at the same depth</em> — the tree is perfectly
+height-balanced at all times, so every look-up costs exactly the height in page fetches, no matter which key. That invariant is not free; it is
+maintained by the splitting of &sect;51.4. But its payoff is total: a B+-tree gives you exact-match look-up (descend to a leaf), range scan (descend
+once, then walk linked leaves), and ordered iteration (walk the leaf chain from the start) — all three of the accesses a heap file could not give
+cheaply — on a structure whose height, the next section shows, is astonishingly small.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: high fanout makes the tree shallow, so a look-up is a handful of page fetches</span>
+<p><strong>1. In words.</strong> Each node is a page holding hundreds of keys, so the tree branches by its fanout at every level; the height is
+therefore the fanout-base logarithm of the key count, which for a fanout in the hundreds is a single-digit number even for billions of keys. Height
+equals page fetches per look-up, so a shallow tree is a fast one.</p>
+<p><strong>2. As a picture.</strong> Figure 51.1: a three-level B+-tree — one root, a middle level fanning out by ~254, a leaf level fanning out again —
+drawn beside a tall thin binary tree of the same key count, the B+-tree three boxes tall and the binary tree running off the page at ~30.</p>
+<p><strong>3. As numbers.</strong> Computed here for a 4&nbsp;KiB page with 8-byte keys and 8-byte pointers: fanout <strong>254</strong>. Height to index
+a billion keys: <strong>4 levels</strong> (so 4 page fetches per look-up), against a binary tree's <strong>~30</strong> — the upper levels of the
+B-tree stay cached in the buffer pool (&sect;48), so in practice only the leaf fetch usually touches the disk.</p>
+</aside>
+
+<p><em>(Answer to the &sect;51.1 quick check: on disk the unit of cost is the <strong>page fetch</strong>, not the comparison. A binary search tree
+minimizes comparisons but puts one key per node, so it has ~log&#8322;(N) levels and pays one page fetch per level — ~30 for a billion keys, i.e. the
+disk cliff thirty times. The single change is to make each node a full page holding hundreds of keys, so one fetch branches hundreds of ways and the
+height collapses to log&#8322;&#8325;&#8325;(N) — that is a B-tree.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 230" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A B+-tree: each node is a page of ~254 keys, so 3-4 levels reach billions. Internal nodes route; linked leaves hold RIDs.</text>
+<rect x="270" y="30" width="100" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="276" y="44" font-size="8">root (page, ~254 keys)</text>
+<rect x="120" y="80" width="100" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="126" y="94" font-size="8">internal</text>
+<rect x="300" y="80" width="40" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="306" y="94" font-size="8">&hellip;</text>
+<rect x="420" y="80" width="100" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="426" y="94" font-size="8">internal</text>
+<path d="M300 50 L170 80" stroke="#333"/><path d="M320 50 L320 80" stroke="#333"/><path d="M340 50 L470 80" stroke="#333"/>
+<rect x="40" y="140" width="70" height="20" fill="#dff0df" stroke="#2f7d32"/><text x="46" y="154" font-size="7">leaf: k,RID</text>
+<rect x="120" y="140" width="70" height="20" fill="#dff0df" stroke="#2f7d32"/><text x="126" y="154" font-size="7">leaf: k,RID</text>
+<rect x="430" y="140" width="70" height="20" fill="#dff0df" stroke="#2f7d32"/><text x="436" y="154" font-size="7">leaf: k,RID</text>
+<rect x="520" y="140" width="70" height="20" fill="#dff0df" stroke="#2f7d32"/><text x="526" y="154" font-size="7">leaf: k,RID</text>
+<path d="M110 150 L120 150" stroke="#2f7d32" stroke-width="1.5"/><path d="M190 150 L200 150" stroke="#2f7d32" stroke-dasharray="3 3"/><path d="M500 150 L520 150" stroke="#2f7d32" stroke-width="1.5"/>
+<text x="40" y="180" font-size="8" fill="#2f7d32">leaves linked in key order &rarr; a range scan walks the chain without returning to the root</text>
+<text x="40" y="205" font-size="8" fill="#8c3a1d">fanout 254, height 4 for 1e9 keys = 4 page fetches; a binary tree would be ~30 levels.</text>
+</svg>
+<figcaption>Figure 51.1: a B+-tree. Every node is a page; internal nodes hold sorted keys and child pointers and only route; leaves hold (key, RID)
+entries and are linked in key order so a range scan walks the chain. With fanout ~254, four levels index a billion keys — four page fetches per
+look-up against a binary tree's ~30.</figcaption>
+</figure>
+
+<h2>51.3 Fanout and height: why three or four levels index billions</h2>
+
+<p>The B-tree's whole advantage is quantitative, so it is worth deriving. The <strong>fanout</strong> of an internal node is how many children it has,
+which is how many (key + child-pointer) pairs fit in a page: fanout &asymp; (page size &minus; header) / (key size + pointer size). For a 4&nbsp;KiB
+page with a small header, 8-byte keys, and 8-byte child pointers, that is (4096 &minus; 24) / 16 &asymp; <strong>254</strong>. The <strong>height</strong>
+— the number of levels, which equals the page fetches per look-up — is then the fanout-base logarithm of the number of keys: a leaf holds some entries,
+and each level up multiplies the reach by the fanout, so height &asymp; ceil(log-base-fanout of (N / leaf-entries)).
+Computed here across a few node sizes:</p>
+
+<pre><code>4-KiB page, exact fanout/height arithmetic:
+  8B key + 8B ptr : fanout=254, leaf entries=254
+     N = 1,000            -> height 2
+     N = 1,000,000        -> height 3
+     N = 1,000,000,000    -> height 4
+     N = 1,000,000,000,000-> height 5
+  16B key + 8B ptr: fanout=169 ->  N=1e9 -> height 5
+  32B key + 8B ptr: fanout=101 ->  N=1e9 -> height 5
+
+contrast: a balanced BINARY tree over 1e9 keys is ceil(log2) = 30 levels
+</code></pre>
+
+<p>This is the number that makes databases possible: with a fanout of 254, <strong>a billion keys are indexed in four levels</strong> — four page
+fetches to find any key, against a binary tree's thirty. And it is better than even four fetches suggests, because the tree is fetched through the
+buffer pool (Chapter 48): the root is one page and is essentially always resident; the second level is a few hundred pages and easily cached; so in
+steady state only the <em>leaf</em> fetch — the last level — actually reaches the disk, and a B-tree look-up on a billion-row table is, in practice,
+often a single disk read. The height grows with the logarithm, so it is extraordinarily flat: going from a billion keys to a trillion adds
+<em>one</em> level (height 5). This is why the B-tree scales — the cost of a look-up grows like the logarithm of the data with a base in the hundreds,
+which is to say it barely grows at all. A working B-tree confirms the arithmetic. An in-memory B-tree of order 8 (max 7 keys per node), inserting keys
+in a scrambled seeded order, produced these heights, each bracketed by the theoretical bounds ceil(log-base-<var>m</var> of N) &le; height &le;
+ceil(log-base-&lceil;<var>m</var>/2&rceil; of N) that a B-tree of order <var>m</var> guarantees:</p>
+
+<pre><code>working B-tree, order m=8 (max 7 keys/node), seeded insert order:
+  N =     1,000 : measured height 4   (bounds: log_8=4  .. log_4=5)
+  N =   100,000 : measured height 7   (bounds: log_8=6  .. log_4=9)
+  N = 10,000,000: measured height 10  (bounds: log_8=8  .. log_4=12)
+</code></pre>
+
+<p>Every measured height lands inside the bracket the invariant guarantees — the tree is provably balanced, its height logarithmic in the key count
+with the fanout as the base. (The measured heights sit above the full-node bound because randomly inserted nodes are on average only about 69% full,
+so the effective fanout is a little below the maximum — which is exactly why real systems care about node occupancy, the subject of the next section's
+trap.) Change <var>m</var> from 8 to 254 and the same logarithm gives the four-levels-for-a-billion result: the working tree and the arithmetic are the
+same claim at different fanouts.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>With a fanout of 254, why does a billion-key B-tree have height 4, and why in practice does a look-up often cost only one disk read rather than
+four? Roughly how many extra levels do you add going from a billion keys to a trillion? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>51.4 Search, insert, and the split that keeps it balanced</h2>
+
+<p><strong>Search</strong> is the easy operation and the one everything is arranged for: start at the root, in each internal node binary-search the
+sorted keys to find which child covers the target, follow it, and repeat until a leaf; then binary-search the leaf for the key and read its RID (or
+report absent). Exactly <em>height</em> page fetches, every time. <strong>Insert</strong> begins the same way — descend to the leaf where the key
+belongs — and then must add the entry while preserving the balance invariant, which is where the B-tree earns its keep. If the target leaf has room,
+the entry is inserted in sorted position and the job is done. If the leaf is <strong>full</strong>, it <strong>splits</strong>: the leaf's entries are
+divided into two half-full leaves, the new leaf is linked into the leaf chain, and the <em>separator key</em> (the first key of the new right leaf) is
+pushed <strong>up</strong> into the parent as a new routing key with a pointer to the new leaf. If that push fills the parent, the parent splits too,
+by the same rule, and the split can propagate up the tree. If it propagates all the way to the root and the root splits, a <strong>new root</strong> is
+created above the old one — and this is the only way a B-tree's height ever increases. That single detail is the source of the balance invariant: the
+tree grows <em>at the root</em>, upward, not at the leaves, so all leaves always stay at the same depth and the tree is never lopsided. Splitting is
+what pays for search's simplicity: because inserts do the work of keeping every path the same length, search never has to handle an unbalanced tree.
+Deletion is the mirror image — remove the entry, and if a node falls below half full, borrow from or merge with a sibling — though many real systems
+simplify deletion by tolerating under-full nodes and reclaiming them lazily. The costly case is the one where inserts arrive in a pattern that makes
+splitting pathological, and that is the named trap.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: monotonically increasing keys create a right-edge hotspot and half-empty pages</span>
+<p>Insert keys in <strong>monotonically increasing order</strong> — an auto-increment id, an appended timestamp, a sequence — and every insert lands
+in the <em>same</em> place: the rightmost leaf, because each new key is the largest so far. Two costs follow. First, a <strong>write hotspot</strong>:
+all inserts hit one leaf and its path to the root, so under concurrency every inserter contends on the same few pages and their latches, and the
+buffer pool churns that one hot path — the opposite of spreading load. Second, and subtler, <strong>space waste from naive splitting</strong>: when the
+rightmost leaf fills and splits 50/50, the left half is left half-full and, because all future keys are larger, it is <em>never inserted into
+again</em> — so a naive B-tree built by sequential insertion tends toward <strong>~50% page utilization</strong>, nearly doubling the tree's size and
+halving the effective fanout (which adds height, the very thing &sect;51.3 worked to avoid). Real systems defend against both: they detect append
+patterns and do an <em>unbalanced right-edge split</em> (keep the full left page, start a fresh nearly-empty right page) so sequential loads reach
+~100% fill, and they bulk-load sorted data bottom-up rather than by repeated insert. The counter-trap is over-correcting: switching a primary key to a
+<em>random</em> value (a UUID v4) to spread inserts destroys the locality that made range scans and cache residency cheap — now every insert lands on a
+random leaf, so the working set of dirty leaves is the whole tree instead of one hot page, and inserts miss the buffer pool constantly. &ldquo;Just use
+an auto-increment key&rdquo; and &ldquo;the index packs densely and inserts spread out&rdquo; are not both true under naive splitting; and &ldquo;use
+a random key to spread load&rdquo; trades a write hotspot for a cache-thrashing insert pattern. The honest answer is append-aware splitting (or sorted
+bulk-load), keeping both density and locality.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our primary key is an auto-increment integer and the index is fine, but someone suggested switching
+to random UUIDs so inserts spread across the tree and we avoid a hotspot on the last page. Should we?&rdquo; Cover the paragraph and respond in four
+or five sentences, drawing on &sect;51.3 and &sect;51.4.</p>
+<p><em>Model answer.</em> &ldquo;Be careful — that trades one problem for a worse one. An auto-increment key does put all inserts on the rightmost
+leaf, which is a contention hotspot and, with naive 50/50 splits, leaves the left pages half-full; but the fix for that is append-aware splitting,
+which most engines already do, so sequential keys actually pack densely and stay cache-friendly. Switching to random UUIDs scatters every insert to a
+random leaf, so instead of one hot page you now dirty leaves all over the tree — the working set of pages you're writing becomes the whole index
+rather than one page, and inserts start missing the buffer pool constantly, which is often slower overall. Random keys also throw away range-scan
+locality: rows inserted together no longer sit together. So keep the sequential key and rely on append-aware splitting (or bulk-load sorted), or if you
+genuinely need to spread writes, use a scheme that keeps locality — not a fully random key.&rdquo; Naming the right-edge hotspot, the density cost of
+naive splitting, and the cache-thrashing counter-trap of random keys is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;51.3 quick check: with fanout 254 the tree's height is &lceil;log&#8322;&#8325;&#8324;(1e9)&rceil; = 4, so four page
+fetches reach any key. In practice a look-up often costs one disk read because the root and the second level are few enough pages to stay resident in
+the buffer pool, so only the leaf fetch actually reaches the disk. Going from a billion to a trillion keys adds just one level — height 5 — because the
+height grows as the logarithm base 254.)</em></p>
+
+<h2>51.5 What to carry forward</h2>
+
+<p>On disk the unit of cost is the <strong>page fetch</strong>, not the comparison, so the balanced binary tree — optimal in comparisons but ~30
+levels and thus ~30 fetches over a billion keys — is the wrong structure; the <strong>B-tree</strong> makes each node a full page of hundreds of keys
+so one fetch branches hundreds of ways (&sect;51.1). A <strong>B+-tree</strong> is a balanced tree of pages: internal nodes hold sorted keys and child
+pointers and only route, leaves hold (key, RID) entries and are linked in key order for range scans, and the balance invariant keeps every node at
+least half full with all leaves at the same depth (&sect;51.2). <strong>Fanout</strong> &asymp; page/(key+pointer) &asymp; 254 for an 8-byte key on a
+4&nbsp;KiB page, giving <strong>height 4 for a billion keys</strong> — four page fetches, often just one disk read after caching, and only one extra
+level per thousandfold more data; a working B-tree's measured heights sit inside the guaranteed logarithmic bracket (&sect;51.3). <strong>Search</strong>
+is <em>height</em> fetches; <strong>insert</strong> descends and, if the leaf is full, <strong>splits</strong>, pushing a separator key up and growing
+the tree only at the root — which is what keeps it balanced — while <strong>monotonic keys</strong> create a right-edge hotspot and, under naive
+splitting, ~50% fill, defended by append-aware splitting rather than random keys (&sect;51.4).</p>
+
+<p>The B-tree is the first storage engine, and it is the workhorse: the default index in PostgreSQL, MySQL/InnoDB (whose tables <em>are</em> a
+B+-tree on the primary key), Oracle, SQL Server, and SQLite, and the structure most look-ups in most databases go through. It is built entirely on the
+storage manager of the previous part — a node is a page from <code>fetchPage</code>, a leaf stores a RID from the heap file — which is exactly why that
+interface was worth building. Its one structural bias is worth carrying forward as the setup for the next engine: the B-tree updates <em>in place</em>,
+splitting and rewriting pages where the keys belong, which makes look-ups and range scans excellent but makes a write a random page update — and a
+workload of many small random writes pays the random-write cost of Chapter 46 on every one. That bias is precisely the opening for the other great
+storage-engine family, the <strong>log-structured merge tree</strong>, which inverts the trade: it turns random writes into sequential ones by buffering
+in memory and flushing sorted runs, paying instead at read time to merge them. The B-tree optimizes reads and range scans; the LSM-tree optimizes
+writes; and the choice between them is the central storage-engine decision the rest of this part unfolds. The heap gave you a table; the storage
+manager gave you the interface; the B-tree gives you the first fast, selective, ordered access to a table — a handful of page fetches to find any row
+among billions.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Explain why a binary search tree is the wrong structure on disk despite its optimal comparison count.</li>
+<li>Describe a B+-tree's two node types, what each holds, and why leaves are linked.</li>
+<li>State the fanout formula and compute it for an 8-byte key on a 4&nbsp;KiB page.</li>
+<li>Explain why a billion-key B-tree has height 4 and often costs one disk read per look-up.</li>
+<li>Describe a node split, why it pushes a key up, and why the tree grows only at the root.</li>
+<li>Explain the monotonic-key trap — hotspot and ~50% fill — and why random keys are the wrong fix.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> On disk, what cost must a search structure minimize, and why does that rule out the binary search tree? (&sect;51.1)</li>
+<li><strong>R2.</strong> What do a B+-tree's internal nodes and leaves each hold, and why are the leaves linked? (&sect;51.2)</li>
+<li><strong>R3.</strong> Write the fanout formula and explain why height 4 indexes a billion keys with fanout ~254. (&sect;51.3)</li>
+<li><strong>R4.</strong> Walk through a leaf split: what is divided, what is pushed up, and how does the tree's height ever grow? (&sect;51.4)</li>
+<li><strong>R5.</strong> Why do monotonically increasing keys cause a hotspot and ~50% fill, and why is a random key the wrong fix? (&sect;51.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Rudolf Bayer &amp; Edward M. McCreight, &ldquo;Organization and Maintenance of Large Ordered Indexes,&rdquo; <em>Acta Informatica</em>
+1(3), 1972, pp. 173&ndash;189, DOI 10.1007/BF00288683.</strong> The original paper introducing the B-tree and the split-and-grow-at-the-root
+maintenance of &sect;51.4. First author Rudolf Bayer; venue, volume, pages, year, and DOI verified via SpringerLink.</li>
+<li><strong>Douglas Comer, &ldquo;The Ubiquitous B-Tree,&rdquo; <em>ACM Computing Surveys</em> 11(2), 1979, pp. 121&ndash;137, DOI 10.1145/356770.356776.</strong>
+The classic survey behind &sect;51.1&ndash;&sect;51.2: the B-tree versus B+-tree distinction, the leaf-linking that makes range scans efficient, and
+why the structure is everywhere. Sole author Douglas Comer; venue, volume, pages, year, and DOI verified via the ACM Digital Library.</li>
+<li><strong>Goetz Graefe, &ldquo;Modern B-Tree Techniques,&rdquo; <em>Foundations and Trends in Databases</em> 3(4), 2011, pp. 203&ndash;402,
+DOI 10.1561/1900000028.</strong> The comprehensive modern survey: fanout and occupancy, splitting and bulk-loading (the &sect;51.4 trap and its
+fixes), and the transactional and concurrency techniques real B-trees use. Sole author Goetz Graefe; venue, volume, pages, year, and DOI verified via
+the ACM Digital Library and publisher.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003 (ISBN 978-0072465631),
+Chapter 10, &ldquo;Tree-Structured Indexing.&rdquo;</strong> The textbook development of the B+-tree, its search/insert/split, and the fanout/height
+arithmetic of &sect;51.3. First authors Raghu Ramakrishnan and Johannes Gehrke; edition, publisher, year, and ISBN verified via the publisher and
+retailer listings.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex51.1"><span class="ex-label">51.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is the unit of cost a disk search structure minimizes, and why does that favor a wide, shallow tree over a binary one?</div>
+
+<div class="exercise" id="ex51.2"><span class="ex-label">51.2</span> <span class="ex-tag warm">warm-up</span>
+In a B+-tree, what do internal nodes hold and what do leaves hold, and why are the leaves linked together in key order?</div>
+
+<div class="exercise" id="ex51.3"><span class="ex-label">51.3</span> <span class="ex-tag warm">warm-up</span>
+For a 4&nbsp;KiB page with 8-byte keys and 8-byte pointers, roughly what is the fanout, and how many levels index a billion keys? How many page
+fetches is a look-up?</div>
+
+<div class="exercise" id="ex51.4"><span class="ex-label">51.4</span> <span class="ex-tag core">core</span>
+Fanout and height. (a) Write the fanout formula in terms of page size, header, key size, and pointer size. (b) Compute the fanout for 16-byte keys
+and 8-byte pointers on a 4&nbsp;KiB page. (c) Using that fanout, estimate the height needed to index a billion keys, and explain why doubling the key
+size does not double the height.</div>
+
+<div class="exercise" id="ex51.5"><span class="ex-label">51.5</span> <span class="ex-tag core">core</span>
+The split. (a) Describe what happens when an insert lands in a full leaf: what is divided, what is created, and what is pushed up. (b) Explain why a
+split can propagate up the tree, and what happens when it reaches the root. (c) Explain how &ldquo;grow only at the root&rdquo; keeps all leaves at
+the same depth.</div>
+
+<div class="exercise" id="ex51.6"><span class="ex-label">51.6</span> <span class="ex-tag core">core</span>
+Binary tree versus B-tree on disk. (a) How many levels does a balanced binary tree over a billion keys have, and how many page fetches would a
+look-up cost if the tree does not fit in memory? (b) How many does a fanout-254 B-tree cost? (c) Explain why the comparison count (both ~30 for the
+binary tree's descent) is irrelevant to the on-disk cost.</div>
+
+<div class="exercise" id="ex51.7"><span class="ex-label">51.7</span> <span class="ex-tag complexity">cost</span>
+Caching the upper levels. (a) A fanout-254 B-tree over a billion keys has height 4; estimate how many pages the root and second level together
+occupy, and argue they stay resident in a reasonable buffer pool. (b) Given that, how many of the 4 page fetches typically reach the disk? (c) Using
+the Chapter 48 hit (~36&nbsp;ns) and miss (~350&nbsp;&micro;s) costs, estimate the effective cost of a look-up when only the leaf misses.</div>
+
+<div class="exercise" id="ex51.8"><span class="ex-label">51.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team loads a billion rows into a table whose primary-key index is a B+-tree, inserting rows in
+increasing key order, and finds the index is nearly twice the size they expected.
+<br><strong>Step 1 (given):</strong> increasing keys always land in the rightmost leaf, which fills and splits.
+<br><strong>Step 2 (given):</strong> a naive 50/50 split leaves the left half half-full, and no future (larger) key is ever inserted into it.
+<br><strong>Step 3 (given):</strong> so pages settle near 50% utilization, roughly doubling the page count.
+<br><strong>Step 4 (you):</strong> Explain why the index is about twice the expected size and what effect the lower fill has on height and look-up
+cost, then name the fix that keeps sequential loads dense.</div>
+
+<div class="exercise" id="ex51.9"><span class="ex-label">51.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the B+-tree concept responsible — <em>fanout</em>, <em>leaf linking</em>, <em>node split</em>, <em>the balance invariant</em>, or
+<em>the RID in the leaf</em> — and why: (a) a range scan walks in sorted order without returning to the root; (b) every look-up costs the same number
+of fetches regardless of key; (c) hundreds of keys fit in one node; (d) the tree stays balanced as it grows; (e) a leaf entry points at the actual
+heap row.</div>
+
+<div class="exercise" id="ex51.10"><span class="ex-label">51.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A B+-tree stores data in its internal nodes.&rdquo; (b) &ldquo;A
+B-tree's height grows when a leaf splits.&rdquo; (c) &ldquo;Doubling the number of keys roughly doubles a B-tree's height.&rdquo; (d) &ldquo;Sequential
+key insertion, split naively, tends toward ~50% page fill.&rdquo; (e) &ldquo;On disk, the binary search tree is preferred because it makes the fewest
+comparisons.&rdquo;</div>
+
+<div class="exercise" id="ex51.11"><span class="ex-label">51.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the access path. (a) Trace a point look-up by key end to end: descend the B-tree (&sect;51.4) fetching each node via the storage manager
+(&sect;50) through the buffer pool (&sect;48), reach the leaf, read the RID, and fetch the heap row (&sect;49) — count the page fetches and say which
+usually hit versus miss. (b) Explain why the B-tree is built entirely on the previous part's <code>fetchPage</code> interface and what that bought.
+(c) Argue that the B-tree's in-place update bias is exactly what motivates the log-structured alternative, using the Chapter 46 random-write cost.</div>
+
+<div class="exercise" id="ex51.12"><span class="ex-label">51.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Write a program that computes fanout and B-tree height for a page size, key size, and pointer size, and
+tabulate the height for N from a thousand to a trillion. (b) Implement a working in-memory B-tree (choose an order <var>m</var>), insert keys in a
+seeded order, and report the measured height and split count, checking it against the bracket ceil(log-base-<var>m</var> of N) &le; height &le;
+ceil(log-base-&lceil;<var>m</var>/2&rceil; of N). (c) State your toolchain and CPU, and explain which results are exact arithmetic and which are
+structural outcomes of a deterministic insert order — and why neither is a wall-clock timing.</div>
+
+</section>
+</section>

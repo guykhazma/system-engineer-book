@@ -1,0 +1,91 @@
+<section class="solutions" id="sol50">
+<h1>Chapter 50 — Solutions</h1>
+
+<div class="solution" id="sol50.1"><span class="sol-label">50.1</span>
+The storage manager owns physical storage and exposes it as a narrow interface of pages and records, hiding the buffer pool, slotted pages, free-space
+directory, and device. Two of its calls: <code>fetchPage</code>/<code>unpinPage</code> (read a page), <code>allocatePage</code>/<code>freePage</code>
+(grow/shrink), <code>readRecord</code>/<code>insertRecord</code> (records). <em>Tempting wrong answer:</em> &ldquo;it manages the disk hardware&rdquo; —
+it manages the abstraction of pages and records <em>over</em> storage, hiding the hardware. <strong>Feed-forward:</strong> &sect;50.1.</div>
+
+<div class="solution" id="sol50.2"><span class="sol-label">50.2</span>
+A PageId is (file identifier, page number within that file). The RID is properly (PageId, slot) because a real database has many files — tables,
+indexes, log — so a bare page number is ambiguous; the file id disambiguates, and page number &times; page size gives the offset. <em>Tempting wrong
+answer:</em> &ldquo;a global page number is enough&rdquo; — it ties every page to one file and one growth path. <strong>Feed-forward:</strong> &sect;50.2.</div>
+
+<div class="solution" id="sol50.3"><span class="sol-label">50.3</span>
+About 258 overflow pages (&lceil;1&nbsp;MiB / ~4072&nbsp;B&rceil;). In place of the value the row keeps a small pointer to the head of the overflow
+chain. <em>Tempting wrong answer:</em> &ldquo;256&rdquo; from 1&nbsp;MiB / 4&nbsp;KiB exactly — per-page overhead reduces the usable bytes, so it is
+258, not 256. <strong>Feed-forward:</strong> &sect;50.3.</div>
+
+<div class="solution" id="sol50.4"><span class="sol-label">50.4</span>
+(a) The buffer pool (page table, pin counts, dirty bits, eviction), the device beneath it, and whether the access was a hit or a disk read. (b) The
+B-tree calls only <code>fetchPage</code>/<code>unpinPage</code> and treats a node as a page, so it never issues a <code>pread</code> or picks a victim
+— it can be written purely in terms of pages. (c) Example: the buffer pool switching from clock to LRU-K eviction, or the heap switching from a
+linked list to a page directory — the layers above call the same interface and are unaffected, because the interface names pages/records, not
+mechanisms. <em>Tempting wrong answer:</em> &ldquo;the B-tree still needs to know the eviction policy for correctness&rdquo; — it does not; pinning is
+the only guarantee it needs, and the interface provides it. <strong>Feed-forward:</strong> &sect;50.1.</div>
+
+<div class="solution" id="sol50.5"><span class="sol-label">50.5</span>
+(a) &lceil;<var>S</var> / (<var>P</var>&minus;<var>h</var>)&rceil; overflow pages. (b) With <var>P</var>&minus;<var>h</var> = 4072:
+64&nbsp;KiB &rarr; &lceil;65536/4072&rceil; = 17; 1&nbsp;MiB &rarr; &lceil;1048576/4072&rceil; = 258. (c) Benefits: the row stays small (many rows per
+heap page, dense scans) and the value is pay-per-use (fetched only when its column is read). Cost: a linked overflow chain must be walked to reach a
+deep offset, so random access into the middle of a large value is <em>O(chain)</em>. <em>Tempting wrong answer:</em> using <var>P</var> not
+<var>P</var>&minus;<var>h</var> — the per-page overhead reduces usable bytes. <strong>Feed-forward:</strong> &sect;50.3.</div>
+
+<div class="solution" id="sol50.6"><span class="sol-label">50.6</span>
+(a) &lfloor;<var>U</var>/<var>R</var>&rfloor; rows fit a page; inlining a 1&nbsp;MiB value makes <var>R</var> &gt; a page, so the count drops to one row
+per page (or fewer, with its own overflow). (b) A full scan reads whole pages; if each page holds one bloated row, the scan reads a megabyte per row
+regardless of which columns the query wants — it cannot skip the inline bytes. (c) Store values beyond a threshold (roughly a quarter of a page)
+out-of-line; this keeps rows small so density — and the cheap scan — is preserved. <em>Tempting wrong answer:</em> &ldquo;the scan reads only the
+requested columns&rdquo; — I/O is by page, so inlined bytes are read whether wanted or not. <strong>Feed-forward:</strong> &sect;50.3.</div>
+
+<div class="solution" id="sol50.7"><span class="sol-label">50.7</span>
+(a) Small rows: about &lceil;<var>N</var>/<var>d</var>&rceil; pages; inlined 1&nbsp;MiB value: about <var>N</var> pages (one row each), each ~256&times;
+larger. (b) The inlined scan moves on the order of <var>d</var>&nbsp;&times;&nbsp;(1&nbsp;MiB / small-row-size) times more bytes — many hundreds of
+times — all at the sequential per-page cost of Chapters 46/48, so the scan is I/O-bound on data it never uses. (c) Out-of-line storage puts only a
+pointer in the row, so the scanned page size depends on the inline columns; the large value's bytes are elsewhere and are read only if that column is
+selected. <em>Tempting wrong answer:</em> &ldquo;sequential reads are cheap, so size doesn't matter&rdquo; — cheap per byte, but hundreds of times
+more bytes is still hundreds of times more time. <strong>Feed-forward:</strong> &sect;50.3&ndash;&sect;50.4.</div>
+
+<div class="solution" id="sol50.8"><span class="sol-label">50.8</span>
+<strong>Step 4:</strong> One page fetch. <code>readRecord</code> does a single <code>fetchPage</code> for the heap page, indexes the slot, and reads
+the inline <code>id</code> and <code>title</code>; <code>body</code> is only a pointer in the row, so its size is irrelevant — the overflow chain is
+never touched. If the query <em>did</em> select <code>body</code>, the storage manager would follow the pointer and fetch the overflow chain — about
+&lceil;|body| / usable-bytes&rceil; further page fetches — so the cost would then scale with the value's size. <em>Tempting wrong answer:</em>
+&ldquo;the big value is always read with the row&rdquo; — out-of-line means it is fetched only when its column is selected. <strong>Feed-forward:</strong>
+&sect;50.3&ndash;&sect;50.4.</div>
+
+<div class="solution" id="sol50.9"><span class="sol-label">50.9</span>
+(a) <strong>The interface (encapsulation)</strong> — the B-tree uses <code>fetchPage</code>, never raw I/O. (b) <strong>Out-of-line storage</strong> —
+the row holds a pointer to the document's overflow chain. (c) <strong>PageId</strong> — a small comparable (file, page) name across files. (d)
+<strong>RID</strong> — the (PageId, slot) row address stored in the index leaf. (e) <strong>fetchPage</strong> — it returns a pinned frame pointer
+whether the page was resident or read from disk. <em>Tempting wrong answer:</em> attributing (a) to <code>fetchPage</code> alone — it is the interface
+abstraction, of which <code>fetchPage</code> is one call, that provides the independence. <strong>Feed-forward:</strong> &sect;50.1&ndash;&sect;50.3.</div>
+
+<div class="solution" id="sol50.10"><span class="sol-label">50.10</span>
+(a) <strong>False</strong> — it exposes pages and records; disk offsets and frame indices are exactly what it hides. (b) <strong>True</strong> — a page
+keeps its PageId for its lifetime, which is why stored PageIds stay valid. (c) <strong>False</strong> — compression may shrink it but a 10&nbsp;MiB
+value generally still exceeds a page and needs out-of-line storage. (d) <strong>False</strong> — inlining a large value <em>slows</em> scans that never
+read it, by reading its bytes on every page. (e) <strong>True</strong> — the value lives elsewhere and is fetched only when its column is read.
+<em>Tempting wrong answer:</em> marking (c) true because &ldquo;compression fixes size&rdquo; — it reduces but does not remove the need for overflow.
+<strong>Feed-forward:</strong> &sect;50.1&ndash;&sect;50.3.</div>
+
+<div class="solution" id="sol50.11"><span class="sol-label">50.11</span>
+(a) RID = (file, page, slot) &rarr; <code>fetchPage(PageId)</code> &rarr; buffer-pool page-table lookup: hit = frame in DRAM (~36&nbsp;ns), miss =
+evict a victim (write back if dirty), compute offset, read the 4&nbsp;KiB page from the device (~350&nbsp;&micro;s, Chapters 46/48) &rarr; pin, index
+the slot array (Chapters 47/49) &rarr; read bytes, following a forwarding pointer (&sect;49.3) or overflow chain (&sect;50.3) if present &rarr; unpin,
+return. (b) A B-tree node <em>is</em> a page reached by <code>fetchPage</code> and a leaf stores a <em>RID</em>; both are exactly what this part
+defined, so the B-tree is buildable purely on the interface, with no I/O code of its own. (c) Both put a small, stable name in front of variable,
+growing data: a PageId names a page across growing files; an out-of-line pointer names a value that outgrew its page — the same instinct at two
+scales. <em>Tempting wrong answer:</em> &ldquo;the B-tree needs its own disk layer&rdquo; — the storage manager already is that layer.
+<strong>Feed-forward:</strong> &sect;50.1&ndash;&sect;50.5.</div>
+
+<div class="solution" id="sol50.12"><span class="sol-label">50.12</span>
+Open-ended and platform-specific. A correct write-up: (a) sketches the six-call interface and implements <code>readRecord</code> as one
+<code>fetchPage</code> plus a slot index (no raw I/O above the interface); (b) computes overflow-page counts as an exact ceiling division
+&lceil;<var>S</var>/(<var>P</var>&minus;<var>h</var>)&rceil; for several sizes and confirms the pattern; (c) if it measures the density effect, states
+toolchain and CPU and separates the <em>exact arithmetic</em> (page counts, reproducible and hardware-independent) from any <em>timed</em> scan
+(machine- and disk-dependent). <em>Tempting wrong answer:</em> reporting the overflow-page arithmetic as a measurement — it is exact arithmetic, not a
+clock reading. <strong>Feed-forward:</strong> &sect;50.1&ndash;&sect;50.4.</div>
+
+</section>

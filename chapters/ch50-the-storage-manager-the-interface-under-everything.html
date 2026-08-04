@@ -1,0 +1,364 @@
+<section class="chapter" id="ch50">
+<h1>Chapter 50 — The Storage Manager: The Interface Under Everything</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (the device and its cost model — the floor everything
+rests on), <a href="#ch47">Chapter 47</a> (the page and the records inside it — the unit and the currency), <a href="#ch48">Chapter 48</a> (the
+buffer pool — how a page becomes memory you can touch, pinned and evictable), <a href="#ch49">Chapter 49</a> (the heap file — pages organized into a
+table, records named by RID). &nbsp;·&nbsp; The four chapters before this each built one slab of the storage foundation. This chapter names the seam
+that joins them — the <em>storage manager</em>, the single interface the rest of the database calls — and handles the one thing a fixed-size page
+cannot: a value bigger than the page itself.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch48">Chapter 48</a> — what does <code>fetchPage(p)</code> do on a hit versus a miss, and what does the caller promise
+to do when it is finished with the page? (2) <a href="#ch49">Chapter 49</a> — a record is named by a RID of (page number, slot number); what happens
+to that RID when a record grows too big for its page? (3) <em>Predict:</em> a page is 4&nbsp;KiB, but a column might hold a 1&nbsp;MiB document or a
+10&nbsp;MiB image. It plainly cannot fit in one page. Two questions: roughly how many 4&nbsp;KiB pages would a 1&nbsp;MiB value need if you chain
+overflow pages, and — the subtler one — what happens to a <em>table scan</em> if you instead try to cram that big value <em>inline</em> in the row,
+next to the small columns queries actually read? Write your guesses; &sect;50.3 answers them.</p>
+</aside>
+
+<p>Four chapters have each built one part of a storage engine: the device and its cost model (Chapter 46), the page and its records (Chapter 47), the
+buffer pool that turns pages into memory (Chapter 48), and the heap file that turns pages into a table (Chapter 49). What has not yet been named is the
+thing that joins them — the <strong>storage manager</strong>, the module that presents all of this to the rest of the database as one coherent
+interface. The layers above it — the indexes and access methods of the next part, the query executor after that — must not each know about disk
+geometry, buffer frames, slot arrays, and free-space directories; they need a small, stable vocabulary: <em>give me page <var>P</var></em>, <em>here
+is a page, make it durable</em>, <em>allocate a new page</em>, <em>free this page</em>, <em>read the record at this RID</em>. The storage manager is
+the layer that provides exactly that vocabulary and hides everything below it, so that a B-tree can be written as &ldquo;a tree whose nodes are
+pages&rdquo; without the B-tree code ever issuing a <code>pread</code> or choosing an eviction victim. This chapter does two jobs. It makes the
+interface explicit — what the storage manager exposes and what it hides (&sect;50.1), and how it names a page across many files with a
+<strong>page identifier</strong> so the address space scales beyond one file (&sect;50.2). And it handles the one case the fixed-size page of Chapter
+47 cannot: a <strong>value larger than a page</strong>, stored out-of-line in a chain of overflow pages, with the named trap of storing it inline
+instead (&sect;50.3). Then it composes the whole foundation into a single end-to-end trace of one record read (&sect;50.4), and hands the finished
+interface up to the storage engines the next part builds on it (&sect;50.5). This is the capstone of the storage part: after it, &ldquo;fetch a
+page&rdquo; and &ldquo;read a record&rdquo; are primitives the rest of the book may simply assume.</p>
+
+<p><strong>On the code in this chapter.</strong> The overflow-page counts of &sect;50.3 are <strong>exact arithmetic</strong>, not measurements: a short
+program computes the ceiling-division page counts for values of various sizes given a 4&nbsp;KiB page and a fixed per-page overhead, so the numbers
+are reproducible and hardware-independent (they depend only on the page size and overhead stated, not on this machine's disk). Where those page
+counts turn into a cost, the cost is the <a href="#ch48">Chapter 48</a> buffer-pool fetch and the <a href="#ch46">Chapter 46</a> device figures
+measured earlier in this part, which this chapter cites rather than re-measures. The arithmetic itself was run on this machine's Intel Core
+i7-12700H (glibc 2.35, gcc 11.4.0 available). The C in &sect;50.1 is an <em>interface sketch</em> — function signatures illustrating the vocabulary,
+with types like <code>PageId</code> left abstract — not a compiled, timed program; no wall-clock claim is made about it, and a hardware-counter
+profiler (<code>perf</code>) is not installed here.</p>
+
+<h2>50.1 What the storage manager is: the interface between access methods and pages</h2>
+
+<p>The <strong>storage manager</strong> is the database module that owns physical storage and exposes it to everyone above as a narrow interface. Its
+whole reason to exist is <em>encapsulation</em>: the layers above — indexes, the table/heap layer, the executor — should reason about pages and
+records, never about how a page reaches memory or which frame it lands in. Concretely, the storage manager sits on top of the buffer pool (Chapter
+48) and the on-disk files (Chapter 47) and offers roughly this vocabulary. To read, <code>fetchPage(pid)</code> returns a pinned pointer to the page's
+frame (a buffer-pool hit or a disk read, invisibly), and <code>unpinPage(pid, dirty)</code> releases it, flagging whether it was modified. To grow
+and shrink storage, <code>allocatePage()</code> extends a file and returns a new page identifier, and <code>freePage(pid)</code> returns a page to the
+free list. To find records, <code>readRecord(rid)</code> resolves a RID to bytes (the heap-file resolution of Chapter 49), and
+<code>insertRecord(bytes)</code> finds room (the free-space directory of Chapter 49), writes, and returns a new RID. In C the shape is small:</p>
+
+<pre><code>/* the storage-manager interface the layers above see -- pages and records,
+   nothing about disks, frames, or eviction */
+Page *fetchPage(PageId pid);              /* pin + return frame pointer (hit or disk read) */
+void  unpinPage(PageId pid, bool dirty);  /* release; 'dirty' -&gt; must be written back before reuse */
+PageId allocatePage(FileId f);            /* extend file f, return new page id */
+void  freePage(PageId pid);               /* return page to the free list */
+Record readRecord(Rid rid);              /* (page,slot) -&gt; bytes: one fetchPage + slot index */
+Rid    insertRecord(FileId f, Bytes rec); /* find room (free-space dir), write, return rid */
+</code></pre>
+
+<p>Everything the previous four chapters built is <em>behind</em> these six calls. <code>fetchPage</code> hides the buffer pool's page table, pin
+counts, dirty bits, and replacement policy, and hides the device beneath them — the caller sees only a pointer that is valid until it unpins.
+<code>insertRecord</code> hides the free-space directory and the slotted-page write. The layers above are written entirely in this vocabulary: a
+B-tree node <em>is</em> a page fetched with <code>fetchPage</code>; a table scan <em>is</em> a loop over page identifiers calling <code>fetchPage</code>
+and yielding records; an index leaf stores a <em>RID</em> and calls <code>readRecord</code> to reach the row. This is the layering that makes a database
+buildable at all: each layer depends only on the interface below it, so the B-tree does not break when the buffer pool changes its eviction policy,
+and the executor does not break when the heap file changes its free-space scheme. The storage manager is where &ldquo;the database on disk&rdquo; stops
+being about disks and starts being about pages and records — the exact abstraction the rest of the book stands on.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name two things the storage manager's <code>fetchPage</code> hides from the layers above it. Why does this encapsulation let a B-tree be written
+without any knowledge of disks or buffer frames? (Answer after the next section.)</p>
+</aside>
+
+<h2>50.2 The page identifier and the address space</h2>
+
+<p>Chapter 49's RID named a record by (page number, slot number), taking &ldquo;page number&rdquo; for granted. The storage manager must make that
+concrete, because a real database is not one file — it is many: one or more per table, more for indexes, still more for the log. So a page is named
+not by a bare number but by a <strong>page identifier</strong> (a <strong>PageId</strong>): typically a pair <em>(file identifier, page number
+within that file)</em>, sometimes packed into a single integer. The PageId is the address the whole storage manager turns on:
+<code>fetchPage(pid)</code> uses the file id to pick the file and the page number to compute the byte offset within it (page number &times; page size),
+then reads that page through the buffer pool. This is the storage layer's <em>address space</em> — a two-level address, file then offset, exactly
+analogous to the virtual-memory address translation of the operating-system part, and for the same reason: a flat global page number would tie every
+page to one file and one growth path, whereas (file, page) lets each table and index grow in its own file independently while still being named by a
+single, comparable identifier. The RID of Chapter 49 is thus properly a <em>(PageId, slot)</em>: file, page, slot — enough to locate any record in the
+database with no search, across any number of files. Two properties make the PageId the right currency for everything above. It is <strong>small and
+comparable</strong>: a few bytes, cheap to store by the million in index leaves and cheap to compare and sort, which is what lets an index hold RIDs
+densely. And it is <strong>stable</strong>: a page keeps its identifier for its lifetime, so a stored PageId remains valid — the property Chapter 49's
+forwarding pointers worked so hard to preserve for records is guaranteed for pages by construction. The address space is deliberately boring, and
+that is its virtue: a stable, small, comparable name for every page means every layer above can refer to storage by identifier and let the storage
+manager do the translation to bytes.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a value bigger than a page must live out-of-line, in a chain of pages</span>
+<p><strong>1. In words.</strong> A page is fixed at 4&nbsp;KiB, so a value larger than a page cannot be a single slotted record. The storage manager
+stores it <em>out-of-line</em>: it writes the value across a chain of dedicated overflow pages and leaves, in the row itself, only a small pointer to
+the head of that chain. The row stays small; the big value lives elsewhere and is fetched only when actually needed.</p>
+<p><strong>2. As a picture.</strong> Figure 50.1: a heap page with a normal-sized row whose large column is not the bytes but a pointer, an arrow
+leading to overflow page O0, which chains O0&rarr;O1&rarr;O2&rarr;&hellip; each holding a slice of the value; the small columns stay inline, dense on
+the heap page.</p>
+<p><strong>3. As numbers.</strong> Computed here with a 4&nbsp;KiB page and ~24&nbsp;bytes of per-page overhead (usable ~4,072&nbsp;B): a 8&nbsp;KiB
+value needs <strong>3</strong> overflow pages; 64&nbsp;KiB needs <strong>17</strong>; 1&nbsp;MiB needs <strong>258</strong>; 10&nbsp;MiB needs
+<strong>2,576</strong>. A linked chain also means random access to a byte deep in the value may walk up to the whole chain — which is why large
+values are read whole or sequentially, not seeked into.</p>
+</aside>
+
+<p><em>(Answer to the &sect;50.1 quick check: <code>fetchPage</code> hides, among other things, the <strong>buffer pool</strong> — its page table,
+pin counts, dirty bits, and eviction policy — and the <strong>device</strong> beneath it: the caller cannot tell a hit from a disk read, and never
+issues a <code>pread</code> or picks a victim. This encapsulation lets a B-tree be written as &ldquo;a tree of pages&rdquo; using only
+<code>fetchPage</code>/<code>unpinPage</code>, so it neither knows nor cares how a page reaches memory — the storage manager owns that, and can change
+it without touching the B-tree.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A large value lives out-of-line: the row holds a pointer; the bytes chain across overflow pages.</text>
+<rect x="20" y="40" width="180" height="60" fill="#eef1f4" stroke="#333"/>
+<text x="28" y="56" font-size="8">heap page (row stays small)</text>
+<rect x="28" y="64" width="40" height="28" fill="#dff0df" stroke="#2f7d32"/><text x="33" y="81" font-size="7">id</text>
+<rect x="70" y="64" width="40" height="28" fill="#dff0df" stroke="#2f7d32"/><text x="75" y="81" font-size="7">name</text>
+<rect x="112" y="64" width="80" height="28" fill="#f6dcd2" stroke="#8c3a1d"/><text x="117" y="81" font-size="7">doc: ptr&rarr;O0</text>
+<rect x="280" y="34" width="70" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="292" y="53" font-size="8">O0</text>
+<rect x="370" y="34" width="70" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="382" y="53" font-size="8">O1</text>
+<rect x="460" y="34" width="70" height="30" fill="#f6dcd2" stroke="#8c3a1d"/><text x="472" y="53" font-size="8">O2 &hellip;</text>
+<path d="M192 78 L280 52" stroke="#8c3a1d" stroke-width="1.5"/>
+<path d="M350 49 L370 49" stroke="#8c3a1d" stroke-width="1.5"/><path d="M440 49 L460 49" stroke="#8c3a1d" stroke-width="1.5"/>
+<text x="280" y="82" font-size="8" fill="#8c3a1d">value chained across overflow pages (1 MiB &rarr; ~258 pages)</text>
+<text x="20" y="130" font-size="8" fill="#2f7d32">Small columns stay dense on the heap page &rarr; scans that ignore 'doc' read few pages per row.</text>
+<text x="20" y="150" font-size="8" fill="#8c3a1d">Inlining 'doc' instead would bloat the row, so few rows fit a page and every scan drags the big value.</text>
+</svg>
+<figcaption>Figure 50.1: out-of-line storage for a large value. The row keeps small columns inline and stores only a pointer to a chain of overflow
+pages holding the big value, so scans that do not read the big column stay dense and cheap; inlining the value instead would bloat every row and slow
+every scan.</figcaption>
+</figure>
+
+<h2>50.3 Values too big for a page: overflow and out-of-line storage</h2>
+
+<p>A page is fixed-size — 4&nbsp;KiB here — but a column is not: a text document, a JSON blob, an image, a serialized vector can be kilobytes or
+megabytes, far larger than any single page. The storage manager cannot store such a value as one slotted record, so it stores it <strong>out-of-line
+(overflow storage)</strong>: the large value is written across a chain of dedicated <strong>overflow pages</strong>, and the row keeps only a small
+pointer to the head of the chain in place of the value. The arithmetic is a ceiling division — a value of <var>S</var> bytes, on pages of <var>P</var>
+bytes with per-page overhead <var>h</var>, needs &lceil;<var>S</var> / (<var>P</var>&minus;<var>h</var>)&rceil; overflow pages — and it grows exactly
+as you would expect:</p>
+
+<pre><code>out-of-line storage, 4-KiB pages, ~24 B/page overhead (usable ~4072 B):
+  value    8 KiB  -&gt;    3 overflow pages
+  value   64 KiB  -&gt;   17 overflow pages
+  value    1 MiB  -&gt;  258 overflow pages
+  value   10 MiB  -&gt; 2576 overflow pages
+</code></pre>
+
+<p>Out-of-line storage buys two things. It keeps the <strong>row small</strong>, so many rows still fit a heap page and scans stay dense (&sect;49.4);
+and it makes the big value <strong>pay-per-use</strong>, fetched only when a query actually reads that column, not dragged through memory every time
+the row is touched for its small fields. The cost is that reading the value is a walk of the overflow chain — sequential and fine when you want the
+whole value, but poor for random access into the middle of it, since a linked chain must be walked to reach a deep offset (real systems that need
+random access into large values use a tree or a chunk index over the overflow pages rather than a bare chain). This is exactly the mechanism behind
+PostgreSQL's TOAST (&ldquo;The Oversized-Attribute Storage Technique&rdquo;), Oracle's and SQL Server's out-of-line LOB storage, and every system's
+BLOB handling: a large value is moved off the row and pointed at. The decision of <em>when</em> to push a value out-of-line is usually a threshold —
+a value beyond some fraction of the page (a common heuristic is roughly a quarter of the page, so several rows still fit) becomes a candidate for
+out-of-line storage — and getting it wrong is the named trap: storing a large value <em>inline</em> bloats every row so that only one or a few fit per
+page, which does not just waste space but destroys the tuple density that made the heap scan of &sect;49.4 cheap. Every full scan then drags the big
+value through the buffer pool even for queries that never read it, turning a cheap scan of the small columns into an expensive scan of megabytes of
+document — a self-inflicted collapse of the storage engine's central advantage.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: storing a large value inline and collapsing tuple density</span>
+<p>A page is fixed-size, so the number of rows it holds is <em>(usable page bytes) / (row size)</em>. Put a large value inline — a multi-kilobyte JSON
+document, a serialized blob, a base64 image — and the row size balloons, so a page holds <strong>one or a handful of rows instead of dozens</strong>.
+The damage is not mainly wasted space; it is that <strong>every full scan now reads that big value for every row, even queries that never touch that
+column</strong>. A scan that should stream the small columns densely (Chapter 49) instead reads megabytes of document per row, so a report over
+<code>customer_id</code> and <code>total</code> is dragging the 1&nbsp;MiB <code>notes</code> field of every row through the buffer pool — the tuple
+density that made the scan cheap is gone, and with it the storage engine's central advantage. The trap is seductive because inline &ldquo;just
+works&rdquo; on small data and only bites when values grow: a <code>text</code> column that held short strings in testing holds novels in production,
+and scans that were fast quietly become I/O-bound with no query change. The fix is to store large values out-of-line above a size threshold (roughly
+a quarter of a page is a common cutoff) so the row stays small and the big value is fetched only when read — exactly what TOAST/LOB storage does
+automatically, and what a hand-rolled engine must do deliberately. &ldquo;It's just a column&rdquo; and &ldquo;scans are cheap&rdquo; are not both
+true once that column holds a value larger than a fraction of the page.</p>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does storing a 1&nbsp;MiB value inline in a row hurt a scan that never reads that value? Roughly how many 4&nbsp;KiB pages does a 1&nbsp;MiB
+value need out-of-line, and what does keeping only a pointer in the row preserve? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>50.4 Composing the layers: one record read, end to end</h2>
+
+<p>The storage part is now complete enough to trace a single operation through every layer it built — the clearest way to see the interface doing its
+job. Suppose the executor holds a RID (from an index leaf or a scan) and wants the row. It calls the storage manager's <code>readRecord(rid)</code>,
+and here is the whole descent. The RID is <em>(PageId, slot)</em> = (file id, page number, slot) (&sect;50.2). The storage manager calls
+<code>fetchPage(pid)</code> (&sect;50.1); the buffer pool looks the PageId up in its page table (&sect;48): on a <strong>hit</strong> the page is
+already in a frame — a memory access, about 36&nbsp;ns measured earlier — and on a <strong>miss</strong> the pool evicts a victim (writing it back if
+dirty), computes the byte offset (page number &times; page size) in the file, and reads the 4&nbsp;KiB page from the device (&sect;46) — about
+350&nbsp;&micro;s on this machine's virtual disk, four orders of magnitude slower. The page is pinned; the storage manager indexes its slot array at
+<em>slot</em> to get the record's in-page offset and length (&sect;47, &sect;49), and reads the record's bytes. If the record is a forwarding pointer
+(the row migrated, &sect;49.3), it follows it with a second <code>fetchPage</code>. If a column is stored out-of-line and the query reads it, the
+pointer in the row is followed into the overflow chain (&sect;50.3) with further fetches. Finally the storage manager <code>unpinPage</code>s and
+returns the bytes; the executor never saw a frame, a slot, or a byte offset — only &ldquo;here is the record.&rdquo; That single trace is the entire
+storage foundation in motion: the RID and page identifier that name the data (&sect;49, &sect;50.2), the heap file and slotted page that lay it out
+(&sect;47, &sect;49), the buffer pool that turns a page into memory and decides hit or miss (&sect;48), the device that is the floor and the cliff
+(&sect;46), and the storage manager that composes them into one call. Everything the next part builds — every B-tree node, every index lookup, every
+log write — is made of exactly this call.</p>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Let's store each document's full JSON — often a megabyte — directly in a <code>data</code> column
+on the main table, so we don't need a second lookup. Simpler, and one row is one read.&rdquo; The table is also scanned nightly for a report that
+reads only two small columns. Cover the paragraph and respond in four or five sentences, drawing on &sect;50.3 and &sect;49.4.</p>
+<p><em>Model answer.</em> &ldquo;One row being one read is only true for the point look-up; for the nightly scan, inlining a megabyte per row is the
+expensive choice. A page is fixed at a few kilobytes, so if the row carries a 1&nbsp;MiB JSON blob, a page holds essentially one row, and the scan
+that needs only two small columns now reads a megabyte per row through the buffer pool anyway — the tuple density that makes a scan cheap is gone. If
+we store the JSON out-of-line and keep a pointer in the row, the row stays small, dozens fit per page, the nightly scan stays dense and fast, and we
+fetch the megabyte only for the queries that actually read it — which is exactly what TOAST or LOB storage does for us automatically. So the blob
+should live out-of-line above a size threshold; the point look-up still gets its data in a follow-the-pointer fetch, and the scan keeps its
+density.&rdquo; Naming tuple density, the scan-versus-point-lookup asymmetry, and out-of-line storage as the standard fix is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;50.3 quick check: storing a 1&nbsp;MiB value inline balloons the row so a fixed-size page holds only one or a few rows,
+and a full scan then reads that megabyte for every row even when the query never touches that column — the tuple density that made the scan cheap
+collapses. A 1&nbsp;MiB value needs about <strong>258</strong> 4&nbsp;KiB overflow pages out-of-line; keeping only a pointer in the row preserves the
+row's small size, so scans of the other columns stay dense and the big value is fetched only when actually read.)</em></p>
+
+<h2>50.5 What to carry forward</h2>
+
+<p>The <strong>storage manager</strong> is the module that owns physical storage and exposes it as a narrow interface — <code>fetchPage</code>/
+<code>unpinPage</code>, <code>allocatePage</code>/<code>freePage</code>, <code>readRecord</code>/<code>insertRecord</code> — hiding the buffer pool,
+the slotted page, the free-space directory, and the device, so the layers above reason only about pages and records (&sect;50.1). A page is named by
+a <strong>page identifier (PageId)</strong> — (file id, page number) — a small, comparable, stable address; the RID of Chapter 49 is properly
+(PageId, slot), enough to locate any record across any number of files with no search (&sect;50.2). A value larger than a page is stored
+<strong>out-of-line</strong> across a chain of overflow pages with only a pointer left in the row — a 1&nbsp;MiB value needing ~258 4&nbsp;KiB pages —
+which keeps rows small and makes big values pay-per-use; storing them <strong>inline</strong> instead collapses tuple density and makes every scan
+drag the big value, the named trap (&sect;50.3). One <code>readRecord</code> composes the whole foundation: RID &rarr; PageId &rarr; buffer-pool
+fetch (hit ~36&nbsp;ns / miss ~350&nbsp;&micro;s) &rarr; slot index &rarr; bytes, following forwarding pointers and overflow chains as needed
+(&sect;50.4).</p>
+
+<p>With this, the storage part is finished, and finished as an <em>interface</em>, not just a pile of mechanisms. The device, the page, the buffer
+pool, the heap file, and the values too big to fit have all been folded behind a handful of calls that speak only of pages and records — and that
+interface is precisely the ground the rest of the volume stands on. The next part builds the <strong>storage engines</strong> — the access methods
+that give a table fast, selective access rather than only the sequential scan of the heap. The first, the <strong>B-tree</strong>, is nothing but a
+tree whose nodes are pages fetched through <code>fetchPage</code>, whose leaves store the RIDs this part defined, and whose shallow height turns a
+key look-up into a handful of page fetches; the second family, the <strong>log-structured merge tree</strong>, is runs of sorted pages written and
+merged through this same interface. Neither needs to know a thing about disks or frames, because the storage manager built here has already hidden
+them. The heap gave you a table; the storage manager gave you the interface; the access methods will give you speed. From here up, &ldquo;fetch a
+page&rdquo; is a primitive — and on that primitive, a database is built.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>State what the storage manager exposes and name three things it hides.</li>
+<li>Say what a PageId is made of and why (file, page) beats a flat global page number.</li>
+<li>Explain why the RID is properly (PageId, slot) and why that locates any record with no search.</li>
+<li>Explain out-of-line storage, why it keeps rows small, and roughly how many pages a 1&nbsp;MiB value needs.</li>
+<li>Explain why storing a large value inline collapses tuple density and slows scans that never read it.</li>
+<li>Trace one <code>readRecord</code> from RID to bytes, naming the layer and cost at each step.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What interface does the storage manager expose, and what does it hide from the layers above? (&sect;50.1)</li>
+<li><strong>R2.</strong> What is a PageId, and why is a two-level (file, page) address better than a flat global page number? (&sect;50.2)</li>
+<li><strong>R3.</strong> How is a value larger than a page stored, and roughly how many 4&nbsp;KiB pages does a 1&nbsp;MiB value need? (&sect;50.3)</li>
+<li><strong>R4.</strong> Why does storing a large value inline collapse tuple density and slow scans? (&sect;50.3)</li>
+<li><strong>R5.</strong> Trace one <code>readRecord</code> from a RID to the record bytes, naming each layer and the hit/miss cost. (&sect;50.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, DOI 10.1561/1900000002.</strong> Its storage-manager and access-method sections are the direct source for
+&sect;50.1&ndash;&sect;50.2: the interface the storage manager presents and the layering above it. First author Joseph M. Hellerstein; venue, year,
+and DOI verified via the ACM Digital Library.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992 (ISBN 978-1558601901).</strong>
+Its storage-structures chapters cover the file/page abstraction, large-object handling, and how the storage layer presents pages and records to the
+transaction manager above — the framing behind &sect;50.1 and &sect;50.3. First author Jim Gray; publisher, year, and ISBN verified via the publisher
+and library listings.</li>
+<li><strong>Abraham Silberschatz, Henry F. Korth &amp; S. Sudarshan, <em>Database System Concepts</em>, 7th ed., McGraw-Hill, 2019
+(ISBN 978-0078022159).</strong> Its storage-and-file-structure chapter covers large-object (LOB) storage and out-of-line representation of oversized
+values — the mechanism of &sect;50.3. First author Abraham Silberschatz; edition, year, and ISBN verified via the publisher listing.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003 (ISBN 978-0072465631),
+Chapter 9, &ldquo;Storing Data: Disks and Files.&rdquo;</strong> The page/record formats and file API that the storage manager wraps (&sect;50.1&ndash;
+&sect;50.2). First authors Raghu Ramakrishnan and Johannes Gehrke; edition, publisher, year, and ISBN verified via the publisher and retailer
+listings.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex50.1"><span class="ex-label">50.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is the storage manager's job, and name two of the six interface calls it exposes.</div>
+
+<div class="exercise" id="ex50.2"><span class="ex-label">50.2</span> <span class="ex-tag warm">warm-up</span>
+What is a PageId made of, and why is the RID of Chapter 49 properly a (PageId, slot) rather than just (page number, slot)?</div>
+
+<div class="exercise" id="ex50.3"><span class="ex-label">50.3</span> <span class="ex-tag warm">warm-up</span>
+Roughly how many 4&nbsp;KiB overflow pages does a 1&nbsp;MiB value need out-of-line, and what does the row keep in place of the value?</div>
+
+<div class="exercise" id="ex50.4"><span class="ex-label">50.4</span> <span class="ex-tag core">core</span>
+Encapsulation. (a) Name three things <code>fetchPage</code> hides from the layer that calls it. (b) Explain why this lets a B-tree be written without
+any knowledge of disks or buffer frames. (c) Give one concrete change to a lower layer (e.g. the buffer pool's eviction policy or the heap's
+free-space scheme) that the layers above do <em>not</em> have to know about, and why the interface protects them.</div>
+
+<div class="exercise" id="ex50.5"><span class="ex-label">50.5</span> <span class="ex-tag core">core</span>
+Out-of-line storage. (a) Write the formula for the number of overflow pages a value of <var>S</var> bytes needs on pages of <var>P</var> bytes with
+per-page overhead <var>h</var>. (b) Evaluate it for <var>S</var> = 64&nbsp;KiB and 1&nbsp;MiB with <var>P</var> = 4096, <var>h</var> = 24. (c) Explain
+the two benefits of out-of-line storage (small rows, pay-per-use) and the one cost (walking the chain for deep random access).</div>
+
+<div class="exercise" id="ex50.6"><span class="ex-label">50.6</span> <span class="ex-tag core">core</span>
+The inline trap. (a) If a page has <var>U</var> usable bytes and rows are <var>R</var> bytes, how many rows fit a page, and what happens to that count
+when a 1&nbsp;MiB value is inlined into each row? (b) Explain why a scan that reads only two small columns is nonetheless slowed by an inlined large
+column. (c) State the threshold rule that avoids the trap and what it preserves.</div>
+
+<div class="exercise" id="ex50.7"><span class="ex-label">50.7</span> <span class="ex-tag complexity">cost</span>
+A table has <var>N</var> rows; a query reads only two small columns via a full scan. (a) Give the number of pages the scan reads when the rows are
+small (density <var>d</var> rows/page) versus when a 1&nbsp;MiB value is inlined (one row/page). (b) Using the Chapter 46/48 sequential-read cost per
+page qualitatively, express how many times more data the inlined scan moves. (c) Explain why out-of-line storage makes the scan cost depend on the
+columns read, not on the size of the unread large column.</div>
+
+<div class="exercise" id="ex50.8"><span class="ex-label">50.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> An index look-up returns a RID for a row whose large <code>body</code> column is stored out-of-line; the
+query selects only <code>id</code> and <code>title</code>.
+<br><strong>Step 1 (given):</strong> the RID is (PageId, slot); one <code>fetchPage</code> brings in the heap page (hit ~36&nbsp;ns, miss ~350&nbsp;&micro;s).
+<br><strong>Step 2 (given):</strong> the slot array gives the row's offset; <code>id</code> and <code>title</code> are inline, so they are read directly.
+<br><strong>Step 3 (given):</strong> <code>body</code> is a pointer to an overflow chain; the query does not read it.
+<br><strong>Step 4 (you):</strong> State how many page fetches this look-up performs and why the size of <code>body</code> does not affect it, then say
+what would change if the query <em>did</em> select <code>body</code>.</div>
+
+<div class="exercise" id="ex50.9"><span class="ex-label">50.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the storage-manager concept responsible — <em>fetchPage</em>, <em>PageId</em>, <em>out-of-line storage</em>, <em>RID</em>, or <em>the
+interface (encapsulation)</em> — and why: (a) a B-tree is written without a single <code>pread</code>; (b) a row keeps only a pointer to its 1&nbsp;MiB
+document; (c) a page is named across many files by a small comparable value; (d) an index leaf stores a row's address; (e) the caller cannot tell a
+buffer-pool hit from a disk read.</div>
+
+<div class="exercise" id="ex50.10"><span class="ex-label">50.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;The storage manager exposes disk offsets and frame indices to the
+executor.&rdquo; (b) &ldquo;A PageId is stable for a page's lifetime.&rdquo; (c) &ldquo;A 10&nbsp;MiB value fits in one page if the page is
+compressed.&rdquo; (d) &ldquo;Inlining a large value speeds up scans that never read it.&rdquo; (e) &ldquo;Out-of-line storage lets a big value be
+fetched only when the query reads that column.&rdquo;</div>
+
+<div class="exercise" id="ex50.11"><span class="ex-label">50.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the storage foundation. (a) Trace one <code>readRecord(rid)</code> from RID to bytes, naming every layer (Chapters 46&ndash;50) and the
+cost at each. (b) Argue that the storage manager's interface is what makes the next part's B-tree buildable, using the fact that a B-tree node is a
+page and a leaf holds a RID. (c) Explain why the two-level address space (file, page) and out-of-line storage are the same design instinct — put a
+small stable name in front of variable, growing data — applied to pages and to values respectively.</div>
+
+<div class="exercise" id="ex50.12"><span class="ex-label">50.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Sketch, in code or pseudocode, the six-call storage-manager interface over a buffer pool and a heap file,
+and implement <code>readRecord(rid)</code> as one <code>fetchPage</code> plus a slot index. (b) Compute (exact arithmetic) the overflow-page count for
+several value sizes given your page size and per-page overhead, and confirm it is a ceiling division. (c) Optionally measure the density effect:
+build one table with a large value inline and one with it out-of-line, scan both reading only the small columns, and report pages read; state your
+toolchain and CPU and which results are exact arithmetic versus timed measurements.</div>
+
+</section>
+</section>

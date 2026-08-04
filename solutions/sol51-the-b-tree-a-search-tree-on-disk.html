@@ -1,0 +1,91 @@
+<section class="solutions" id="sol51">
+<h1>Chapter 51 — Solutions</h1>
+
+<div class="solution" id="sol51.1"><span class="sol-label">51.1</span>
+The page fetch. A wide, shallow tree is favored because each page fetch is enormously expensive (the disk cliff), so the structure that minimizes
+fetches wins; a binary tree makes the fewest <em>comparisons</em> but one page fetch per level, ~30 levels over a billion keys, which is 30 fetches.
+<em>Tempting wrong answer:</em> &ldquo;minimize comparisons&rdquo; — that is the RAM-model cost; on disk comparisons are free and fetches are the
+cost. <strong>Feed-forward:</strong> &sect;51.1.</div>
+
+<div class="solution" id="sol51.2"><span class="sol-label">51.2</span>
+Internal nodes hold sorted keys and child pointers and only route (no data); leaves hold the index entries — (key, RID) pairs pointing at heap rows —
+and are linked in key order. The linking lets a range scan, once it reaches the first matching leaf, walk the leaf chain in sorted order without
+returning to the root. <em>Tempting wrong answer:</em> &ldquo;internal nodes store the data too&rdquo; — that is the plain B-tree; the B+-tree keeps
+all data in the leaves, which is what makes range scans efficient. <strong>Feed-forward:</strong> &sect;51.2.</div>
+
+<div class="solution" id="sol51.3"><span class="sol-label">51.3</span>
+Fanout &asymp; (4096&minus;24)/(8+8) &asymp; 254; a billion keys need 4 levels, so a look-up is 4 page fetches. <em>Tempting wrong answer:</em>
+&ldquo;a few dozen fetches&rdquo; — that is the binary-tree figure; the B-tree's high fanout makes it single digits. <strong>Feed-forward:</strong>
+&sect;51.3.</div>
+
+<div class="solution" id="sol51.4"><span class="sol-label">51.4</span>
+(a) fanout &asymp; (page size &minus; header) / (key size + pointer size). (b) (4096&minus;24)/(16+8) &asymp; 169. (c) With fanout 169, a billion keys
+need height &asymp; ceil(log-base-169 of (1e9/169)) which is about 5 levels; doubling the key size only lowers the fanout (here 254&rarr;169), and
+since height is a <em>logarithm</em> of N in that base, a modest base change adds at most a level — it does not double the height. <em>Tempting wrong
+answer:</em> &ldquo;bigger keys double the height&rdquo; — height depends on log-base-fanout, so it changes slowly. <strong>Feed-forward:</strong>
+&sect;51.3.</div>
+
+<div class="solution" id="sol51.5"><span class="sol-label">51.5</span>
+(a) The full leaf's entries are divided into two half-full leaves; a new leaf node is created and linked into the leaf chain; the separator key (the
+first key of the new right leaf) is pushed up into the parent with a pointer to the new leaf. (b) If the push fills the parent, the parent splits by
+the same rule, and so on up; if it reaches and splits the root, a new root is created above the old one. (c) Because growth happens only by adding a
+new root on top, every existing leaf keeps its depth and a whole new level is added uniformly — so all leaves stay at the same depth. <em>Tempting
+wrong answer:</em> &ldquo;the tree grows by making a leaf deeper&rdquo; — leaves never deepen individually; the tree grows at the root.
+<strong>Feed-forward:</strong> &sect;51.4.</div>
+
+<div class="solution" id="sol51.6"><span class="sol-label">51.6</span>
+(a) About 30 levels (log&#8322; of a billion), so ~30 page fetches if the tree is not resident. (b) 4 fetches (height 4). (c) The ~30 comparisons on
+the binary descent cost tens of nanoseconds total and are irrelevant; the on-disk cost is entirely the ~30 page fetches versus 4, each fetch being
+potentially a ~350&nbsp;&micro;s disk read. <em>Tempting wrong answer:</em> &ldquo;both do ~30 comparisons so they're similar&rdquo; — comparisons are
+free; the fetch count differs 30 vs 4. <strong>Feed-forward:</strong> &sect;51.1&ndash;&sect;51.3.</div>
+
+<div class="solution" id="sol51.7"><span class="sol-label">51.7</span>
+(a) The root is 1 page; the second level is at most ~254 pages (one per root child) — together a few hundred pages, a fraction of a megabyte, trivially
+held resident in any real buffer pool. (b) Given that, typically only the leaf fetch (the 4th level) reaches the disk. (c) Effective cost &asymp;
+3&nbsp;hits&nbsp;+&nbsp;1&nbsp;miss &asymp; 3&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;350&nbsp;&micro;s &asymp; ~350&nbsp;&micro;s — dominated by the single
+leaf miss, essentially one disk read. <em>Tempting wrong answer:</em> &ldquo;4 disk reads&rdquo; — the upper levels are cached, so it is ~1.
+<strong>Feed-forward:</strong> &sect;51.3.</div>
+
+<div class="solution" id="sol51.8"><span class="sol-label">51.8</span>
+<strong>Step 4:</strong> Because increasing keys always split the rightmost leaf 50/50 and the left half is never revisited, pages settle near 50%
+full, so the index needs roughly twice as many pages as a densely packed one — about twice the expected size. Lower fill also means lower effective
+fanout, which can add a level to the height and thus a page fetch to some look-ups, and it wastes buffer-pool space on half-empty pages. The fix that
+keeps sequential loads dense is <strong>append-aware (unbalanced) splitting</strong> — keep the full left page and start a fresh right page — or a
+bottom-up sorted <strong>bulk load</strong>, both of which reach near-100% fill. <em>Tempting wrong answer:</em> &ldquo;switch to random keys&rdquo; —
+that spreads inserts but thrashes the cache and destroys locality; the fix is the split policy, not the key. <strong>Feed-forward:</strong> &sect;51.4.</div>
+
+<div class="solution" id="sol51.9"><span class="sol-label">51.9</span>
+(a) <strong>Leaf linking</strong> — a range scan walks the linked leaves in order. (b) <strong>The balance invariant</strong> — all leaves at the same
+depth, so every look-up is the same height. (c) <strong>Fanout</strong> — hundreds of (key, pointer) pairs per page. (d) <strong>Node split</strong> —
+splitting and growing at the root keeps the tree balanced as it grows. (e) <strong>The RID in the leaf</strong> — the leaf entry points at the heap
+row. <em>Tempting wrong answer:</em> attributing (b) to fanout — fanout sets width, the balance invariant sets uniform depth. <strong>Feed-forward:</strong>
+&sect;51.2&ndash;&sect;51.4.</div>
+
+<div class="solution" id="sol51.10"><span class="sol-label">51.10</span>
+(a) <strong>False</strong> — a B+-tree stores data only in the leaves; internal nodes hold routing keys and pointers. (b) <strong>False</strong> — a
+leaf split pushes a key up but does not itself add a level; height grows only when the root splits. (c) <strong>False</strong> — height is
+log-base-fanout of N, so doubling N adds far less than a level. (d) <strong>True</strong> — naive 50/50 splits on sorted inserts leave left pages
+half-full forever. (e) <strong>False</strong> — on disk the binary tree is a poor choice; the cost is page fetches, not comparisons. <em>Tempting
+wrong answer:</em> marking (b) true because a split &ldquo;made the tree bigger&rdquo; — only a root split adds height. <strong>Feed-forward:</strong>
+&sect;51.1&ndash;&sect;51.4.</div>
+
+<div class="solution" id="sol51.11"><span class="sol-label">51.11</span>
+(a) Descend root &rarr; internal &rarr; &hellip; &rarr; leaf, each node a <code>fetchPage</code> (&sect;50) through the buffer pool (&sect;48): for a
+height-4 tree that is 4 fetches, of which the upper 3 usually hit (cached) and the leaf usually misses; read the RID at the leaf, then one more
+<code>fetchPage</code> for the heap row (&sect;49) — so ~5 fetches, ~1&ndash;2 disk misses. (b) A B-tree node <em>is</em> a page from
+<code>fetchPage</code> and a leaf stores a RID, both defined by the storage manager, so the B-tree needs no I/O code of its own — that interface is
+exactly what let it be written as &ldquo;a tree of pages.&rdquo; (c) A B-tree updates in place, so each small write is a random page update paying
+Chapter 46's random-write cost; a write-heavy workload of many such updates is expensive, which is precisely what motivates a log-structured engine
+that turns those random writes into sequential ones. <em>Tempting wrong answer:</em> &ldquo;the look-up is one fetch&rdquo; — it is the height plus
+the heap fetch; caching reduces the <em>misses</em>, not the fetch count. <strong>Feed-forward:</strong> &sect;51.1&ndash;&sect;51.5.</div>
+
+<div class="solution" id="sol51.12"><span class="sol-label">51.12</span>
+Open-ended and platform-specific. A correct write-up: (a) computes fanout &asymp; (page&minus;header)/(key+pointer) and tabulates height across N,
+showing single-digit heights even at a trillion keys; (b) implements a working B-tree of some order <var>m</var>, inserts in a seeded order, reports
+measured height and split count, and checks height against the bracket ceil(log-base-<var>m</var> of N) &le; height &le; ceil(log-base-&lceil;<var>m</var>/2&rceil;
+of N); (c) states toolchain and CPU and notes the fanout table is <em>exact arithmetic</em> and the tree height is a <em>structural outcome</em> of a
+deterministic insert order — neither is a wall-clock timing, so both are reproducible and hardware-independent. <em>Tempting wrong answer:</em>
+reporting the tree height as a performance measurement — it is a structural property, not a clock reading. <strong>Feed-forward:</strong>
+&sect;51.3&ndash;&sect;51.4.</div>
+
+</section>

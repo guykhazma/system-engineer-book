@@ -1,0 +1,94 @@
+<section class="solutions" id="sol49">
+<h1>Chapter 49 — Solutions</h1>
+
+<div class="solution" id="sol49.1"><span class="sol-label">49.1</span>
+It promises only that every record inserted and not yet deleted is returned exactly once by a scan. It deliberately does <em>not</em> promise any
+order — rows come back in whatever physical order they happen to occupy, because they were placed wherever there was free space. <em>Tempting wrong
+answer:</em> &ldquo;rows come back sorted by key&rdquo; — that ordering is an index's job, not the heap's. <strong>Feed-forward:</strong> &sect;49.1.</div>
+
+<div class="solution" id="sol49.2"><span class="sol-label">49.2</span>
+The page number is a direct index into the file's linear page space and the slot number is a direct index into that page's slot array, so no search
+is needed: index the file to compute the byte offset of the page, fetch that one page through the buffer pool, and index the slot array to read the
+record's in-page offset and length. Two array indexings, one page fetch. <em>Tempting wrong answer:</em> &ldquo;you scan the page for the
+record&rdquo; — the slot array gives the offset directly. <strong>Feed-forward:</strong> &sect;49.1.</div>
+
+<div class="solution" id="sol49.3"><span class="sol-label">49.3</span>
+The linked-list heap cost about 3,542 data-page fetches per insert; the page directory cost zero data-page fetches to <em>locate</em> free space (the
+search is an in-memory scan of the directory array), plus one fetch to write. The linked-list number is not a constant because it walks the chain of
+pages until one has room, and as the file fills with mostly-full pages that walk gets longer — the cost grows with file size. <em>Tempting wrong
+answer:</em> &ldquo;both are roughly constant&rdquo; — only the directory is; the list is <em>O(pages)</em>. <strong>Feed-forward:</strong> &sect;49.2.</div>
+
+<div class="solution" id="sol49.4"><span class="sol-label">49.4</span>
+(a) A linked-list heap finds room by fetching each page and reading its free-space header, walking from the front; more pages (and fuller ones) mean
+a longer walk, so cost rises with the file. (b) A page directory keeps a compact per-page free-space entry in a separate in-memory array; the search
+scans that array (a memory op) and touches no data page until it fetches the single chosen page to write. (c) Linked list: <em>O(pages)</em> page
+fetches to find room; page directory: <em>O(1)</em> data-page fetches (an in-memory scan plus one write). For a growing table the first is
+unbounded and the second is flat — decisive. <em>Tempting wrong answer:</em> &ldquo;the directory is a constant-factor win&rdquo; — it changes the
+asymptotics, not just a constant. <strong>Feed-forward:</strong> &sect;49.2.</div>
+
+<div class="solution" id="sol49.5"><span class="sol-label">49.5</span>
+(a) Same-size-or-smaller fits in the record's existing space, so the heap overwrites in place and only adjusts the slot length; a larger record may
+exceed the page's remaining free bytes, so it cannot stay. (b) Moving it would change its physical location — its (page, slot) RID — and every index
+entry storing that RID would dangle. (c) A forwarding pointer leaves a tombstone at the old RID redirecting to the record's new page, keeping the RID
+valid; the cost is two page fetches on every later read — the original page for the pointer, then the page where the row now lives. <em>Tempting
+wrong answer:</em> &ldquo;just move it and update the indexes&rdquo; — that requires touching every index and is what the forwarding pointer avoids.
+<strong>Feed-forward:</strong> &sect;49.3.</div>
+
+<div class="solution" id="sol49.6"><span class="sol-label">49.6</span>
+(a) A workload that repeatedly grows rows after insertion — a status field that lengthens, a JSON/array column that gains elements, a null filled with
+a long string — so updates keep outgrowing their pages. (b) Each migration adds one forwarding pointer, turning one row's reads from one fetch to two;
+the aggregate is a slow one-to-two I/O drift that appears with no schema or index change and is easy to misattribute. (c) Compaction/reorganization
+(rewrite rows into fresh dense pages, collapsing redirects) and fill-factor headroom (leave free space per page so a grown update stays in place) — the
+first removes existing forwards, the second prevents new ones. <em>Tempting wrong answer:</em> &ldquo;add an index&rdquo; — an index does not remove
+forwarding pointers; the RID it stores still lands on the tombstone. <strong>Feed-forward:</strong> &sect;49.3.</div>
+
+<div class="solution" id="sol49.7"><span class="sol-label">49.7</span>
+(a) A full scan reads all <var>P</var> pages, cost <em>O(P)</em> page reads, and they are sequential — front-to-back over the file's page space — which
+Chapter 46 measured as far cheaper than random because the device streams and the system reads ahead. (b) A point look-up by RID is one page fetch if
+the row has not migrated, two if it has (tombstone then real page). (c) Average cost &asymp; (1&minus;<var>m</var>)&nbsp;&times;&nbsp;1&nbsp;+&nbsp;<var>m</var>&nbsp;&times;&nbsp;2
+&nbsp;=&nbsp;1&nbsp;+&nbsp;<var>m</var> fetches; compaction lowers <var>m</var> (fewer forwards, cheaper look-ups) and raises tuple density (more live
+rows per sequential page, cheaper scans). <em>Tempting wrong answer:</em> &ldquo;the scan is random because rows are unordered&rdquo; — the pages are
+read in file order, which is sequential regardless of record order within them. <strong>Feed-forward:</strong> &sect;49.4.</div>
+
+<div class="solution" id="sol49.8"><span class="sol-label">49.8</span>
+<strong>Step 4:</strong> The scan is slow because it reads every page whether dense or not, and a year of updates has left pages half-empty and
+dotted with forwarding pointers, so the scan streams many pages that carry few live rows — the device is fast but it is moving mostly dead space and
+overhead. The fix without an index is to <strong>reorganize/compact</strong> the table (e.g. <code>VACUUM FULL</code> / a table rewrite), which packs
+live rows densely into fresh pages and collapses the forwards, so the same sequential bandwidth now returns far more live rows per page and the scan
+touches fewer pages. <em>Tempting wrong answer:</em> &ldquo;buy faster storage&rdquo; — the device is already streaming; the waste is low density,
+which compaction, not bandwidth, fixes. <strong>Feed-forward:</strong> &sect;49.4.</div>
+
+<div class="solution" id="sol49.9"><span class="sol-label">49.9</span>
+(a) <strong>RID</strong> — the index stores the (page, slot) address, so following it is one direct fetch. (b) <strong>Page directory</strong> — the
+free-space search is an in-memory array scan, no data-page fetches. (c) <strong>Forwarding pointer</strong> — the tombstone at the old RID keeps the
+address valid after the row moves. (d) <strong>Slot array</strong> — indirection lets a deleted record leave a hole reclaimed at compaction. (e)
+<strong>Sequential scan</strong> — reading all pages in file order is cheap sequential I/O. <em>Tempting wrong answer:</em> attributing (a) to the
+page directory — the directory is for free space, the RID is the row address. <strong>Feed-forward:</strong> &sect;49.1&ndash;&sect;49.4.</div>
+
+<div class="solution" id="sol49.10"><span class="sol-label">49.10</span>
+(a) <strong>False</strong> — a heap file returns rows in physical order, which need not be insertion order (deletes and reuse scramble it). (b)
+<strong>True</strong> — the directory search is in memory, so locating free space costs zero data-page fetches. (c) <strong>False</strong> — a shrink
+fits in place; only a grow past the page needs relocation. (d) <strong>False</strong> — a forwarding pointer makes reads <em>more</em> expensive (two
+fetches), not cheaper; it only preserves the RID. (e) <strong>False</strong> — a full table scan reads pages in file order, which is sequential I/O.
+<em>Tempting wrong answer:</em> marking (a) true because inserts append — reuse of freed slots breaks insertion order. <strong>Feed-forward:</strong>
+&sect;49.1&ndash;&sect;49.4.</div>
+
+<div class="solution" id="sol49.11"><span class="sol-label">49.11</span>
+(a) Insert: scan the free-space <em>directory</em> in memory to pick a page with room (&sect;49.2); fetch that page through the buffer pool (&sect;48);
+write the record into free space and add a slot pointing at it (&sect;47); update the page and directory free-space counts; return the RID (page,
+slot). (b) Both a free-space directory and an index are a small, searchable structure kept beside the data so you need not scan the data to answer a
+question: the directory answers &ldquo;which page has room for a record of size <var>b</var>?&rdquo; and an index answers &ldquo;which page (RID)
+holds key <var>k</var>?&rdquo; (c) A single always-sorted file would make inserts expensive (shifting to maintain order) while a heap keeps inserts
+cheap (&sect;49.2) and cheap sequential scans (&sect;49.4), and lets indexes supply order/selectivity separately — so the heap-plus-index split gives
+cheap writes, cheap full reads, and cheap selective reads at once. <em>Tempting wrong answer:</em> &ldquo;a sorted file is strictly better because
+lookups are fast&rdquo; — it pays for that with costly ordered inserts the heap avoids. <strong>Feed-forward:</strong> &sect;49.1&ndash;&sect;49.5.</div>
+
+<div class="solution" id="sol49.12"><span class="sol-label">49.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports data-page-fetch counts to locate room for a linked-list walk versus a page-directory
+scan over the same seeded reference string, their ratio, and how the linked-list count rises as the file grows (the directory stays flat); (b) reports
+the two-fetch read rate after injecting growing updates that leave forwarding pointers; (c) states toolchain and CPU and distinguishes these
+<em>exact counts</em> from a deterministic simulation (reproducible and hardware-independent — the claim that travels) from any wall-clock timing
+(machine- and disk-dependent). <em>Tempting wrong answer:</em> presenting the fetch counts as timings — they are structural counts, not clock
+readings, which is exactly why they are portable. <strong>Feed-forward:</strong> &sect;49.2&ndash;&sect;49.4.</div>
+
+</section>

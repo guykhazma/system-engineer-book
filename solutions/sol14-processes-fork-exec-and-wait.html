@@ -1,0 +1,125 @@
+<section class="solutions" id="sol14">
+<h1>Chapter 14 — Solutions</h1>
+
+<div class="solution" id="sol14.1"><span class="sol-label">14.1</span>
+A process bundles (1) an <strong>address space</strong> (its private virtual memory — text, data, bss, heap,
+stack), (2) one or more <strong>threads of execution</strong> (the running context: program counter, stack
+pointer, registers), and (3) a set of <strong>kernel resources</strong> (open file descriptors, PID/parent
+PID, credentials, working directory). <em>Tempting wrong answer:</em> "a process is just the program's code" —
+the code on disk is inert; the process is the running instance with memory, execution state, and resources.
+<strong>Feed-forward:</strong> §14.1.</div>
+
+<div class="solution" id="sol14.2"><span class="sol-label">14.2</span>
+<code>fork</code> returns the <strong>child's PID in the parent</strong> and <strong>0 in the child</strong> (or
+<code>-1</code> on failure). That difference is how each of the two otherwise-identical processes learns which
+one it is, so it can branch to different code. <em>Tempting wrong answer:</em> "<code>fork</code> returns 0 to
+whichever called it" — both continue from the return; the caller becomes the parent and gets the child's PID,
+while the new child gets 0. <strong>Feed-forward:</strong> §14.2.</div>
+
+<div class="solution" id="sol14.3"><span class="sol-label">14.3</span>
+No — on success <code>exec</code> does <strong>not return</strong> (there is no original program to return to).
+It <strong>replaces the entire process image</strong> — text, data, heap, stack — with a new program, while
+<strong>keeping the PID</strong> (and the open file descriptors, unless marked close-on-exec). <em>Tempting
+wrong answer:</em> "<code>exec</code> starts a new process" — it does not; it transforms the <em>current</em>
+process into a different program, same PID. <strong>Feed-forward:</strong> §14.3.</div>
+
+<div class="solution" id="sol14.4"><span class="sol-label">14.4</span>
+<code>pid_t pid = fork(); if (pid == 0) { /* child */ } else if (pid &gt; 0) { int st; waitpid(pid, &amp;st, 0);
+/* parent, after child exits */ } else { /* fork failed */ }</code>. The <code>pid == 0</code> branch is the
+child; the <code>pid &gt; 0</code> branch is the parent, which waits for the child; each knows which it is
+solely from <code>fork</code>'s return value. <em>Tempting wrong answer:</em> forgetting the parent must
+<code>wait</code> — without it the finished child becomes a zombie (§14.4). <strong>Feed-forward:</strong>
+§14.2, §14.4.</div>
+
+<div class="solution" id="sol14.5"><span class="sol-label">14.5</span>
+At <code>fork</code>, the kernel does <strong>not</strong> copy the parent's pages; it maps the same physical
+pages into both processes and marks them <strong>read-only</strong>. A real copy is triggered only when
+<em>either</em> process <strong>writes</strong> a page: the hardware faults, the kernel makes a private copy of
+that one page for the writer, and both continue. So the cost is proportional to the number of pages actually
+modified, not to the size of the address space — forking a 1 GB process is fast because almost none of that
+gigabyte is written before use. <em>Tempting wrong answer:</em> "<code>fork</code> duplicates all of memory
+immediately" — that would make forking large processes prohibitively slow; copy-on-write avoids it.
+<strong>Feed-forward:</strong> §14.2, Ch 4.</div>
+
+<div class="solution" id="sol14.6"><span class="sol-label">14.6</span>
+The shell <code>fork</code>s a child; the child <code>exec</code>s the requested program (replacing itself with
+it); the parent (shell) <code>wait</code>s for the child to finish before prompting again. The gap between
+<code>fork</code> and <code>exec</code> is where the child, still running the shell's code, adjusts its
+inherited resources — e.g. <strong>redirecting standard output to a file</strong> or wiring its input/output to
+a <strong>pipe</strong> — so that the program it then <code>exec</code>s starts up already plumbed into that
+environment. <em>Tempting wrong answer:</em> "the shell <code>exec</code>s the command directly" — then the
+shell would replace <em>itself</em> and never return to the prompt; it forks first so a child does the
+<code>exec</code>. <strong>Feed-forward:</strong> §14.3.</div>
+
+<div class="solution" id="sol14.7"><span class="sol-label">14.7</span>
+(a) <code>fork</code> is cheap because of <strong>copy-on-write</strong>: it shares the parent's physical pages
+read-only rather than copying them, so it does work proportional to pages later modified, not to address-space
+size. (b) A workload where the child promptly <strong>writes to nearly every inherited page</strong> (e.g. it
+mutates a large data structure it inherited) gets little from COW — almost every page faults and is copied
+anyway, so you pay close to a full copy. (c) Process-per-request pays <strong>process-creation and
+context-switch overhead</strong> and needs IPC to share data; thread-per-request pays the <strong>loss of
+isolation</strong> (a crash or memory bug in one thread takes down all requests in the process) and the burden
+of synchronizing shared state. <em>Tempting wrong answer:</em> "COW makes <code>fork</code> free regardless of
+workload" — a write-heavy child erodes the benefit. <strong>Feed-forward:</strong> §14.2, and Ch 15.</div>
+
+<div class="solution" id="sol14.8"><span class="sol-label">14.8</span>
+<strong>Step 4:</strong> The accumulating state is <strong>zombies</strong> — terminated children whose exit
+status the kernel is still holding because the parent never collected it. They eventually stop new
+<code>fork</code>s because each zombie occupies a <strong>process-table slot</strong>, and once the table (a
+finite resource) fills, the kernel cannot allocate a slot for a new process, so <code>fork</code> fails. This
+is a <strong>defined resource leak, not undefined behavior</strong> — the program violates no language rule; it
+simply fails to clean up (like a memory leak). Fix: the parent must <strong>reap</strong> its children — call
+<code>wait</code>/<code>waitpid</code> (e.g. from a <code>SIGCHLD</code> handler, or a reaping loop) so each
+child's status is collected and its slot freed. <em>Tempting wrong answer:</em> "the zombies are using up
+memory/CPU" — a zombie holds essentially no memory or CPU, only a table slot and its exit status; the leak is
+of slots. <strong>Feed-forward:</strong> §14.4.</div>
+
+<div class="solution" id="sol14.9"><span class="sol-label">14.9</span>
+(a) <strong><code>fork</code> then <code>exec</code></strong> — fork a child, have it <code>exec</code>
+<code>/bin/ls</code>, and the parent waits and continues (a lone <code>exec</code> would replace your program
+permanently). (b) <strong><code>fork</code></strong> alone — you want a second process running the <em>same</em>
+code, which is exactly what fork gives (no <code>exec</code> needed). (c) <strong><code>fork</code> then
+<code>exec</code></strong> — the shell forks and the child execs the typed command, while the shell waits.
+<em>Method-selection cue:</em> same program, new process → <code>fork</code>; different program, replace this
+one → <code>exec</code>; new process running a different program → both. <strong>Feed-forward:</strong>
+§14.2–14.3.</div>
+
+<div class="solution" id="sol14.10"><span class="sol-label">14.10</span>
+(a) <strong>A defined-but-real defect</strong> — the expectation is simply wrong: after <code>fork</code> the
+two processes have independent address spaces, so the child's changes are invisible to the parent (not UB, just
+a mistaken mental model that will produce bugs). (b) <strong>A defined-but-real defect</strong> — never reaping
+children leaks zombies (a resource leak, defined). (c) <strong>Well-defined and fine (though usually
+unintended)</strong> — both flushing a buffer copied across <code>fork</code> is defined behavior; it prints
+the line twice, which is a correctness surprise to fix with <code>fflush</code> before <code>fork</code>, but
+not UB. (d) <strong>Well-defined and fine</strong> — a child <code>exec</code>ing a new program while the parent
+runs is the normal pattern. <em>Tempting wrong answer:</em> calling (a) or (c) undefined behavior — both are
+defined; the issues are a wrong assumption and a duplicated buffer, not language-rule violations.
+<strong>Feed-forward:</strong> §14.2–14.4.</div>
+
+<div class="solution" id="sol14.11"><span class="sol-label">14.11</span>
+(a) A buffer overflow in process A writes through A's pointers, which are virtual addresses translated by
+<strong>A's page tables</strong> (Ch 4); they cannot name B's physical memory, and A cannot rewrite the
+translation tables to escape because installing page tables is a <strong>privileged instruction</strong> that
+traps in user mode (Ch 13). So the two mechanisms — per-process address translation and the user/kernel mode
+bit — confine the corruption to A. (b) Because a thread shares its process's address space, a compromised or
+crashing thread can corrupt the whole process; a separate <em>process</em> has its own address space and
+authority, so untrusted code in it cannot reach the host's memory — making the process the right sandbox unit.
+(c) Putting each tenant in its own process means one tenant's crash, memory corruption, or compromise cannot
+read or damage another tenant's data — fault and security isolation come for free from the process boundary.
+<em>Tempting wrong answer:</em> "a thread is isolated enough because it has its own stack" — a private stack
+does not isolate memory; all threads share the heap and globals and one bug corrupts them all.
+<strong>Feed-forward:</strong> §14.1, Ch 11, Ch 13, and Ch 15.</div>
+
+<div class="solution" id="sol14.12"><span class="sol-label">14.12</span>
+Machine-specific by design. A correct write-up reports: (a) the demo prints two lines with different PIDs, the
+child's <code>ppid</code> equal to the parent's <code>pid</code>, and independent values of the variable (e.g.
+child 101, parent 110) — confirming <code>fork</code> returned twice into two separate address spaces; (b) with
+a <code>printf</code>ed line <em>before</em> the <code>fork</code> and output redirected to a file (block
+buffering), the line appears <strong>twice</strong>, because <code>fork</code> copied the unflushed buffer into
+both processes and both flushed it at exit; (c) adding <code>fflush(stdout)</code> before the <code>fork</code>
+makes the line appear once, because the bytes crossed to the kernel before the buffer was duplicated. Essential
+discipline: report exactly what you observed and label your compiler/system. <em>Tempting wrong answer:</em>
+"the double line means <code>fork</code> ran the <code>printf</code> twice" — it ran once; <code>fork</code>
+duplicated the <em>buffer</em>, not the print. <strong>Feed-forward:</strong> §14.2, §14.4, and Ch 13.</div>
+
+</section>

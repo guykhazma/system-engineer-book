@@ -1,0 +1,125 @@
+<section class="solutions" id="sol15">
+<h1>Chapter 15 — Solutions</h1>
+
+<div class="solution" id="sol15.1"><span class="sol-label">15.1</span>
+Threads in a process <strong>share</strong> the address space — code (text), the heap, global/static data, and
+open file descriptors. Each thread keeps <strong>private</strong> its own stack, its own registers (program
+counter and stack pointer), and its thread-local storage. <em>Tempting wrong answer:</em> "each thread has its
+own heap" — no; the heap is shared, which is exactly why threads can pass data by pointer and also why they
+race. <strong>Feed-forward:</strong> §15.1.</div>
+
+<div class="solution" id="sol15.2"><span class="sol-label">15.2</span>
+<code>pthread_create(&amp;tid, attr, fn, arg)</code> takes a pointer to a <code>pthread_t</code> to fill in,
+optional attributes, the function <code>fn</code> (of type <code>void *(*)(void *)</code>) the new thread will
+run, and the <code>arg</code> passed to it; it starts <code>fn(arg)</code> running concurrently.
+<code>pthread_join(tid, &amp;ret)</code> blocks until that thread finishes and collects its return value.
+<em>Tempting wrong answer:</em> "<code>pthread_create</code> runs the function and returns its result" — it
+starts the function on a <em>new</em> thread and returns immediately; <code>pthread_join</code> is what waits.
+<strong>Feed-forward:</strong> §15.2.</div>
+
+<div class="solution" id="sol15.3"><span class="sol-label">15.3</span>
+Linux uses the <strong>one-to-one (1:1)</strong> model — each <code>pthread</code> is its own kernel-scheduled
+thread (implemented by NPTL). <code>pthread_create</code> uses the <strong><code>clone</code></strong> system
+call underneath, with flags including <code>CLONE_VM</code> to share the address space. <em>Tempting wrong
+answer:</em> "Linux threads are M:N green threads scheduled in user space" — that was never NPTL; Linux threads
+are 1:1 kernel threads (language runtimes may add their own user-space scheduling above them).
+<strong>Feed-forward:</strong> §15.3.</div>
+
+<div class="solution" id="sol15.4"><span class="sol-label">15.4</span>
+<code>pthread_t t1, t2; pthread_create(&amp;t1, NULL, worker, NULL); pthread_create(&amp;t2, NULL, worker,
+NULL); pthread_join(t1, NULL); pthread_join(t2, NULL);</code> with <code>void *worker(void *a){ ... return
+NULL; }</code>. <code>pthread_create</code> is the thread analog of <code>fork</code> (start a new flow of
+control) and <code>pthread_join</code> of <code>wait</code> (wait for it and collect its result). The joins are
+necessary because if <code>main</code> returned first, the process would exit and tear down the shared address
+space the workers are still using. <em>Tempting wrong answer:</em> skipping the joins "because the threads will
+finish anyway" — <code>main</code> returning ends the process and can kill still-running threads.
+<strong>Feed-forward:</strong> §15.2, and Ch 14.</div>
+
+<div class="solution" id="sol15.5"><span class="sol-label">15.5</span>
+<code>counter++</code> compiles to a <strong>read-modify-write</strong>: (1) load <code>counter</code> into a
+register, (2) add one, (3) store it back. With two threads and no synchronization, an interleaving such as — A
+loads 5, B loads 5, A computes 6, B computes 6, A stores 6, B stores 6 — has both threads increment from the
+same starting value, so two increments produce a net change of only <strong>one</strong>; one update is lost.
+Repeated across millions of iterations, many updates vanish. <em>Tempting wrong answer:</em> "<code>++</code> is
+a single atomic operation" — in C it is not; it is three separate steps that can interleave.
+<strong>Feed-forward:</strong> §15.4.</div>
+
+<div class="solution" id="sol15.6"><span class="sol-label">15.6</span>
+<strong>Address space:</strong> processes have separate address spaces; threads share one. <strong>Isolation:</strong>
+processes are isolated (a crash is contained); threads are not (a crash or memory bug kills the whole process).
+<strong>Cost to create:</strong> a thread is cheaper (no address-space copy / copy-on-write setup); a process
+is heavier. <strong>Cost of sharing data:</strong> processes need explicit IPC (pipes, shared memory); threads
+share by pointer for free — but that "free" sharing costs you the obligation to synchronize (data races).
+<em>Tempting wrong answer:</em> "threads are strictly better because they're cheaper" — they trade away
+isolation, which is sometimes exactly what you need. <strong>Feed-forward:</strong> §15.1, and Ch 14.</div>
+
+<div class="solution" id="sol15.7"><span class="sol-label">15.7</span>
+(a) Thread creation skips duplicating the address space — no copy-on-write page setup, no new page tables —
+because the new thread <em>shares</em> the existing address space; it just needs a stack and a kernel-scheduled
+context. (b) In exchange you take on the <strong>data race</strong> hazard (and the loss of isolation): every
+piece of shared mutable state must now be synchronized or it is undefined behavior. (c) The loss is
+<strong>not deterministic</strong> — it depends on how the threads' read-modify-writes happen to interleave,
+which varies with scheduling, load, core count, and compiler, so the demo gave a different wrong total each run.
+Its nondeterminism means <strong>tests cannot be trusted to catch it</strong>: a racing program can pass
+repeatedly (even print the exactly-right answer) and still be broken. <em>Tempting wrong answer:</em> "if the
+test passes, there's no race" — a race is defined by the rules (unsynchronized conflicting access), not by
+whether a run misbehaved. <strong>Feed-forward:</strong> §15.4.</div>
+
+<div class="solution" id="sol15.8"><span class="sol-label">15.8</span>
+<strong>Step 4:</strong> The bug is a <strong>data race</strong> on <code>hits</code> — multiple threads
+performing unsynchronized read-modify-writes (<code>hits++</code>) on shared memory — and in C/C++ it is
+<strong>undefined behavior</strong>. The unit tests missed it because they exercised requests <strong>one at a
+time</strong>, so no two increments ever overlapped and nothing raced; the bug only manifests under genuine
+concurrency, which the tests never created. The fix category is <strong>synchronization</strong>: make the
+update atomic — e.g. protect it with a <strong>mutex</strong> (<code>pthread_mutex_lock</code>/<code>unlock</code>
+around <code>hits++</code>) or use an <strong>atomic</strong> increment (a <code>_Atomic</code>/
+<code>std::atomic</code> counter, or an atomic fetch-add). <em>Tempting wrong answer:</em> "add more tests" —
+single-threaded tests, however many, cannot exercise a race; you need concurrency plus a race detector, and the
+real fix is synchronization. <strong>Feed-forward:</strong> §15.4.</div>
+
+<div class="solution" id="sol15.9"><span class="sol-label">15.9</span>
+(a) <strong>Separate process</strong> — isolation is the whole point; an untrusted plugin in its own address
+space cannot corrupt or crash the host, whereas a thread shares memory and could take everything down. (b)
+<strong>Thread</strong> — the workers all read one large in-memory array, so shared-address-space threads let
+them access it directly with no copy or IPC (and reads alone do not race). (c) <strong>Separate process</strong>
+(via <code>fork</code>+<code>exec</code>) — running a typed command means launching a different program, which
+is a process, not a thread. <em>Method-selection cue:</em> need containment/a different program → process; need
+cheap shared-memory work → thread. <strong>Feed-forward:</strong> §15.1, and Ch 14.</div>
+
+<div class="solution" id="sol15.10"><span class="sol-label">15.10</span>
+(a) <strong>Undefined behavior</strong> — two threads writing the same non-atomic variable with no
+synchronization is a data race. (b) <strong>Well-defined and fine</strong> — writing two <em>different</em>
+variables with no shared location is not a race (barring false-sharing performance effects, which are a cost,
+not UB). (c) <strong>Undefined behavior</strong> — reading through a freed pointer is a use-after-free (Ch 9),
+regardless of threads. (d) <strong>Well-defined and fine</strong> — concurrent <em>reads</em> of a shared value,
+with no writer, do not race. <em>Tempting wrong answer:</em> calling (b) or (d) a race — a data race requires a
+conflicting access (at least one write) to the <em>same</em> location; disjoint writes and read-only sharing
+are fine. <strong>Feed-forward:</strong> §15.4, and Ch 9.</div>
+
+<div class="solution" id="sol15.11"><span class="sol-label">15.11</span>
+(a) The added clause: <strong>no unsynchronized concurrent access to shared mutable memory</strong> (any two
+threads' accesses to the same location, at least one a write, must be ordered by synchronization). (b)
+Violating it is a data race, which is <strong>undefined behavior</strong> in C/C++; unlike a use-after-free —
+which reliably touches freed memory every run — a race depends on interleaving, so it <strong>may never
+reproduce</strong> under testing even though the program is incorrect for some schedule. (c) A language can move
+this to compile time with a type system that tracks sharing and mutation: Rust's <code>Send</code>/
+<code>Sync</code> traits mark which data may cross or be shared between threads, and the borrow checker forbids
+aliasing a mutable reference — so an unsynchronized shared mutation is a <em>compile error</em>, not a runtime
+gamble. <em>Tempting wrong answer:</em> "a thorough test suite proves there's no race" — no finite set of runs
+can, because the offending interleaving may simply never occur; only reasoning from the rules (or a checker/
+detector) settles it. <strong>Feed-forward:</strong> §15.4, §15.5, and Part 5 (Rust).</div>
+
+<div class="solution" id="sol15.12"><span class="sol-label">15.12</span>
+Machine-specific by design. A correct write-up reports: (a) the four-thread, one-million-each unsynchronized
+counter prints totals well below 4,000,000 that differ every run (on the book's machine ~1.1–1.8 million across
+five runs) — lost updates from interleaved read-modify-writes; (b) adding a mutex around the increment (or using
+an atomic increment) restores exactly 4,000,000 every run; (c) the bug's visibility depends on build and
+variable: at <code>-O2</code> without <code>volatile</code> the optimizer may collapse each loop into a single
+add, shrinking the race window so the "wrong" answer hides (it printed 4,000,000 for the author), while
+<code>-O0</code> or a <code>volatile</code> counter forces per-iteration memory writes and exposes the loss —
+demonstrating that a correct-looking run does not mean the code is correct. Essential discipline: report exactly
+what you saw and label compiler/core count/hardware. <em>Tempting wrong answer:</em> "the version that printed
+4,000,000 is the correct one" — it is the same racy code; it merely failed to manifest.
+<strong>Feed-forward:</strong> §15.4.</div>
+
+</section>

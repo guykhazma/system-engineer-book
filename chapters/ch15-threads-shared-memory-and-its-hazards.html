@@ -1,0 +1,377 @@
+<section class="chapter" id="ch15">
+<h1>Chapter 15 — Threads: Shared Memory and Its Hazards</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch14">Chapter 14</a> (a process copies its
+address space; threads will share it), <a href="#ch13">Chapter 13</a> (the system-call boundary —
+<code>clone</code> is the syscall underneath thread creation), <a href="#ch12">Chapter 12</a> (in C you carry,
+by hand, a proof about memory — that proof is about to get a new clause). &nbsp;·&nbsp; Chapter 14's processes
+each had one thread of execution. This chapter adds more threads to a single process — a cheaper concurrency
+than <code>fork</code>, bought by giving up the isolation that made processes safe.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch13">Chapter 13</a> — a system call is a controlled trap; name
+the instruction on x86-64 and say where the system-call number goes. (2) <a href="#ch14">Chapter 14</a> —
+<code>fork</code> gives the child its own address space (via copy-on-write), so when the parent and child both
+hold a variable <code>x</code>, are they the same storage or two copies? (3) <em>Predict:</em> two threads
+share a single counter and each executes <code>counter++</code> one million times, with no locking. When both
+finish, is the final value exactly two million, less than two million, or possibly more? Write down your guess
+and your reasoning — we will run this exact program and measure the answer.</p>
+</aside>
+
+<p>Chapter 14 gave you a way to do two things at once — <code>fork</code> a second process — but at the price
+of a second, isolated address space: the processes cannot see each other's memory, so sharing data means
+explicit inter-process communication. Often that isolation is exactly what you want. But often you want the
+opposite: several flows of control working on the <em>same</em> data structures in the <em>same</em> memory,
+cheaply. That is a <strong>thread</strong>. This chapter defines a thread as a second flow of control inside one
+address space (§15.1), creates threads with the POSIX <code>pthreads</code> API (§15.2), explains how the
+kernel actually schedules them and why Linux uses a one-to-one model (§15.3), and then confronts the hazard
+that sharing buys you — the <strong>data race</strong>, which we will reproduce and measure losing more than
+half of a program's work (§15.4). We close by carrying the new proof burden forward toward the concurrency part
+that makes shared memory correct (§15.5). Threads make sharing trivial; this chapter is about why that is both
+the point and the danger.</p>
+
+<h2>15.1 A thread is a second flow of control in one address space</h2>
+
+<p>A process can contain more than one <strong>thread</strong> of execution, and the defining fact of threads
+is <em>what they share and what they don't</em>. All threads in a process <strong>share</strong> one address
+space: the same code (text), the same heap, the same global and static variables, and the same open file
+descriptors. What each thread keeps <strong>private</strong> is only what it needs to be an independent flow of
+control: its own <strong>stack</strong>, its own <strong>registers</strong> (including the program counter and
+stack pointer), and its own thread-local storage. That is the whole model. Two threads in one process see the
+same <code>malloc</code>'d object at the same address and can both read and write it — directly, through an
+ordinary pointer, with no copy and no IPC.</p>
+
+<p>Set this against Chapter 14 precisely, because the contrast <em>is</em> the concept. When you
+<code>fork</code>, the child gets a <em>copy</em> of the address space (copy-on-write), so the parent's and
+child's variables are separate storage — writes in one are invisible to the other, and that isolation is what
+contains a crash. When you create a thread, the new thread gets the <em>same</em> address space, so a write by
+one thread is immediately visible to the others — and a wild pointer or a crash in one thread corrupts or kills
+the <em>whole</em> process, all threads with it. Process is copy-and-isolate; thread is share-and-expose. The
+power of threads (cheap communication through shared memory) and their danger (no isolation, and the races of
+§15.4) are the same fact viewed twice.</p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">One process, two threads: shared address space, private stacks and registers.</text>
+<rect x="20" y="26" width="600" height="150" fill="#f5f8fb" stroke="#14406b"/>
+<text x="30" y="42" font-size="10" fill="#14406b">Process (one address space)</text>
+<rect x="40" y="52" width="270" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="50" y="71" font-size="9">SHARED: text (code)</text>
+<rect x="40" y="88" width="270" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="50" y="107" font-size="9">SHARED: heap + global/static data</text>
+<rect x="40" y="124" width="270" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="50" y="143" font-size="9">SHARED: open file descriptors</text>
+<rect x="330" y="52" width="130" height="102" fill="#fdeee6" stroke="#8c3a1d"/><text x="340" y="68" font-size="9">Thread 1 PRIVATE</text>
+<text x="340" y="84" font-size="8">own stack</text><text x="340" y="98" font-size="8">own registers (PC, SP)</text><text x="340" y="112" font-size="8">thread-local storage</text>
+<rect x="475" y="52" width="130" height="102" fill="#fdeee6" stroke="#8c3a1d"/><text x="485" y="68" font-size="9">Thread 2 PRIVATE</text>
+<text x="485" y="84" font-size="8">own stack</text><text x="485" y="98" font-size="8">own registers (PC, SP)</text><text x="485" y="112" font-size="8">thread-local storage</text>
+<text x="40" y="170" font-size="9" fill="#8c3a1d">Both threads reach the SAME heap object through an ordinary pointer — no copy, no IPC. That is the danger too.</text>
+</svg>
+<figcaption>Figure 15.1: Threads in one process share the address space — code, heap, globals, file descriptors
+— while each keeps a private stack, registers, and thread-local storage. Compare Chapter 14's <code>fork</code>,
+which <em>copies</em> the address space. Sharing is why threads communicate cheaply and why they race.</figcaption>
+</figure>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name two things all threads in a process share, and two things each thread keeps private. If thread A stores
+7 into a global variable, can thread B see it — and how does that differ from a parent and child after
+<code>fork</code>? (Answer after the next section.)</p>
+</aside>
+
+<h2>15.2 Creating threads: the <code>pthreads</code> model</h2>
+
+<p>On Unix systems the portable interface is <strong>POSIX threads</strong> (<code>pthreads</code>). Two calls
+carry most of the weight. <code>pthread_create(&amp;tid, attr, fn, arg)</code> starts a new thread that begins
+by running <code>fn(arg)</code> concurrently with the caller, and writes the new thread's identifier into
+<code>tid</code>. <code>pthread_join(tid, &amp;ret)</code> blocks until that thread finishes and collects its
+return value — it is the thread analog of Chapter 14's <code>wait</code>: create is to fork as join is to wait.
+The thread function has the fixed signature <code>void *fn(void *)</code>; a thread ends by returning from it
+(or calling <code>pthread_exit</code>). You compile such a program with <code>-pthread</code>. A minimal
+two-thread program:</p>
+
+<pre><code>void *worker(void *arg){ /* runs concurrently */ return NULL; }
+
+int main(void){
+    pthread_t t1, t2;
+    pthread_create(&amp;t1, NULL, worker, NULL);   /* start thread 1 */
+    pthread_create(&amp;t2, NULL, worker, NULL);   /* start thread 2 */
+    pthread_join(t1, NULL);                     /* wait for it, like wait() for a child */
+    pthread_join(t2, NULL);
+    return 0;
+}</code></pre>
+
+<p>After the two <code>pthread_create</code> calls, three flows of control exist in one address space — the
+main thread and the two workers — all sharing the heap and globals, each on its own stack. The two
+<code>pthread_join</code> calls make the main thread wait for both to finish before returning, so the process
+does not exit (and tear down the shared memory the workers are using) out from under them. That is the whole
+lifecycle: create, run concurrently, join.</p>
+
+<h2>15.3 Kernel threads, user threads, and the one-to-one model</h2>
+
+<p>Who actually schedules a thread onto a CPU? There are two classic models. In a <strong>user-level</strong>
+(or <strong>M:N</strong>) model, a runtime library multiplexes many user threads onto a smaller number of
+kernel-scheduled entities, switching between them in user space; this makes creating and switching threads very
+cheap, but it has a sharp edge — if one user thread makes a blocking system call, it can stall the underlying
+kernel thread and thus every user thread mapped onto it. In a <strong>kernel-level</strong> (or
+<strong>one-to-one</strong>, <strong>1:1</strong>) model, each user thread corresponds to its own
+kernel-scheduled thread, so the kernel schedules them independently and a blocking call in one blocks only that
+one, at the cost of a kernel-managed object per thread.</p>
+
+<p>Linux uses the <strong>one-to-one</strong> model, implemented by the <strong>NPTL</strong> (Native POSIX
+Thread Library, which replaced the older LinuxThreads around the 2.6 kernel). Under the hood,
+<code>pthread_create</code> calls the <code>clone</code> system call with a set of flags that ask for sharing —
+<code>CLONE_VM</code> (share the address space), <code>CLONE_FILES</code> (share the file-descriptor table),
+<code>CLONE_THREAD</code>, <code>CLONE_SIGHAND</code>, and others — so the new thread is a full kernel-scheduled
+entity that happens to share memory and resources with its creator. This reveals a clean underlying truth:
+<code>clone</code> is the general primitive, and <code>fork</code> and thread-creation are two points on its
+spectrum. <code>fork</code> (Chapter 14) is <code>clone</code> asking to <em>copy</em> the address space;
+thread creation is <code>clone</code> asking to <em>share</em> it. A thread and a process are the same kind of
+schedulable thing; they differ only in how much they share. (User-space schedulers do still exist above the
+kernel — language runtimes such as Go schedule many lightweight tasks onto a pool of OS threads — but on Linux
+the OS threads underneath are 1:1 kernel threads.)</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Does Linux map each <code>pthread</code> to its own kernel-scheduled thread (1:1) or multiplex many onto few
+(M:N)? Which system call does <code>pthread_create</code> use underneath, and which flag makes the new thread
+share the caller's memory? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>15.4 The shared-memory hazard: the data race</h2>
+
+<p>Now the predict. Threads share memory, so two threads can touch the same variable at the same time — and
+that is where correctness goes to die. Take the simplest possible shared operation, <code>counter++</code> on
+a shared integer. It looks atomic in C, but it is not: at the machine level it is a <strong>read-modify-write
+</strong> — load the current value into a register, add one, store it back — three steps that can interleave
+with another thread's three steps. If thread A loads 5, thread B loads 5, both add one, both store 6, then two
+increments produced a net change of <em>one</em>: an update was lost. Run this at scale and the losses pile up.
+Here is the exact program from the opener — four threads, each incrementing a shared counter one million times,
+no locking — compiled and run on this machine (gcc 11.4.0, <code>-O2</code>, x86-64), five times:</p>
+
+<pre><code>void *bump(void *a){ for (int i = 0; i &lt; 1000000; i++) counter++; return NULL; }
+/* 4 threads all run bump() on the same shared `counter`, then we join and print it */
+
+expected = 4000000, got = 1092939
+expected = 4000000, got = 1170537
+expected = 4000000, got = 1372703
+expected = 4000000, got = 1810815
+expected = 4000000, got = 1324249</code></pre>
+
+<p>The program should have counted to four million. It counted to between roughly 1.1 and 1.8 million —
+<strong>more than half of the four million increments simply vanished</strong>, and the
+answer was different every run. This is a <strong>data race</strong>: concurrent accesses to the same memory
+location, at least one of them a write, with no synchronization ordering them. In C and C++ a data race is
+<strong>undefined behavior</strong> — Chapter 10's UB returns, now arising from concurrency rather than from a
+bad pointer or an overflow — and the nondeterministic, mostly-wrong output above is exactly what UB looks like
+when it manifests. The lost updates come straight from the interleaved read-modify-writes: whenever two threads
+read the same value before either stores, one increment is overwritten and lost.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a data race loses updates</span>
+<p><strong>1. In words.</strong> <code>counter++</code> is not atomic — it is load, add, store. Two threads
+running it on the same variable can both load the same value, both add one, and both store, so their two
+increments net only one. Nothing orders them, so results are nondeterministic. That unordered, conflicting
+access is a data race, and in C/C++ it is undefined behavior.</p>
+<p><strong>2. As a picture.</strong> An interleaving timeline: A loads 5 · B loads 5 · A adds → 6 · B adds → 6
+· A stores 6 · B stores 6. Two increments, one net change.</p>
+<p><strong>3. As numbers.</strong> Four threads, one million increments each, no lock: expected 4,000,000;
+measured on this machine ~1.1–1.8 million across five runs — over half the work lost, and different every time.
+Adding synchronization (a mutex or an atomic increment) restores exactly 4,000,000.</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: "it printed the right answer on my machine, so the code is correct"</span>
+<p>A data race is undefined behavior <em>whether or not it visibly misbehaves on a given run</em>, and it can
+easily produce the right answer while being thoroughly broken — which is exactly what makes it dangerous.
+<strong>Correct-looking output is not evidence of correctness for racing code.</strong> Writing this very
+chapter, an earlier version of the counter program — compiled at <code>-O2</code> without the variable marked
+<code>volatile</code> — printed <code>4000000</code> on every single run, because the optimizer had collapsed
+each thread's million-iteration loop into a single add, shrinking the race window to almost nothing so the
+threads happened to serialize. The bug was fully present (four threads doing unsynchronized read-modify-writes
+on shared memory); it simply did not <em>manifest</em>, just as Chapter 10's undefined behavior need not
+misbehave to be undefined. A race that surfaces only under a particular compiler, optimization level, CPU load,
+or core count will pass every test on your laptop and corrupt data in production. The lesson: reason about
+shared-memory correctness from the <em>rules</em> (is there an unsynchronized conflicting access? then it is a
+race, full stop), never from whether a test run looked fine. The fix is real synchronization — a mutex around
+the update, or an atomic increment — not a comforting green test.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Threads are just cheaper processes. Let's convert our
+process-per-request server to threads across the board for the speed win." Cover the paragraph and respond in
+three or four sentences, drawing on §15.1 and §15.4.</p>
+<p><em>Model answer.</em> "Threads <em>are</em> cheaper — they share the address space instead of copying it,
+so creation skips the copy-on-write setup and they can communicate through shared memory with no IPC — but
+'cheaper processes' misses the crucial difference: threads drop the isolation that processes gave us. A memory
+bug or crash in one thread takes down the whole process — every in-flight request — where a bad process only
+took itself down, and every piece of mutable state we now share becomes a potential data race, which is
+undefined behavior. That is not theoretical: an unsynchronized shared counter under four threads lost over half
+its increments in our measurement and gave a different wrong answer each run, and a race can even pass tests by
+printing the right number. So threads are right where we want cheap shared-memory concurrency and can enforce
+synchronization discipline; keep processes where fault containment or a security boundary matters. Let's not
+convert blindly — decide per component and protect every shared write." Naming the isolation trade, the
+data-race hazard, and refusing the blanket swap is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §15.3 quick check: Linux uses the one-to-one (1:1) model via NPTL — each
+<code>pthread</code> is its own kernel-scheduled thread. <code>pthread_create</code> uses the
+<code>clone</code> system call underneath, and <code>CLONE_VM</code> is the flag that makes the new thread share
+the caller's address space.)</em></p>
+
+<h2>15.5 What to carry forward — and toward concurrency</h2>
+
+<p>A <strong>thread</strong> is a second flow of control inside one process: all threads <strong>share</strong>
+the address space — code, heap, globals, file descriptors — while each keeps a <strong>private</strong> stack,
+registers, and thread-local storage. You create and reap them with <code>pthreads</code> —
+<code>pthread_create</code> starts a thread running a <code>void *fn(void *)</code>, <code>pthread_join</code>
+waits for it and collects its result (create/join is the thread's fork/wait). Linux schedules threads
+<strong>one-to-one</strong> with kernel threads via NPTL, and <code>pthread_create</code> is really the
+<code>clone</code> system call asking to share memory (<code>CLONE_VM</code>) — the same primitive
+<code>fork</code> uses to <em>copy</em> it, so a thread and a process differ only in how much they share. The
+price of sharing is the <strong>data race</strong>: unsynchronized conflicting access to the same memory, which
+is undefined behavior in C/C++ and which we measured losing more than half of a four-million-increment workload,
+nondeterministically — and which can hide by printing the right answer, so correctness must be reasoned from the
+rules, not from a passing run.</p>
+
+<p>That last point reopens the theme of Part 2 at a new level. Chapter 12 said that in C you carry, by hand, a
+proof about lifetimes, bounds, and freeing. Threads add a clause: <em>no unsynchronized concurrent access to
+shared mutable memory</em> — and violating it is undefined behavior just like the rest. Making shared-memory
+concurrency correct is a large subject of its own: the synchronization primitives that order accesses (locks,
+condition variables, atomics), the lock-free techniques that avoid them, and the memory model that defines
+precisely what a multithreaded program means. That is the concurrency-and-parallelism part of this volume,
+which the data race you just measured is the doorway into. And it is one more place where a language can help:
+just as Rust's ownership makes use-after-free a compile error, its type system also encodes which data may
+cross between threads and which must be synchronized — turning "don't race" from a discipline you enforce by
+hand into an invariant the compiler checks, the payoff this whole part has been building toward.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State what threads in a process share and what each keeps private, and contrast that with parent/child
+after <code>fork</code>.</li>
+<li>Write a minimal two-thread <code>pthreads</code> program and explain <code>pthread_create</code>/
+<code>pthread_join</code> as the thread analog of <code>fork</code>/<code>wait</code>.</li>
+<li>Explain the difference between 1:1 and M:N threading, say which Linux uses, and name the system call and
+flag underneath <code>pthread_create</code>.</li>
+<li>Explain why <code>counter++</code> from two threads can lose updates, decomposing it into load/add/store
+with an interleaving.</li>
+<li>State what a data race is, why it is undefined behavior, and why a passing test does not prove racing code
+correct.</li>
+<li>Give the new clause threads add to Part 2's hand-carried proof, and name the fix category (synchronization).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does a thread share with its process's other threads, and what does it keep
+private? (§15.1)</li>
+<li><strong>R2.</strong> What do <code>pthread_create</code> and <code>pthread_join</code> do, and what earlier
+pair are they analogous to? (§15.2)</li>
+<li><strong>R3.</strong> What is the 1:1 threading model, which library implements it on Linux, and what system
+call/flag underlie a thread? (§15.3)</li>
+<li><strong>R4.</strong> Why can two threads doing <code>counter++</code> lose updates, and what did the
+measurement show? (§15.4)</li>
+<li><strong>R5.</strong> What is a data race, why is it undefined behavior, and why can it pass a test yet be
+wrong? (§15.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Concurrency: An Introduction" and "Interlude: Thread API."</strong> The free chapters that introduce threads,
+the shared/private split, the <code>pthreads</code> API, and the race that motivates all of concurrency. The
+reference for §15.1–15.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter
+12 (Concurrent Programming).</strong> Threads, shared variables, and races from the programmer's view.</li>
+<li><strong>The Linux <code>pthreads(7)</code> and <code>clone(2)</code> manual pages.</strong> Primary sources
+for the NPTL one-to-one model of §15.3 and the exact <code>clone</code> flags (<code>CLONE_VM</code>,
+<code>CLONE_FILES</code>, <code>CLONE_THREAD</code>, …) that distinguish a thread from a <code>fork</code>.
+Verify per system.</li>
+<li><strong>The C11/C++11 standard's memory model (see cppreference.com).</strong> The authority for why a data
+race is undefined behavior and what "synchronizes-with" means — the formal ground the concurrency part builds
+on.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex15.1"><span class="ex-label">15.1</span> <span class="ex-tag warm">warm-up</span>
+Name two things all threads in a process share, and two things each thread keeps private.</div>
+
+<div class="exercise" id="ex15.2"><span class="ex-label">15.2</span> <span class="ex-tag warm">warm-up</span>
+What does <code>pthread_create</code> take as arguments, and what does <code>pthread_join</code> do?</div>
+
+<div class="exercise" id="ex15.3"><span class="ex-label">15.3</span> <span class="ex-tag warm">warm-up</span>
+Does Linux use a 1:1 or an M:N threading model, and which system call does <code>pthread_create</code> use
+underneath?</div>
+
+<div class="exercise" id="ex15.4"><span class="ex-label">15.4</span> <span class="ex-tag core">core</span>
+Write, from memory, a minimal program that starts two threads running the same function and waits for both.
+Explain how <code>pthread_create</code>/<code>pthread_join</code> mirror Chapter 14's
+<code>fork</code>/<code>wait</code>, and why the joins are necessary before <code>main</code> returns.</div>
+
+<div class="exercise" id="ex15.5"><span class="ex-label">15.5</span> <span class="ex-tag core">core</span>
+Explain why two threads each doing <code>counter++</code> on a shared variable can lose updates. Decompose
+<code>counter++</code> into its machine-level steps and give a concrete interleaving in which two increments
+produce a net change of one.</div>
+
+<div class="exercise" id="ex15.6"><span class="ex-label">15.6</span> <span class="ex-tag core">core</span>
+Contrast a process and a thread on four axes: address space, isolation, cost to create, and what data sharing
+costs you. For each, say which is cheaper/safer and why.</div>
+
+<div class="exercise" id="ex15.7"><span class="ex-label">15.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is creating a thread cheaper than <code>fork</code>ing a process — what work does thread creation
+skip? (b) What new cost or hazard do you take on in exchange for sharing memory? (c) The measured demo lost
+more than half of its increments and gave a different total each run; is that loss deterministic, and what does
+its nondeterminism imply for whether tests can be trusted to catch it?</div>
+
+<div class="exercise" id="ex15.8"><span class="ex-label">15.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A web service keeps a shared <code>long hits</code> counter that
+each request thread increments with <code>hits++</code>. Under load, the reported hit count is noticeably lower
+than the true number of requests — but every unit test passes.
+<br><strong>Step 1 (given):</strong> <code>hits++</code> is a non-atomic read-modify-write on memory shared by
+all request threads.
+<br><strong>Step 2 (given):</strong> The unit tests exercise one request at a time, so no two increments ever
+overlap and nothing races.
+<br><strong>Step 3 (given):</strong> Under real load, many threads increment concurrently and their
+read-modify-writes interleave, so some increments overwrite others.
+<br><strong>Step 4 (you):</strong> Name the bug precisely, say whether it is undefined behavior, explain why
+the passing tests failed to catch it, and name the category of fix (and one concrete mechanism) that makes the
+count correct.</div>
+
+<div class="exercise" id="ex15.9"><span class="ex-label">15.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, choose a separate <em>process</em> (via <code>fork</code>) or a <em>thread</em>, and justify in a
+line: (a) run an untrusted plugin so that if it crashes or corrupts memory it cannot take down the host; (b)
+compute a parallel sum over a large in-memory array that all workers read; (c) run a command the user typed at
+a shell.</div>
+
+<div class="exercise" id="ex15.10"><span class="ex-label">15.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 9–15, classify each as <em>undefined behavior</em>, <em>a defined-but-real defect</em>, or
+<em>well-defined and fine</em>: (a) two threads writing the same non-atomic <code>long</code> with no
+synchronization; (b) two threads each writing a <em>different</em> variable with no synchronization; (c) a
+thread reading through a pointer whose target was already <code>free</code>d; (d) two threads reading (never
+writing) the same shared value.</div>
+
+<div class="exercise" id="ex15.11"><span class="ex-label">15.11</span> <span class="ex-tag stretch">stretch</span>
+Chapter 12 said that in C the programmer carries, by hand, a proof about lifetimes, bounds, and freeing. (a)
+State the additional clause that threads add to that proof. (b) Explain why violating it is undefined behavior
+and why, unlike a use-after-free, it may never reproduce in testing. (c) In one or two sentences, describe how
+a language could move this from a runtime hope to a compile-time guarantee — for example, a type system that
+tracks which data may be shared across threads and which accesses must be synchronized (Rust's
+<code>Send</code>/<code>Sync</code> and borrow checking; forward reference, prose only).</div>
+
+<div class="exercise" id="ex15.12"><span class="ex-label">15.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) run the shared-counter race — four threads, one million increments each of one shared
+counter, no lock — five times, and report the wrong totals and how much they vary run to run. (b) Add a mutex
+around the increment (or use an atomic increment) and confirm the total is now exactly four million every time.
+(c) Try building the unsynchronized version at <code>-O0</code> versus <code>-O2</code>, and with the counter
+marked <code>volatile</code> or not; report which combinations make the bug visible and which hide it — and
+explain why a "correct" run does not mean the code is correct. Label your compiler, core count, and hardware.</div>
+
+</section>
+</section>

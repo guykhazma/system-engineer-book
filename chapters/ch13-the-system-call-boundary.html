@@ -1,0 +1,415 @@
+<section class="chapter" id="ch13">
+<h1>Chapter 13 — The System-Call Boundary</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch04">Chapter 4</a> (virtual addresses; the
+hardware translates every pointer and can refuse the access), <a href="#ch11">Chapter 11</a> (a buffer
+overflow corrupts <em>this</em> process — but only this one), <a href="#ch12">Chapter 12</a> (you became the
+allocator; the backing memory came from somewhere). &nbsp;·&nbsp; <strong>Opens Part 3.</strong> Part 2 left
+you holding, by hand, a proof about the memory <em>inside</em> one program. This part is about the operating
+system underneath all of it — the code that gave you an address space, a heap, and the illusion of owning the
+machine. We start at the seam where your program meets that code: the <strong>system call</strong>, the single
+controlled doorway from your program into the kernel.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch11">Chapter 11</a> — a stack buffer overflow can overwrite the
+saved return address and hijack <em>this</em> program's control flow. Can it, by the same mechanism, overwrite
+memory belonging to a <em>different</em> running program? What stops it? (2) <a href="#ch04">Chapter 4</a> —
+when you dereference a pointer, the address is virtual and the hardware translates it; who set up the
+translation tables, and could your code just rewrite them to point anywhere in physical RAM? (3)
+<em>Predict:</em> when your C program calls <code>write()</code> to print to the screen, does <em>your</em>
+code push the bytes out to the terminal device — or does something else do it on your behalf? Guess what stops
+an ordinary program from writing straight to the disk controller. By the end you will be able to trace exactly
+what happens on that call.</p>
+</aside>
+
+<p>Every useful program eventually needs to do something it is not allowed to do. Reading a file, sending a
+network packet, getting more memory from the OS, creating a process, drawing on the screen — all of these
+touch hardware or shared state that a single process must not control directly, because the whole point of an
+operating system is that one buggy or malicious program cannot seize the machine or read another program's
+secrets. So the machine runs your code in a restricted mode, and the only way to get privileged work done is
+to <em>ask</em>: to make a <strong>system call</strong>, a controlled transfer into the kernel that switches
+into privileged mode, runs a specific pre-approved handler, and returns. This chapter is about that boundary.
+We establish the two privilege modes and why they exist (§13.1), trace exactly how a system call crosses the
+boundary on this machine, register by register (§13.2), separate the C library's friendly wrappers from the
+kernel underneath them (§13.3), measure what a crossing actually costs and how to avoid paying it (§13.4), and
+carry the boundary forward into processes and threads (§13.5). This is the seam Chapter 12 promised you would
+see "from the other side."</p>
+
+<h2>13.1 Two modes: user and kernel</h2>
+
+<p>The CPU itself enforces the boundary. A modern processor runs in one of (at least) two <strong>privilege
+modes</strong>: <strong>user mode</strong>, in which most of your code runs, and <strong>kernel mode</strong>
+(also called supervisor or privileged mode), in which the operating system runs. On x86 these are implemented
+as <em>rings</em> — ring 3 for user code, ring 0 for the kernel. The difference is not speed; it is
+<em>authority</em>. In user mode a set of instructions simply will not execute: you cannot halt the CPU,
+disable interrupts, load the page tables that define address translation (Chapter 4), or read and write device
+registers. Attempt one and the hardware traps into the kernel instead of obeying you.</p>
+
+<p>That single mechanism is what makes the isolation of Chapter 11 real. Your buffer overflow can wreck
+<em>this</em> process because it runs with this process's authority — but it cannot reach another process's
+memory, because the memory-management unit (Chapter 4) translates every address through <em>this</em>
+process's page tables and faults on anything outside them, and it cannot rewrite those page tables to escape,
+because installing page tables is a privileged instruction it is not allowed to run. Two hardware
+mechanisms, working together: the MMU draws the boundary around each process's <em>memory</em>, and the
+user/kernel mode bit draws the boundary around the machine's <em>instructions and devices</em>. Everything you
+have written in this book so far has run in ring 3, with no direct access to any of it. The kernel is the only
+software that runs privileged, and it is the referee that hands out access under its own rules.</p>
+
+<p>This is the answer to the opener's first two questions. A process cannot corrupt another process's memory
+because it is confined to its own translated address space and cannot touch the translation machinery; it
+cannot rewrite the page tables because that instruction traps. The confinement is not politeness — it is
+enforced by silicon on every instruction.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name one privileged operation that a program in user mode is <em>not</em> allowed to perform directly, and
+say what the hardware does if it tries anyway. (Answer after the next section.)</p>
+</aside>
+
+<h2>13.2 Crossing the boundary: the system-call mechanism</h2>
+
+<p>If user code cannot touch devices or memory tables, how does it ever read a file? It asks the kernel to do
+it, through a deliberately narrow door. The mechanism is a <strong>trap</strong>: a special instruction that
+simultaneously switches the CPU into kernel mode <em>and</em> jumps to a single, fixed entry point that the
+kernel installed at boot. This is the crucial safety property — user code does not get to switch into kernel
+mode and then run wherever it likes; the trap lands only at the kernel's chosen handler, which decides what to
+do. On 64-bit x86 Linux that instruction is <code>syscall</code> (the older 32-bit path used the software
+interrupt <code>int 0x80</code>).</p>
+
+<p>Because the boundary is narrow, there is a strict convention — an <strong>application binary interface
+(ABI)</strong> — for how you name the call and pass its arguments. On x86-64 Linux (verified against the
+<code>syscall(2)</code> manual page): the <strong>system-call number</strong> goes in register
+<code>rax</code>; the first six arguments go in <code>rdi</code>, <code>rsi</code>, <code>rdx</code>,
+<code>r10</code>, <code>r8</code>, <code>r9</code> (note <code>r10</code>, not <code>rcx</code> — the
+<code>syscall</code> instruction itself clobbers <code>rcx</code> and <code>r11</code>); you execute
+<code>syscall</code>; and the kernel returns the result in <code>rax</code>. A negative return in the range of
+a small error code means failure — the raw kernel interface returns <code>-errno</code> (§13.3 turns that into
+the friendly <code>errno</code> you know). The kernel also <em>validates</em> what you pass: hand it a pointer
+to write into, and it checks that the pointer really belongs to your address space, so you cannot trick it into
+scribbling on kernel memory on your behalf.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A system call is a controlled trap: one fixed door from ring 3 into ring 0 and back.</text>
+<rect x="20" y="30" width="600" height="80" fill="#f5f8fb" stroke="#14406b"/>
+<text x="30" y="46" font-size="10" fill="#14406b">USER MODE (ring 3) — your program, the C library</text>
+<rect x="40" y="56" width="230" height="44" fill="#eef4fa" stroke="#14406b"/>
+<text x="50" y="72" font-size="9">rax = SYS_write (1)</text>
+<text x="50" y="86" font-size="9">rdi=fd  rsi=buf  rdx=len</text>
+<text x="50" y="98" font-size="9" fill="#8c3a1d">syscall  &rarr;  (trap)</text>
+<rect x="20" y="140" width="600" height="80" fill="#fbf5f0" stroke="#8c3a1d"/>
+<text x="30" y="156" font-size="10" fill="#8c3a1d">KERNEL MODE (ring 0) — the operating system</text>
+<rect x="40" y="166" width="300" height="44" fill="#fdeee6" stroke="#8c3a1d"/>
+<text x="50" y="182" font-size="9">fixed entry point &rarr; sys_write handler</text>
+<text x="50" y="196" font-size="9">validate fd &amp; buffer, do the I/O, set return</text>
+<line x1="155" y1="110" x2="155" y2="166" stroke="#8c3a1d" stroke-width="2" marker-end="url(#a13)"/>
+<text x="162" y="132" font-size="9" fill="#8c3a1d">syscall: switch to ring 0, jump to fixed handler</text>
+<line x1="360" y1="166" x2="360" y2="110" stroke="#2e6b34" stroke-width="2" marker-end="url(#a13b)"/>
+<text x="368" y="132" font-size="9" fill="#2e6b34">return: rax = result (3), back to ring 3</text>
+<defs>
+<marker id="a13" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8c3a1d"/></marker>
+<marker id="a13b" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2e6b34"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 13.1: A system call. User code loads the call number and arguments into the ABI's registers
+and executes <code>syscall</code>; the CPU switches to kernel mode and jumps to one fixed entry point (never
+an address of the caller's choosing); the kernel validates, does the privileged work, and returns the result
+in <code>rax</code>. The boundary is narrow by design — that narrowness is the security.</figcaption>
+</figure>
+
+<p>Here is the whole path made concrete. When a program runs <code>write(1, "hi\n", 3)</code> — write three
+bytes to file descriptor 1, standard output — the sequence is: put the number for <code>write</code> in
+<code>rax</code>, put <code>1</code> in <code>rdi</code>, the buffer address in <code>rsi</code>, and
+<code>3</code> in <code>rdx</code>; execute <code>syscall</code>; the CPU traps to the kernel, which writes the
+bytes and returns <code>3</code> (the count written) in <code>rax</code>. We can watch this happen with
+<code>strace</code>, which intercepts and prints every system call a program makes. Compiling a three-line C
+program that does exactly that and running it under <code>strace</code> on this machine (gcc 11.4.0, x86-64
+Linux) shows the crossing directly:</p>
+
+<pre><code>$ strace -e trace=write ./hello
+write(1, "hi\n", 3)                     = 3
++++ exited with 0 +++</code></pre>
+
+<p>That one line <em>is</em> the boundary: the arguments the program marshaled, and the <code>= 3</code> the
+kernel returned. Everything else the program did — computing, moving data in its own memory — never appears,
+because none of it crossed into the kernel.</p>
+
+<p><em>(Answer to the §13.1 quick check: a user-mode program may not execute privileged instructions such as
+halting the CPU, disabling interrupts, loading the page tables, or accessing device registers directly. If it
+tries, the hardware does not obey — it traps into the kernel, which typically terminates the offending
+process.)</em></p>
+
+<h2>13.3 The library wrapper vs. the raw system call</h2>
+
+<p>You have almost certainly never written <code>syscall</code> by hand, and you rarely will. The C library
+(glibc on most Linux systems) provides an ordinary-looking function for each system call — <code>write</code>,
+<code>read</code>, <code>open</code>, <code>fork</code> — and that <strong>wrapper</strong> does the register
+marshaling for you: it moves your arguments into <code>rdi</code>/<code>rsi</code>/<code>rdx</code>, sets
+<code>rax</code>, executes <code>syscall</code>, and inspects the result. On the negative-return failure
+convention from §13.2, the wrapper does the translation you already know: it stores the error code in the
+global <code>errno</code> and returns <code>-1</code>. So the raw kernel interface returns <code>-EBADF</code>;
+the wrapper you call returns <code>-1</code> and sets <code>errno == EBADF</code>. The wrapper is a thin
+shell around one <code>syscall</code>.</p>
+
+<p>The distinction that trips people up is that <em>not every library function is a wrapper</em>, and the ones
+that matter most are not. <code>printf</code> is <strong>not</strong> a system call. It is a substantial C
+library routine that parses your format string, converts numbers to text, and — critically — <em>buffers</em>
+the result in user-space memory, only calling the <code>write</code> system call later, when the buffer fills
+or is flushed. Similarly <code>malloc</code> (Chapters 9 and 12) is a library function that manages a heap in
+user space; it crosses into the kernel only occasionally, calling the <code>brk</code> or <code>mmap</code>
+system calls when it needs to grow the heap — which is exactly where your arena's backing block came from in
+Chapter 12. This is the "other side" that chapter promised: your allocator handed out bytes that the C library
+had obtained, in bulk, from the kernel across this very boundary. The layering is real and worth holding
+precisely: <em>your code</em> calls a <em>library function</em>, which may buffer and compute in user space,
+and which crosses into the <em>kernel</em> only when it must, through a <em>system-call wrapper</em>.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>You run a program that prints with <code>printf</code>, then crashes before returning from <code>main</code>
+— and the printed line never appears in your terminal. Nothing was wrong with the format string. What most
+likely happened to those bytes? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>13.4 The cost of crossing — and how to avoid paying it</h2>
+
+<p>Crossing the boundary is not free, and the cost is the reason a great deal of systems performance work
+exists. A system call must switch privilege mode, save and later restore the caller's state, enter the kernel,
+validate arguments, and eventually switch back — and along the way it can disturb the CPU's caches and TLB
+(Chapters 3–4). Compared with an ordinary function call, which on a modern core is a couple of instructions,
+that is enormously more expensive. Measured on this machine (gcc 11.4.0, <code>-O2</code>, x86-64), calling a
+trivial non-inlined function ten million times versus making the <code>getpid</code> system call the same
+number of times:</p>
+
+<pre><code>plain function call :  ~1-2 ns each
+getpid system call  :  ~150-190 ns each
+ratio               :  roughly two orders of magnitude</code></pre>
+
+<p><strong>These figures are illustrative, from this specific machine and run — they vary with hardware,
+kernel, and mitigations (some CPU-vulnerability mitigations make the boundary crossing markedly more
+expensive), and you should measure your own.</strong> But the shape is robust and the lesson is durable: a
+system call costs on the order of a hundred function calls or more. Three consequences follow, and each is a
+technique you will use:</p>
+
+<ul>
+<li><strong>Batch — do not cross per item.</strong> Reading a megabyte one byte at a time is a million
+crossings; reading it in large blocks is a handful. This is exactly why the C library buffers: <code>printf</code>
+and <code>fread</code> accumulate in user space and cross the boundary rarely. The single most common I/O
+performance bug is an unbuffered per-item system call in a hot loop.</li>
+<li><strong>Let the kernel share read-only data without a crossing — the vDSO.</strong> A few "system calls"
+that only <em>read</em> kernel-maintained data, such as <code>clock_gettime</code> and
+<code>gettimeofday</code>, are served from the <strong>vDSO</strong> (virtual dynamic shared object): a page
+the kernel maps read-only into every process, containing the data and the code to read it, so the call runs
+entirely in user mode with no trap. On this machine, a program that calls <code>clock_gettime</code> one
+million times produces, under <code>strace -c</code>, <em>zero</em> <code>clock_gettime</code> system calls —
+the crossings simply are not there, because the vDSO answered in user space. (You can see the vDSO mapped into
+any process: <code>ldd</code> on a dynamically linked program lists <code>linux-vdso.so.1</code>.)</li>
+<li><strong>Observe the boundary with <code>strace</code>.</strong> Because every crossing is visible,
+<code>strace</code> (and <code>strace -c</code> for a counted summary) is the first tool to reach for when a
+program is mysteriously slow or stuck: it shows you exactly which system calls it is making, how many, and
+where it is blocked.</li>
+</ul>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a system call is a controlled trap</span>
+<p><strong>1. In words.</strong> User code cannot touch devices or memory tables, so it <em>asks</em> the
+kernel by executing a trap instruction that switches to kernel mode and jumps to one fixed handler — never an
+address of the caller's choosing. The kernel validates, does the privileged work, and returns. Narrowness is
+the security.</p>
+<p><strong>2. As a picture.</strong> Figure 13.1: two stacked bands (ring 3, ring 0) with a single arrow down
+(<code>syscall</code> → fixed entry) and a single arrow up (return in <code>rax</code>).</p>
+<p><strong>3. As numbers.</strong> The ABI: number in <code>rax</code>; args in
+<code>rdi,rsi,rdx,r10,r8,r9</code>; result in <code>rax</code>; <code>-errno</code> on failure. The cost:
+~150-190 ns for <code>getpid</code> versus ~1-2 ns for a function call on this machine — roughly 100&times;,
+which is why you batch and why the vDSO exists.</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: "<code>printf</code> is a system call" — confusing the library with the kernel</span>
+<p>It is tempting to treat every function that produces output as a direct line to the operating system.
+<strong>It is not: <code>printf</code> is a C library function that formats and <em>buffers</em> in user-space
+memory, and calls the <code>write</code> system call only when that buffer flushes.</strong> Conflating the two
+produces real, confusing bugs. A program that <code>printf</code>s a line and then crashes may show
+<em>nothing</em> in the terminal, because the bytes were sitting in the library's buffer and the crash skipped
+the flush — the boundary was never crossed (this is the §13.3 quick check, and it returns in Chapter 14 when
+<code>fork</code> <em>duplicates</em> that unflushed buffer and a line prints twice). The fix when you need
+output to be real <em>now</em> is to force the crossing: <code>fflush(stdout)</code>, or configure line
+buffering, or call <code>write</code> directly — which is unbuffered and goes straight across. The mental model
+that prevents a dozen bugs: <em>your code → a library function (may buffer) → a system-call wrapper → the
+kernel</em>. Know which layer you are on. The library's job is often to <em>avoid</em> the kernel; the kernel
+is only reached deliberately.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate reports: "Our service writes one log line per request with a bare
+<code>write()</code> call, and profiling says it is spending huge time in the kernel. Let's just delete the
+logging." Cover the paragraph and respond in three or four sentences, drawing on §13.3–13.4.</p>
+<p><em>Model answer.</em> "The problem is almost certainly not <em>that</em> we log, but <em>how</em> — one
+unbuffered <code>write</code> per line is one system-call crossing per line, and a crossing costs on the order
+of a hundred function calls or more (on our box <code>getpid</code> was ~150 ns versus ~1-2 ns for a call), so
+at high request rates those crossings dominate. The fix is to batch: buffer log lines in user space and flush
+in large blocks, which is exactly why the C library buffers <code>printf</code> in the first place; we cross
+the boundary a few times instead of thousands. Let's confirm with <code>strace -c</code> that <code>write</code>
+is the hot call, switch to a buffered logger, and re-measure — deleting logging throws away observability to
+fix a batching bug." Naming the crossing cost, reaching for batching rather than removal, and confirming with
+<code>strace</code> is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §13.3 quick check: the bytes were almost certainly still in <code>printf</code>'s
+user-space buffer. Because <code>printf</code> buffers and only crosses into the kernel via <code>write</code>
+on a flush, a crash before the flush loses them — they never reached the terminal. Force the crossing with
+<code>fflush</code>, line buffering, or a direct <code>write</code>.)</em></p>
+
+<h2>13.5 What to carry forward</h2>
+
+<p>The CPU runs your code in <strong>user mode</strong> (ring 3), where privileged instructions — touching
+devices, loading page tables, disabling interrupts — simply will not execute, and the operating system in
+<strong>kernel mode</strong> (ring 0) is the only software with that authority. Together the MMU (Chapter 4)
+and this mode bit are what make process isolation real: a bug confined to your address space cannot reach
+another process or the machine. To get privileged work done, user code makes a <strong>system call</strong> —
+a controlled trap (<code>syscall</code> on x86-64) that switches mode and jumps to <em>one fixed kernel entry
+point</em>, passing a call number in <code>rax</code> and arguments in
+<code>rdi,rsi,rdx,r10,r8,r9</code>, receiving a result in <code>rax</code> (with <code>-errno</code> on
+failure). The C library wraps each call in an ordinary function and translates the error convention into
+<code>errno</code> and <code>-1</code> — but many library functions (<code>printf</code>, <code>malloc</code>)
+are <em>not</em> system calls; they compute and buffer in user space and cross only when they must. And the
+crossing is expensive — on this machine roughly two orders of magnitude more than a function call — so you
+batch, you lean on the vDSO for cheap read-only data like the time, and you observe the boundary with
+<code>strace</code>.</p>
+
+<p>This is the seam the rest of Part 3 lives on. A <strong>process</strong> (Chapter 14) is the isolated
+container this boundary protects — its own address space, created and destroyed through system calls
+(<code>fork</code>, <code>execve</code>, <code>exit</code>, <code>wait</code>) that cross exactly this line.
+A <strong>thread</strong> (Chapter 15) is a second flow of control that shares one side of the boundary — the
+same address space — trading isolation for cheap sharing. Every abstraction the OS gives you, from the heap
+that fed your allocator to the files and sockets you will read later, is reached through the doorway you have
+just learned to trace.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name the two CPU privilege modes and give two operations user mode is forbidden to do — and say what
+enforces the ban.</li>
+<li>Explain why a system call jumps to a <em>fixed</em> kernel entry point rather than an address the caller
+chooses, and why that matters.</li>
+<li>State the x86-64 Linux system-call ABI: where the call number, the arguments, and the return value go.</li>
+<li>Explain how <code>printf</code> differs from the <code>write</code> system call, and why a crash can lose a
+<code>printf</code>ed line.</li>
+<li>Give the rough cost of a system call versus a function call on a machine you have measured, and name two
+ways to cross the boundary less (batching, the vDSO).</li>
+<li>Say how process isolation follows from the MMU plus the user/kernel mode bit.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is the difference between user mode and kernel mode, and what enforces it? (§13.1)</li>
+<li><strong>R2.</strong> Describe the system-call mechanism on x86-64 Linux: instruction, where the number and
+arguments go, where the result comes back. (§13.2)</li>
+<li><strong>R3.</strong> Is <code>printf</code> a system call? What actually crosses the boundary, and when?
+(§13.3)</li>
+<li><strong>R4.</strong> Roughly how much more expensive is a system call than a function call, and why?
+(§13.4)</li>
+<li><strong>R5.</strong> What is the vDSO, and why does calling <code>clock_gettime</code> often <em>not</em>
+show up as a system call? (§13.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Mechanism: Limited Direct Execution."</strong> The free chapter that develops exactly this boundary — user vs.
+kernel mode, traps, and the system-call mechanism. The reference for §13.1–13.2.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter
+8.</strong> Exceptional control flow: how the hardware and OS handle traps and system calls from the
+programmer's view.</li>
+<li><strong>The Linux <code>syscall(2)</code> and <code>vdso(7)</code> manual pages.</strong> The primary
+sources for the per-architecture calling convention of §13.2 and the vDSO of §13.4. Verify against your kernel
+and architecture.</li>
+<li><strong><code>strace</code> documentation and man page.</strong> The tool used throughout this chapter to
+make the boundary visible; <code>strace -c</code> for a counted summary. Free.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex13.1"><span class="ex-label">13.1</span> <span class="ex-tag warm">warm-up</span>
+Name the two CPU privilege modes, and give one operation a program in user mode is not allowed to perform
+directly.</div>
+
+<div class="exercise" id="ex13.2"><span class="ex-label">13.2</span> <span class="ex-tag warm">warm-up</span>
+On x86-64 Linux, which register holds the system-call number, and which register holds the return value?</div>
+
+<div class="exercise" id="ex13.3"><span class="ex-label">13.3</span> <span class="ex-tag warm">warm-up</span>
+Is <code>printf</code> a system call? If not, what does it do first, and which system call does it eventually
+use to produce output?</div>
+
+<div class="exercise" id="ex13.4"><span class="ex-label">13.4</span> <span class="ex-tag core">core</span>
+Trace, step by step, what happens when a program executes <code>write(1, buf, 5)</code>: what does the C
+library put in which registers, what instruction crosses the boundary, and what comes back on success? (Use the
+ABI from §13.2.)</div>
+
+<div class="exercise" id="ex13.5"><span class="ex-label">13.5</span> <span class="ex-tag core">core</span>
+Explain the relationship between the kernel's raw error convention and the <code>errno</code>/<code>-1</code>
+you see from a C library call. If a raw system call returns <code>-EBADF</code>, what does the wrapper return
+and what does it set?</div>
+
+<div class="exercise" id="ex13.6"><span class="ex-label">13.6</span> <span class="ex-tag core">core</span>
+You run <code>strace</code> on a program and see, among other lines: <code>openat(...) = 3</code>,
+<code>read(3, ..., 4096) = 512</code>, and then thousands of <code>read(3, ..., 1) = 1</code> lines. In one
+or two sentences, say what the last pattern tells you is wrong and what to change.</div>
+
+<div class="exercise" id="ex13.7"><span class="ex-label">13.7</span> <span class="ex-tag complexity">cost</span>
+(a) Name two reasons a system call costs far more than an ordinary function call. (b) A program reads a 1 MB
+file by calling <code>read</code> one byte at a time; explain why this is slow in terms of boundary crossings,
+and give the fix. (c) Why does calling <code>clock_gettime</code> in a tight loop often cost <em>no</em> system
+calls at all?</div>
+
+<div class="exercise" id="ex13.8"><span class="ex-label">13.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A program prints a diagnostic line with <code>printf</code> just
+before dereferencing a bad pointer and crashing. The line never appears in the terminal, even though the
+program definitely reached the <code>printf</code>.
+<br><strong>Step 1 (given):</strong> <code>printf</code> writes into the C library's user-space output buffer,
+not directly to the terminal.
+<br><strong>Step 2 (given):</strong> The buffer is flushed (crossed to the kernel via <code>write</code>) only
+when it fills, at a newline for a line-buffered terminal, or at normal program exit.
+<br><strong>Step 3 (given):</strong> A crash from an invalid dereference terminates the process abnormally,
+skipping the normal flush.
+<br><strong>Step 4 (you):</strong> State where the bytes actually were when the program died, explain why the
+line was lost (referencing the boundary), and give two ways to make sure the line appears before a possible
+crash.</div>
+
+<div class="exercise" id="ex13.9"><span class="ex-label">13.9</span> <span class="ex-tag mixed">mixed</span>
+For each, decide whether it requires crossing the system-call boundary or is pure user-space computation, and
+say why in a few words: (a) adding two integers in registers; (b) opening a file; (c) sorting an in-memory
+array; (d) sending a network packet; (e) formatting a number into a string with <code>sprintf</code>.</div>
+
+<div class="exercise" id="ex13.10"><span class="ex-label">13.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 10–13, classify each as <em>undefined behavior</em>, <em>a boundary crossing (system
+call)</em>, or <em>neither</em>: (a) reading one past the end of a stack array; (b) calling <code>read</code> on
+a valid file descriptor; (c) signed integer overflow in a loop counter; (d) a buffered <code>printf</code> that
+has not yet flushed.</div>
+
+<div class="exercise" id="ex13.11"><span class="ex-label">13.11</span> <span class="ex-tag stretch">stretch</span>
+The kernel validates every pointer you pass to a system call such as <code>write</code>, checking it belongs
+to your address space. (a) Relate this to Chapter 4's address translation: why can a process not simply pass a
+pointer to another process's memory or to kernel memory and have the kernel read it? (b) Sketch what could go
+wrong for security if the kernel skipped this validation. (c) Explain how the two mechanisms — per-process
+address translation and the user/kernel mode bit — together make one process unable to spy on another.</div>
+
+<div class="exercise" id="ex13.12"><span class="ex-label">13.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a program that prints with <code>write</code> and run it under
+<code>strace -e trace=write</code>; confirm you see the <code>write</code> call and its return value. (b) With
+<code>strace -c</code>, count the total system calls of a trivial "hello world" and note how many are startup
+overhead (dynamic linking, etc.) versus your own output. (c) Measure the cost of the <code>getpid</code> system
+call versus a trivial function call in a loop, and (d) call <code>clock_gettime</code> a million times and
+confirm with <code>strace -c</code> that it does <em>not</em> appear as a million system calls. Report your
+numbers and label your compiler, kernel, and hardware, since figures vary.</div>
+
+</section>
+</section>

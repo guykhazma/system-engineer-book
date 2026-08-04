@@ -1,0 +1,117 @@
+<section class="solutions" id="sol13">
+<h1>Chapter 13 — Solutions</h1>
+
+<div class="solution" id="sol13.1"><span class="sol-label">13.1</span>
+The two modes are <strong>user mode</strong> (ring 3, where your code runs) and <strong>kernel mode</strong>
+(ring 0, where the OS runs). A user-mode program may not, for example, execute privileged instructions such as
+halting the CPU, disabling interrupts, loading the page tables (Ch 4), or accessing device registers directly.
+<em>Tempting wrong answer:</em> "user mode is just slower than kernel mode" — the difference is authority, not
+speed; the same instruction runs at the same rate, but privileged ones simply trap in user mode.
+<strong>Feed-forward:</strong> §13.1.</div>
+
+<div class="solution" id="sol13.2"><span class="sol-label">13.2</span>
+On x86-64 Linux the system-call number goes in <strong><code>rax</code></strong>, and the return value comes
+back in <strong><code>rax</code></strong> as well (a negative small value being <code>-errno</code>). <em>Tempting
+wrong answer:</em> "the fourth argument goes in <code>rcx</code>" — it goes in <code>r10</code>, because the
+<code>syscall</code> instruction clobbers <code>rcx</code> (and <code>r11</code>). <strong>Feed-forward:</strong>
+§13.2.</div>
+
+<div class="solution" id="sol13.3"><span class="sol-label">13.3</span>
+No — <code>printf</code> is <strong>not</strong> a system call; it is a C library function that parses the
+format string, converts values to text, and <strong>buffers</strong> the result in user-space memory. It
+eventually produces output through the <strong><code>write</code></strong> system call, but only when the
+buffer flushes (fills, hits a newline for a line-buffered terminal, or the program exits normally). <em>Tempting
+wrong answer:</em> "every output function is a system call" — most output is buffered in user space precisely
+to avoid crossing the boundary per call. <strong>Feed-forward:</strong> §13.3.</div>
+
+<div class="solution" id="sol13.4"><span class="sol-label">13.4</span>
+The C library's <code>write</code> wrapper puts the <code>write</code> system-call number in <code>rax</code>,
+the file descriptor <code>1</code> in <code>rdi</code>, the buffer's address in <code>rsi</code>, and the length
+<code>5</code> in <code>rdx</code>; it executes the <code>syscall</code> instruction, which switches to kernel
+mode and jumps to the fixed kernel entry point; the kernel validates the arguments, does the I/O, and returns
+the number of bytes written (5 on success) in <code>rax</code>. <em>Tempting wrong answer:</em> "the program
+jumps directly into the kernel function" — it cannot choose the target; the trap lands only at the kernel's
+fixed entry point. <strong>Feed-forward:</strong> §13.2.</div>
+
+<div class="solution" id="sol13.5"><span class="sol-label">13.5</span>
+The raw kernel interface signals failure by returning a <strong>negative error code</strong> (e.g.
+<code>-EBADF</code>) in <code>rax</code>. The C library wrapper detects that, stores the code in the global
+<strong><code>errno</code></strong>, and returns <strong><code>-1</code></strong> to the caller. So a raw
+<code>-EBADF</code> becomes: the wrapper returns <code>-1</code> and sets <code>errno == EBADF</code>. <em>Tempting
+wrong answer:</em> "<code>errno</code> is set by the kernel" — the kernel returns a negative number; the
+library <em>translates</em> it into <code>errno</code> and <code>-1</code>. <strong>Feed-forward:</strong>
+§13.3.</div>
+
+<div class="solution" id="sol13.6"><span class="sol-label">13.6</span>
+The thousands of <code>read(3, ..., 1) = 1</code> lines mean the program is reading the file <strong>one byte
+per system call</strong> — one boundary crossing per byte, which is the most expensive way possible. The fix is
+to <strong>read in large blocks</strong> (a big buffer, or buffered I/O such as <code>fread</code>/a
+<code>FILE*</code>), turning thousands of crossings into a handful. <em>Tempting wrong answer:</em> "nothing is
+wrong; it's reading the file" — it is, but at ~100&times; the necessary cost. <strong>Feed-forward:</strong>
+§13.4.</div>
+
+<div class="solution" id="sol13.7"><span class="sol-label">13.7</span>
+(a) A system call must <strong>switch privilege mode</strong> (save/restore state, enter and leave the kernel)
+and it <strong>disturbs caches/TLB</strong> and runs argument validation — none of which a plain function call
+does. (b) Reading 1 MB one byte at a time is ~1,000,000 boundary crossings, and each costs ~100&times; a
+function call; buffering (read a large block, or use a <code>FILE*</code>) cuts it to a handful of crossings.
+(c) <code>clock_gettime</code> is served by the <strong>vDSO</strong> — a page the kernel maps read-only into
+every process — so it runs entirely in user mode with no trap, and the "call" makes no system call at all.
+<em>Tempting wrong answer:</em> "reading byte-by-byte is slow because the disk is slow" — the dominant cost
+here is the boundary crossings, not the device (the data may already be cached). <strong>Feed-forward:</strong>
+§13.4.</div>
+
+<div class="solution" id="sol13.8"><span class="sol-label">13.8</span>
+<strong>Step 4:</strong> When the program died, the diagnostic bytes were still in the <strong>C library's
+user-space output buffer</strong> — they had never crossed the boundary, because <code>printf</code> buffers
+and only calls <code>write</code> on a flush. The abnormal termination skipped the normal exit-time flush, so
+the line was lost: it never reached the terminal. Two ways to guarantee it appears before a possible crash:
+call <strong><code>fflush(stdout)</code></strong> immediately after the <code>printf</code> (force the
+crossing), or use <strong>unbuffered output</strong> — write with the <code>write</code> system call directly,
+or set the stream unbuffered / line-buffered. <em>Tempting wrong answer:</em> "the <code>printf</code> never
+executed" — it did; its output was simply stranded in the buffer. <strong>Feed-forward:</strong> §13.3, §13.4.</div>
+
+<div class="solution" id="sol13.9"><span class="sol-label">13.9</span>
+(a) <strong>Neither / user space</strong> — an integer add is a plain instruction. (b) <strong>Boundary
+crossing</strong> — opening a file needs the kernel (<code>openat</code>). (c) <strong>User space</strong> —
+sorting an in-memory array is pure computation. (d) <strong>Boundary crossing</strong> — sending a packet
+touches the network device, so it needs the kernel. (e) <strong>User space</strong> — <code>sprintf</code>
+formats into a memory buffer; no I/O, no crossing (contrast <code>printf</code>, which will eventually
+<code>write</code>). <em>Method-selection cue:</em> touch a device, another process, or kernel-managed state →
+crossing; compute in your own memory → user space. <strong>Feed-forward:</strong> §13.2–13.4.</div>
+
+<div class="solution" id="sol13.10"><span class="sol-label">13.10</span>
+(a) <strong>Undefined behavior</strong> — reading one past a stack array is an out-of-bounds access (Ch 11).
+(b) <strong>A boundary crossing</strong> — <code>read</code> on a valid descriptor is a system call. (c)
+<strong>Undefined behavior</strong> — signed integer overflow is UB (Ch 10). (d) <strong>Neither</strong> — a
+buffered <code>printf</code> that has not flushed is well-defined; the bytes are simply still in user space and
+no crossing has happened yet. <em>Tempting wrong answer:</em> calling (d) a system call — the crossing happens
+only at the flush, not at the <code>printf</code>. <strong>Feed-forward:</strong> §13.3, and Ch 10–11.</div>
+
+<div class="solution" id="sol13.11"><span class="sol-label">13.11</span>
+(a) A process's pointers are <strong>virtual addresses translated through its own page tables</strong> (Ch 4);
+a pointer value that names another process's or the kernel's memory does not map to anything in <em>this</em>
+process's address space, so the kernel's validation rejects it (or it simply is not this process's memory to
+read). (b) Without validation, a process could pass the kernel a pointer into <em>kernel</em> memory as the
+"buffer" for a <code>read</code>, tricking privileged code into copying secrets out, or into <em>another</em>
+process's memory — a confused-deputy attack; validation is what keeps the kernel from acting on addresses the
+caller has no right to. (c) Per-process address translation confines each process to its own memory (it cannot
+even name another's), and the user/kernel mode bit prevents it from rewriting the translation tables or reading
+devices to get around that — together, one process can neither address nor reach another's memory. <em>Tempting
+wrong answer:</em> "the kernel trusts the pointer because the process passed it" — the kernel must never trust a
+user pointer; validating it is essential to isolation. <strong>Feed-forward:</strong> §13.1–13.2, Ch 4.</div>
+
+<div class="solution" id="sol13.12"><span class="sol-label">13.12</span>
+Machine-specific by design. A correct write-up reports: (a) <code>strace</code> shows the <code>write</code>
+call with its arguments and return value (e.g. <code>write(1, "...", n) = n</code>); (b) a trivial hello-world
+makes a couple dozen system calls, most of them process startup (dynamic linker <code>mmap</code>/<code>openat</code>/
+<code>mprotect</code>, <code>brk</code>, etc.) with only one or two being the program's own output; (c) the
+<code>getpid</code> system call costs on the order of ~100&times; a trivial function call (on the book's machine
+~150–190 ns vs. ~1–2 ns), varying run to run and with mitigations; (d) one million <code>clock_gettime</code>
+calls produce <em>zero</em> <code>clock_gettime</code> system calls under <code>strace -c</code>, because the
+vDSO answers in user space. Essential discipline: report only measured numbers and label compiler/kernel/
+hardware, since figures vary. <em>Tempting wrong answer:</em> "the syscall and the function call cost about the
+same" — the whole point is that they differ by roughly two orders of magnitude. <strong>Feed-forward:</strong>
+§13.2, §13.4.</div>
+
+</section>

@@ -252,6 +252,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch11">Chapter 11 — Arrays, Strings &amp; Buffer Safety</a></li>
 <li class="toc-ch"><a href="#ch12">Chapter 12 — Custom Allocators: Arenas, Pools &amp; Free Lists</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part III &mdash; The Operating System</li>
+<li class="toc-ch"><a href="#ch13">Chapter 13 — The System-Call Boundary</a></li>
+<li class="toc-ch"><a href="#ch14">Chapter 14 — Processes: fork, exec, and wait</a></li>
+<li class="toc-ch"><a href="#ch15">Chapter 15 — Threads: Shared Memory and Its Hazards</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part IV &mdash; Concurrency & Parallelism</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part V &mdash; Rust for Systems</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VI &mdash; Performance Engineering</li>
@@ -5521,6 +5524,1195 @@ what you measured and label your compiler/hardware, since numbers vary.</div>
 </section>
 
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part III</div><h1>The Operating System</h1><p class='part-blurb'>Processes, threads, scheduling, virtual memory, and the system-call boundary — how the OS multiplexes the machine.</p></div>
+<section class="chapter" id="ch13">
+<h1>Chapter 13 — The System-Call Boundary</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch04">Chapter 4</a> (virtual addresses; the
+hardware translates every pointer and can refuse the access), <a href="#ch11">Chapter 11</a> (a buffer
+overflow corrupts <em>this</em> process — but only this one), <a href="#ch12">Chapter 12</a> (you became the
+allocator; the backing memory came from somewhere). &nbsp;·&nbsp; <strong>Opens Part 3.</strong> Part 2 left
+you holding, by hand, a proof about the memory <em>inside</em> one program. This part is about the operating
+system underneath all of it — the code that gave you an address space, a heap, and the illusion of owning the
+machine. We start at the seam where your program meets that code: the <strong>system call</strong>, the single
+controlled doorway from your program into the kernel.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch11">Chapter 11</a> — a stack buffer overflow can overwrite the
+saved return address and hijack <em>this</em> program's control flow. Can it, by the same mechanism, overwrite
+memory belonging to a <em>different</em> running program? What stops it? (2) <a href="#ch04">Chapter 4</a> —
+when you dereference a pointer, the address is virtual and the hardware translates it; who set up the
+translation tables, and could your code just rewrite them to point anywhere in physical RAM? (3)
+<em>Predict:</em> when your C program calls <code>write()</code> to print to the screen, does <em>your</em>
+code push the bytes out to the terminal device — or does something else do it on your behalf? Guess what stops
+an ordinary program from writing straight to the disk controller. By the end you will be able to trace exactly
+what happens on that call.</p>
+</aside>
+
+<p>Every useful program eventually needs to do something it is not allowed to do. Reading a file, sending a
+network packet, getting more memory from the OS, creating a process, drawing on the screen — all of these
+touch hardware or shared state that a single process must not control directly, because the whole point of an
+operating system is that one buggy or malicious program cannot seize the machine or read another program's
+secrets. So the machine runs your code in a restricted mode, and the only way to get privileged work done is
+to <em>ask</em>: to make a <strong>system call</strong>, a controlled transfer into the kernel that switches
+into privileged mode, runs a specific pre-approved handler, and returns. This chapter is about that boundary.
+We establish the two privilege modes and why they exist (§13.1), trace exactly how a system call crosses the
+boundary on this machine, register by register (§13.2), separate the C library's friendly wrappers from the
+kernel underneath them (§13.3), measure what a crossing actually costs and how to avoid paying it (§13.4), and
+carry the boundary forward into processes and threads (§13.5). This is the seam Chapter 12 promised you would
+see "from the other side."</p>
+
+<h2>13.1 Two modes: user and kernel</h2>
+
+<p>The CPU itself enforces the boundary. A modern processor runs in one of (at least) two <strong>privilege
+modes</strong>: <strong>user mode</strong>, in which most of your code runs, and <strong>kernel mode</strong>
+(also called supervisor or privileged mode), in which the operating system runs. On x86 these are implemented
+as <em>rings</em> — ring 3 for user code, ring 0 for the kernel. The difference is not speed; it is
+<em>authority</em>. In user mode a set of instructions simply will not execute: you cannot halt the CPU,
+disable interrupts, load the page tables that define address translation (Chapter 4), or read and write device
+registers. Attempt one and the hardware traps into the kernel instead of obeying you.</p>
+
+<p>That single mechanism is what makes the isolation of Chapter 11 real. Your buffer overflow can wreck
+<em>this</em> process because it runs with this process's authority — but it cannot reach another process's
+memory, because the memory-management unit (Chapter 4) translates every address through <em>this</em>
+process's page tables and faults on anything outside them, and it cannot rewrite those page tables to escape,
+because installing page tables is a privileged instruction it is not allowed to run. Two hardware
+mechanisms, working together: the MMU draws the boundary around each process's <em>memory</em>, and the
+user/kernel mode bit draws the boundary around the machine's <em>instructions and devices</em>. Everything you
+have written in this book so far has run in ring 3, with no direct access to any of it. The kernel is the only
+software that runs privileged, and it is the referee that hands out access under its own rules.</p>
+
+<p>This is the answer to the opener's first two questions. A process cannot corrupt another process's memory
+because it is confined to its own translated address space and cannot touch the translation machinery; it
+cannot rewrite the page tables because that instruction traps. The confinement is not politeness — it is
+enforced by silicon on every instruction.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name one privileged operation that a program in user mode is <em>not</em> allowed to perform directly, and
+say what the hardware does if it tries anyway. (Answer after the next section.)</p>
+</aside>
+
+<h2>13.2 Crossing the boundary: the system-call mechanism</h2>
+
+<p>If user code cannot touch devices or memory tables, how does it ever read a file? It asks the kernel to do
+it, through a deliberately narrow door. The mechanism is a <strong>trap</strong>: a special instruction that
+simultaneously switches the CPU into kernel mode <em>and</em> jumps to a single, fixed entry point that the
+kernel installed at boot. This is the crucial safety property — user code does not get to switch into kernel
+mode and then run wherever it likes; the trap lands only at the kernel's chosen handler, which decides what to
+do. On 64-bit x86 Linux that instruction is <code>syscall</code> (the older 32-bit path used the software
+interrupt <code>int 0x80</code>).</p>
+
+<p>Because the boundary is narrow, there is a strict convention — an <strong>application binary interface
+(ABI)</strong> — for how you name the call and pass its arguments. On x86-64 Linux (verified against the
+<code>syscall(2)</code> manual page): the <strong>system-call number</strong> goes in register
+<code>rax</code>; the first six arguments go in <code>rdi</code>, <code>rsi</code>, <code>rdx</code>,
+<code>r10</code>, <code>r8</code>, <code>r9</code> (note <code>r10</code>, not <code>rcx</code> — the
+<code>syscall</code> instruction itself clobbers <code>rcx</code> and <code>r11</code>); you execute
+<code>syscall</code>; and the kernel returns the result in <code>rax</code>. A negative return in the range of
+a small error code means failure — the raw kernel interface returns <code>-errno</code> (§13.3 turns that into
+the friendly <code>errno</code> you know). The kernel also <em>validates</em> what you pass: hand it a pointer
+to write into, and it checks that the pointer really belongs to your address space, so you cannot trick it into
+scribbling on kernel memory on your behalf.</p>
+
+<figure>
+<svg viewBox="0 0 640 250" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A system call is a controlled trap: one fixed door from ring 3 into ring 0 and back.</text>
+<rect x="20" y="30" width="600" height="80" fill="#f5f8fb" stroke="#14406b"/>
+<text x="30" y="46" font-size="10" fill="#14406b">USER MODE (ring 3) — your program, the C library</text>
+<rect x="40" y="56" width="230" height="44" fill="#eef4fa" stroke="#14406b"/>
+<text x="50" y="72" font-size="9">rax = SYS_write (1)</text>
+<text x="50" y="86" font-size="9">rdi=fd  rsi=buf  rdx=len</text>
+<text x="50" y="98" font-size="9" fill="#8c3a1d">syscall  &rarr;  (trap)</text>
+<rect x="20" y="140" width="600" height="80" fill="#fbf5f0" stroke="#8c3a1d"/>
+<text x="30" y="156" font-size="10" fill="#8c3a1d">KERNEL MODE (ring 0) — the operating system</text>
+<rect x="40" y="166" width="300" height="44" fill="#fdeee6" stroke="#8c3a1d"/>
+<text x="50" y="182" font-size="9">fixed entry point &rarr; sys_write handler</text>
+<text x="50" y="196" font-size="9">validate fd &amp; buffer, do the I/O, set return</text>
+<line x1="155" y1="110" x2="155" y2="166" stroke="#8c3a1d" stroke-width="2" marker-end="url(#a13)"/>
+<text x="162" y="132" font-size="9" fill="#8c3a1d">syscall: switch to ring 0, jump to fixed handler</text>
+<line x1="360" y1="166" x2="360" y2="110" stroke="#2e6b34" stroke-width="2" marker-end="url(#a13b)"/>
+<text x="368" y="132" font-size="9" fill="#2e6b34">return: rax = result (3), back to ring 3</text>
+<defs>
+<marker id="a13" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8c3a1d"/></marker>
+<marker id="a13b" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2e6b34"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 13.1: A system call. User code loads the call number and arguments into the ABI's registers
+and executes <code>syscall</code>; the CPU switches to kernel mode and jumps to one fixed entry point (never
+an address of the caller's choosing); the kernel validates, does the privileged work, and returns the result
+in <code>rax</code>. The boundary is narrow by design — that narrowness is the security.</figcaption>
+</figure>
+
+<p>Here is the whole path made concrete. When a program runs <code>write(1, "hi\n", 3)</code> — write three
+bytes to file descriptor 1, standard output — the sequence is: put the number for <code>write</code> in
+<code>rax</code>, put <code>1</code> in <code>rdi</code>, the buffer address in <code>rsi</code>, and
+<code>3</code> in <code>rdx</code>; execute <code>syscall</code>; the CPU traps to the kernel, which writes the
+bytes and returns <code>3</code> (the count written) in <code>rax</code>. We can watch this happen with
+<code>strace</code>, which intercepts and prints every system call a program makes. Compiling a three-line C
+program that does exactly that and running it under <code>strace</code> on this machine (gcc 11.4.0, x86-64
+Linux) shows the crossing directly:</p>
+
+<pre><code>$ strace -e trace=write ./hello
+write(1, "hi\n", 3)                     = 3
++++ exited with 0 +++</code></pre>
+
+<p>That one line <em>is</em> the boundary: the arguments the program marshaled, and the <code>= 3</code> the
+kernel returned. Everything else the program did — computing, moving data in its own memory — never appears,
+because none of it crossed into the kernel.</p>
+
+<p><em>(Answer to the §13.1 quick check: a user-mode program may not execute privileged instructions such as
+halting the CPU, disabling interrupts, loading the page tables, or accessing device registers directly. If it
+tries, the hardware does not obey — it traps into the kernel, which typically terminates the offending
+process.)</em></p>
+
+<h2>13.3 The library wrapper vs. the raw system call</h2>
+
+<p>You have almost certainly never written <code>syscall</code> by hand, and you rarely will. The C library
+(glibc on most Linux systems) provides an ordinary-looking function for each system call — <code>write</code>,
+<code>read</code>, <code>open</code>, <code>fork</code> — and that <strong>wrapper</strong> does the register
+marshaling for you: it moves your arguments into <code>rdi</code>/<code>rsi</code>/<code>rdx</code>, sets
+<code>rax</code>, executes <code>syscall</code>, and inspects the result. On the negative-return failure
+convention from §13.2, the wrapper does the translation you already know: it stores the error code in the
+global <code>errno</code> and returns <code>-1</code>. So the raw kernel interface returns <code>-EBADF</code>;
+the wrapper you call returns <code>-1</code> and sets <code>errno == EBADF</code>. The wrapper is a thin
+shell around one <code>syscall</code>.</p>
+
+<p>The distinction that trips people up is that <em>not every library function is a wrapper</em>, and the ones
+that matter most are not. <code>printf</code> is <strong>not</strong> a system call. It is a substantial C
+library routine that parses your format string, converts numbers to text, and — critically — <em>buffers</em>
+the result in user-space memory, only calling the <code>write</code> system call later, when the buffer fills
+or is flushed. Similarly <code>malloc</code> (Chapters 9 and 12) is a library function that manages a heap in
+user space; it crosses into the kernel only occasionally, calling the <code>brk</code> or <code>mmap</code>
+system calls when it needs to grow the heap — which is exactly where your arena's backing block came from in
+Chapter 12. This is the "other side" that chapter promised: your allocator handed out bytes that the C library
+had obtained, in bulk, from the kernel across this very boundary. The layering is real and worth holding
+precisely: <em>your code</em> calls a <em>library function</em>, which may buffer and compute in user space,
+and which crosses into the <em>kernel</em> only when it must, through a <em>system-call wrapper</em>.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>You run a program that prints with <code>printf</code>, then crashes before returning from <code>main</code>
+— and the printed line never appears in your terminal. Nothing was wrong with the format string. What most
+likely happened to those bytes? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>13.4 The cost of crossing — and how to avoid paying it</h2>
+
+<p>Crossing the boundary is not free, and the cost is the reason a great deal of systems performance work
+exists. A system call must switch privilege mode, save and later restore the caller's state, enter the kernel,
+validate arguments, and eventually switch back — and along the way it can disturb the CPU's caches and TLB
+(Chapters 3–4). Compared with an ordinary function call, which on a modern core is a couple of instructions,
+that is enormously more expensive. Measured on this machine (gcc 11.4.0, <code>-O2</code>, x86-64), calling a
+trivial non-inlined function ten million times versus making the <code>getpid</code> system call the same
+number of times:</p>
+
+<pre><code>plain function call :  ~1-2 ns each
+getpid system call  :  ~150-190 ns each
+ratio               :  roughly two orders of magnitude</code></pre>
+
+<p><strong>These figures are illustrative, from this specific machine and run — they vary with hardware,
+kernel, and mitigations (some CPU-vulnerability mitigations make the boundary crossing markedly more
+expensive), and you should measure your own.</strong> But the shape is robust and the lesson is durable: a
+system call costs on the order of a hundred function calls or more. Three consequences follow, and each is a
+technique you will use:</p>
+
+<ul>
+<li><strong>Batch — do not cross per item.</strong> Reading a megabyte one byte at a time is a million
+crossings; reading it in large blocks is a handful. This is exactly why the C library buffers: <code>printf</code>
+and <code>fread</code> accumulate in user space and cross the boundary rarely. The single most common I/O
+performance bug is an unbuffered per-item system call in a hot loop.</li>
+<li><strong>Let the kernel share read-only data without a crossing — the vDSO.</strong> A few "system calls"
+that only <em>read</em> kernel-maintained data, such as <code>clock_gettime</code> and
+<code>gettimeofday</code>, are served from the <strong>vDSO</strong> (virtual dynamic shared object): a page
+the kernel maps read-only into every process, containing the data and the code to read it, so the call runs
+entirely in user mode with no trap. On this machine, a program that calls <code>clock_gettime</code> one
+million times produces, under <code>strace -c</code>, <em>zero</em> <code>clock_gettime</code> system calls —
+the crossings simply are not there, because the vDSO answered in user space. (You can see the vDSO mapped into
+any process: <code>ldd</code> on a dynamically linked program lists <code>linux-vdso.so.1</code>.)</li>
+<li><strong>Observe the boundary with <code>strace</code>.</strong> Because every crossing is visible,
+<code>strace</code> (and <code>strace -c</code> for a counted summary) is the first tool to reach for when a
+program is mysteriously slow or stuck: it shows you exactly which system calls it is making, how many, and
+where it is blocked.</li>
+</ul>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a system call is a controlled trap</span>
+<p><strong>1. In words.</strong> User code cannot touch devices or memory tables, so it <em>asks</em> the
+kernel by executing a trap instruction that switches to kernel mode and jumps to one fixed handler — never an
+address of the caller's choosing. The kernel validates, does the privileged work, and returns. Narrowness is
+the security.</p>
+<p><strong>2. As a picture.</strong> Figure 13.1: two stacked bands (ring 3, ring 0) with a single arrow down
+(<code>syscall</code> → fixed entry) and a single arrow up (return in <code>rax</code>).</p>
+<p><strong>3. As numbers.</strong> The ABI: number in <code>rax</code>; args in
+<code>rdi,rsi,rdx,r10,r8,r9</code>; result in <code>rax</code>; <code>-errno</code> on failure. The cost:
+~150-190 ns for <code>getpid</code> versus ~1-2 ns for a function call on this machine — roughly 100&times;,
+which is why you batch and why the vDSO exists.</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: "<code>printf</code> is a system call" — confusing the library with the kernel</span>
+<p>It is tempting to treat every function that produces output as a direct line to the operating system.
+<strong>It is not: <code>printf</code> is a C library function that formats and <em>buffers</em> in user-space
+memory, and calls the <code>write</code> system call only when that buffer flushes.</strong> Conflating the two
+produces real, confusing bugs. A program that <code>printf</code>s a line and then crashes may show
+<em>nothing</em> in the terminal, because the bytes were sitting in the library's buffer and the crash skipped
+the flush — the boundary was never crossed (this is the §13.3 quick check, and it returns in Chapter 14 when
+<code>fork</code> <em>duplicates</em> that unflushed buffer and a line prints twice). The fix when you need
+output to be real <em>now</em> is to force the crossing: <code>fflush(stdout)</code>, or configure line
+buffering, or call <code>write</code> directly — which is unbuffered and goes straight across. The mental model
+that prevents a dozen bugs: <em>your code → a library function (may buffer) → a system-call wrapper → the
+kernel</em>. Know which layer you are on. The library's job is often to <em>avoid</em> the kernel; the kernel
+is only reached deliberately.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate reports: "Our service writes one log line per request with a bare
+<code>write()</code> call, and profiling says it is spending huge time in the kernel. Let's just delete the
+logging." Cover the paragraph and respond in three or four sentences, drawing on §13.3–13.4.</p>
+<p><em>Model answer.</em> "The problem is almost certainly not <em>that</em> we log, but <em>how</em> — one
+unbuffered <code>write</code> per line is one system-call crossing per line, and a crossing costs on the order
+of a hundred function calls or more (on our box <code>getpid</code> was ~150 ns versus ~1-2 ns for a call), so
+at high request rates those crossings dominate. The fix is to batch: buffer log lines in user space and flush
+in large blocks, which is exactly why the C library buffers <code>printf</code> in the first place; we cross
+the boundary a few times instead of thousands. Let's confirm with <code>strace -c</code> that <code>write</code>
+is the hot call, switch to a buffered logger, and re-measure — deleting logging throws away observability to
+fix a batching bug." Naming the crossing cost, reaching for batching rather than removal, and confirming with
+<code>strace</code> is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §13.3 quick check: the bytes were almost certainly still in <code>printf</code>'s
+user-space buffer. Because <code>printf</code> buffers and only crosses into the kernel via <code>write</code>
+on a flush, a crash before the flush loses them — they never reached the terminal. Force the crossing with
+<code>fflush</code>, line buffering, or a direct <code>write</code>.)</em></p>
+
+<h2>13.5 What to carry forward</h2>
+
+<p>The CPU runs your code in <strong>user mode</strong> (ring 3), where privileged instructions — touching
+devices, loading page tables, disabling interrupts — simply will not execute, and the operating system in
+<strong>kernel mode</strong> (ring 0) is the only software with that authority. Together the MMU (Chapter 4)
+and this mode bit are what make process isolation real: a bug confined to your address space cannot reach
+another process or the machine. To get privileged work done, user code makes a <strong>system call</strong> —
+a controlled trap (<code>syscall</code> on x86-64) that switches mode and jumps to <em>one fixed kernel entry
+point</em>, passing a call number in <code>rax</code> and arguments in
+<code>rdi,rsi,rdx,r10,r8,r9</code>, receiving a result in <code>rax</code> (with <code>-errno</code> on
+failure). The C library wraps each call in an ordinary function and translates the error convention into
+<code>errno</code> and <code>-1</code> — but many library functions (<code>printf</code>, <code>malloc</code>)
+are <em>not</em> system calls; they compute and buffer in user space and cross only when they must. And the
+crossing is expensive — on this machine roughly two orders of magnitude more than a function call — so you
+batch, you lean on the vDSO for cheap read-only data like the time, and you observe the boundary with
+<code>strace</code>.</p>
+
+<p>This is the seam the rest of Part 3 lives on. A <strong>process</strong> (Chapter 14) is the isolated
+container this boundary protects — its own address space, created and destroyed through system calls
+(<code>fork</code>, <code>execve</code>, <code>exit</code>, <code>wait</code>) that cross exactly this line.
+A <strong>thread</strong> (Chapter 15) is a second flow of control that shares one side of the boundary — the
+same address space — trading isolation for cheap sharing. Every abstraction the OS gives you, from the heap
+that fed your allocator to the files and sockets you will read later, is reached through the doorway you have
+just learned to trace.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name the two CPU privilege modes and give two operations user mode is forbidden to do — and say what
+enforces the ban.</li>
+<li>Explain why a system call jumps to a <em>fixed</em> kernel entry point rather than an address the caller
+chooses, and why that matters.</li>
+<li>State the x86-64 Linux system-call ABI: where the call number, the arguments, and the return value go.</li>
+<li>Explain how <code>printf</code> differs from the <code>write</code> system call, and why a crash can lose a
+<code>printf</code>ed line.</li>
+<li>Give the rough cost of a system call versus a function call on a machine you have measured, and name two
+ways to cross the boundary less (batching, the vDSO).</li>
+<li>Say how process isolation follows from the MMU plus the user/kernel mode bit.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is the difference between user mode and kernel mode, and what enforces it? (§13.1)</li>
+<li><strong>R2.</strong> Describe the system-call mechanism on x86-64 Linux: instruction, where the number and
+arguments go, where the result comes back. (§13.2)</li>
+<li><strong>R3.</strong> Is <code>printf</code> a system call? What actually crosses the boundary, and when?
+(§13.3)</li>
+<li><strong>R4.</strong> Roughly how much more expensive is a system call than a function call, and why?
+(§13.4)</li>
+<li><strong>R5.</strong> What is the vDSO, and why does calling <code>clock_gettime</code> often <em>not</em>
+show up as a system call? (§13.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Mechanism: Limited Direct Execution."</strong> The free chapter that develops exactly this boundary — user vs.
+kernel mode, traps, and the system-call mechanism. The reference for §13.1–13.2.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter
+8.</strong> Exceptional control flow: how the hardware and OS handle traps and system calls from the
+programmer's view.</li>
+<li><strong>The Linux <code>syscall(2)</code> and <code>vdso(7)</code> manual pages.</strong> The primary
+sources for the per-architecture calling convention of §13.2 and the vDSO of §13.4. Verify against your kernel
+and architecture.</li>
+<li><strong><code>strace</code> documentation and man page.</strong> The tool used throughout this chapter to
+make the boundary visible; <code>strace -c</code> for a counted summary. Free.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex13.1"><span class="ex-label">13.1</span> <span class="ex-tag warm">warm-up</span>
+Name the two CPU privilege modes, and give one operation a program in user mode is not allowed to perform
+directly.</div>
+
+<div class="exercise" id="ex13.2"><span class="ex-label">13.2</span> <span class="ex-tag warm">warm-up</span>
+On x86-64 Linux, which register holds the system-call number, and which register holds the return value?</div>
+
+<div class="exercise" id="ex13.3"><span class="ex-label">13.3</span> <span class="ex-tag warm">warm-up</span>
+Is <code>printf</code> a system call? If not, what does it do first, and which system call does it eventually
+use to produce output?</div>
+
+<div class="exercise" id="ex13.4"><span class="ex-label">13.4</span> <span class="ex-tag core">core</span>
+Trace, step by step, what happens when a program executes <code>write(1, buf, 5)</code>: what does the C
+library put in which registers, what instruction crosses the boundary, and what comes back on success? (Use the
+ABI from §13.2.)</div>
+
+<div class="exercise" id="ex13.5"><span class="ex-label">13.5</span> <span class="ex-tag core">core</span>
+Explain the relationship between the kernel's raw error convention and the <code>errno</code>/<code>-1</code>
+you see from a C library call. If a raw system call returns <code>-EBADF</code>, what does the wrapper return
+and what does it set?</div>
+
+<div class="exercise" id="ex13.6"><span class="ex-label">13.6</span> <span class="ex-tag core">core</span>
+You run <code>strace</code> on a program and see, among other lines: <code>openat(...) = 3</code>,
+<code>read(3, ..., 4096) = 512</code>, and then thousands of <code>read(3, ..., 1) = 1</code> lines. In one
+or two sentences, say what the last pattern tells you is wrong and what to change.</div>
+
+<div class="exercise" id="ex13.7"><span class="ex-label">13.7</span> <span class="ex-tag complexity">cost</span>
+(a) Name two reasons a system call costs far more than an ordinary function call. (b) A program reads a 1 MB
+file by calling <code>read</code> one byte at a time; explain why this is slow in terms of boundary crossings,
+and give the fix. (c) Why does calling <code>clock_gettime</code> in a tight loop often cost <em>no</em> system
+calls at all?</div>
+
+<div class="exercise" id="ex13.8"><span class="ex-label">13.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A program prints a diagnostic line with <code>printf</code> just
+before dereferencing a bad pointer and crashing. The line never appears in the terminal, even though the
+program definitely reached the <code>printf</code>.
+<br><strong>Step 1 (given):</strong> <code>printf</code> writes into the C library's user-space output buffer,
+not directly to the terminal.
+<br><strong>Step 2 (given):</strong> The buffer is flushed (crossed to the kernel via <code>write</code>) only
+when it fills, at a newline for a line-buffered terminal, or at normal program exit.
+<br><strong>Step 3 (given):</strong> A crash from an invalid dereference terminates the process abnormally,
+skipping the normal flush.
+<br><strong>Step 4 (you):</strong> State where the bytes actually were when the program died, explain why the
+line was lost (referencing the boundary), and give two ways to make sure the line appears before a possible
+crash.</div>
+
+<div class="exercise" id="ex13.9"><span class="ex-label">13.9</span> <span class="ex-tag mixed">mixed</span>
+For each, decide whether it requires crossing the system-call boundary or is pure user-space computation, and
+say why in a few words: (a) adding two integers in registers; (b) opening a file; (c) sorting an in-memory
+array; (d) sending a network packet; (e) formatting a number into a string with <code>sprintf</code>.</div>
+
+<div class="exercise" id="ex13.10"><span class="ex-label">13.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 10–13, classify each as <em>undefined behavior</em>, <em>a boundary crossing (system
+call)</em>, or <em>neither</em>: (a) reading one past the end of a stack array; (b) calling <code>read</code> on
+a valid file descriptor; (c) signed integer overflow in a loop counter; (d) a buffered <code>printf</code> that
+has not yet flushed.</div>
+
+<div class="exercise" id="ex13.11"><span class="ex-label">13.11</span> <span class="ex-tag stretch">stretch</span>
+The kernel validates every pointer you pass to a system call such as <code>write</code>, checking it belongs
+to your address space. (a) Relate this to Chapter 4's address translation: why can a process not simply pass a
+pointer to another process's memory or to kernel memory and have the kernel read it? (b) Sketch what could go
+wrong for security if the kernel skipped this validation. (c) Explain how the two mechanisms — per-process
+address translation and the user/kernel mode bit — together make one process unable to spy on another.</div>
+
+<div class="exercise" id="ex13.12"><span class="ex-label">13.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a program that prints with <code>write</code> and run it under
+<code>strace -e trace=write</code>; confirm you see the <code>write</code> call and its return value. (b) With
+<code>strace -c</code>, count the total system calls of a trivial "hello world" and note how many are startup
+overhead (dynamic linking, etc.) versus your own output. (c) Measure the cost of the <code>getpid</code> system
+call versus a trivial function call in a loop, and (d) call <code>clock_gettime</code> a million times and
+confirm with <code>strace -c</code> that it does <em>not</em> appear as a million system calls. Report your
+numbers and label your compiler, kernel, and hardware, since figures vary.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch14">
+<h1>Chapter 14 — Processes: fork, exec, and wait</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch13">Chapter 13</a> (the system-call
+boundary — <code>fork</code>, <code>exec</code>, and <code>wait</code> are all system calls),
+<a href="#ch04">Chapter 4</a> (each process has its own virtual address space, translated through its own page
+tables), <a href="#ch11">Chapter 11</a> (a memory bug is confined to <em>one</em> process's address space).
+&nbsp;·&nbsp; Pairs with <a href="#ch15">Chapter 15</a> (threads share an address space instead of copying it).
+Chapter 13 showed the boundary that protects a process; this chapter is about the process itself — what it is,
+how the OS makes a new one, how one program becomes another, and how a parent collects a finished child.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch13">Chapter 13</a> — to do something privileged, user code must
+do what, and through which instruction on x86-64? (2) <a href="#ch11">Chapter 11</a> — a buffer overflow can
+corrupt the process it runs in; can it corrupt a <em>different</em> running process's memory, and what two
+mechanisms decide the answer? (3) <em>Predict:</em> <code>fork()</code> makes a new process that is a copy of
+the calling one. If your program is holding a 1 GB array in memory and calls <code>fork()</code>, do you think
+the operating system immediately copies all 1 GB? Guess, and note why the answer matters for how often you can
+afford to <code>fork</code>. We measure the idea behind it shortly.</p>
+</aside>
+
+<p>A running program is not the same thing as the file on disk. The file is inert bytes; the running instance
+— with its own memory, its own place in the CPU, its own open files — is a <strong>process</strong>, and the
+process is the operating system's fundamental unit of isolation and accounting. Everything Chapter 13 protected
+was protecting a process: its private address space, its authority level, its resources. This chapter opens the
+process up. We define precisely what a process bundles together (§14.1); we build a new one with the Unix
+system call <code>fork</code>, and see why it returns <em>twice</em> and why copying a process can be cheap
+(§14.2); we turn a copied process into a <em>different</em> program with <code>exec</code>, and meet the
+fork-then-exec pattern that every shell uses (§14.3); we collect a finished child with <code>wait</code>, and
+meet the zombie and the orphan (§14.4); and we carry the model into threads (§14.5). By the end you will be able
+to write, and reason about, the create-run-reap lifecycle that underlies every command you have ever typed.</p>
+
+<h2>14.1 What a process is — the unit of isolation</h2>
+
+<p>A process is three things bundled and protected together. First, an <strong>address space</strong>: the
+private virtual memory of Chapters 4, 7, and 8 — text, initialized data, bss, heap, and stack — that the MMU
+translates through this process's own page tables so that its pointers name only its own memory. Second, one
+or more <strong>threads of execution</strong>: the actual running context — the program counter, the stack
+pointer, the register values — that says <em>where</em> in the code the process currently is (this chapter's
+processes have exactly one; Chapter 15 adds more). Third, a bundle of <strong>kernel-managed resources</strong>:
+the open file descriptors, the process ID (PID) and parent PID, the current working directory, the user and
+group credentials, and more, all tracked by the kernel on the process's behalf.</p>
+
+<p>The reason these are bundled is <strong>isolation</strong>. The kernel gives each process the illusion of
+owning the machine: its own address space (so one process's pointers are meaningless in another's — the answer
+to Chapter 11's confinement), its own turn on the CPU, its own resource handles. A fault in one process — a
+wild pointer, a crash, even a security compromise — is contained to that process's address space and cannot,
+by the mechanisms of Chapter 13, corrupt another process or the kernel. This is why the process is the natural
+boundary for a sandbox, a multi-tenant service, or any place you need one failure not to become everyone's
+failure. The process is precisely the thing the system-call boundary was built to protect.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the three things a process bundles together. Which one makes two processes' identical-looking pointer
+values refer to completely different memory? (Answer after the next section.)</p>
+</aside>
+
+<h2>14.2 Creating a process: <code>fork</code> and copy-on-write</h2>
+
+<p>Unix creates a new process in a way that surprises everyone the first time: the <code>fork()</code> system
+call is called <em>once</em> but returns <em>twice</em>. It makes the calling process (the <strong>parent</strong>)
+into two nearly identical processes — the parent and a new <strong>child</strong> — and then both continue
+from the point of the return. The child is a copy: same code, same current values of every variable, copies of
+the open file descriptors. The one difference is the return value, which is how each copy knows who it is:
+<code>fork</code> returns <strong>0 in the child</strong> and <strong>the child's PID in the parent</strong>
+(or <code>-1</code> on failure). You branch on it. Here is the whole pattern, compiled and run on this machine
+(gcc 11.4.0, x86-64 Linux):</p>
+
+<pre><code>int x = 100;
+pid_t pid = fork();          /* one call, returns TWICE */
+if (pid == 0) {              /* child sees 0 */
+    x += 1;
+    printf("child : pid=%d ppid=%d x=%d  (fork returned %d)\n", getpid(), getppid(), x, pid);
+} else {                     /* parent sees the child's pid */
+    int st; waitpid(pid, &amp;st, 0);
+    x += 10;
+    printf("parent: pid=%d x=%d  (fork returned %d; child exit=%d)\n", getpid(), x, pid, WEXITSTATUS(st));
+}</code></pre>
+
+<pre><code>child : pid=1341934 ppid=1341933 x=101  (fork returned 0)
+parent: pid=1341933 x=110  (fork returned 1341934; child exit=0)</code></pre>
+
+<p>Read that output closely, because it shows every essential fact. The two processes have different PIDs
+(1341934 and 1341933), and the child's parent PID equals the parent's PID — the family tree is real. Both
+started with <code>x == 100</code>, but the child's <code>x += 1</code> and the parent's <code>x += 10</code>
+did not interfere: the child ends at 101 and the parent at 110. Their memory is <em>independent</em> — the
+same variable name, at what is even the same virtual address, but two separate physical copies, because each
+process has its own address space (§14.1). And <code>fork</code> returned 0 down one path and the child's PID
+down the other, which is the only thing distinguishing the twins.</p>
+
+<p>Now the predict from the opener: if the parent held a 1 GB array, did <code>fork</code> copy a gigabyte?
+No — and it could not afford to, or forking would be unusable. The kernel uses <strong>copy-on-write
+(COW)</strong>: rather than duplicating the parent's pages, it maps the <em>same</em> physical pages into both
+processes and marks them read-only. Both share the physical memory as long as they only read it. The instant
+<em>either</em> one writes to a page, the hardware faults, the kernel makes a private copy of just that one
+page for the writer, and both continue. So <code>fork</code>'s cost is proportional not to the size of the
+address space but to the number of pages actually modified afterward — which is why forking a huge process is
+cheap, and why the child's <code>x += 1</code> above triggered a copy of exactly the one page holding
+<code>x</code> and nothing else. Copy-on-write is Chapter 4's page tables doing double duty: the same
+translation-and-fault machinery that isolates processes also lets them share until the moment sharing becomes
+incorrect.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: <code>fork</code> returns twice into two address spaces</span>
+<p><strong>1. In words.</strong> One call, two returns: the parent gets the child's PID, the child gets 0, and
+from then on they are separate processes with separate (copy-on-write) memory. You branch on the return value
+to run different code in each.</p>
+<p><strong>2. As a picture.</strong> Figure 14.1: a single arrow entering <code>fork</code> and two arrows
+leaving, into two boxes that start as copies and diverge as each writes its own pages.</p>
+<p><strong>3. As a trace.</strong> Before: one process, <code>x = 100</code>. After <code>fork</code>: two
+processes, both <code>x = 100</code>, distinguished by return value (child 0, parent child-PID). After each
+runs: child <code>x = 101</code>, parent <code>x = 110</code> — independent, exactly as the measured output
+shows.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 190" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">fork(): one call, two returns, two independent (copy-on-write) address spaces.</text>
+<rect x="20" y="30" width="180" height="44" fill="#eef4fa" stroke="#14406b"/>
+<text x="30" y="48" font-size="9">parent before fork()</text>
+<text x="30" y="64" font-size="9">x = 100</text>
+<line x1="200" y1="52" x2="260" y2="52" stroke="#14406b" stroke-width="1.5" marker-end="url(#a14)"/>
+<text x="205" y="46" font-size="8" fill="#14406b">fork()</text>
+<rect x="260" y="20" width="200" height="44" fill="#cfe8cf" stroke="#2e6b34"/>
+<text x="270" y="38" font-size="9">parent: fork()=child pid</text>
+<text x="270" y="54" font-size="9">x: 100 &rarr; 110</text>
+<rect x="260" y="86" width="200" height="44" fill="#fdeee6" stroke="#8c3a1d"/>
+<text x="270" y="104" font-size="9">child: fork()=0</text>
+<text x="270" y="120" font-size="9">x: 100 &rarr; 101</text>
+<line x1="255" y1="52" x2="260" y2="42" stroke="#2e6b34" stroke-width="1.5"/>
+<line x1="255" y1="52" x2="260" y2="108" stroke="#8c3a1d" stroke-width="1.5"/>
+<text x="475" y="30" font-size="9" fill="#333">Same code, same starting</text>
+<text x="475" y="44" font-size="9" fill="#333">values, copies of the fds.</text>
+<text x="475" y="62" font-size="9" fill="#333">Pages shared read-only</text>
+<text x="475" y="76" font-size="9" fill="#333">until one writes (COW),</text>
+<text x="475" y="90" font-size="9" fill="#333">then copied per page —</text>
+<text x="475" y="104" font-size="9" fill="#333">so forking 1 GB does</text>
+<text x="475" y="118" font-size="9" fill="#333">NOT copy 1 GB.</text>
+<text x="20" y="152" font-size="9" fill="#8c3a1d">The only difference between the twins is fork()'s return value — that is how each knows which one it is.</text>
+<text x="20" y="170" font-size="9" fill="#2e6b34">Memory is independent afterward: the child's x+=1 and the parent's x+=10 touch separate physical pages.</text>
+<defs><marker id="a14" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#14406b"/></marker></defs>
+</svg>
+<figcaption>Figure 14.1: <code>fork</code> returns twice — 0 in the child, the child's PID in the parent —
+producing two processes that start as copies and, thanks to copy-on-write, share physical pages until one
+writes. The branch on the return value is how each copy runs different code.</figcaption>
+</figure>
+
+<p><em>(Answer to the §14.1 quick check: a process bundles an <strong>address space</strong>, one or more
+<strong>threads of execution</strong>, and a set of <strong>kernel resources</strong> such as open file
+descriptors and its PID. The <strong>address space</strong> — separate per process and translated through its
+own page tables — is what makes two processes' identical-looking pointer values refer to different memory.)</em></p>
+
+<h2>14.3 Running a new program: <code>exec</code> and the fork-exec pattern</h2>
+
+<p><code>fork</code> gives you a copy of the <em>same</em> program. To run a <em>different</em> program you
+need <code>exec</code> — the <code>execve</code> system call and its convenience wrappers. <code>exec</code>
+does something drastic: it <strong>replaces the current process image</strong> — text, data, heap, stack —
+with a brand-new program loaded from disk, and jumps to its entry point. Everything the process was running is
+gone; the new program starts fresh. Two things survive the replacement, and they are the important ones: the
+<strong>PID stays the same</strong> (it is the same process, now running different code), and the <strong>open
+file descriptors stay open</strong> (unless marked close-on-exec). On success, <code>exec</code> <em>does not
+return</em> — there is nothing to return to, because the code that called it no longer exists.</p>
+
+<p>Put the two together and you get the pattern behind every command you run: <strong>fork, then exec, then
+wait</strong>. To launch a program, a process <code>fork</code>s; the child <code>exec</code>s the new program
+(replacing itself with it); and the parent <code>wait</code>s for the child to finish. This is exactly what a
+shell does for every command you type — <code>fork</code> a child, have it <code>exec</code>
+<code>/bin/ls</code>, and wait for it to complete before printing the next prompt — and it is how your terminal
+launched the demo program in §14.2. The pattern is also why the parent in that demo called
+<code>waitpid</code> before continuing.</p>
+
+<p>Why split creation (<code>fork</code>) from loading (<code>exec</code>) into two calls, when almost every
+use runs them back to back? Because the <em>gap between them</em> is where the elegance lives. After the child
+is forked but before it execs, it is still running the parent's code and can adjust its inherited resources:
+it can redirect standard output to a file, wire its input or output to a pipe connected to a sibling, drop
+privileges, or change directory — and then <code>exec</code> the target program, which starts up already
+plumbed into that environment without knowing anything about it. Unix I/O redirection and pipelines
+(<code>ls | grep foo &gt; out.txt</code>) are built entirely in that fork-to-exec gap. The two-call design is
+not clumsiness; it is the seam that makes composition possible.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A shell runs the command <code>ls</code>. In order, which of <code>fork</code>, <code>exec</code>, and
+<code>wait</code> does the shell process perform, which does the new child process perform, and which call does
+<em>not</em> return on success? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>14.4 Reaping: <code>wait</code>, exit status, zombies, and orphans</h2>
+
+<p>A process ends by calling <code>exit</code> (or returning from <code>main</code>, or being killed). But it
+does not vanish the instant it ends. The kernel must keep a small amount of information about it — most
+importantly its <strong>exit status</strong>, the number it passed to <code>exit</code> — so that the parent
+can find out how the child fared. A process that has terminated but whose exit status has not yet been
+collected is a <strong>zombie</strong> (shown as <code>&lt;defunct&gt;</code> in <code>ps</code>): it holds no
+memory or CPU, just a slot in the process table and its exit status, waiting to be read.</p>
+
+<p>The parent collects it by calling <code>wait</code> or <code>waitpid</code>, which blocks until a child
+finishes (or returns immediately if one already has), hands back the child's PID and its exit status (decode it
+with macros like <code>WEXITSTATUS</code>), and lets the kernel finally free the zombie's last slot. This is
+<strong>reaping</strong>. It is the parent's responsibility, and forgetting it is a real defect: a long-running
+parent that <code>fork</code>s children and never <code>wait</code>s accumulates zombies, slowly filling the
+process table. Note the category carefully — a leaked zombie is a <em>defined</em> resource leak, not undefined
+behavior; the program is not doing anything the language forbids, it is just failing to clean up, exactly as a
+memory leak is defined-but-bad (Chapter 9).</p>
+
+<p>The mirror-image case is the <strong>orphan</strong>: a child whose parent exits <em>first</em>. An orphan
+is not left dangling — the kernel <strong>reparents</strong> it to <code>init</code> (PID 1, or a subreaper),
+which <code>wait</code>s for it when it finishes, so orphans are reaped automatically. The lifecycle, then, is:
+a process is <code>fork</code>ed, runs, <code>exit</code>s (becoming a zombie holding its status), and is
+reaped by a <code>wait</code>ing parent (or by <code>init</code> if orphaned). Create, run, exit, reap.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: <code>fork</code> duplicates your unflushed output buffer (the double-print)</span>
+<p>Chapter 13 warned that <code>printf</code> buffers in user-space memory and crosses to the kernel only on a
+flush. <code>fork</code> copies the <em>entire</em> address space — <strong>including that buffer with its
+unflushed contents.</strong> So if you <code>printf</code> a line and <em>then</em> <code>fork</code>, the
+un-crossed bytes sit in both the parent's and the child's copy of the buffer, and when each process later
+flushes (at exit), the line is written <em>twice</em> — once per process — even though your code printed it
+once. This is not hypothetical: constructing exactly this (a <code>printf</code> before the fork, with output
+going to a pipe so buffering is block-mode) reproduces the doubled line every time. The trap is subtle because
+it disappears when output goes to a terminal (line-buffered, so the newline already flushed before the fork)
+and reappears when output is redirected to a file or pipe. The fix is the same as Chapter 13's: force the
+crossing before you branch — <code>fflush(stdout)</code> before <code>fork</code> (or use unbuffered
+<code>write</code>). The deeper lesson: <code>fork</code> copies <em>everything</em>, including the parts of
+your program's state you had forgotten were state.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: "Let's handle each incoming request by <code>fork</code>ing a
+fresh process — that way one bad request can't take down the others." Cover the paragraph and respond in three
+or four sentences, drawing on §14.1–14.2.</p>
+<p><em>Model answer.</em> "That is a genuinely good instinct for <em>isolation</em>: a separate process has its
+own address space, so a crash or memory corruption in one request is contained and can't touch a sibling — it's
+the classic robustness pattern, and <code>fork</code> is cheaper than it looks because copy-on-write means we
+don't duplicate the whole address space, only the pages a child actually writes. The costs to weigh are that
+processes don't share memory, so passing data between them needs explicit IPC (pipes, shared memory) rather
+than a pointer, and each request pays process-creation and context-switch overhead, which can hurt at very high
+rates. So process-per-request is the right call when fault-containment or a security boundary is the priority;
+if instead we need cheap shared-memory concurrency and can enforce discipline, threads (Chapter 15) share the
+address space and skip the copy — at the cost of exactly that isolation. Let's decide based on whether
+containment or shared-state throughput is what this service needs, and measure." Naming copy-on-write, the
+isolation-vs-sharing trade, and deferring to a measurement is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §14.3 quick check: the shell process performs <code>fork</code> and then <code>wait</code>;
+the new child process performs <code>exec</code> (replacing itself with <code>ls</code>). <code>exec</code> is
+the one that does not return on success — on success there is no original program left to return to.)</em></p>
+
+<h2>14.5 What to carry forward</h2>
+
+<p>A <strong>process</strong> is the operating system's unit of isolation: an <strong>address space</strong>
+(private virtual memory, Chapter 4), one or more <strong>threads of execution</strong> (the running context),
+and a bundle of <strong>kernel resources</strong> (open files, PID, credentials), all protected by the boundary
+of Chapter 13. You create one with <code>fork</code>, which is called once and <strong>returns twice</strong> —
+0 in the child, the child's PID in the parent — producing two processes that start as copies and diverge;
+copying is cheap because of <strong>copy-on-write</strong>, which shares physical pages until one side writes,
+so forking a huge process costs only the pages later modified. You turn a copied process into a different
+program with <code>exec</code>, which <strong>replaces the image</strong> (keeping the PID and open descriptors)
+and does not return on success; the universal <strong>fork-exec-wait</strong> pattern — with the fork-to-exec
+gap used to set up redirection and pipes — is how every shell runs every command. And you clean up with
+<code>wait</code>, which reaps a finished child's exit status; an unreaped terminated child is a
+<strong>zombie</strong> (a defined leak), while an orphaned child is reparented to <code>init</code> and reaped
+for you.</p>
+
+<p>Every process in this chapter had a single thread of execution — one program counter walking through the
+code. Chapter 15 relaxes that. A <strong>thread</strong> is a second (third, hundredth) flow of control
+<em>within one process</em>, sharing its address space rather than copying it as <code>fork</code> does. That
+one change — share instead of copy — buys cheap concurrency and drops the isolation this chapter spent its
+length building: the very memory that <code>fork</code> kept separate, threads deliberately share, and the
+proof burden of Part 2 returns, now with multiple threads reaching for the same bytes at once.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the three things a process bundles together, and which one enforces memory isolation between
+processes.</li>
+<li>Explain why <code>fork</code> returns twice, what it returns to each side, and how a program uses that to
+run different code in parent and child.</li>
+<li>Explain copy-on-write and why forking a 1 GB process does not copy 1 GB.</li>
+<li>Describe what <code>exec</code> replaces and what it keeps, and why it does not return on success.</li>
+<li>Lay out the fork-exec-wait pattern and say what the gap between fork and exec is used for.</li>
+<li>Define a zombie and an orphan, say who reaps each, and classify a leaked zombie (UB or defined defect?).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What three things make up a process, and what does the address space give it? (§14.1)</li>
+<li><strong>R2.</strong> What does <code>fork</code> return in the parent and in the child, and why is that the
+only difference between them? (§14.2)</li>
+<li><strong>R3.</strong> What is copy-on-write, and why does it make <code>fork</code> cheap? (§14.2)</li>
+<li><strong>R4.</strong> What does <code>exec</code> do, what survives it, and does it return on success? (§14.3)</li>
+<li><strong>R5.</strong> What is a zombie, what is an orphan, and who reaps each? (§14.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Abstraction: The Process" and "Interlude: Process API."</strong> The free chapters that build exactly this
+material — the process abstraction and the <code>fork</code>/<code>exec</code>/<code>wait</code> API. The
+reference for §14.1–14.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter
+8 (Exceptional Control Flow).</strong> Processes, process creation, and reaping children, from the
+programmer's view.</li>
+<li><strong>The Linux <code>fork(2)</code>, <code>execve(2)</code>, and <code>wait(2)</code> manual pages.</strong>
+Primary sources for the exact semantics, including copy-on-write, the fate of file descriptors across
+<code>exec</code>, and zombie/orphan behavior. Verify per system.</li>
+<li><strong>Beej's Guide to Unix IPC / C.</strong> Free, practical walkthroughs of <code>fork</code>/<code>exec</code>
+and inter-process communication (pipes) — the plumbing that lives in the fork-to-exec gap.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex14.1"><span class="ex-label">14.1</span> <span class="ex-tag warm">warm-up</span>
+Name the three things a process bundles together.</div>
+
+<div class="exercise" id="ex14.2"><span class="ex-label">14.2</span> <span class="ex-tag warm">warm-up</span>
+What does <code>fork</code> return in the parent process, and what does it return in the child?</div>
+
+<div class="exercise" id="ex14.3"><span class="ex-label">14.3</span> <span class="ex-tag warm">warm-up</span>
+Does <code>exec</code> return on success? What does it replace, and name one thing it keeps.</div>
+
+<div class="exercise" id="ex14.4"><span class="ex-label">14.4</span> <span class="ex-tag core">core</span>
+Write, from memory, the <code>fork</code>/<code>if</code>-<code>else</code> skeleton that distinguishes child
+from parent, with the parent calling <code>waitpid</code>. Explain in a sentence what each branch is and how
+each process knows which it is.</div>
+
+<div class="exercise" id="ex14.5"><span class="ex-label">14.5</span> <span class="ex-tag core">core</span>
+Explain copy-on-write: what does the kernel actually do to the parent's pages at <code>fork</code> time, what
+triggers a real copy, and why does this make <code>fork</code>ing a 1 GB process fast?</div>
+
+<div class="exercise" id="ex14.6"><span class="ex-label">14.6</span> <span class="ex-tag core">core</span>
+Describe the fork-exec-wait pattern a shell uses to run a command. Then explain what useful work can happen in
+the gap between <code>fork</code> and <code>exec</code>, and give one concrete example (e.g. I/O redirection).</div>
+
+<div class="exercise" id="ex14.7"><span class="ex-label">14.7</span> <span class="ex-tag complexity">cost</span>
+(a) Explain why <code>fork</code> is cheaper than the size of the address space would suggest — name the
+mechanism. (b) Describe a workload for which copy-on-write buys you almost nothing (the child writes to nearly
+all inherited pages) and say why. (c) Compare process-per-request and thread-per-request on one cost each pays
+that the other does not.</div>
+
+<div class="exercise" id="ex14.8"><span class="ex-label">14.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A long-running server <code>fork</code>s a worker for each
+connection and never calls <code>wait</code>. After hours, <code>ps</code> shows hundreds of
+<code>&lt;defunct&gt;</code> entries and the server eventually cannot create new processes.
+<br><strong>Step 1 (given):</strong> When a child exits, the kernel keeps its exit status until the parent
+collects it, leaving the child as a zombie.
+<br><strong>Step 2 (given):</strong> This server never calls <code>wait</code>/<code>waitpid</code>, so no
+child's status is ever collected.
+<br><strong>Step 3 (given):</strong> Each zombie holds a process-table slot, and the table is finite.
+<br><strong>Step 4 (you):</strong> Name the accumulating state, explain why it eventually stops new
+<code>fork</code>s from succeeding, say whether this is undefined behavior or a defined resource leak, and give
+a fix (how the parent should reap, mentioning <code>wait</code>/<code>waitpid</code> or handling
+<code>SIGCHLD</code>).</div>
+
+<div class="exercise" id="ex14.9"><span class="ex-label">14.9</span> <span class="ex-tag mixed">mixed</span>
+For each goal, decide whether you need <code>fork</code>, <code>exec</code>, or <code>fork</code> then
+<code>exec</code>, and say why in a line: (a) run <code>/bin/ls</code> from inside your program and return to
+your program afterward; (b) create a second process that runs the <em>same</em> code on the second half of an
+array; (c) a shell running a command the user just typed.</div>
+
+<div class="exercise" id="ex14.10"><span class="ex-label">14.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 9–14, classify each as <em>undefined behavior</em>, <em>a defined-but-real defect</em>, or
+<em>well-defined and fine</em>: (a) after <code>fork</code>, the parent expects to see changes the child made
+to <code>x</code> in the child's memory; (b) a server that never reaps its children; (c) both parent and child
+printing a line that was <code>printf</code>ed (unflushed) before the <code>fork</code>; (d) a child that
+<code>exec</code>s a new program while the parent keeps running.</div>
+
+<div class="exercise" id="ex14.11"><span class="ex-label">14.11</span> <span class="ex-tag stretch">stretch</span>
+Tie process isolation back to Chapters 11 and 13. (a) Explain why a buffer overflow in process A cannot corrupt
+process B's memory, naming the two hardware mechanisms (Chapters 4 and 13) that enforce it. (b) Explain why
+this makes a separate process, not a thread, the right unit for sandboxing untrusted code. (c) In one or two
+sentences, describe what a multi-tenant service gains by putting each tenant's work in its own process rather
+than sharing one.</div>
+
+<div class="exercise" id="ex14.12"><span class="ex-label">14.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write the <code>fork</code> demo of §14.2 and confirm from its output that
+<code>fork</code> returned twice, that the child's <code>ppid</code> equals the parent's <code>pid</code>, and
+that the two processes' copies of a variable are independent. (b) Add a <code>printf</code> of some line
+<em>before</em> the <code>fork</code>, without an <code>fflush</code>, and run the program with its output
+redirected to a file; observe whether the line appears once or twice and explain why. (c) Add
+<code>fflush(stdout)</code> before the <code>fork</code> and confirm the fix. Report your output and your
+explanation; note your compiler and system.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch15">
+<h1>Chapter 15 — Threads: Shared Memory and Its Hazards</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch14">Chapter 14</a> (a process copies its
+address space; threads will share it), <a href="#ch13">Chapter 13</a> (the system-call boundary —
+<code>clone</code> is the syscall underneath thread creation), <a href="#ch12">Chapter 12</a> (in C you carry,
+by hand, a proof about memory — that proof is about to get a new clause). &nbsp;·&nbsp; Chapter 14's processes
+each had one thread of execution. This chapter adds more threads to a single process — a cheaper concurrency
+than <code>fork</code>, bought by giving up the isolation that made processes safe.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch13">Chapter 13</a> — a system call is a controlled trap; name
+the instruction on x86-64 and say where the system-call number goes. (2) <a href="#ch14">Chapter 14</a> —
+<code>fork</code> gives the child its own address space (via copy-on-write), so when the parent and child both
+hold a variable <code>x</code>, are they the same storage or two copies? (3) <em>Predict:</em> two threads
+share a single counter and each executes <code>counter++</code> one million times, with no locking. When both
+finish, is the final value exactly two million, less than two million, or possibly more? Write down your guess
+and your reasoning — we will run this exact program and measure the answer.</p>
+</aside>
+
+<p>Chapter 14 gave you a way to do two things at once — <code>fork</code> a second process — but at the price
+of a second, isolated address space: the processes cannot see each other's memory, so sharing data means
+explicit inter-process communication. Often that isolation is exactly what you want. But often you want the
+opposite: several flows of control working on the <em>same</em> data structures in the <em>same</em> memory,
+cheaply. That is a <strong>thread</strong>. This chapter defines a thread as a second flow of control inside one
+address space (§15.1), creates threads with the POSIX <code>pthreads</code> API (§15.2), explains how the
+kernel actually schedules them and why Linux uses a one-to-one model (§15.3), and then confronts the hazard
+that sharing buys you — the <strong>data race</strong>, which we will reproduce and measure losing more than
+half of a program's work (§15.4). We close by carrying the new proof burden forward toward the concurrency part
+that makes shared memory correct (§15.5). Threads make sharing trivial; this chapter is about why that is both
+the point and the danger.</p>
+
+<h2>15.1 A thread is a second flow of control in one address space</h2>
+
+<p>A process can contain more than one <strong>thread</strong> of execution, and the defining fact of threads
+is <em>what they share and what they don't</em>. All threads in a process <strong>share</strong> one address
+space: the same code (text), the same heap, the same global and static variables, and the same open file
+descriptors. What each thread keeps <strong>private</strong> is only what it needs to be an independent flow of
+control: its own <strong>stack</strong>, its own <strong>registers</strong> (including the program counter and
+stack pointer), and its own thread-local storage. That is the whole model. Two threads in one process see the
+same <code>malloc</code>'d object at the same address and can both read and write it — directly, through an
+ordinary pointer, with no copy and no IPC.</p>
+
+<p>Set this against Chapter 14 precisely, because the contrast <em>is</em> the concept. When you
+<code>fork</code>, the child gets a <em>copy</em> of the address space (copy-on-write), so the parent's and
+child's variables are separate storage — writes in one are invisible to the other, and that isolation is what
+contains a crash. When you create a thread, the new thread gets the <em>same</em> address space, so a write by
+one thread is immediately visible to the others — and a wild pointer or a crash in one thread corrupts or kills
+the <em>whole</em> process, all threads with it. Process is copy-and-isolate; thread is share-and-expose. The
+power of threads (cheap communication through shared memory) and their danger (no isolation, and the races of
+§15.4) are the same fact viewed twice.</p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">One process, two threads: shared address space, private stacks and registers.</text>
+<rect x="20" y="26" width="600" height="150" fill="#f5f8fb" stroke="#14406b"/>
+<text x="30" y="42" font-size="10" fill="#14406b">Process (one address space)</text>
+<rect x="40" y="52" width="270" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="50" y="71" font-size="9">SHARED: text (code)</text>
+<rect x="40" y="88" width="270" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="50" y="107" font-size="9">SHARED: heap + global/static data</text>
+<rect x="40" y="124" width="270" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="50" y="143" font-size="9">SHARED: open file descriptors</text>
+<rect x="330" y="52" width="130" height="102" fill="#fdeee6" stroke="#8c3a1d"/><text x="340" y="68" font-size="9">Thread 1 PRIVATE</text>
+<text x="340" y="84" font-size="8">own stack</text><text x="340" y="98" font-size="8">own registers (PC, SP)</text><text x="340" y="112" font-size="8">thread-local storage</text>
+<rect x="475" y="52" width="130" height="102" fill="#fdeee6" stroke="#8c3a1d"/><text x="485" y="68" font-size="9">Thread 2 PRIVATE</text>
+<text x="485" y="84" font-size="8">own stack</text><text x="485" y="98" font-size="8">own registers (PC, SP)</text><text x="485" y="112" font-size="8">thread-local storage</text>
+<text x="40" y="170" font-size="9" fill="#8c3a1d">Both threads reach the SAME heap object through an ordinary pointer — no copy, no IPC. That is the danger too.</text>
+</svg>
+<figcaption>Figure 15.1: Threads in one process share the address space — code, heap, globals, file descriptors
+— while each keeps a private stack, registers, and thread-local storage. Compare Chapter 14's <code>fork</code>,
+which <em>copies</em> the address space. Sharing is why threads communicate cheaply and why they race.</figcaption>
+</figure>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name two things all threads in a process share, and two things each thread keeps private. If thread A stores
+7 into a global variable, can thread B see it — and how does that differ from a parent and child after
+<code>fork</code>? (Answer after the next section.)</p>
+</aside>
+
+<h2>15.2 Creating threads: the <code>pthreads</code> model</h2>
+
+<p>On Unix systems the portable interface is <strong>POSIX threads</strong> (<code>pthreads</code>). Two calls
+carry most of the weight. <code>pthread_create(&amp;tid, attr, fn, arg)</code> starts a new thread that begins
+by running <code>fn(arg)</code> concurrently with the caller, and writes the new thread's identifier into
+<code>tid</code>. <code>pthread_join(tid, &amp;ret)</code> blocks until that thread finishes and collects its
+return value — it is the thread analog of Chapter 14's <code>wait</code>: create is to fork as join is to wait.
+The thread function has the fixed signature <code>void *fn(void *)</code>; a thread ends by returning from it
+(or calling <code>pthread_exit</code>). You compile such a program with <code>-pthread</code>. A minimal
+two-thread program:</p>
+
+<pre><code>void *worker(void *arg){ /* runs concurrently */ return NULL; }
+
+int main(void){
+    pthread_t t1, t2;
+    pthread_create(&amp;t1, NULL, worker, NULL);   /* start thread 1 */
+    pthread_create(&amp;t2, NULL, worker, NULL);   /* start thread 2 */
+    pthread_join(t1, NULL);                     /* wait for it, like wait() for a child */
+    pthread_join(t2, NULL);
+    return 0;
+}</code></pre>
+
+<p>After the two <code>pthread_create</code> calls, three flows of control exist in one address space — the
+main thread and the two workers — all sharing the heap and globals, each on its own stack. The two
+<code>pthread_join</code> calls make the main thread wait for both to finish before returning, so the process
+does not exit (and tear down the shared memory the workers are using) out from under them. That is the whole
+lifecycle: create, run concurrently, join.</p>
+
+<h2>15.3 Kernel threads, user threads, and the one-to-one model</h2>
+
+<p>Who actually schedules a thread onto a CPU? There are two classic models. In a <strong>user-level</strong>
+(or <strong>M:N</strong>) model, a runtime library multiplexes many user threads onto a smaller number of
+kernel-scheduled entities, switching between them in user space; this makes creating and switching threads very
+cheap, but it has a sharp edge — if one user thread makes a blocking system call, it can stall the underlying
+kernel thread and thus every user thread mapped onto it. In a <strong>kernel-level</strong> (or
+<strong>one-to-one</strong>, <strong>1:1</strong>) model, each user thread corresponds to its own
+kernel-scheduled thread, so the kernel schedules them independently and a blocking call in one blocks only that
+one, at the cost of a kernel-managed object per thread.</p>
+
+<p>Linux uses the <strong>one-to-one</strong> model, implemented by the <strong>NPTL</strong> (Native POSIX
+Thread Library, which replaced the older LinuxThreads around the 2.6 kernel). Under the hood,
+<code>pthread_create</code> calls the <code>clone</code> system call with a set of flags that ask for sharing —
+<code>CLONE_VM</code> (share the address space), <code>CLONE_FILES</code> (share the file-descriptor table),
+<code>CLONE_THREAD</code>, <code>CLONE_SIGHAND</code>, and others — so the new thread is a full kernel-scheduled
+entity that happens to share memory and resources with its creator. This reveals a clean underlying truth:
+<code>clone</code> is the general primitive, and <code>fork</code> and thread-creation are two points on its
+spectrum. <code>fork</code> (Chapter 14) is <code>clone</code> asking to <em>copy</em> the address space;
+thread creation is <code>clone</code> asking to <em>share</em> it. A thread and a process are the same kind of
+schedulable thing; they differ only in how much they share. (User-space schedulers do still exist above the
+kernel — language runtimes such as Go schedule many lightweight tasks onto a pool of OS threads — but on Linux
+the OS threads underneath are 1:1 kernel threads.)</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Does Linux map each <code>pthread</code> to its own kernel-scheduled thread (1:1) or multiplex many onto few
+(M:N)? Which system call does <code>pthread_create</code> use underneath, and which flag makes the new thread
+share the caller's memory? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>15.4 The shared-memory hazard: the data race</h2>
+
+<p>Now the predict. Threads share memory, so two threads can touch the same variable at the same time — and
+that is where correctness goes to die. Take the simplest possible shared operation, <code>counter++</code> on
+a shared integer. It looks atomic in C, but it is not: at the machine level it is a <strong>read-modify-write
+</strong> — load the current value into a register, add one, store it back — three steps that can interleave
+with another thread's three steps. If thread A loads 5, thread B loads 5, both add one, both store 6, then two
+increments produced a net change of <em>one</em>: an update was lost. Run this at scale and the losses pile up.
+Here is the exact program from the opener — four threads, each incrementing a shared counter one million times,
+no locking — compiled and run on this machine (gcc 11.4.0, <code>-O2</code>, x86-64), five times:</p>
+
+<pre><code>void *bump(void *a){ for (int i = 0; i &lt; 1000000; i++) counter++; return NULL; }
+/* 4 threads all run bump() on the same shared `counter`, then we join and print it */
+
+expected = 4000000, got = 1092939
+expected = 4000000, got = 1170537
+expected = 4000000, got = 1372703
+expected = 4000000, got = 1810815
+expected = 4000000, got = 1324249</code></pre>
+
+<p>The program should have counted to four million. It counted to between roughly 1.1 and 1.8 million —
+<strong>more than half of the four million increments simply vanished</strong>, and the
+answer was different every run. This is a <strong>data race</strong>: concurrent accesses to the same memory
+location, at least one of them a write, with no synchronization ordering them. In C and C++ a data race is
+<strong>undefined behavior</strong> — Chapter 10's UB returns, now arising from concurrency rather than from a
+bad pointer or an overflow — and the nondeterministic, mostly-wrong output above is exactly what UB looks like
+when it manifests. The lost updates come straight from the interleaved read-modify-writes: whenever two threads
+read the same value before either stores, one increment is overwritten and lost.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a data race loses updates</span>
+<p><strong>1. In words.</strong> <code>counter++</code> is not atomic — it is load, add, store. Two threads
+running it on the same variable can both load the same value, both add one, and both store, so their two
+increments net only one. Nothing orders them, so results are nondeterministic. That unordered, conflicting
+access is a data race, and in C/C++ it is undefined behavior.</p>
+<p><strong>2. As a picture.</strong> An interleaving timeline: A loads 5 · B loads 5 · A adds → 6 · B adds → 6
+· A stores 6 · B stores 6. Two increments, one net change.</p>
+<p><strong>3. As numbers.</strong> Four threads, one million increments each, no lock: expected 4,000,000;
+measured on this machine ~1.1–1.8 million across five runs — over half the work lost, and different every time.
+Adding synchronization (a mutex or an atomic increment) restores exactly 4,000,000.</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: "it printed the right answer on my machine, so the code is correct"</span>
+<p>A data race is undefined behavior <em>whether or not it visibly misbehaves on a given run</em>, and it can
+easily produce the right answer while being thoroughly broken — which is exactly what makes it dangerous.
+<strong>Correct-looking output is not evidence of correctness for racing code.</strong> Writing this very
+chapter, an earlier version of the counter program — compiled at <code>-O2</code> without the variable marked
+<code>volatile</code> — printed <code>4000000</code> on every single run, because the optimizer had collapsed
+each thread's million-iteration loop into a single add, shrinking the race window to almost nothing so the
+threads happened to serialize. The bug was fully present (four threads doing unsynchronized read-modify-writes
+on shared memory); it simply did not <em>manifest</em>, just as Chapter 10's undefined behavior need not
+misbehave to be undefined. A race that surfaces only under a particular compiler, optimization level, CPU load,
+or core count will pass every test on your laptop and corrupt data in production. The lesson: reason about
+shared-memory correctness from the <em>rules</em> (is there an unsynchronized conflicting access? then it is a
+race, full stop), never from whether a test run looked fine. The fix is real synchronization — a mutex around
+the update, or an atomic increment — not a comforting green test.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Threads are just cheaper processes. Let's convert our
+process-per-request server to threads across the board for the speed win." Cover the paragraph and respond in
+three or four sentences, drawing on §15.1 and §15.4.</p>
+<p><em>Model answer.</em> "Threads <em>are</em> cheaper — they share the address space instead of copying it,
+so creation skips the copy-on-write setup and they can communicate through shared memory with no IPC — but
+'cheaper processes' misses the crucial difference: threads drop the isolation that processes gave us. A memory
+bug or crash in one thread takes down the whole process — every in-flight request — where a bad process only
+took itself down, and every piece of mutable state we now share becomes a potential data race, which is
+undefined behavior. That is not theoretical: an unsynchronized shared counter under four threads lost over half
+its increments in our measurement and gave a different wrong answer each run, and a race can even pass tests by
+printing the right number. So threads are right where we want cheap shared-memory concurrency and can enforce
+synchronization discipline; keep processes where fault containment or a security boundary matters. Let's not
+convert blindly — decide per component and protect every shared write." Naming the isolation trade, the
+data-race hazard, and refusing the blanket swap is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §15.3 quick check: Linux uses the one-to-one (1:1) model via NPTL — each
+<code>pthread</code> is its own kernel-scheduled thread. <code>pthread_create</code> uses the
+<code>clone</code> system call underneath, and <code>CLONE_VM</code> is the flag that makes the new thread share
+the caller's address space.)</em></p>
+
+<h2>15.5 What to carry forward — and toward concurrency</h2>
+
+<p>A <strong>thread</strong> is a second flow of control inside one process: all threads <strong>share</strong>
+the address space — code, heap, globals, file descriptors — while each keeps a <strong>private</strong> stack,
+registers, and thread-local storage. You create and reap them with <code>pthreads</code> —
+<code>pthread_create</code> starts a thread running a <code>void *fn(void *)</code>, <code>pthread_join</code>
+waits for it and collects its result (create/join is the thread's fork/wait). Linux schedules threads
+<strong>one-to-one</strong> with kernel threads via NPTL, and <code>pthread_create</code> is really the
+<code>clone</code> system call asking to share memory (<code>CLONE_VM</code>) — the same primitive
+<code>fork</code> uses to <em>copy</em> it, so a thread and a process differ only in how much they share. The
+price of sharing is the <strong>data race</strong>: unsynchronized conflicting access to the same memory, which
+is undefined behavior in C/C++ and which we measured losing more than half of a four-million-increment workload,
+nondeterministically — and which can hide by printing the right answer, so correctness must be reasoned from the
+rules, not from a passing run.</p>
+
+<p>That last point reopens the theme of Part 2 at a new level. Chapter 12 said that in C you carry, by hand, a
+proof about lifetimes, bounds, and freeing. Threads add a clause: <em>no unsynchronized concurrent access to
+shared mutable memory</em> — and violating it is undefined behavior just like the rest. Making shared-memory
+concurrency correct is a large subject of its own: the synchronization primitives that order accesses (locks,
+condition variables, atomics), the lock-free techniques that avoid them, and the memory model that defines
+precisely what a multithreaded program means. That is the concurrency-and-parallelism part of this volume,
+which the data race you just measured is the doorway into. And it is one more place where a language can help:
+just as Rust's ownership makes use-after-free a compile error, its type system also encodes which data may
+cross between threads and which must be synchronized — turning "don't race" from a discipline you enforce by
+hand into an invariant the compiler checks, the payoff this whole part has been building toward.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State what threads in a process share and what each keeps private, and contrast that with parent/child
+after <code>fork</code>.</li>
+<li>Write a minimal two-thread <code>pthreads</code> program and explain <code>pthread_create</code>/
+<code>pthread_join</code> as the thread analog of <code>fork</code>/<code>wait</code>.</li>
+<li>Explain the difference between 1:1 and M:N threading, say which Linux uses, and name the system call and
+flag underneath <code>pthread_create</code>.</li>
+<li>Explain why <code>counter++</code> from two threads can lose updates, decomposing it into load/add/store
+with an interleaving.</li>
+<li>State what a data race is, why it is undefined behavior, and why a passing test does not prove racing code
+correct.</li>
+<li>Give the new clause threads add to Part 2's hand-carried proof, and name the fix category (synchronization).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does a thread share with its process's other threads, and what does it keep
+private? (§15.1)</li>
+<li><strong>R2.</strong> What do <code>pthread_create</code> and <code>pthread_join</code> do, and what earlier
+pair are they analogous to? (§15.2)</li>
+<li><strong>R3.</strong> What is the 1:1 threading model, which library implements it on Linux, and what system
+call/flag underlie a thread? (§15.3)</li>
+<li><strong>R4.</strong> Why can two threads doing <code>counter++</code> lose updates, and what did the
+measurement show? (§15.4)</li>
+<li><strong>R5.</strong> What is a data race, why is it undefined behavior, and why can it pass a test yet be
+wrong? (§15.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Concurrency: An Introduction" and "Interlude: Thread API."</strong> The free chapters that introduce threads,
+the shared/private split, the <code>pthreads</code> API, and the race that motivates all of concurrency. The
+reference for §15.1–15.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter
+12 (Concurrent Programming).</strong> Threads, shared variables, and races from the programmer's view.</li>
+<li><strong>The Linux <code>pthreads(7)</code> and <code>clone(2)</code> manual pages.</strong> Primary sources
+for the NPTL one-to-one model of §15.3 and the exact <code>clone</code> flags (<code>CLONE_VM</code>,
+<code>CLONE_FILES</code>, <code>CLONE_THREAD</code>, …) that distinguish a thread from a <code>fork</code>.
+Verify per system.</li>
+<li><strong>The C11/C++11 standard's memory model (see cppreference.com).</strong> The authority for why a data
+race is undefined behavior and what "synchronizes-with" means — the formal ground the concurrency part builds
+on.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex15.1"><span class="ex-label">15.1</span> <span class="ex-tag warm">warm-up</span>
+Name two things all threads in a process share, and two things each thread keeps private.</div>
+
+<div class="exercise" id="ex15.2"><span class="ex-label">15.2</span> <span class="ex-tag warm">warm-up</span>
+What does <code>pthread_create</code> take as arguments, and what does <code>pthread_join</code> do?</div>
+
+<div class="exercise" id="ex15.3"><span class="ex-label">15.3</span> <span class="ex-tag warm">warm-up</span>
+Does Linux use a 1:1 or an M:N threading model, and which system call does <code>pthread_create</code> use
+underneath?</div>
+
+<div class="exercise" id="ex15.4"><span class="ex-label">15.4</span> <span class="ex-tag core">core</span>
+Write, from memory, a minimal program that starts two threads running the same function and waits for both.
+Explain how <code>pthread_create</code>/<code>pthread_join</code> mirror Chapter 14's
+<code>fork</code>/<code>wait</code>, and why the joins are necessary before <code>main</code> returns.</div>
+
+<div class="exercise" id="ex15.5"><span class="ex-label">15.5</span> <span class="ex-tag core">core</span>
+Explain why two threads each doing <code>counter++</code> on a shared variable can lose updates. Decompose
+<code>counter++</code> into its machine-level steps and give a concrete interleaving in which two increments
+produce a net change of one.</div>
+
+<div class="exercise" id="ex15.6"><span class="ex-label">15.6</span> <span class="ex-tag core">core</span>
+Contrast a process and a thread on four axes: address space, isolation, cost to create, and what data sharing
+costs you. For each, say which is cheaper/safer and why.</div>
+
+<div class="exercise" id="ex15.7"><span class="ex-label">15.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is creating a thread cheaper than <code>fork</code>ing a process — what work does thread creation
+skip? (b) What new cost or hazard do you take on in exchange for sharing memory? (c) The measured demo lost
+more than half of its increments and gave a different total each run; is that loss deterministic, and what does
+its nondeterminism imply for whether tests can be trusted to catch it?</div>
+
+<div class="exercise" id="ex15.8"><span class="ex-label">15.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A web service keeps a shared <code>long hits</code> counter that
+each request thread increments with <code>hits++</code>. Under load, the reported hit count is noticeably lower
+than the true number of requests — but every unit test passes.
+<br><strong>Step 1 (given):</strong> <code>hits++</code> is a non-atomic read-modify-write on memory shared by
+all request threads.
+<br><strong>Step 2 (given):</strong> The unit tests exercise one request at a time, so no two increments ever
+overlap and nothing races.
+<br><strong>Step 3 (given):</strong> Under real load, many threads increment concurrently and their
+read-modify-writes interleave, so some increments overwrite others.
+<br><strong>Step 4 (you):</strong> Name the bug precisely, say whether it is undefined behavior, explain why
+the passing tests failed to catch it, and name the category of fix (and one concrete mechanism) that makes the
+count correct.</div>
+
+<div class="exercise" id="ex15.9"><span class="ex-label">15.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, choose a separate <em>process</em> (via <code>fork</code>) or a <em>thread</em>, and justify in a
+line: (a) run an untrusted plugin so that if it crashes or corrupts memory it cannot take down the host; (b)
+compute a parallel sum over a large in-memory array that all workers read; (c) run a command the user typed at
+a shell.</div>
+
+<div class="exercise" id="ex15.10"><span class="ex-label">15.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 9–15, classify each as <em>undefined behavior</em>, <em>a defined-but-real defect</em>, or
+<em>well-defined and fine</em>: (a) two threads writing the same non-atomic <code>long</code> with no
+synchronization; (b) two threads each writing a <em>different</em> variable with no synchronization; (c) a
+thread reading through a pointer whose target was already <code>free</code>d; (d) two threads reading (never
+writing) the same shared value.</div>
+
+<div class="exercise" id="ex15.11"><span class="ex-label">15.11</span> <span class="ex-tag stretch">stretch</span>
+Chapter 12 said that in C the programmer carries, by hand, a proof about lifetimes, bounds, and freeing. (a)
+State the additional clause that threads add to that proof. (b) Explain why violating it is undefined behavior
+and why, unlike a use-after-free, it may never reproduce in testing. (c) In one or two sentences, describe how
+a language could move this from a runtime hope to a compile-time guarantee — for example, a type system that
+tracks which data may be shared across threads and which accesses must be synchronized (Rust's
+<code>Send</code>/<code>Sync</code> and borrow checking; forward reference, prose only).</div>
+
+<div class="exercise" id="ex15.12"><span class="ex-label">15.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) run the shared-counter race — four threads, one million increments each of one shared
+counter, no lock — five times, and report the wrong totals and how much they vary run to run. (b) Add a mutex
+around the increment (or use an atomic increment) and confirm the total is now exactly four million every time.
+(c) Try building the unsynchronized version at <code>-O0</code> versus <code>-O2</code>, and with the counter
+marked <code>volatile</code> or not; report which combinations make the bug visible and which hide it — and
+explain why a "correct" run does not mean the code is correct. Label your compiler, core count, and hardware.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part IV</div><h1>Concurrency & Parallelism</h1><p class='part-blurb'>Threads, locks and their hazards, lock-free techniques, atomics, and the memory model that makes concurrent code correct (or not).</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part V</div><h1>Rust for Systems</h1><p class='part-blurb'>Ownership, borrowing, and lifetimes — memory safety without a GC, and how the type system encodes the invariants the previous parts made you prove by hand.</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VI</div><h1>Performance Engineering</h1><p class='part-blurb'>Measure before you optimize: profiling, benchmarking, cache-aware and data-oriented design, SIMD, and reasoning about where time actually goes.</p></div>
@@ -6986,6 +8178,376 @@ allocator reuses one hot block and per-object cost nearly vanishes — showing t
 lifetime pattern. Essential discipline: report only measured numbers and label compiler/hardware (gcc 11.4.0,
 x86-64 here), since figures vary. <em>Tempting wrong answer:</em> "the arena is faster in every test" — not
 for the free-immediately pattern. <strong>Feed-forward:</strong> §12.2, §12.4.</div>
+
+</section>
+
+<section class="solutions" id="sol13">
+<h1>Chapter 13 — Solutions</h1>
+
+<div class="solution" id="sol13.1"><span class="sol-label">13.1</span>
+The two modes are <strong>user mode</strong> (ring 3, where your code runs) and <strong>kernel mode</strong>
+(ring 0, where the OS runs). A user-mode program may not, for example, execute privileged instructions such as
+halting the CPU, disabling interrupts, loading the page tables (Ch 4), or accessing device registers directly.
+<em>Tempting wrong answer:</em> "user mode is just slower than kernel mode" — the difference is authority, not
+speed; the same instruction runs at the same rate, but privileged ones simply trap in user mode.
+<strong>Feed-forward:</strong> §13.1.</div>
+
+<div class="solution" id="sol13.2"><span class="sol-label">13.2</span>
+On x86-64 Linux the system-call number goes in <strong><code>rax</code></strong>, and the return value comes
+back in <strong><code>rax</code></strong> as well (a negative small value being <code>-errno</code>). <em>Tempting
+wrong answer:</em> "the fourth argument goes in <code>rcx</code>" — it goes in <code>r10</code>, because the
+<code>syscall</code> instruction clobbers <code>rcx</code> (and <code>r11</code>). <strong>Feed-forward:</strong>
+§13.2.</div>
+
+<div class="solution" id="sol13.3"><span class="sol-label">13.3</span>
+No — <code>printf</code> is <strong>not</strong> a system call; it is a C library function that parses the
+format string, converts values to text, and <strong>buffers</strong> the result in user-space memory. It
+eventually produces output through the <strong><code>write</code></strong> system call, but only when the
+buffer flushes (fills, hits a newline for a line-buffered terminal, or the program exits normally). <em>Tempting
+wrong answer:</em> "every output function is a system call" — most output is buffered in user space precisely
+to avoid crossing the boundary per call. <strong>Feed-forward:</strong> §13.3.</div>
+
+<div class="solution" id="sol13.4"><span class="sol-label">13.4</span>
+The C library's <code>write</code> wrapper puts the <code>write</code> system-call number in <code>rax</code>,
+the file descriptor <code>1</code> in <code>rdi</code>, the buffer's address in <code>rsi</code>, and the length
+<code>5</code> in <code>rdx</code>; it executes the <code>syscall</code> instruction, which switches to kernel
+mode and jumps to the fixed kernel entry point; the kernel validates the arguments, does the I/O, and returns
+the number of bytes written (5 on success) in <code>rax</code>. <em>Tempting wrong answer:</em> "the program
+jumps directly into the kernel function" — it cannot choose the target; the trap lands only at the kernel's
+fixed entry point. <strong>Feed-forward:</strong> §13.2.</div>
+
+<div class="solution" id="sol13.5"><span class="sol-label">13.5</span>
+The raw kernel interface signals failure by returning a <strong>negative error code</strong> (e.g.
+<code>-EBADF</code>) in <code>rax</code>. The C library wrapper detects that, stores the code in the global
+<strong><code>errno</code></strong>, and returns <strong><code>-1</code></strong> to the caller. So a raw
+<code>-EBADF</code> becomes: the wrapper returns <code>-1</code> and sets <code>errno == EBADF</code>. <em>Tempting
+wrong answer:</em> "<code>errno</code> is set by the kernel" — the kernel returns a negative number; the
+library <em>translates</em> it into <code>errno</code> and <code>-1</code>. <strong>Feed-forward:</strong>
+§13.3.</div>
+
+<div class="solution" id="sol13.6"><span class="sol-label">13.6</span>
+The thousands of <code>read(3, ..., 1) = 1</code> lines mean the program is reading the file <strong>one byte
+per system call</strong> — one boundary crossing per byte, which is the most expensive way possible. The fix is
+to <strong>read in large blocks</strong> (a big buffer, or buffered I/O such as <code>fread</code>/a
+<code>FILE*</code>), turning thousands of crossings into a handful. <em>Tempting wrong answer:</em> "nothing is
+wrong; it's reading the file" — it is, but at ~100&times; the necessary cost. <strong>Feed-forward:</strong>
+§13.4.</div>
+
+<div class="solution" id="sol13.7"><span class="sol-label">13.7</span>
+(a) A system call must <strong>switch privilege mode</strong> (save/restore state, enter and leave the kernel)
+and it <strong>disturbs caches/TLB</strong> and runs argument validation — none of which a plain function call
+does. (b) Reading 1 MB one byte at a time is ~1,000,000 boundary crossings, and each costs ~100&times; a
+function call; buffering (read a large block, or use a <code>FILE*</code>) cuts it to a handful of crossings.
+(c) <code>clock_gettime</code> is served by the <strong>vDSO</strong> — a page the kernel maps read-only into
+every process — so it runs entirely in user mode with no trap, and the "call" makes no system call at all.
+<em>Tempting wrong answer:</em> "reading byte-by-byte is slow because the disk is slow" — the dominant cost
+here is the boundary crossings, not the device (the data may already be cached). <strong>Feed-forward:</strong>
+§13.4.</div>
+
+<div class="solution" id="sol13.8"><span class="sol-label">13.8</span>
+<strong>Step 4:</strong> When the program died, the diagnostic bytes were still in the <strong>C library's
+user-space output buffer</strong> — they had never crossed the boundary, because <code>printf</code> buffers
+and only calls <code>write</code> on a flush. The abnormal termination skipped the normal exit-time flush, so
+the line was lost: it never reached the terminal. Two ways to guarantee it appears before a possible crash:
+call <strong><code>fflush(stdout)</code></strong> immediately after the <code>printf</code> (force the
+crossing), or use <strong>unbuffered output</strong> — write with the <code>write</code> system call directly,
+or set the stream unbuffered / line-buffered. <em>Tempting wrong answer:</em> "the <code>printf</code> never
+executed" — it did; its output was simply stranded in the buffer. <strong>Feed-forward:</strong> §13.3, §13.4.</div>
+
+<div class="solution" id="sol13.9"><span class="sol-label">13.9</span>
+(a) <strong>Neither / user space</strong> — an integer add is a plain instruction. (b) <strong>Boundary
+crossing</strong> — opening a file needs the kernel (<code>openat</code>). (c) <strong>User space</strong> —
+sorting an in-memory array is pure computation. (d) <strong>Boundary crossing</strong> — sending a packet
+touches the network device, so it needs the kernel. (e) <strong>User space</strong> — <code>sprintf</code>
+formats into a memory buffer; no I/O, no crossing (contrast <code>printf</code>, which will eventually
+<code>write</code>). <em>Method-selection cue:</em> touch a device, another process, or kernel-managed state →
+crossing; compute in your own memory → user space. <strong>Feed-forward:</strong> §13.2–13.4.</div>
+
+<div class="solution" id="sol13.10"><span class="sol-label">13.10</span>
+(a) <strong>Undefined behavior</strong> — reading one past a stack array is an out-of-bounds access (Ch 11).
+(b) <strong>A boundary crossing</strong> — <code>read</code> on a valid descriptor is a system call. (c)
+<strong>Undefined behavior</strong> — signed integer overflow is UB (Ch 10). (d) <strong>Neither</strong> — a
+buffered <code>printf</code> that has not flushed is well-defined; the bytes are simply still in user space and
+no crossing has happened yet. <em>Tempting wrong answer:</em> calling (d) a system call — the crossing happens
+only at the flush, not at the <code>printf</code>. <strong>Feed-forward:</strong> §13.3, and Ch 10–11.</div>
+
+<div class="solution" id="sol13.11"><span class="sol-label">13.11</span>
+(a) A process's pointers are <strong>virtual addresses translated through its own page tables</strong> (Ch 4);
+a pointer value that names another process's or the kernel's memory does not map to anything in <em>this</em>
+process's address space, so the kernel's validation rejects it (or it simply is not this process's memory to
+read). (b) Without validation, a process could pass the kernel a pointer into <em>kernel</em> memory as the
+"buffer" for a <code>read</code>, tricking privileged code into copying secrets out, or into <em>another</em>
+process's memory — a confused-deputy attack; validation is what keeps the kernel from acting on addresses the
+caller has no right to. (c) Per-process address translation confines each process to its own memory (it cannot
+even name another's), and the user/kernel mode bit prevents it from rewriting the translation tables or reading
+devices to get around that — together, one process can neither address nor reach another's memory. <em>Tempting
+wrong answer:</em> "the kernel trusts the pointer because the process passed it" — the kernel must never trust a
+user pointer; validating it is essential to isolation. <strong>Feed-forward:</strong> §13.1–13.2, Ch 4.</div>
+
+<div class="solution" id="sol13.12"><span class="sol-label">13.12</span>
+Machine-specific by design. A correct write-up reports: (a) <code>strace</code> shows the <code>write</code>
+call with its arguments and return value (e.g. <code>write(1, "...", n) = n</code>); (b) a trivial hello-world
+makes a couple dozen system calls, most of them process startup (dynamic linker <code>mmap</code>/<code>openat</code>/
+<code>mprotect</code>, <code>brk</code>, etc.) with only one or two being the program's own output; (c) the
+<code>getpid</code> system call costs on the order of ~100&times; a trivial function call (on the book's machine
+~150–190 ns vs. ~1–2 ns), varying run to run and with mitigations; (d) one million <code>clock_gettime</code>
+calls produce <em>zero</em> <code>clock_gettime</code> system calls under <code>strace -c</code>, because the
+vDSO answers in user space. Essential discipline: report only measured numbers and label compiler/kernel/
+hardware, since figures vary. <em>Tempting wrong answer:</em> "the syscall and the function call cost about the
+same" — the whole point is that they differ by roughly two orders of magnitude. <strong>Feed-forward:</strong>
+§13.2, §13.4.</div>
+
+</section>
+
+<section class="solutions" id="sol14">
+<h1>Chapter 14 — Solutions</h1>
+
+<div class="solution" id="sol14.1"><span class="sol-label">14.1</span>
+A process bundles (1) an <strong>address space</strong> (its private virtual memory — text, data, bss, heap,
+stack), (2) one or more <strong>threads of execution</strong> (the running context: program counter, stack
+pointer, registers), and (3) a set of <strong>kernel resources</strong> (open file descriptors, PID/parent
+PID, credentials, working directory). <em>Tempting wrong answer:</em> "a process is just the program's code" —
+the code on disk is inert; the process is the running instance with memory, execution state, and resources.
+<strong>Feed-forward:</strong> §14.1.</div>
+
+<div class="solution" id="sol14.2"><span class="sol-label">14.2</span>
+<code>fork</code> returns the <strong>child's PID in the parent</strong> and <strong>0 in the child</strong> (or
+<code>-1</code> on failure). That difference is how each of the two otherwise-identical processes learns which
+one it is, so it can branch to different code. <em>Tempting wrong answer:</em> "<code>fork</code> returns 0 to
+whichever called it" — both continue from the return; the caller becomes the parent and gets the child's PID,
+while the new child gets 0. <strong>Feed-forward:</strong> §14.2.</div>
+
+<div class="solution" id="sol14.3"><span class="sol-label">14.3</span>
+No — on success <code>exec</code> does <strong>not return</strong> (there is no original program to return to).
+It <strong>replaces the entire process image</strong> — text, data, heap, stack — with a new program, while
+<strong>keeping the PID</strong> (and the open file descriptors, unless marked close-on-exec). <em>Tempting
+wrong answer:</em> "<code>exec</code> starts a new process" — it does not; it transforms the <em>current</em>
+process into a different program, same PID. <strong>Feed-forward:</strong> §14.3.</div>
+
+<div class="solution" id="sol14.4"><span class="sol-label">14.4</span>
+<code>pid_t pid = fork(); if (pid == 0) { /* child */ } else if (pid &gt; 0) { int st; waitpid(pid, &amp;st, 0);
+/* parent, after child exits */ } else { /* fork failed */ }</code>. The <code>pid == 0</code> branch is the
+child; the <code>pid &gt; 0</code> branch is the parent, which waits for the child; each knows which it is
+solely from <code>fork</code>'s return value. <em>Tempting wrong answer:</em> forgetting the parent must
+<code>wait</code> — without it the finished child becomes a zombie (§14.4). <strong>Feed-forward:</strong>
+§14.2, §14.4.</div>
+
+<div class="solution" id="sol14.5"><span class="sol-label">14.5</span>
+At <code>fork</code>, the kernel does <strong>not</strong> copy the parent's pages; it maps the same physical
+pages into both processes and marks them <strong>read-only</strong>. A real copy is triggered only when
+<em>either</em> process <strong>writes</strong> a page: the hardware faults, the kernel makes a private copy of
+that one page for the writer, and both continue. So the cost is proportional to the number of pages actually
+modified, not to the size of the address space — forking a 1 GB process is fast because almost none of that
+gigabyte is written before use. <em>Tempting wrong answer:</em> "<code>fork</code> duplicates all of memory
+immediately" — that would make forking large processes prohibitively slow; copy-on-write avoids it.
+<strong>Feed-forward:</strong> §14.2, Ch 4.</div>
+
+<div class="solution" id="sol14.6"><span class="sol-label">14.6</span>
+The shell <code>fork</code>s a child; the child <code>exec</code>s the requested program (replacing itself with
+it); the parent (shell) <code>wait</code>s for the child to finish before prompting again. The gap between
+<code>fork</code> and <code>exec</code> is where the child, still running the shell's code, adjusts its
+inherited resources — e.g. <strong>redirecting standard output to a file</strong> or wiring its input/output to
+a <strong>pipe</strong> — so that the program it then <code>exec</code>s starts up already plumbed into that
+environment. <em>Tempting wrong answer:</em> "the shell <code>exec</code>s the command directly" — then the
+shell would replace <em>itself</em> and never return to the prompt; it forks first so a child does the
+<code>exec</code>. <strong>Feed-forward:</strong> §14.3.</div>
+
+<div class="solution" id="sol14.7"><span class="sol-label">14.7</span>
+(a) <code>fork</code> is cheap because of <strong>copy-on-write</strong>: it shares the parent's physical pages
+read-only rather than copying them, so it does work proportional to pages later modified, not to address-space
+size. (b) A workload where the child promptly <strong>writes to nearly every inherited page</strong> (e.g. it
+mutates a large data structure it inherited) gets little from COW — almost every page faults and is copied
+anyway, so you pay close to a full copy. (c) Process-per-request pays <strong>process-creation and
+context-switch overhead</strong> and needs IPC to share data; thread-per-request pays the <strong>loss of
+isolation</strong> (a crash or memory bug in one thread takes down all requests in the process) and the burden
+of synchronizing shared state. <em>Tempting wrong answer:</em> "COW makes <code>fork</code> free regardless of
+workload" — a write-heavy child erodes the benefit. <strong>Feed-forward:</strong> §14.2, and Ch 15.</div>
+
+<div class="solution" id="sol14.8"><span class="sol-label">14.8</span>
+<strong>Step 4:</strong> The accumulating state is <strong>zombies</strong> — terminated children whose exit
+status the kernel is still holding because the parent never collected it. They eventually stop new
+<code>fork</code>s because each zombie occupies a <strong>process-table slot</strong>, and once the table (a
+finite resource) fills, the kernel cannot allocate a slot for a new process, so <code>fork</code> fails. This
+is a <strong>defined resource leak, not undefined behavior</strong> — the program violates no language rule; it
+simply fails to clean up (like a memory leak). Fix: the parent must <strong>reap</strong> its children — call
+<code>wait</code>/<code>waitpid</code> (e.g. from a <code>SIGCHLD</code> handler, or a reaping loop) so each
+child's status is collected and its slot freed. <em>Tempting wrong answer:</em> "the zombies are using up
+memory/CPU" — a zombie holds essentially no memory or CPU, only a table slot and its exit status; the leak is
+of slots. <strong>Feed-forward:</strong> §14.4.</div>
+
+<div class="solution" id="sol14.9"><span class="sol-label">14.9</span>
+(a) <strong><code>fork</code> then <code>exec</code></strong> — fork a child, have it <code>exec</code>
+<code>/bin/ls</code>, and the parent waits and continues (a lone <code>exec</code> would replace your program
+permanently). (b) <strong><code>fork</code></strong> alone — you want a second process running the <em>same</em>
+code, which is exactly what fork gives (no <code>exec</code> needed). (c) <strong><code>fork</code> then
+<code>exec</code></strong> — the shell forks and the child execs the typed command, while the shell waits.
+<em>Method-selection cue:</em> same program, new process → <code>fork</code>; different program, replace this
+one → <code>exec</code>; new process running a different program → both. <strong>Feed-forward:</strong>
+§14.2–14.3.</div>
+
+<div class="solution" id="sol14.10"><span class="sol-label">14.10</span>
+(a) <strong>A defined-but-real defect</strong> — the expectation is simply wrong: after <code>fork</code> the
+two processes have independent address spaces, so the child's changes are invisible to the parent (not UB, just
+a mistaken mental model that will produce bugs). (b) <strong>A defined-but-real defect</strong> — never reaping
+children leaks zombies (a resource leak, defined). (c) <strong>Well-defined and fine (though usually
+unintended)</strong> — both flushing a buffer copied across <code>fork</code> is defined behavior; it prints
+the line twice, which is a correctness surprise to fix with <code>fflush</code> before <code>fork</code>, but
+not UB. (d) <strong>Well-defined and fine</strong> — a child <code>exec</code>ing a new program while the parent
+runs is the normal pattern. <em>Tempting wrong answer:</em> calling (a) or (c) undefined behavior — both are
+defined; the issues are a wrong assumption and a duplicated buffer, not language-rule violations.
+<strong>Feed-forward:</strong> §14.2–14.4.</div>
+
+<div class="solution" id="sol14.11"><span class="sol-label">14.11</span>
+(a) A buffer overflow in process A writes through A's pointers, which are virtual addresses translated by
+<strong>A's page tables</strong> (Ch 4); they cannot name B's physical memory, and A cannot rewrite the
+translation tables to escape because installing page tables is a <strong>privileged instruction</strong> that
+traps in user mode (Ch 13). So the two mechanisms — per-process address translation and the user/kernel mode
+bit — confine the corruption to A. (b) Because a thread shares its process's address space, a compromised or
+crashing thread can corrupt the whole process; a separate <em>process</em> has its own address space and
+authority, so untrusted code in it cannot reach the host's memory — making the process the right sandbox unit.
+(c) Putting each tenant in its own process means one tenant's crash, memory corruption, or compromise cannot
+read or damage another tenant's data — fault and security isolation come for free from the process boundary.
+<em>Tempting wrong answer:</em> "a thread is isolated enough because it has its own stack" — a private stack
+does not isolate memory; all threads share the heap and globals and one bug corrupts them all.
+<strong>Feed-forward:</strong> §14.1, Ch 11, Ch 13, and Ch 15.</div>
+
+<div class="solution" id="sol14.12"><span class="sol-label">14.12</span>
+Machine-specific by design. A correct write-up reports: (a) the demo prints two lines with different PIDs, the
+child's <code>ppid</code> equal to the parent's <code>pid</code>, and independent values of the variable (e.g.
+child 101, parent 110) — confirming <code>fork</code> returned twice into two separate address spaces; (b) with
+a <code>printf</code>ed line <em>before</em> the <code>fork</code> and output redirected to a file (block
+buffering), the line appears <strong>twice</strong>, because <code>fork</code> copied the unflushed buffer into
+both processes and both flushed it at exit; (c) adding <code>fflush(stdout)</code> before the <code>fork</code>
+makes the line appear once, because the bytes crossed to the kernel before the buffer was duplicated. Essential
+discipline: report exactly what you observed and label your compiler/system. <em>Tempting wrong answer:</em>
+"the double line means <code>fork</code> ran the <code>printf</code> twice" — it ran once; <code>fork</code>
+duplicated the <em>buffer</em>, not the print. <strong>Feed-forward:</strong> §14.2, §14.4, and Ch 13.</div>
+
+</section>
+
+<section class="solutions" id="sol15">
+<h1>Chapter 15 — Solutions</h1>
+
+<div class="solution" id="sol15.1"><span class="sol-label">15.1</span>
+Threads in a process <strong>share</strong> the address space — code (text), the heap, global/static data, and
+open file descriptors. Each thread keeps <strong>private</strong> its own stack, its own registers (program
+counter and stack pointer), and its thread-local storage. <em>Tempting wrong answer:</em> "each thread has its
+own heap" — no; the heap is shared, which is exactly why threads can pass data by pointer and also why they
+race. <strong>Feed-forward:</strong> §15.1.</div>
+
+<div class="solution" id="sol15.2"><span class="sol-label">15.2</span>
+<code>pthread_create(&amp;tid, attr, fn, arg)</code> takes a pointer to a <code>pthread_t</code> to fill in,
+optional attributes, the function <code>fn</code> (of type <code>void *(*)(void *)</code>) the new thread will
+run, and the <code>arg</code> passed to it; it starts <code>fn(arg)</code> running concurrently.
+<code>pthread_join(tid, &amp;ret)</code> blocks until that thread finishes and collects its return value.
+<em>Tempting wrong answer:</em> "<code>pthread_create</code> runs the function and returns its result" — it
+starts the function on a <em>new</em> thread and returns immediately; <code>pthread_join</code> is what waits.
+<strong>Feed-forward:</strong> §15.2.</div>
+
+<div class="solution" id="sol15.3"><span class="sol-label">15.3</span>
+Linux uses the <strong>one-to-one (1:1)</strong> model — each <code>pthread</code> is its own kernel-scheduled
+thread (implemented by NPTL). <code>pthread_create</code> uses the <strong><code>clone</code></strong> system
+call underneath, with flags including <code>CLONE_VM</code> to share the address space. <em>Tempting wrong
+answer:</em> "Linux threads are M:N green threads scheduled in user space" — that was never NPTL; Linux threads
+are 1:1 kernel threads (language runtimes may add their own user-space scheduling above them).
+<strong>Feed-forward:</strong> §15.3.</div>
+
+<div class="solution" id="sol15.4"><span class="sol-label">15.4</span>
+<code>pthread_t t1, t2; pthread_create(&amp;t1, NULL, worker, NULL); pthread_create(&amp;t2, NULL, worker,
+NULL); pthread_join(t1, NULL); pthread_join(t2, NULL);</code> with <code>void *worker(void *a){ ... return
+NULL; }</code>. <code>pthread_create</code> is the thread analog of <code>fork</code> (start a new flow of
+control) and <code>pthread_join</code> of <code>wait</code> (wait for it and collect its result). The joins are
+necessary because if <code>main</code> returned first, the process would exit and tear down the shared address
+space the workers are still using. <em>Tempting wrong answer:</em> skipping the joins "because the threads will
+finish anyway" — <code>main</code> returning ends the process and can kill still-running threads.
+<strong>Feed-forward:</strong> §15.2, and Ch 14.</div>
+
+<div class="solution" id="sol15.5"><span class="sol-label">15.5</span>
+<code>counter++</code> compiles to a <strong>read-modify-write</strong>: (1) load <code>counter</code> into a
+register, (2) add one, (3) store it back. With two threads and no synchronization, an interleaving such as — A
+loads 5, B loads 5, A computes 6, B computes 6, A stores 6, B stores 6 — has both threads increment from the
+same starting value, so two increments produce a net change of only <strong>one</strong>; one update is lost.
+Repeated across millions of iterations, many updates vanish. <em>Tempting wrong answer:</em> "<code>++</code> is
+a single atomic operation" — in C it is not; it is three separate steps that can interleave.
+<strong>Feed-forward:</strong> §15.4.</div>
+
+<div class="solution" id="sol15.6"><span class="sol-label">15.6</span>
+<strong>Address space:</strong> processes have separate address spaces; threads share one. <strong>Isolation:</strong>
+processes are isolated (a crash is contained); threads are not (a crash or memory bug kills the whole process).
+<strong>Cost to create:</strong> a thread is cheaper (no address-space copy / copy-on-write setup); a process
+is heavier. <strong>Cost of sharing data:</strong> processes need explicit IPC (pipes, shared memory); threads
+share by pointer for free — but that "free" sharing costs you the obligation to synchronize (data races).
+<em>Tempting wrong answer:</em> "threads are strictly better because they're cheaper" — they trade away
+isolation, which is sometimes exactly what you need. <strong>Feed-forward:</strong> §15.1, and Ch 14.</div>
+
+<div class="solution" id="sol15.7"><span class="sol-label">15.7</span>
+(a) Thread creation skips duplicating the address space — no copy-on-write page setup, no new page tables —
+because the new thread <em>shares</em> the existing address space; it just needs a stack and a kernel-scheduled
+context. (b) In exchange you take on the <strong>data race</strong> hazard (and the loss of isolation): every
+piece of shared mutable state must now be synchronized or it is undefined behavior. (c) The loss is
+<strong>not deterministic</strong> — it depends on how the threads' read-modify-writes happen to interleave,
+which varies with scheduling, load, core count, and compiler, so the demo gave a different wrong total each run.
+Its nondeterminism means <strong>tests cannot be trusted to catch it</strong>: a racing program can pass
+repeatedly (even print the exactly-right answer) and still be broken. <em>Tempting wrong answer:</em> "if the
+test passes, there's no race" — a race is defined by the rules (unsynchronized conflicting access), not by
+whether a run misbehaved. <strong>Feed-forward:</strong> §15.4.</div>
+
+<div class="solution" id="sol15.8"><span class="sol-label">15.8</span>
+<strong>Step 4:</strong> The bug is a <strong>data race</strong> on <code>hits</code> — multiple threads
+performing unsynchronized read-modify-writes (<code>hits++</code>) on shared memory — and in C/C++ it is
+<strong>undefined behavior</strong>. The unit tests missed it because they exercised requests <strong>one at a
+time</strong>, so no two increments ever overlapped and nothing raced; the bug only manifests under genuine
+concurrency, which the tests never created. The fix category is <strong>synchronization</strong>: make the
+update atomic — e.g. protect it with a <strong>mutex</strong> (<code>pthread_mutex_lock</code>/<code>unlock</code>
+around <code>hits++</code>) or use an <strong>atomic</strong> increment (a <code>_Atomic</code>/
+<code>std::atomic</code> counter, or an atomic fetch-add). <em>Tempting wrong answer:</em> "add more tests" —
+single-threaded tests, however many, cannot exercise a race; you need concurrency plus a race detector, and the
+real fix is synchronization. <strong>Feed-forward:</strong> §15.4.</div>
+
+<div class="solution" id="sol15.9"><span class="sol-label">15.9</span>
+(a) <strong>Separate process</strong> — isolation is the whole point; an untrusted plugin in its own address
+space cannot corrupt or crash the host, whereas a thread shares memory and could take everything down. (b)
+<strong>Thread</strong> — the workers all read one large in-memory array, so shared-address-space threads let
+them access it directly with no copy or IPC (and reads alone do not race). (c) <strong>Separate process</strong>
+(via <code>fork</code>+<code>exec</code>) — running a typed command means launching a different program, which
+is a process, not a thread. <em>Method-selection cue:</em> need containment/a different program → process; need
+cheap shared-memory work → thread. <strong>Feed-forward:</strong> §15.1, and Ch 14.</div>
+
+<div class="solution" id="sol15.10"><span class="sol-label">15.10</span>
+(a) <strong>Undefined behavior</strong> — two threads writing the same non-atomic variable with no
+synchronization is a data race. (b) <strong>Well-defined and fine</strong> — writing two <em>different</em>
+variables with no shared location is not a race (barring false-sharing performance effects, which are a cost,
+not UB). (c) <strong>Undefined behavior</strong> — reading through a freed pointer is a use-after-free (Ch 9),
+regardless of threads. (d) <strong>Well-defined and fine</strong> — concurrent <em>reads</em> of a shared value,
+with no writer, do not race. <em>Tempting wrong answer:</em> calling (b) or (d) a race — a data race requires a
+conflicting access (at least one write) to the <em>same</em> location; disjoint writes and read-only sharing
+are fine. <strong>Feed-forward:</strong> §15.4, and Ch 9.</div>
+
+<div class="solution" id="sol15.11"><span class="sol-label">15.11</span>
+(a) The added clause: <strong>no unsynchronized concurrent access to shared mutable memory</strong> (any two
+threads' accesses to the same location, at least one a write, must be ordered by synchronization). (b)
+Violating it is a data race, which is <strong>undefined behavior</strong> in C/C++; unlike a use-after-free —
+which reliably touches freed memory every run — a race depends on interleaving, so it <strong>may never
+reproduce</strong> under testing even though the program is incorrect for some schedule. (c) A language can move
+this to compile time with a type system that tracks sharing and mutation: Rust's <code>Send</code>/
+<code>Sync</code> traits mark which data may cross or be shared between threads, and the borrow checker forbids
+aliasing a mutable reference — so an unsynchronized shared mutation is a <em>compile error</em>, not a runtime
+gamble. <em>Tempting wrong answer:</em> "a thorough test suite proves there's no race" — no finite set of runs
+can, because the offending interleaving may simply never occur; only reasoning from the rules (or a checker/
+detector) settles it. <strong>Feed-forward:</strong> §15.4, §15.5, and Part 5 (Rust).</div>
+
+<div class="solution" id="sol15.12"><span class="sol-label">15.12</span>
+Machine-specific by design. A correct write-up reports: (a) the four-thread, one-million-each unsynchronized
+counter prints totals well below 4,000,000 that differ every run (on the book's machine ~1.1–1.8 million across
+five runs) — lost updates from interleaved read-modify-writes; (b) adding a mutex around the increment (or using
+an atomic increment) restores exactly 4,000,000 every run; (c) the bug's visibility depends on build and
+variable: at <code>-O2</code> without <code>volatile</code> the optimizer may collapse each loop into a single
+add, shrinking the race window so the "wrong" answer hides (it printed 4,000,000 for the author), while
+<code>-O0</code> or a <code>volatile</code> counter forces per-iteration memory writes and exposes the loss —
+demonstrating that a correct-looking run does not mean the code is correct. Essential discipline: report exactly
+what you saw and label compiler/core count/hardware. <em>Tempting wrong answer:</em> "the version that printed
+4,000,000 is the correct one" — it is the same racy code; it merely failed to manifest.
+<strong>Feed-forward:</strong> §15.4.</div>
 
 </section>
 </body></html>

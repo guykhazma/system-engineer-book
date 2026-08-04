@@ -1,0 +1,394 @@
+<section class="chapter" id="ch14">
+<h1>Chapter 14 — Processes: fork, exec, and wait</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch13">Chapter 13</a> (the system-call
+boundary — <code>fork</code>, <code>exec</code>, and <code>wait</code> are all system calls),
+<a href="#ch04">Chapter 4</a> (each process has its own virtual address space, translated through its own page
+tables), <a href="#ch11">Chapter 11</a> (a memory bug is confined to <em>one</em> process's address space).
+&nbsp;·&nbsp; Pairs with <a href="#ch15">Chapter 15</a> (threads share an address space instead of copying it).
+Chapter 13 showed the boundary that protects a process; this chapter is about the process itself — what it is,
+how the OS makes a new one, how one program becomes another, and how a parent collects a finished child.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch13">Chapter 13</a> — to do something privileged, user code must
+do what, and through which instruction on x86-64? (2) <a href="#ch11">Chapter 11</a> — a buffer overflow can
+corrupt the process it runs in; can it corrupt a <em>different</em> running process's memory, and what two
+mechanisms decide the answer? (3) <em>Predict:</em> <code>fork()</code> makes a new process that is a copy of
+the calling one. If your program is holding a 1 GB array in memory and calls <code>fork()</code>, do you think
+the operating system immediately copies all 1 GB? Guess, and note why the answer matters for how often you can
+afford to <code>fork</code>. We measure the idea behind it shortly.</p>
+</aside>
+
+<p>A running program is not the same thing as the file on disk. The file is inert bytes; the running instance
+— with its own memory, its own place in the CPU, its own open files — is a <strong>process</strong>, and the
+process is the operating system's fundamental unit of isolation and accounting. Everything Chapter 13 protected
+was protecting a process: its private address space, its authority level, its resources. This chapter opens the
+process up. We define precisely what a process bundles together (§14.1); we build a new one with the Unix
+system call <code>fork</code>, and see why it returns <em>twice</em> and why copying a process can be cheap
+(§14.2); we turn a copied process into a <em>different</em> program with <code>exec</code>, and meet the
+fork-then-exec pattern that every shell uses (§14.3); we collect a finished child with <code>wait</code>, and
+meet the zombie and the orphan (§14.4); and we carry the model into threads (§14.5). By the end you will be able
+to write, and reason about, the create-run-reap lifecycle that underlies every command you have ever typed.</p>
+
+<h2>14.1 What a process is — the unit of isolation</h2>
+
+<p>A process is three things bundled and protected together. First, an <strong>address space</strong>: the
+private virtual memory of Chapters 4, 7, and 8 — text, initialized data, bss, heap, and stack — that the MMU
+translates through this process's own page tables so that its pointers name only its own memory. Second, one
+or more <strong>threads of execution</strong>: the actual running context — the program counter, the stack
+pointer, the register values — that says <em>where</em> in the code the process currently is (this chapter's
+processes have exactly one; Chapter 15 adds more). Third, a bundle of <strong>kernel-managed resources</strong>:
+the open file descriptors, the process ID (PID) and parent PID, the current working directory, the user and
+group credentials, and more, all tracked by the kernel on the process's behalf.</p>
+
+<p>The reason these are bundled is <strong>isolation</strong>. The kernel gives each process the illusion of
+owning the machine: its own address space (so one process's pointers are meaningless in another's — the answer
+to Chapter 11's confinement), its own turn on the CPU, its own resource handles. A fault in one process — a
+wild pointer, a crash, even a security compromise — is contained to that process's address space and cannot,
+by the mechanisms of Chapter 13, corrupt another process or the kernel. This is why the process is the natural
+boundary for a sandbox, a multi-tenant service, or any place you need one failure not to become everyone's
+failure. The process is precisely the thing the system-call boundary was built to protect.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the three things a process bundles together. Which one makes two processes' identical-looking pointer
+values refer to completely different memory? (Answer after the next section.)</p>
+</aside>
+
+<h2>14.2 Creating a process: <code>fork</code> and copy-on-write</h2>
+
+<p>Unix creates a new process in a way that surprises everyone the first time: the <code>fork()</code> system
+call is called <em>once</em> but returns <em>twice</em>. It makes the calling process (the <strong>parent</strong>)
+into two nearly identical processes — the parent and a new <strong>child</strong> — and then both continue
+from the point of the return. The child is a copy: same code, same current values of every variable, copies of
+the open file descriptors. The one difference is the return value, which is how each copy knows who it is:
+<code>fork</code> returns <strong>0 in the child</strong> and <strong>the child's PID in the parent</strong>
+(or <code>-1</code> on failure). You branch on it. Here is the whole pattern, compiled and run on this machine
+(gcc 11.4.0, x86-64 Linux):</p>
+
+<pre><code>int x = 100;
+pid_t pid = fork();          /* one call, returns TWICE */
+if (pid == 0) {              /* child sees 0 */
+    x += 1;
+    printf("child : pid=%d ppid=%d x=%d  (fork returned %d)\n", getpid(), getppid(), x, pid);
+} else {                     /* parent sees the child's pid */
+    int st; waitpid(pid, &amp;st, 0);
+    x += 10;
+    printf("parent: pid=%d x=%d  (fork returned %d; child exit=%d)\n", getpid(), x, pid, WEXITSTATUS(st));
+}</code></pre>
+
+<pre><code>child : pid=1341934 ppid=1341933 x=101  (fork returned 0)
+parent: pid=1341933 x=110  (fork returned 1341934; child exit=0)</code></pre>
+
+<p>Read that output closely, because it shows every essential fact. The two processes have different PIDs
+(1341934 and 1341933), and the child's parent PID equals the parent's PID — the family tree is real. Both
+started with <code>x == 100</code>, but the child's <code>x += 1</code> and the parent's <code>x += 10</code>
+did not interfere: the child ends at 101 and the parent at 110. Their memory is <em>independent</em> — the
+same variable name, at what is even the same virtual address, but two separate physical copies, because each
+process has its own address space (§14.1). And <code>fork</code> returned 0 down one path and the child's PID
+down the other, which is the only thing distinguishing the twins.</p>
+
+<p>Now the predict from the opener: if the parent held a 1 GB array, did <code>fork</code> copy a gigabyte?
+No — and it could not afford to, or forking would be unusable. The kernel uses <strong>copy-on-write
+(COW)</strong>: rather than duplicating the parent's pages, it maps the <em>same</em> physical pages into both
+processes and marks them read-only. Both share the physical memory as long as they only read it. The instant
+<em>either</em> one writes to a page, the hardware faults, the kernel makes a private copy of just that one
+page for the writer, and both continue. So <code>fork</code>'s cost is proportional not to the size of the
+address space but to the number of pages actually modified afterward — which is why forking a huge process is
+cheap, and why the child's <code>x += 1</code> above triggered a copy of exactly the one page holding
+<code>x</code> and nothing else. Copy-on-write is Chapter 4's page tables doing double duty: the same
+translation-and-fault machinery that isolates processes also lets them share until the moment sharing becomes
+incorrect.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: <code>fork</code> returns twice into two address spaces</span>
+<p><strong>1. In words.</strong> One call, two returns: the parent gets the child's PID, the child gets 0, and
+from then on they are separate processes with separate (copy-on-write) memory. You branch on the return value
+to run different code in each.</p>
+<p><strong>2. As a picture.</strong> Figure 14.1: a single arrow entering <code>fork</code> and two arrows
+leaving, into two boxes that start as copies and diverge as each writes its own pages.</p>
+<p><strong>3. As a trace.</strong> Before: one process, <code>x = 100</code>. After <code>fork</code>: two
+processes, both <code>x = 100</code>, distinguished by return value (child 0, parent child-PID). After each
+runs: child <code>x = 101</code>, parent <code>x = 110</code> — independent, exactly as the measured output
+shows.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 190" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">fork(): one call, two returns, two independent (copy-on-write) address spaces.</text>
+<rect x="20" y="30" width="180" height="44" fill="#eef4fa" stroke="#14406b"/>
+<text x="30" y="48" font-size="9">parent before fork()</text>
+<text x="30" y="64" font-size="9">x = 100</text>
+<line x1="200" y1="52" x2="260" y2="52" stroke="#14406b" stroke-width="1.5" marker-end="url(#a14)"/>
+<text x="205" y="46" font-size="8" fill="#14406b">fork()</text>
+<rect x="260" y="20" width="200" height="44" fill="#cfe8cf" stroke="#2e6b34"/>
+<text x="270" y="38" font-size="9">parent: fork()=child pid</text>
+<text x="270" y="54" font-size="9">x: 100 &rarr; 110</text>
+<rect x="260" y="86" width="200" height="44" fill="#fdeee6" stroke="#8c3a1d"/>
+<text x="270" y="104" font-size="9">child: fork()=0</text>
+<text x="270" y="120" font-size="9">x: 100 &rarr; 101</text>
+<line x1="255" y1="52" x2="260" y2="42" stroke="#2e6b34" stroke-width="1.5"/>
+<line x1="255" y1="52" x2="260" y2="108" stroke="#8c3a1d" stroke-width="1.5"/>
+<text x="475" y="30" font-size="9" fill="#333">Same code, same starting</text>
+<text x="475" y="44" font-size="9" fill="#333">values, copies of the fds.</text>
+<text x="475" y="62" font-size="9" fill="#333">Pages shared read-only</text>
+<text x="475" y="76" font-size="9" fill="#333">until one writes (COW),</text>
+<text x="475" y="90" font-size="9" fill="#333">then copied per page —</text>
+<text x="475" y="104" font-size="9" fill="#333">so forking 1 GB does</text>
+<text x="475" y="118" font-size="9" fill="#333">NOT copy 1 GB.</text>
+<text x="20" y="152" font-size="9" fill="#8c3a1d">The only difference between the twins is fork()'s return value — that is how each knows which one it is.</text>
+<text x="20" y="170" font-size="9" fill="#2e6b34">Memory is independent afterward: the child's x+=1 and the parent's x+=10 touch separate physical pages.</text>
+<defs><marker id="a14" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#14406b"/></marker></defs>
+</svg>
+<figcaption>Figure 14.1: <code>fork</code> returns twice — 0 in the child, the child's PID in the parent —
+producing two processes that start as copies and, thanks to copy-on-write, share physical pages until one
+writes. The branch on the return value is how each copy runs different code.</figcaption>
+</figure>
+
+<p><em>(Answer to the §14.1 quick check: a process bundles an <strong>address space</strong>, one or more
+<strong>threads of execution</strong>, and a set of <strong>kernel resources</strong> such as open file
+descriptors and its PID. The <strong>address space</strong> — separate per process and translated through its
+own page tables — is what makes two processes' identical-looking pointer values refer to different memory.)</em></p>
+
+<h2>14.3 Running a new program: <code>exec</code> and the fork-exec pattern</h2>
+
+<p><code>fork</code> gives you a copy of the <em>same</em> program. To run a <em>different</em> program you
+need <code>exec</code> — the <code>execve</code> system call and its convenience wrappers. <code>exec</code>
+does something drastic: it <strong>replaces the current process image</strong> — text, data, heap, stack —
+with a brand-new program loaded from disk, and jumps to its entry point. Everything the process was running is
+gone; the new program starts fresh. Two things survive the replacement, and they are the important ones: the
+<strong>PID stays the same</strong> (it is the same process, now running different code), and the <strong>open
+file descriptors stay open</strong> (unless marked close-on-exec). On success, <code>exec</code> <em>does not
+return</em> — there is nothing to return to, because the code that called it no longer exists.</p>
+
+<p>Put the two together and you get the pattern behind every command you run: <strong>fork, then exec, then
+wait</strong>. To launch a program, a process <code>fork</code>s; the child <code>exec</code>s the new program
+(replacing itself with it); and the parent <code>wait</code>s for the child to finish. This is exactly what a
+shell does for every command you type — <code>fork</code> a child, have it <code>exec</code>
+<code>/bin/ls</code>, and wait for it to complete before printing the next prompt — and it is how your terminal
+launched the demo program in §14.2. The pattern is also why the parent in that demo called
+<code>waitpid</code> before continuing.</p>
+
+<p>Why split creation (<code>fork</code>) from loading (<code>exec</code>) into two calls, when almost every
+use runs them back to back? Because the <em>gap between them</em> is where the elegance lives. After the child
+is forked but before it execs, it is still running the parent's code and can adjust its inherited resources:
+it can redirect standard output to a file, wire its input or output to a pipe connected to a sibling, drop
+privileges, or change directory — and then <code>exec</code> the target program, which starts up already
+plumbed into that environment without knowing anything about it. Unix I/O redirection and pipelines
+(<code>ls | grep foo &gt; out.txt</code>) are built entirely in that fork-to-exec gap. The two-call design is
+not clumsiness; it is the seam that makes composition possible.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A shell runs the command <code>ls</code>. In order, which of <code>fork</code>, <code>exec</code>, and
+<code>wait</code> does the shell process perform, which does the new child process perform, and which call does
+<em>not</em> return on success? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>14.4 Reaping: <code>wait</code>, exit status, zombies, and orphans</h2>
+
+<p>A process ends by calling <code>exit</code> (or returning from <code>main</code>, or being killed). But it
+does not vanish the instant it ends. The kernel must keep a small amount of information about it — most
+importantly its <strong>exit status</strong>, the number it passed to <code>exit</code> — so that the parent
+can find out how the child fared. A process that has terminated but whose exit status has not yet been
+collected is a <strong>zombie</strong> (shown as <code>&lt;defunct&gt;</code> in <code>ps</code>): it holds no
+memory or CPU, just a slot in the process table and its exit status, waiting to be read.</p>
+
+<p>The parent collects it by calling <code>wait</code> or <code>waitpid</code>, which blocks until a child
+finishes (or returns immediately if one already has), hands back the child's PID and its exit status (decode it
+with macros like <code>WEXITSTATUS</code>), and lets the kernel finally free the zombie's last slot. This is
+<strong>reaping</strong>. It is the parent's responsibility, and forgetting it is a real defect: a long-running
+parent that <code>fork</code>s children and never <code>wait</code>s accumulates zombies, slowly filling the
+process table. Note the category carefully — a leaked zombie is a <em>defined</em> resource leak, not undefined
+behavior; the program is not doing anything the language forbids, it is just failing to clean up, exactly as a
+memory leak is defined-but-bad (Chapter 9).</p>
+
+<p>The mirror-image case is the <strong>orphan</strong>: a child whose parent exits <em>first</em>. An orphan
+is not left dangling — the kernel <strong>reparents</strong> it to <code>init</code> (PID 1, or a subreaper),
+which <code>wait</code>s for it when it finishes, so orphans are reaped automatically. The lifecycle, then, is:
+a process is <code>fork</code>ed, runs, <code>exit</code>s (becoming a zombie holding its status), and is
+reaped by a <code>wait</code>ing parent (or by <code>init</code> if orphaned). Create, run, exit, reap.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: <code>fork</code> duplicates your unflushed output buffer (the double-print)</span>
+<p>Chapter 13 warned that <code>printf</code> buffers in user-space memory and crosses to the kernel only on a
+flush. <code>fork</code> copies the <em>entire</em> address space — <strong>including that buffer with its
+unflushed contents.</strong> So if you <code>printf</code> a line and <em>then</em> <code>fork</code>, the
+un-crossed bytes sit in both the parent's and the child's copy of the buffer, and when each process later
+flushes (at exit), the line is written <em>twice</em> — once per process — even though your code printed it
+once. This is not hypothetical: constructing exactly this (a <code>printf</code> before the fork, with output
+going to a pipe so buffering is block-mode) reproduces the doubled line every time. The trap is subtle because
+it disappears when output goes to a terminal (line-buffered, so the newline already flushed before the fork)
+and reappears when output is redirected to a file or pipe. The fix is the same as Chapter 13's: force the
+crossing before you branch — <code>fflush(stdout)</code> before <code>fork</code> (or use unbuffered
+<code>write</code>). The deeper lesson: <code>fork</code> copies <em>everything</em>, including the parts of
+your program's state you had forgotten were state.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: "Let's handle each incoming request by <code>fork</code>ing a
+fresh process — that way one bad request can't take down the others." Cover the paragraph and respond in three
+or four sentences, drawing on §14.1–14.2.</p>
+<p><em>Model answer.</em> "That is a genuinely good instinct for <em>isolation</em>: a separate process has its
+own address space, so a crash or memory corruption in one request is contained and can't touch a sibling — it's
+the classic robustness pattern, and <code>fork</code> is cheaper than it looks because copy-on-write means we
+don't duplicate the whole address space, only the pages a child actually writes. The costs to weigh are that
+processes don't share memory, so passing data between them needs explicit IPC (pipes, shared memory) rather
+than a pointer, and each request pays process-creation and context-switch overhead, which can hurt at very high
+rates. So process-per-request is the right call when fault-containment or a security boundary is the priority;
+if instead we need cheap shared-memory concurrency and can enforce discipline, threads (Chapter 15) share the
+address space and skip the copy — at the cost of exactly that isolation. Let's decide based on whether
+containment or shared-state throughput is what this service needs, and measure." Naming copy-on-write, the
+isolation-vs-sharing trade, and deferring to a measurement is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §14.3 quick check: the shell process performs <code>fork</code> and then <code>wait</code>;
+the new child process performs <code>exec</code> (replacing itself with <code>ls</code>). <code>exec</code> is
+the one that does not return on success — on success there is no original program left to return to.)</em></p>
+
+<h2>14.5 What to carry forward</h2>
+
+<p>A <strong>process</strong> is the operating system's unit of isolation: an <strong>address space</strong>
+(private virtual memory, Chapter 4), one or more <strong>threads of execution</strong> (the running context),
+and a bundle of <strong>kernel resources</strong> (open files, PID, credentials), all protected by the boundary
+of Chapter 13. You create one with <code>fork</code>, which is called once and <strong>returns twice</strong> —
+0 in the child, the child's PID in the parent — producing two processes that start as copies and diverge;
+copying is cheap because of <strong>copy-on-write</strong>, which shares physical pages until one side writes,
+so forking a huge process costs only the pages later modified. You turn a copied process into a different
+program with <code>exec</code>, which <strong>replaces the image</strong> (keeping the PID and open descriptors)
+and does not return on success; the universal <strong>fork-exec-wait</strong> pattern — with the fork-to-exec
+gap used to set up redirection and pipes — is how every shell runs every command. And you clean up with
+<code>wait</code>, which reaps a finished child's exit status; an unreaped terminated child is a
+<strong>zombie</strong> (a defined leak), while an orphaned child is reparented to <code>init</code> and reaped
+for you.</p>
+
+<p>Every process in this chapter had a single thread of execution — one program counter walking through the
+code. Chapter 15 relaxes that. A <strong>thread</strong> is a second (third, hundredth) flow of control
+<em>within one process</em>, sharing its address space rather than copying it as <code>fork</code> does. That
+one change — share instead of copy — buys cheap concurrency and drops the isolation this chapter spent its
+length building: the very memory that <code>fork</code> kept separate, threads deliberately share, and the
+proof burden of Part 2 returns, now with multiple threads reaching for the same bytes at once.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the three things a process bundles together, and which one enforces memory isolation between
+processes.</li>
+<li>Explain why <code>fork</code> returns twice, what it returns to each side, and how a program uses that to
+run different code in parent and child.</li>
+<li>Explain copy-on-write and why forking a 1 GB process does not copy 1 GB.</li>
+<li>Describe what <code>exec</code> replaces and what it keeps, and why it does not return on success.</li>
+<li>Lay out the fork-exec-wait pattern and say what the gap between fork and exec is used for.</li>
+<li>Define a zombie and an orphan, say who reaps each, and classify a leaked zombie (UB or defined defect?).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What three things make up a process, and what does the address space give it? (§14.1)</li>
+<li><strong>R2.</strong> What does <code>fork</code> return in the parent and in the child, and why is that the
+only difference between them? (§14.2)</li>
+<li><strong>R3.</strong> What is copy-on-write, and why does it make <code>fork</code> cheap? (§14.2)</li>
+<li><strong>R4.</strong> What does <code>exec</code> do, what survives it, and does it return on success? (§14.3)</li>
+<li><strong>R5.</strong> What is a zombie, what is an orphan, and who reaps each? (§14.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Abstraction: The Process" and "Interlude: Process API."</strong> The free chapters that build exactly this
+material — the process abstraction and the <code>fork</code>/<code>exec</code>/<code>wait</code> API. The
+reference for §14.1–14.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter
+8 (Exceptional Control Flow).</strong> Processes, process creation, and reaping children, from the
+programmer's view.</li>
+<li><strong>The Linux <code>fork(2)</code>, <code>execve(2)</code>, and <code>wait(2)</code> manual pages.</strong>
+Primary sources for the exact semantics, including copy-on-write, the fate of file descriptors across
+<code>exec</code>, and zombie/orphan behavior. Verify per system.</li>
+<li><strong>Beej's Guide to Unix IPC / C.</strong> Free, practical walkthroughs of <code>fork</code>/<code>exec</code>
+and inter-process communication (pipes) — the plumbing that lives in the fork-to-exec gap.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex14.1"><span class="ex-label">14.1</span> <span class="ex-tag warm">warm-up</span>
+Name the three things a process bundles together.</div>
+
+<div class="exercise" id="ex14.2"><span class="ex-label">14.2</span> <span class="ex-tag warm">warm-up</span>
+What does <code>fork</code> return in the parent process, and what does it return in the child?</div>
+
+<div class="exercise" id="ex14.3"><span class="ex-label">14.3</span> <span class="ex-tag warm">warm-up</span>
+Does <code>exec</code> return on success? What does it replace, and name one thing it keeps.</div>
+
+<div class="exercise" id="ex14.4"><span class="ex-label">14.4</span> <span class="ex-tag core">core</span>
+Write, from memory, the <code>fork</code>/<code>if</code>-<code>else</code> skeleton that distinguishes child
+from parent, with the parent calling <code>waitpid</code>. Explain in a sentence what each branch is and how
+each process knows which it is.</div>
+
+<div class="exercise" id="ex14.5"><span class="ex-label">14.5</span> <span class="ex-tag core">core</span>
+Explain copy-on-write: what does the kernel actually do to the parent's pages at <code>fork</code> time, what
+triggers a real copy, and why does this make <code>fork</code>ing a 1 GB process fast?</div>
+
+<div class="exercise" id="ex14.6"><span class="ex-label">14.6</span> <span class="ex-tag core">core</span>
+Describe the fork-exec-wait pattern a shell uses to run a command. Then explain what useful work can happen in
+the gap between <code>fork</code> and <code>exec</code>, and give one concrete example (e.g. I/O redirection).</div>
+
+<div class="exercise" id="ex14.7"><span class="ex-label">14.7</span> <span class="ex-tag complexity">cost</span>
+(a) Explain why <code>fork</code> is cheaper than the size of the address space would suggest — name the
+mechanism. (b) Describe a workload for which copy-on-write buys you almost nothing (the child writes to nearly
+all inherited pages) and say why. (c) Compare process-per-request and thread-per-request on one cost each pays
+that the other does not.</div>
+
+<div class="exercise" id="ex14.8"><span class="ex-label">14.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A long-running server <code>fork</code>s a worker for each
+connection and never calls <code>wait</code>. After hours, <code>ps</code> shows hundreds of
+<code>&lt;defunct&gt;</code> entries and the server eventually cannot create new processes.
+<br><strong>Step 1 (given):</strong> When a child exits, the kernel keeps its exit status until the parent
+collects it, leaving the child as a zombie.
+<br><strong>Step 2 (given):</strong> This server never calls <code>wait</code>/<code>waitpid</code>, so no
+child's status is ever collected.
+<br><strong>Step 3 (given):</strong> Each zombie holds a process-table slot, and the table is finite.
+<br><strong>Step 4 (you):</strong> Name the accumulating state, explain why it eventually stops new
+<code>fork</code>s from succeeding, say whether this is undefined behavior or a defined resource leak, and give
+a fix (how the parent should reap, mentioning <code>wait</code>/<code>waitpid</code> or handling
+<code>SIGCHLD</code>).</div>
+
+<div class="exercise" id="ex14.9"><span class="ex-label">14.9</span> <span class="ex-tag mixed">mixed</span>
+For each goal, decide whether you need <code>fork</code>, <code>exec</code>, or <code>fork</code> then
+<code>exec</code>, and say why in a line: (a) run <code>/bin/ls</code> from inside your program and return to
+your program afterward; (b) create a second process that runs the <em>same</em> code on the second half of an
+array; (c) a shell running a command the user just typed.</div>
+
+<div class="exercise" id="ex14.10"><span class="ex-label">14.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 9–14, classify each as <em>undefined behavior</em>, <em>a defined-but-real defect</em>, or
+<em>well-defined and fine</em>: (a) after <code>fork</code>, the parent expects to see changes the child made
+to <code>x</code> in the child's memory; (b) a server that never reaps its children; (c) both parent and child
+printing a line that was <code>printf</code>ed (unflushed) before the <code>fork</code>; (d) a child that
+<code>exec</code>s a new program while the parent keeps running.</div>
+
+<div class="exercise" id="ex14.11"><span class="ex-label">14.11</span> <span class="ex-tag stretch">stretch</span>
+Tie process isolation back to Chapters 11 and 13. (a) Explain why a buffer overflow in process A cannot corrupt
+process B's memory, naming the two hardware mechanisms (Chapters 4 and 13) that enforce it. (b) Explain why
+this makes a separate process, not a thread, the right unit for sandboxing untrusted code. (c) In one or two
+sentences, describe what a multi-tenant service gains by putting each tenant's work in its own process rather
+than sharing one.</div>
+
+<div class="exercise" id="ex14.12"><span class="ex-label">14.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write the <code>fork</code> demo of §14.2 and confirm from its output that
+<code>fork</code> returned twice, that the child's <code>ppid</code> equals the parent's <code>pid</code>, and
+that the two processes' copies of a variable are independent. (b) Add a <code>printf</code> of some line
+<em>before</em> the <code>fork</code>, without an <code>fflush</code>, and run the program with its output
+redirected to a file; observe whether the line appears once or twice and explain why. (c) Add
+<code>fflush(stdout)</code> before the <code>fork</code> and confirm the fix. Report your output and your
+explanation; note your compiler and system.</div>
+
+</section>
+</section>

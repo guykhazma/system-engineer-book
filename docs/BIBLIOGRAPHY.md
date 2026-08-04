@@ -23,9 +23,14 @@ NEVER make anything up. This is the single most important rule in the entire ser
 
 ## Vol 1 — Systems Programming & Performance
 - **Bryant & O'Hallaron — *Computer Systems: A Programmer's Perspective* (CS:APP).** `[⚠ reference — not free]`
-  The canonical machine/OS-from-the-programmer's-view text; the CMU 15-213 course materials are free.
+  The canonical machine/OS-from-the-programmer's-view text; the CMU 15-213 course materials are free. Cited in
+  **ch13** (Ch 8, exceptional control flow / traps & system calls), **ch14** (Ch 8, processes, process creation,
+  reaping children), **ch15** (Ch 12, concurrent programming — threads, shared variables, races).
 - **Arpaci-Dusseau — *Operating Systems: Three Easy Pieces* (OSTEP).** FREE full text (`pages.cs.wisc.edu/~remzi/OSTEP/`).
-  Processes, scheduling, virtual memory, concurrency, persistence.
+  Processes, scheduling, virtual memory, concurrency, persistence. Cited in **ch13** ("Mechanism: Limited Direct
+  Execution" — user/kernel mode, traps, the system-call mechanism), **ch14** ("Abstraction: The Process" and
+  "Interlude: Process API" — <code>fork</code>/<code>exec</code>/<code>wait</code>), **ch15** ("Concurrency: An
+  Introduction" and "Interlude: Thread API" — threads, the shared/private split, the data race).
 - **Beej's Guide to C / Network Programming.** Free (`beej.us`). Practical C and sockets.
 - **The Rust Programming Language ("the book").** Free (`doc.rust-lang.org/book/`), and the Rustonomicon for unsafe.
 - **Drepper — *What Every Programmer Should Know About Memory* (2007).** Free PDF. Caches/memory (dated but seminal).
@@ -35,6 +40,11 @@ NEVER make anything up. This is the single most important rule in the entire ser
 - **Martin Thompson — "Mechanical Sympathy"** (mechanical-sympathy.blogspot.com; talks/QCon). Free. Popularized the term "mechanical sympathy" (borrowed from motor racing) for writing software that works *with* the hardware; co-designer of the LMAX Disruptor. Cited in ch05 as the descriptive origin of the term (the underlying cache/layout technique is attributed to Drepper / MIT 6.172).
 - **MIT 6.172 *Performance Engineering of Software Systems*.** Free OCW. Profiling, cache-aware, vectorization.
 - **The Linux `man` pages / `io_uring` docs (Jens Axboe).** Primary source for syscalls; verify per kernel version.
+  Cited for documented behavior in **ch13** (`syscall(2)` — the x86-64 calling convention: number in `rax`, args in
+  `rdi,rsi,rdx,r10,r8,r9`, result in `rax`; `vdso(7)` — the vDSO serving `clock_gettime`/`gettimeofday` without a
+  trap), **ch14** (`fork(2)`, `execve(2)`, `wait(2)` — copy-on-write, image replacement, zombies/orphans), **ch15**
+  (`pthreads(7)`, `clone(2)` — the NPTL one-to-one model and the `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD` flags that
+  distinguish a thread from a `fork`). Verify per kernel/architecture.
 - **AddressSanitizer / LeakSanitizer / MemorySanitizer documentation** (Clang/GCC; `github.com/google/sanitizers`, LLVM/GCC docs). Free. The compile-time (`-fsanitize=address`) memory-error detectors; cited in ch09 for documented behavior only (use-after-free, heap-overflow, double-free, leaks — ASan does not catch uninitialized reads; that is MSan/Valgrind). Verify flags per compiler version.
 - **Valgrind (Memcheck) documentation** (`valgrind.org`). Free. The runtime memory-error/leak detector; cited in ch09 as a complementary tool to the sanitizers. Documented behavior only.
 - **Chris Lattner — "What Every C Programmer Should Know About Undefined Behavior"** (The LLVM Project Blog, May 2011, three parts; `blog.llvm.org/2011/05/what-every-c-programmer-should-know.html`). Free. The compiler-writer's account of how/why optimizers exploit UB (signed overflow, null-check elimination, strict aliasing). Cited in ch10.
@@ -45,7 +55,8 @@ NEVER make anything up. This is the single most important rule in the entire ser
 - **CS:APP §3.10 (buffer overflows).** Buffer overflow, stack smashing, and mitigations (canaries, ASLR, NX) on the stack-frame model. Cited in ch11 (see CS:APP entry above; `[⚠ reference — not free]`, CMU 15-213 materials free).
 - **Berger, Zorn & McKinley — "Reconsidering Custom Memory Allocation," OOPSLA 2002** (ACM SIGPLAN; free from authors, `people.cs.umass.edu/~emery/pubs/berger-oopsla2002.pdf`). Empirical study: a good general-purpose allocator matches/beats most hand-written custom allocators; regions (arenas) the exception (up to 44% faster, with a memory-consumption downside). Cited in ch12.
 - **Jeff Bonwick — "The Slab Allocator: An Object-Caching Kernel Memory Allocator," USENIX Summer 1994**, pp. 87–98. Free. The production pool/slab allocator (SunOS; later Linux). Cited in ch12 for the fixed-size/free-list model.
-- **cppreference.com / the C standard — `<string.h>` functions and integer/overflow rules.** The authority for `strcpy`/`strncpy`/`strcat`/`snprintf`/`fgets` contracts (and the removal of `gets` in C11), and for signed/unsigned overflow and the §3.4 behavior categories. Cited in ch10–ch12.
+- **cppreference.com / the C standard — `<string.h>` functions and integer/overflow rules.** The authority for `strcpy`/`strncpy`/`strcat`/`snprintf`/`fgets` contracts (and the removal of `gets` in C11), and for signed/unsigned overflow and the §3.4 behavior categories. Cited in ch10–ch12,
+  and in **ch15** for the C11/C++11 memory model — a data race is undefined behavior.
 
 ## Vol 2 — Database Internals
 - **Petrov — *Database Internals* (2019).** `[⚠ reference — not free]` Storage engines, B-trees/LSM, distributed DBs.

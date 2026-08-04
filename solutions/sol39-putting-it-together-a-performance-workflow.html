@@ -1,0 +1,111 @@
+<section class="solutions" id="sol39">
+<h1>Chapter 39 — Solutions</h1>
+
+<div class="solution" id="sol39.1"><span class="sol-label">39.1</span>
+(1) <strong>Measure</strong> the real workload and set a baseline (minimum of several trials). (2) Find the <strong>dominant cost</strong> —
+the largest share of runtime. (3) <strong>Identify the ceiling</strong> that cost is under (compute, cache, bandwidth, control,
+allocation). (4) <strong>Raise that ceiling</strong> with its matching tool, and only that tool. (5) <strong>Re-measure</strong> against
+the baseline and repeat on the next ceiling. <em>Tempting wrong answer:</em> &ldquo;pick the fastest technique and apply it&rdquo; — that
+skips steps 1&ndash;3, the diagnosis that decides which technique is even relevant. <strong>Feed-forward:</strong> &sect;39.1.</div>
+
+<div class="solution" id="sol39.2"><span class="sol-label">39.2</span>
+Because the tools are not interchangeable — each raises one specific ceiling, so applying one before naming the ceiling risks raising a
+roof the program is not under, which does nothing or loses. Example: SIMD on the &sect;36.3 bandwidth-bound dot product gave only
+2.4&times;, not the 13&times; it gave a compute-bound kernel, because the loop waited on DRAM, not the adder (other valid examples:
+branchless code losing to a predictable branch, Chapter 37; a faster allocator doing nothing for a scattered traversal, Chapter 38).
+<em>Tempting wrong answer:</em> &ldquo;identify the ceiling afterward, once the tool didn't help&rdquo; — that wastes the effort and the
+added complexity the workflow exists to avoid. <strong>Feed-forward:</strong> &sect;39.1&ndash;&sect;39.2.</div>
+
+<div class="solution" id="sol39.3"><span class="sol-label">39.3</span>
+(a) <strong>Compute</strong>-bound — widening arithmetic (SIMD) moves the number. (b) <strong>Bandwidth</strong>-bound — streaming an array
+larger than cache waits on DRAM. (c) <strong>Control</strong>-bound — a data-dependent branch swinging with input order is misprediction.
+(d) <strong>Latency</strong>-bound (a memory ceiling) — a scattered pointer chase misses cache per node. <em>Tempting wrong answer:</em>
+calling (b) compute-bound because &ldquo;it does arithmetic&rdquo; — it does, but it is limited by byte delivery, not by the adder.
+<strong>Feed-forward:</strong> &sect;39.2.</div>
+
+<div class="solution" id="sol39.4"><span class="sol-label">39.4</span>
+(a) Overall speedup = 1&nbsp;/&nbsp;((1&minus;<em>p</em>)&nbsp;+&nbsp;<em>p</em>/<em>s</em>), where <em>p</em> is the fraction of runtime
+optimized and <em>s</em> the local speedup. (b) With <em>p</em>=0.20, <em>s</em>=4: 1&nbsp;/&nbsp;(0.80&nbsp;+&nbsp;0.20/4) =
+1&nbsp;/&nbsp;0.85 &asymp; <strong>1.18&times;</strong>. (c) The maximum, at <em>s</em>&nbsp;&rarr;&nbsp;&infin;, is
+1&nbsp;/&nbsp;(1&minus;0.20) = 1.25&times; — so even infinite speedup on this function caps the program at 1.25&times;, which says the
+other 80% is where the larger remaining gains live: look there next. <em>Tempting wrong answer:</em> &ldquo;4&times; on 20% gives about
+4&times;&rdquo; — no; the 80% you did not touch dominates, giving only ~1.18&times;. <strong>Feed-forward:</strong> &sect;39.3.</div>
+
+<div class="solution" id="sol39.5"><span class="sol-label">39.5</span>
+(a) It is <strong>latency</strong>-bound (a memory ceiling): a pointer chase over scattered nodes with a working set beyond L3 misses
+cache on essentially every node; confirm by checking that time is in the traversal (not in <code>malloc</code>), that the miss rate is
+high (or, without <code>perf</code>, that shrinking the working set below cache collapses the time), and that access is non-sequential.
+(b) The fix is <strong>contiguity</strong> — an arena or a flat array with indices instead of pointers (Chapter 38, echoing Chapters
+34&ndash;35) so the walk prefetches; SIMD, branchless code, and a faster allocator would <em>not</em> help, because none of them changes
+the scattered layout. (c) With the loop now 30% and the profile flat, Amdahl's law says the next single change is bounded low — stop
+optimizing this, or move to whatever the new dominant cost is if one emerges. <em>Tempting wrong answer:</em> &ldquo;swap in a faster
+allocator&rdquo; — the time is in the traversal's cache misses, not in allocation. <strong>Feed-forward:</strong> &sect;39.2&ndash;&sect;39.3.</div>
+
+<div class="solution" id="sol39.6"><span class="sol-label">39.6</span>
+(a) <strong>Compute</strong> ceiling → SIMD; echoes the 13&times; kernel of &sect;36.2. (b) <strong>Bandwidth</strong> ceiling → locality/layout
+(SIMD barely helps); echoes the 2.4&times; dot product of &sect;36.3. (c) <strong>Control</strong> ceiling → make the branch predictable
+or branchless; echoes the 15&times; swing of &sect;37.2. (d) <strong>Allocation/locality</strong> ceiling → arena or flatten for
+contiguity; echoes the 22&times; scattered-vs-contiguous traversal of &sect;38.2. <em>Tempting wrong answer:</em> giving (b) SIMD as the
+fix &ldquo;because it's arithmetic&rdquo; — it is bandwidth-bound, so lanes don't help; layout does. <strong>Feed-forward:</strong>
+&sect;39.2.</div>
+
+<div class="solution" id="sol39.7"><span class="sol-label">39.7</span>
+(a) Optimizing A (<em>p</em>=0.60, <em>s</em>=5): 1&nbsp;/&nbsp;(0.40&nbsp;+&nbsp;0.60/5) = 1&nbsp;/&nbsp;0.52 &asymp;
+<strong>1.92&times;</strong>. Optimizing B (<em>p</em>=0.30, <em>s</em>=5): 1&nbsp;/&nbsp;(0.70&nbsp;+&nbsp;0.30/5) = 1&nbsp;/&nbsp;0.76
+&asymp; <strong>1.32&times;</strong>. (b) Do <strong>A</strong> first — for the same effort and same local speedup, the larger fraction
+yields the larger overall gain; Amdahl's law makes the bigger share always the better target. (c) After speeding A 5&times;, A's time
+falls to 0.12 of the original while the rest (the 0.40 of non-A work) is unchanged, so the new runtime is 0.52 of the original; B is now
+0.30&nbsp;/&nbsp;0.52 &asymp; 58% of the new runtime, so B has become the dominant cost and is now clearly worth doing. <em>Tempting wrong answer:</em>
+&ldquo;do B first because it's easier to reason about&rdquo; — effort is equal by assumption, so the larger fraction wins.
+<strong>Feed-forward:</strong> &sect;39.3.</div>
+
+<div class="solution" id="sol39.8"><span class="sol-label">39.8</span>
+<strong>Step 4:</strong> The ~1&times; is expected, not a bug: the loop is bandwidth-bound, so it is limited by how fast DRAM delivers
+bytes, and SIMD widens the arithmetic — a ceiling the loop was never under — so the memory bus caps it at roughly the scalar throughput.
+A profile beforehand would have shown the loop stalled on memory (a high miss rate or, without <code>perf</code>, throughput flat as you
+widen the arithmetic and rising only if you shrink the working set below cache), identifying the bandwidth ceiling before any code was
+written. The PR should be dropped despite the &ldquo;more advanced&rdquo; code because it adds CPU-specific complexity for no measured
+gain, and the real lever — if the loop must be faster — is moving fewer bytes (locality and layout, Chapters 34&ndash;35), not more lanes.
+<em>Tempting wrong answer:</em> &ldquo;keep it, advanced code is better&rdquo; — complexity with no measured speedup is a net loss.
+<strong>Feed-forward:</strong> &sect;39.2, &sect;39.4.</div>
+
+<div class="solution" id="sol39.9"><span class="sol-label">39.9</span>
+The shared trap is <strong>acting on a model of the hardware instead of a measurement of it</strong> — reasoning from &ldquo;fewer
+instructions,&rdquo; &ldquo;more lanes,&rdquo; &ldquo;no branch,&rdquo; or &ldquo;faster allocator&rdquo; without evidence. What would have
+caught each: (a) a profile showing the function is 2% of runtime (Amdahl caps the win at ~1.02&times;); (b) timing scalar vs vectorized,
+or noting the working set exceeds cache — the number does not move; (c) reading the emitted assembly and finding a <code>cmov</code>, not
+a conditional jump, so there is no branch to remove; (d) a profile showing the time is in the traversal's cache misses, not in
+<code>malloc</code>. <em>Tempting wrong answer:</em> treating them as four unrelated mistakes — they are one mistake (no measurement) in
+four costumes. <strong>Feed-forward:</strong> &sect;39.4.</div>
+
+<div class="solution" id="sol39.10"><span class="sol-label">39.10</span>
+(a) <strong>False</strong> — the fastest program is the one that raises the ceiling it is actually under; a cache-hostile loop with fewer
+instructions can be slower than a cache-friendly one with more (Chapter 34). (b) <strong>True</strong> — 1&nbsp;/&nbsp;0.95 &asymp; 1.05&times;
+is the Amdahl ceiling for a 5% part. (c) <strong>False</strong> — each raises a different ceiling (compute, control, allocation) and does
+little or nothing against the others. (d) <strong>True</strong> — re-measuring is mandatory; the layers routinely make the &ldquo;obvious&rdquo;
+change do nothing or lose. (e) <strong>False</strong> — a program is under one dominant ceiling at a time; raise that one, re-measure, and
+the next surfaces. <em>Tempting wrong answer:</em> marking (a) true from the instruction-count intuition — the machine counts stalls, not
+just instructions. <strong>Feed-forward:</strong> &sect;39.1&ndash;&sect;39.4.</div>
+
+<div class="solution" id="sol39.11"><span class="sol-label">39.11</span>
+(a) Every trap is reasoning from a model of the hardware — operation counts, lane counts, source branches, allocator speed — when the
+machine's interacting layers (compiler, cache, predictor, allocator, bus) routinely make the intuitive answer wrong; the one common
+defense is evidence: profile and time before, re-measure after. (b) What decides the outcome is whether the tool matches the ceiling the
+loop is actually under: SIMD gave 13&times; on a compute-bound kernel but 2.4&times; on a bandwidth-bound one; a branch swung 15&times;
+when it survived and was unpredictable but nothing when the compiler removed it; contiguity gave 22&times; on a scattered traversal — same
+techniques, different ceilings, so the match, not the technique, sets the number. (c) Techniques change with hardware and language, but
+&ldquo;find the binding ceiling and raise that one&rdquo; is the invariant method that tells you <em>which</em> technique to reach for and
+when to stop — it survives every new tool and every new machine. <em>Tempting wrong answer:</em> &ldquo;master all the techniques and
+apply them everywhere&rdquo; — without diagnosis that is how the regressions in (b) get shipped. <strong>Feed-forward:</strong>
+&sect;39.4&ndash;&sect;39.5.</div>
+
+<div class="solution" id="sol39.12"><span class="sol-label">39.12</span>
+Open-ended and platform-specific. A correct write-up: (a) names a real hot loop found by profiling or timing and gives a baseline as the
+minimum of several trials; (b) identifies the ceiling with an actual test — a cache cliff as input size crosses last-level cache, a
+scalar-vs-vectorized timing, the emitted assembly for a surviving branch, or whether time is in the allocator versus the traversal — then
+applies only the matching tool and re-measures; (c) reports before/after honestly, including the outcome (common and valuable) that the
+change did <em>not</em> move the number and the ceiling was elsewhere, plus toolchain, CPU, and the note that these are wall-clock times if
+<code>perf</code> is unavailable. <em>Tempting wrong answer:</em> &ldquo;apply SIMD and report the speedup&rdquo; — that skips the
+diagnosis and may raise a ceiling the loop is not under. <strong>Feed-forward:</strong> &sect;39.1&ndash;&sect;39.2.</div>
+
+</section>

@@ -1,0 +1,121 @@
+<section class="solutions" id="sol37">
+<h1>Chapter 37 — Solutions</h1>
+
+<div class="solution" id="sol37.1"><span class="sol-label">37.1</span>
+A deeply pipelined core has many instructions in flight at once (Chapter 2), so stalling at every branch until its condition is computed
+would drain the pipeline and throw away the instruction-level parallelism that makes the core fast. Instead it <strong>predicts</strong>
+the outcome with a hardware branch predictor and speculatively executes down the guessed path, committing the results if the guess was
+right and squashing them if it was wrong. <em>Tempting wrong answer:</em> &ldquo;it just evaluates the condition first&rdquo; — it cannot;
+the condition is often not ready for many cycles, and waiting for it is exactly the stall speculation exists to avoid.
+<strong>Feed-forward:</strong> &sect;37.1.</div>
+
+<div class="solution" id="sol37.2"><span class="sol-label">37.2</span>
+The misprediction penalty is the cost of a wrong guess: the speculatively executed instructions after the branch are squashed and the
+front end refills the pipeline from the correct target. On modern x86 it is roughly <strong>15&ndash;20 cycles</strong> — a published
+figure (Agner Fog; Hennessy &amp; Patterson), not measured here, since <code>perf</code> is unavailable. It is about the depth of the
+pipeline because that is how many stages must be re-primed before useful work resumes. <em>Tempting wrong answer:</em> &ldquo;it is the
+cost of the comparison&rdquo; — the <code>cmp</code> is one cheap instruction; the penalty is the refill. <strong>Feed-forward:</strong>
+&sect;37.1.</div>
+
+<div class="solution" id="sol37.3"><span class="sol-label">37.3</span>
+Because the branch's cost is not the comparison but the <em>misprediction</em> the comparison's outcome can trigger. If the branch is a
+data-dependent coin flip, the predictor is wrong on about half of the iterations and each miss costs a pipeline-depth refill
+(~15&ndash;20 cycles), which dwarfs the handful of arithmetic instructions the branch guards. So the same branch is nearly free when
+predictable and dominant when not — the cost lives in the data, not the opcode. <em>Tempting wrong answer:</em> &ldquo;a branch is
+always cheap because <code>cmp</code> is cheap&rdquo; — that conflates the one-cycle comparison with the pipeline-refill penalty a wrong
+guess pays. <strong>Feed-forward:</strong> &sect;37.1&ndash;&sect;37.2.</div>
+
+<div class="solution" id="sol37.4"><span class="sol-label">37.4</span>
+(a) On unsorted data the branch is a ~50/50 coin flip with no learnable pattern, so the predictor misses roughly half of the ~655&nbsp;million
+branches and each miss costs a ~15&ndash;20-cycle refill; the accumulated penalty is essentially the whole 15&times; gap. On sorted data
+the branch is false for the entire run of values below 128 and then true for the rest, so it flips once and is predicted correctly almost
+always. (b) It is predictable on the sorted array because the outcomes arrive in two long runs the predictor learns immediately;
+unpredictable on the unsorted array because consecutive outcomes are independent. (c) Nothing about the arithmetic, the instruction
+count, or the number of elements summed differs — only the <em>predictability</em> of the branch, which is a property of the data order.
+<em>Tempting wrong answer:</em> &ldquo;sorting makes the arithmetic cheaper&rdquo; — the arithmetic is bit-for-bit identical; only
+prediction changed. <strong>Feed-forward:</strong> &sect;37.2.</div>
+
+<div class="solution" id="sol37.5"><span class="sol-label">37.5</span>
+(a) <code>int m = (x - 128) &gt;&gt; 31; sum += x &amp; ~m;</code> — the arithmetic right shift turns the sign of <code>x-128</code> into an
+all-ones or all-zeros mask, which is ANDed against <code>x</code>, so the loop always executes the same instructions regardless of the
+data: there is no conditional jump, hence nothing to predict or mispredict. (b) On sorted data the real branch is predicted correctly
+almost always, so it does the work of only the taken path and skips the rest for free (0.50&nbsp;s); the branchless version always
+computes both paths' work — the subtract, the shift, the AND, the add — on every element (~0.9&nbsp;s), so it loses to a well-predicted
+branch. (c) Branchless wins only when the branch is genuinely unpredictable, i.e. when the misprediction it avoids costs more than the
+extra both-paths arithmetic it always pays. <em>Tempting wrong answer:</em> &ldquo;branchless is always faster because it has no
+branch&rdquo; — it pays for both paths every iteration and loses to a predictable branch. <strong>Feed-forward:</strong> &sect;37.3.</div>
+
+<div class="solution" id="sol37.6"><span class="sol-label">37.6</span>
+(a) At plain <code>-O2</code> gcc applied <strong>if-conversion</strong>, turning the <code>if</code> into a conditional move
+(<code>cmovg</code>) — a branchless select — so no branch survives; confirm it by reading the emitted assembly (<code>gcc -S</code>) and
+finding <code>cmovg</code> where a conditional jump would be. (b) At <code>-O3 -march=native</code> it vectorized the loop with a masked
+AVX2 add (8 elements per instruction, no branch), confirmable with <code>-fopt-info-vec</code>. (c) You cannot read branch cost off the C
+source: whether a branch even exists in the binary depends on if-conversion and vectorization decisions the compiler makes at your
+optimization level and target, so counting <code>if</code>s and multiplying by a cycle penalty often prices a branch that is not there.
+<em>Tempting wrong answer:</em> &ldquo;the source has an <code>if</code>, so there is a branch&rdquo; — the build, not the source, decides.
+<strong>Feed-forward:</strong> &sect;37.4.</div>
+
+<div class="solution" id="sol37.7"><span class="sol-label">37.7</span>
+(a) The extra cycles spent on mispredictions are approximately <var>K</var>&nbsp;&middot;&nbsp;<var>f</var>&nbsp;&middot;&nbsp;<var>p</var>.
+(b) At <var>f</var>&nbsp;=&nbsp;0.5 this is <var>K</var>&nbsp;&middot;&nbsp;0.5&nbsp;&middot;&nbsp;<var>p</var> — a large per-iteration tax
+that, with <var>p</var>&nbsp;&asymp;&nbsp;15&ndash;20, dwarfs a few-cycle loop body; at <var>f</var>&nbsp;&asymp;&nbsp;0 it is ~0 and the
+branch is essentially free. (c) Branchless does <var>w</var> extra both-paths cycles per iteration and never mispredicts, costing
+<var>K</var>&nbsp;&middot;&nbsp;<var>w</var>; it is faster than the branch when
+<var>K</var>&nbsp;&middot;&nbsp;<var>w</var>&nbsp;&lt;&nbsp;<var>K</var>&nbsp;&middot;&nbsp;<var>f</var>&nbsp;&middot;&nbsp;<var>p</var>, i.e.
+when <var>w</var>&nbsp;&lt;&nbsp;<var>f</var>&nbsp;&middot;&nbsp;<var>p</var>. So the more unpredictable the branch (larger <var>f</var>)
+and the deeper the pipeline (larger <var>p</var>), the more room branchless has to win. <em>Tempting wrong answer:</em> &ldquo;branchless
+always wins because <var>f</var>&middot;<var>p</var> is large&rdquo; — only when <var>w</var>&nbsp;&lt;&nbsp;<var>f</var>&middot;<var>p</var>;
+a predictable branch (small <var>f</var>) flips the inequality. <strong>Feed-forward:</strong> &sect;37.3.</div>
+
+<div class="solution" id="sol37.8"><span class="sol-label">37.8</span>
+<strong>Step 4:</strong> They saw no sorted-vs-unsorted difference because at <code>-O2</code> the compiler if-converted the
+<code>if</code> into a <code>cmovg</code>, so there was no branch in the binary to mispredict — with nothing to predict, data order is
+irrelevant. The single change that would let them observe the effect is to forbid if-conversion
+(<code>-fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert</code>) so a real conditional jump survives; then the sorted run
+is dramatically faster. The correct conclusion is about the <em>build</em>, not the CPU: branch prediction is present and working, but
+this build removed the branch, so &ldquo;prediction is a myth on this CPU&rdquo; mistakes a compiler transform for a hardware fact.
+<em>Tempting wrong answer:</em> &ldquo;the CPU's predictor is broken or absent&rdquo; — the predictor is fine; the branch was compiled
+away. <strong>Feed-forward:</strong> &sect;37.4.</div>
+
+<div class="solution" id="sol37.9"><span class="sol-label">37.9</span>
+(a) <strong>Well</strong> — a loop back-edge taken 10&nbsp;million times is mispredicted essentially once, on the final exit; it is the most
+predictable branch there is. (b) <strong>Badly</strong> — <code>rand() &amp; 1</code> is a 50/50 coin flip with no pattern, the worst case
+(~50% misprediction). (c) <strong>Well</strong> — a branch that is almost always the same way is learned in a few iterations and predicted
+right almost always. (d) <strong>Badly</strong> — a uniform distribution over 8 cases is near-random with no learnable pattern, so a
+<code>switch</code> the compiler keeps as a data-dependent jump mispredicts most of the time. <em>Tempting wrong answer:</em> &ldquo;loops
+are unpredictable because they branch every iteration&rdquo; — the back-edge is precisely the branch the predictor gets right.
+<strong>Feed-forward:</strong> &sect;37.2.</div>
+
+<div class="solution" id="sol37.10"><span class="sol-label">37.10</span>
+(a) <strong>False</strong> — only if the branch survives compilation and is actually mispredicted; the compiler often if-converts or
+vectorizes it away, and a predictable branch costs nearly nothing. (b) <strong>False</strong> — branchless loses to a well-predicted
+branch because it always does both paths' work. (c) <strong>True</strong> — a correctly predicted branch commits already-completed
+speculative work and costs essentially nothing. (d) <strong>True</strong> — <code>-O3 -march=native</code> can turn a scalar
+<code>if</code>-loop into a masked vector loop with no branch (&sect;37.4). (e) <strong>False</strong> — whether there is even a branch to
+mispredict depends on the build, so you must read the emitted assembly and time the binary. <em>Tempting wrong answer:</em> marking (a)
+true from &ldquo;it is a branch in the source&rdquo; — the build, not the source, decides whether the branch exists.
+<strong>Feed-forward:</strong> &sect;37.1&ndash;&sect;37.4.</div>
+
+<div class="solution" id="sol37.11"><span class="sol-label">37.11</span>
+(a) In order: first confirm the branch exists in the shipped build — read the emitted assembly for a conditional jump versus a
+<code>cmov</code>, or check <code>-fopt-info-vec</code> for vectorization; if no branch survives, there is nothing to rewrite. If a real
+branch does survive, measure branch versus branchless on representative data (Chapter 33), because the right choice flips with
+predictability; only then change code. (b) &sect;37.4's masked vectorization is branch elimination carried further: instead of a
+<code>cmov</code> selecting one scalar, the vectorizer computes all lanes and blends them with a mask, so a data-dependent <code>if</code>
+becomes uniform SIMD arithmetic — the same &ldquo;remove the branch, do both paths&rdquo; idea as Chapter 36, applied across lanes. (c)
+&ldquo;Branches are slow, avoid them&rdquo; leads you to rewrite branches the compiler already deleted and to make predictable branches
+slower with always-both-paths code; &ldquo;the cost is a property of the build and the data&rdquo; tells you to check the binary and
+measure predictability first, which is where the real decision lives. <em>Tempting wrong answer:</em> &ldquo;always rewrite the hot
+branch branchless&rdquo; — pointless if the branch is not in the binary, and a regression if it is predictable.
+<strong>Feed-forward:</strong> &sect;37.4&ndash;&sect;37.5.</div>
+
+<div class="solution" id="sol37.12"><span class="sol-label">37.12</span>
+Platform-specific. A correct write-up reports: (a) the summing loop at plain <code>-O2</code> showing little or no sorted-vs-unsorted
+difference (the compiler if-converted to a <code>cmov</code>) and the if-conversion-disabled build showing a large swing (sorted much
+faster), with the assembly confirming <code>cmov</code> versus a conditional jump. (b) a branchless mask version running the same time on
+both orders, order-independent. (c) the toolchain version and CPU, noting these are wall-clock minimum-of-trials times with no hardware
+counters if <code>perf</code> is unavailable. <em>Tempting wrong answer:</em> &ldquo;report the <code>-O2</code> build as proof that
+prediction does not matter&rdquo; — that build has no branch; you must disable if-conversion to observe the effect at all.
+<strong>Feed-forward:</strong> &sect;37.4.</div>
+
+</section>

@@ -1,0 +1,353 @@
+<section class="chapter" id="ch39">
+<h1>Chapter 39 — Putting It Together: A Performance Workflow</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch33">Chapter 33</a> (measure first — the discipline this chapter turns
+into a full workflow), <a href="#ch34">Chapter 34</a> (locality — the cache ceiling), <a href="#ch36">Chapter 36</a> (SIMD and the
+roofline — the compute and bandwidth ceilings), <a href="#ch37">Chapter 37</a> (branch misprediction — the control ceiling),
+<a href="#ch38">Chapter 38</a> (allocation — the ceiling hiding in your traversals). &nbsp;·&nbsp; The last six chapters each raised one
+ceiling; this one is the map — given a profile, which ceiling are you actually under, and how do you raise <em>that</em> one without
+wasting effort on the others.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back across the part: (1) <a href="#ch33">Chapter 33</a> — why do you profile before optimizing rather than
+guess, and why report the minimum of several timed trials? (2) <a href="#ch36">Chapter 36</a> — what is the roofline idea: what two
+ceilings cap a loop, and what decides which one binds? (3) <em>Predict:</em> a profile says one function is 80% of runtime. You have five
+tools in hand — better locality, better layout, SIMD, branchless code, a custom allocator. Before you reach for any of them, what is the
+<em>first</em> question you should answer about that function, and why can the wrong first move make things slower? Write your guess;
+&sect;39.1 and &sect;39.2 answer it.</p>
+</aside>
+
+<p>Every chapter in this part measured one cost and raised one ceiling: cache misses (Chapters 34&ndash;35), compute throughput and
+memory bandwidth (Chapter 36), branch mispredictions (Chapter 37), and dynamic allocation (Chapter 38), all under the founding rule to
+measure first (Chapter 33). Taken singly, each is a technique; taken together, they are a <strong>decision problem</strong>, because a
+real program is under exactly one dominant ceiling at a time, and the whole art of performance engineering is finding which one and
+raising only that. This is not optional discipline — it is forced by arithmetic. A machine's speed is capped by whichever resource
+saturates first, so effort spent raising a ceiling you are not under buys nothing: vectorizing a memory-bound loop, de-branching a
+predictable branch, or replacing an allocator whose cost is really scattered traversal all fail for the same reason — they raise the
+wrong ceiling. This capstone assembles the part into one workflow. It proceeds in five steps: the loop that is the whole method — measure,
+find the dominant cost, identify its ceiling, raise that one, re-measure (&sect;39.1); reading a profile to name the ceiling, with the
+part's symptoms in one table (&sect;39.2); knowing when to stop, via Amdahl's law and the cost of premature optimization (&sect;39.3);
+the traps of the part collected — the ways each ceiling is misdiagnosed (&sect;39.4); and what to carry out of Performance Engineering
+(&sect;39.5).</p>
+
+<p><strong>On the code in this chapter.</strong> This is a synthesis chapter and introduces no new benchmark; every number it cites was
+measured earlier in this part, in this environment (gcc 11.4.0 on an Intel Core i7-12700H, wall-clock <code>clock_gettime(CLOCK_MONOTONIC)</code>
+as the minimum of several trials, with the caches and allocator read from the machine as noted in each chapter). A hardware-counter
+profiler (<code>perf</code>) is <em>not</em> installed here, which is itself part of the lesson: the workflow below is written to run on
+wall-clock time plus the compiler's own reports (assembly, <code>-fopt-info-vec</code>) — the evidence you can always get — and it names
+where percentage-level cache-miss and misprediction counters would sharpen a diagnosis if you have them. The published figures it
+references (pipeline-depth and misprediction penalties, Amdahl's law) are labelled as such and attributed; they are not measured here.</p>
+
+<h2>39.1 The workflow: find the ceiling, raise that one, re-measure</h2>
+
+<p>The entire method is a short loop, and its order is the point. <strong>First, measure</strong> — profile the real workload to find
+where time actually goes, and establish a baseline as the minimum of several trials (Chapter 33), because every later step is judged
+against it. <strong>Second, find the dominant cost</strong> — the one function, loop, or phase that is the largest share of runtime;
+Amdahl's law (&sect;39.3) says nothing else is worth touching yet. <strong>Third, identify the ceiling</strong> that dominant cost is
+under: is it compute-bound (saturating the arithmetic units), memory-bound (waiting on cache misses or DRAM bandwidth), control-bound
+(mispredicting a branch), or allocation-bound (in <code>malloc</code>/<code>free</code> or the scattered memory they returned)? This is
+the crux, and &sect;39.2 is a table for it. <strong>Fourth, raise that ceiling</strong> with the matching tool — locality and layout for
+cache misses (Chapters 34&ndash;35), SIMD for compute (Chapter 36), predictability or branchless code for mispredictions (Chapter 37), an
+arena or pool for allocation (Chapter 38) — and only that tool. <strong>Fifth, re-measure</strong> against the baseline: confirm the
+change moved the number, and then repeat, because raising one ceiling exposes the next. The ordering is not bureaucracy; it is what stops
+the two failure modes the part kept meeting. Skipping step one and optimizing by intuition rewrites cold code (Chapter 33's whole
+warning). Skipping step three — reaching for a favourite tool before naming the ceiling — is worse, because the tools are not
+interchangeable: SIMD does almost nothing for a bandwidth-bound loop (Chapter 36's 2.4&times; versus 13&times;), a branchless rewrite
+loses to a predictable branch (Chapter 37), and a faster allocator does nothing for a scattered traversal (Chapter 38). Each tool raises
+one specific ceiling, so you must name the ceiling first, and by measurement, not guess.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the five steps of the workflow in order. Which step is the one the part warns is most often skipped, and what goes wrong when
+you skip it? (Answer after the next section.)</p>
+</aside>
+
+<h2>39.2 Reading a profile: which ceiling are you under?</h2>
+
+<p>Naming the ceiling is a matter of matching a symptom to a cause, and the part supplies the symptoms. A loop that is
+<strong>compute-bound</strong> already touches data resident in cache and does substantial arithmetic per element; its throughput scales
+when you widen the arithmetic, so SIMD helps (the &sect;36.2 kernel: 13&times; scalar to AVX2), and the tell is that vectorizing moves the
+number. A loop that is <strong>memory-bound</strong> stalls waiting on data: if it streams arrays larger than cache, it is
+<em>bandwidth</em>-bound (the &sect;36.3 dot product: only 2.4&times; from SIMD, because it waits on DRAM), and if it chases pointers
+across scattered memory it is <em>latency</em>-bound (the &sect;38.2 traversal: 177 versus 8&nbsp;ns/node) — in both cases widening
+arithmetic does nothing and the fix is locality and layout, to move fewer bytes or touch them in order. A loop that is
+<strong>control-bound</strong> spends its time in mispredictions: the tell is a data-dependent branch that swings with input order (the
+&sect;37.2 loop: 15&times; sorted versus unsorted) — but only if the branch survived the compiler, which you confirm in the assembly
+before believing it. A phase that is <strong>allocation-bound</strong> shows time inside <code>malloc</code>/<code>free</code> (a
+per-call problem) or, more often, time in a traversal of freshly allocated data with a high miss rate (a locality problem in disguise,
+&sect;38.4). The discipline is that these are distinguished by <em>measurement</em> — varying input size to find cache cliffs, timing
+scalar versus vectorized to see if compute binds, reading the assembly to see if a branch exists, checking whether time is in the
+allocator or in the walk of what it returned — not by staring at source, because the same C can be any of them depending on data sizes
+and what the compiler emitted. Where hardware counters are available (<code>perf</code>) they name the ceiling directly — cache-miss
+rate, misprediction rate, instructions-per-cycle — and are worth using; where they are not, as here, wall-clock experiments and the
+compiler's reports still resolve the question, which is the whole reason the part insisted the honest number is a measured one.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: raise the ceiling you are under, not the one you know best</span>
+<p><strong>1. In words.</strong> A program runs at the speed of its slowest resource, so performance work is diagnosis before treatment:
+profile to find the dominant cost, identify which ceiling it is under (compute, cache, bandwidth, control, allocation), raise exactly that
+one, and re-measure. Reaching for a familiar tool before naming the ceiling raises the wrong roof and buys nothing — or loses.</p>
+<p><strong>2. As a picture.</strong> Figure 39.1: a flow — <em>measure &rarr; dominant cost? &rarr; which ceiling? &rarr; matching fix
+&rarr; re-measure &rarr; repeat</em> — beside a table mapping each symptom (scales with SIMD; stalls on a streamed array; stalls on a
+pointer chase; swings with branch order; time in <code>malloc</code> or in a walk of fresh data) to its ceiling and its one right
+tool.</p>
+<p><strong>3. As numbers/contrast.</strong> The same part, five ceilings, one machine: SIMD gave <strong>13&times;</strong> on a
+compute-bound kernel but only <strong>2.4&times;</strong> on a bandwidth-bound one (Chapter 36); a real branch swung <strong>15&times;</strong>
+on predictability (Chapter 37); a scattered traversal ran <strong>22&times;</strong> slower than a contiguous one (Chapter 38). Each
+number is large only when it matches the ceiling — the proof that naming the ceiling first is the whole game.</p>
+</aside>
+
+<p><em>(Answer to the &sect;39.1 quick check: the five steps are (1) measure and baseline, (2) find the dominant cost, (3) identify its
+ceiling, (4) raise that ceiling with the matching tool, (5) re-measure and repeat. The most-often-skipped step is (3), identifying the
+ceiling: skip it and you reach for a favourite tool — SIMD, branchless code, a new allocator — that may raise a ceiling you are not
+under, doing nothing on a memory-bound loop or even losing on a predictable branch, because the tools are not interchangeable.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 270" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The workflow, and the symptom-to-ceiling table it turns on.</text>
+<rect x="12" y="28" width="86" height="22" fill="#eef1f4" stroke="#14406b"/><text x="20" y="43" font-size="9">1. measure</text>
+<rect x="108" y="28" width="104" height="22" fill="#eef1f4" stroke="#14406b"/><text x="116" y="43" font-size="9">2. dominant cost?</text>
+<rect x="222" y="28" width="104" height="22" fill="#fff3d6" stroke="#8a6d1d"/><text x="230" y="43" font-size="9">3. which ceiling?</text>
+<rect x="336" y="28" width="96" height="22" fill="#dfeee0" stroke="#2f7d32"/><text x="344" y="43" font-size="9">4. raise THAT one</text>
+<rect x="442" y="28" width="92" height="22" fill="#eef1f4" stroke="#14406b"/><text x="450" y="43" font-size="9">5. re-measure</text>
+<path d="M98 39 L 108 39" stroke="#14406b" stroke-width="1"/><path d="M212 39 L 222 39" stroke="#14406b" stroke-width="1"/><path d="M326 39 L 336 39" stroke="#14406b" stroke-width="1"/><path d="M432 39 L 442 39" stroke="#14406b" stroke-width="1"/>
+<path d="M488 50 C 488 70, 60 70, 55 52" fill="none" stroke="#14406b" stroke-width="1" stroke-dasharray="3,2"/><text x="250" y="70" font-size="8" fill="#14406b">repeat: the next ceiling</text>
+<line x1="12" y1="92" x2="620" y2="92" stroke="#b9c2cc"/>
+<text x="12" y="108" font-size="9" fill="#14406b">symptom</text><text x="300" y="108" font-size="9" fill="#8a6d1d">ceiling</text><text x="430" y="108" font-size="9" fill="#2f7d32">the one right tool</text>
+<text x="12" y="128" font-size="8">throughput scales when you widen arithmetic (cache-resident, math-heavy)</text><text x="300" y="128" font-size="8" fill="#8a6d1d">compute</text><text x="430" y="128" font-size="8" fill="#2f7d32">SIMD (Ch 36) &mdash; 13&times;</text>
+<text x="12" y="146" font-size="8">stalls streaming an array larger than cache</text><text x="300" y="146" font-size="8" fill="#8a6d1d">bandwidth</text><text x="430" y="146" font-size="8" fill="#2f7d32">locality / layout (Ch 34&ndash;35)</text>
+<text x="12" y="164" font-size="8">stalls chasing pointers across scattered memory</text><text x="300" y="164" font-size="8" fill="#8a6d1d">latency</text><text x="430" y="164" font-size="8" fill="#2f7d32">contiguity / arena (Ch 38) &mdash; 22&times;</text>
+<text x="12" y="182" font-size="8">time swings with branch order; a surviving data-dependent branch</text><text x="300" y="182" font-size="8" fill="#8a6d1d">control</text><text x="430" y="182" font-size="8" fill="#2f7d32">predictable / branchless (Ch 37) &mdash; 15&times;</text>
+<text x="12" y="200" font-size="8">time in malloc/free, or in a walk of freshly allocated data</text><text x="300" y="200" font-size="8" fill="#8a6d1d">allocation</text><text x="430" y="200" font-size="8" fill="#2f7d32">arena / pool (Ch 38) &mdash; 5&times;</text>
+<line x1="12" y1="212" x2="620" y2="212" stroke="#b9c2cc"/>
+<text x="12" y="230" font-size="8" fill="#8c3a1d">Wrong first move: raise a ceiling you are not under &rarr; SIMD on a bandwidth-bound loop = 2.4&times;, not 13&times;.</text>
+<text x="12" y="248" font-size="8" fill="#14406b">Each large number in this part appeared only when the tool matched the ceiling. Diagnosis before treatment.</text>
+</svg>
+<figcaption>Figure 39.1: The performance workflow (top) and the symptom-to-ceiling table it turns on (bottom). A program runs at the speed
+of its slowest resource, so the method is diagnosis before treatment: profile, name the ceiling, raise <em>that</em> one, re-measure. The
+part's large speedups (13&times;, 15&times;, 22&times;) each appeared only when the tool matched the ceiling; the wrong first move raises a
+roof you are not under (&sect;39.1&ndash;&sect;39.2).</figcaption>
+</figure>
+
+<h2>39.3 Knowing when to stop: Amdahl's law and the 5% part</h2>
+
+<p>The workflow's second step — optimize the dominant cost, nothing else yet — is not a preference; it is <strong>Amdahl's law</strong>
+(Amdahl, 1967). If a part of the program takes a fraction <em>p</em> of the runtime and you speed <em>that part</em> up by a factor
+<em>s</em>, the whole program speeds up by only 1&nbsp;/&nbsp;((1&minus;<em>p</em>)&nbsp;+&nbsp;<em>p</em>/<em>s</em>). The consequence is
+brutal and clarifying: the overall speedup is bounded by 1&nbsp;/&nbsp;(1&minus;<em>p</em>) no matter how large <em>s</em> is, so a part
+that is 5% of runtime yields at most a 1&nbsp;/&nbsp;0.95&nbsp;&asymp;&nbsp;1.05&times; overall <em>even if you make it infinitely
+fast</em>. This is the arithmetic behind the phrase the part has used repeatedly — &ldquo;optimizing the 5% part&rdquo; — and behind
+Knuth's older warning that <em>premature optimization is the root of all evil</em> (Knuth, 1974): effort spent on code that is not the
+dominant cost is capped at a rounding error before it begins, and it is not free — it adds complexity, risks bugs, and can block the
+compiler (a hand-written branchless loop that defeats the vectorizer, Chapter 37). So the discipline has two edges. One edge says
+<em>start</em> at the dominant cost, because that is where the ceiling of achievable speedup is highest. The other says <em>stop</em> when
+the remaining costs are small: once the dominant cost is raised and the profile flattens — no single part is a large share — Amdahl's law
+says the next change is bounded low, and the right engineering move is often to stop optimizing and spend the complexity budget elsewhere.
+Knowing when to stop is as much a part of the workflow as knowing where to start: the goal is not the fastest possible code but code fast
+enough that the dominant cost no longer dominates, reached by the fewest changes that measurably move the baseline.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A function is 10% of runtime and you make it 100&times; faster. What is the overall speedup, roughly? What does Amdahl's law say is the
+ceiling on optimizing a part that is 5% of runtime, and what does that imply about where to start? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>39.4 The traps of the part, in one place</h2>
+
+<p>Each chapter of this part ended with a trap, and collected they are one trap wearing five costumes: <strong>acting on a model of the
+hardware instead of a measurement of it</strong>. Chapter 33's trap was optimizing without profiling — rewriting code that a profile
+would have shown to be cold. Chapter 34's was assuming an algorithm with fewer operations is faster when a cache-hostile access pattern
+makes it slower — the model counted operations, the machine counted misses. Chapter 36's was counting vector lanes — &ldquo;8 lanes, so
+8&times;&rdquo; — when the loop was bandwidth-bound and gained 2.4&times;, or compute-bound and gained more than 8&times; via FMA; the lane
+count is a model, the ceiling is measured. Chapter 37's was counting branches in the source and multiplying by a cycle penalty, against a
+branch the compiler had already if-converted away — the source is a model, the binary is the fact. Chapter 38's was blaming the
+allocator's speed for time that was really the scattered memory it returned — the call is a small model, the traversal's cache misses are
+the fact. The unifying lesson is that the machine has too many interacting layers — compiler, cache hierarchy, predictor, allocator,
+memory bus — for a mental model to reliably predict where time goes; the layers routinely conspire to make the intuitive answer wrong
+(the branch that was compiled away, the SIMD the memory bus ate, the algorithm the cache punished). The defense is the same in every case:
+before optimizing, get evidence of what the machine actually does — a profile, a timed experiment, the emitted assembly, the vectorization
+report — and after optimizing, re-measure to confirm the change helped. Every large number in this part came from measuring the machine;
+every trap came from trusting a model of it.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: optimizing to a story &mdash; the change that is plausible, measured against nothing</span>
+<p>The final and most general trap is the one under all the others: shipping an optimization because it <em>sounds</em> right — fewer
+instructions, more lanes, no branch, a faster allocator — without a before-and-after measurement of the workload it is supposed to help.
+Every specific trap in this part is an instance: the vectorized memory-bound loop, the de-branched predictable branch, the swapped
+allocator on a scattered traversal, the rewritten cold function. Each is plausible; each is measured against nothing; each raises a
+ceiling the program was not under, so the profile does not move — and worse, the added complexity stays. Two defenses close the part.
+First, tie every optimization to a number: a profile that names the dominant cost before, and a re-measured baseline that shows the change
+moved it after — no number, no merge (Chapter 33). Second, respect Amdahl's law as a gate: if the part you are optimizing is not the
+dominant cost, the best case is a rounding error, so the change has to justify its complexity against a ceiling that is provably low.
+Optimizing to a story rather than a measurement is how fast-sounding code that is not actually faster — and is now harder to read — gets
+written; the whole part exists to replace the story with the number.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate opens a PR: &ldquo;Rewrote the hot path — vectorized the inner loop with intrinsics, made the filter
+branchless, and swapped in a faster allocator. Should be a big speedup across the board.&rdquo; No before/after numbers are attached.
+Cover the paragraph and respond in four or five sentences, drawing on &sect;39.1&ndash;&sect;39.4.</p>
+<p><em>Model answer.</em> &ldquo;Three real techniques, but I can't tell which one is actually helping without numbers — and they don't
+all raise the same ceiling, so some may be doing nothing or losing. Can you attach the profile that identified the hot path and a
+before/after on the representative workload? Specifically: is the inner loop compute-bound (then SIMD earns its keep) or memory-bound
+(then it's ~1&times; and the real fix is layout); did the branch even survive the old build, or did the compiler already if-convert it, in
+which case branchless can be a regression on predictable data; and is the allocator time in <code>malloc</code> itself or in traversing
+what it returned, because a faster allocator only helps the former. Let's land the measured win — the one or two changes the profile
+actually moves — and drop the rest, so we're not carrying complexity for speedups that aren't there.&rdquo; Asking which ceiling each
+change raises, and gating the merge on a measured before/after, is the senior register — and the whole part in one review.</p>
+</aside>
+
+<p><em>(Answer to the &sect;39.3 quick check: a function that is 10% of runtime made 100&times; faster gives an overall speedup of
+1&nbsp;/&nbsp;(0.90&nbsp;+&nbsp;0.10/100)&nbsp;&asymp;&nbsp;1.11&times; — the 90% you did not touch dominates. Amdahl's law caps optimizing a
+5%-of-runtime part at 1&nbsp;/&nbsp;0.95&nbsp;&asymp;&nbsp;1.05&times; even at infinite speedup, which is why you start at the dominant
+cost — the part with the highest ceiling on achievable speedup — and why optimizing a small part is bounded to a rounding error before you
+begin.)</em></p>
+
+<h2>39.5 What to carry forward</h2>
+
+<p>Performance engineering is a <strong>diagnosis discipline</strong>, and this part is one method repeated against five ceilings. The
+method: <strong>measure</strong> the real workload and baseline it (Chapter 33); find the <strong>dominant cost</strong>, because Amdahl's
+law caps everything else low (&sect;39.3); <strong>identify the ceiling</strong> that cost is under — compute, cache, bandwidth, control,
+or allocation (&sect;39.2); <strong>raise that one</strong> with its matching tool and only that tool — locality and layout for the memory
+ceilings (Chapters 34&ndash;35), SIMD for compute (Chapter 36), predictability or branchless code for control (Chapter 37), an arena or
+pool for allocation (Chapter 38); and <strong>re-measure</strong>, then repeat on the ceiling that surfaces next. The part's large numbers
+— 13&times; from SIMD, 15&times; from branch predictability, 22&times; from contiguity — were each large only because the tool matched
+the ceiling; the same tools against the wrong ceiling gave 2.4&times;, a regression, or nothing. That is the through-line to carry out:
+the machine has several ceilings, and engineering performance is finding, by measurement, which one you are actually under, and raising
+<em>that</em> one — never reasoning from a model of the hardware when you can get evidence of what it does, and never shipping an
+optimization that is not tied to a before-and-after number.</p>
+
+<p>This closes Volume 1's turn toward the CPU and its memory. The part began by refusing to guess and ends with a workflow that never has
+to: given a profile, you can now name the ceiling and reach for the one tool that raises it. But every cost this part measured lived
+<em>inside</em> the machine — in caches, pipelines, vector units, and the heap — where the program runs alone against silicon. The next
+part crosses the boundary where the program meets the outside world: <strong>I/O and networking</strong>, where the costs are no longer
+cycles and cache lines but system calls, disk and network latency, and the blocking that stalls a whole thread while it waits — a new
+cost model, and a new set of &ldquo;where does the time go&rdquo; questions, with the same measure-first discipline carried across. The
+machine is understood; now it must talk to the world.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the five steps of the performance workflow in order, and why the order matters.</li>
+<li>Match each symptom (scales with SIMD, stalls on a stream, chases scattered pointers, swings with branch order, time in the allocator) to its ceiling and tool.</li>
+<li>State Amdahl's law and compute the ceiling on optimizing a 5%-of-runtime part.</li>
+<li>Explain why each tool in the part fails against the wrong ceiling, with an example.</li>
+<li>Name the single trap under all five chapters' traps, and the defense against it.</li>
+<li>Say when to <em>stop</em> optimizing, in Amdahl terms.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are the five steps of the workflow, and which is most often skipped with what consequence? (&sect;39.1)</li>
+<li><strong>R2.</strong> Give the symptom that identifies each of the compute, bandwidth, latency, control, and allocation ceilings. (&sect;39.2)</li>
+<li><strong>R3.</strong> State Amdahl's law and the ceiling it puts on optimizing a 5%-of-runtime part. (&sect;39.3)</li>
+<li><strong>R4.</strong> What single trap underlies all five chapters' traps, and what is the defense? (&sect;39.4)</li>
+<li><strong>R5.</strong> Why did the part's tools give large speedups in some cases and near-nothing in others — what decides it? (&sect;39.2, &sect;39.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Gene M. Amdahl, &ldquo;Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities,&rdquo; in
+<em>AFIPS '67 Spring Joint Computer Conference</em>, pp. 483&ndash;485 (1967), DOI 10.1145/1465482.1465560.</strong> The origin of
+&sect;39.3's law bounding overall speedup by the fraction you do not optimize — the arithmetic behind &ldquo;start at the dominant
+cost.&rdquo; First author Gene Amdahl; DOI verified via the ACM Digital Library.</li>
+<li><strong>Donald E. Knuth, &ldquo;Structured Programming with go to Statements,&rdquo; <em>ACM Computing Surveys</em> 6(4),
+pp. 261&ndash;301 (1974), DOI 10.1145/356635.356640.</strong> The source of &ldquo;premature optimization is the root of all evil&rdquo;
+(&sect;39.3) — and its less-quoted second half, that the critical few percent are worth optimizing well. First author Donald Knuth; DOI
+verified via the ACM Digital Library.</li>
+<li><strong>Samuel Williams, Andrew Waterman &amp; David Patterson, &ldquo;Roofline: An Insightful Visual Performance Model for Multicore
+Architectures,&rdquo; <em>Communications of the ACM</em> 52(4), 65&ndash;76 (2009), DOI 10.1145/1498765.1498785.</strong> The compute-vs-bandwidth
+ceiling model of &sect;39.2 — arithmetic intensity deciding which roof binds. First author Samuel Williams; DOI verified via the ACM
+Digital Library.</li>
+<li><strong>Brendan Gregg, <em>Systems Performance: Enterprise and the Cloud</em>, 2nd ed. (Addison-Wesley, 2020),
+ISBN 978-0-13-682015-4.</strong> A practitioner's reference for the whole workflow of &sect;39.1&ndash;&sect;39.2 — methodologies
+(including the USE method), tools, and reading profiles across the stack. First author Brendan Gregg; edition and ISBN verified via the
+publisher.</li>
+<li><strong>John L. Hennessy &amp; David A. Patterson, <em>Computer Architecture: A Quantitative Approach</em>, 6th ed. (Morgan Kaufmann,
+2017), ISBN 978-0-12-811905-1.</strong> The architectural ground under every ceiling in this part — pipelines, caches, memory, and
+data-level parallelism. First author John Hennessy; edition and ISBN verified via the publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex39.1"><span class="ex-label">39.1</span> <span class="ex-tag warm">warm-up</span>
+State the five steps of the performance workflow in order, in one line each.</div>
+
+<div class="exercise" id="ex39.2"><span class="ex-label">39.2</span> <span class="ex-tag warm">warm-up</span>
+Why must you identify the ceiling <em>before</em> choosing a tool? Give one example from the part of a tool that fails against the wrong
+ceiling.</div>
+
+<div class="exercise" id="ex39.3"><span class="ex-label">39.3</span> <span class="ex-tag warm">warm-up</span>
+For each symptom, name the ceiling: (a) throughput scales when you widen the arithmetic; (b) a loop stalls streaming an array far larger
+than cache; (c) time swings 15&times; with the sort order of the input; (d) a pointer-chasing walk over separately-allocated nodes is
+slow.</div>
+
+<div class="exercise" id="ex39.4"><span class="ex-label">39.4</span> <span class="ex-tag core">core</span>
+Amdahl's law. (a) State it in terms of the optimized fraction <em>p</em> and the local speedup <em>s</em>. (b) A function is 20% of
+runtime; you make it 4&times; faster. Compute the overall speedup. (c) What is the maximum overall speedup from optimizing that same 20%
+function, no matter how fast you make it, and what does that imply about where to look next?</div>
+
+<div class="exercise" id="ex39.5"><span class="ex-label">39.5</span> <span class="ex-tag core">core</span>
+A profile shows one loop at 70% of runtime, chasing pointers through a graph of separately-<code>malloc</code>'d nodes, over a working set
+far larger than L3. (a) Which ceiling is it under, and how would you confirm? (b) Which tool from the part raises that ceiling, and which
+tools would <em>not</em> help here? (c) After the fix the same loop is now 30% of runtime and the profile is flat — what does Amdahl's law
+advise?</div>
+
+<div class="exercise" id="ex39.6"><span class="ex-label">39.6</span> <span class="ex-tag core">core</span>
+For each, name the ceiling and the one tool, and say which of the part's numbers it echoes: (a) a cache-resident, math-heavy kernel with
+independent lanes; (b) a 64&nbsp;MiB-streaming dot product; (c) a data-dependent branch that survived compilation and swings with input
+order; (d) a phase spending its time in a traversal of freshly built, scattered data structures.</div>
+
+<div class="exercise" id="ex39.7"><span class="ex-label">39.7</span> <span class="ex-tag complexity">cost</span>
+A program has two hot parts: part A is 60% of runtime, part B is 30%. You can raise either ceiling for the same effort, achieving a
+5&times; local speedup on whichever you pick. (a) Compute the overall speedup from optimizing A alone, and from B alone. (b) Which should
+you do first, and why does Amdahl's law make the choice obvious? (c) After doing the better one, recompute the fractions and say whether
+the other is now worth doing.</div>
+
+<div class="exercise" id="ex39.8"><span class="ex-label">39.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague ships a PR that hand-vectorizes an inner loop with AVX2 intrinsics and reports
+&ldquo;no measurable speedup, but the code is more advanced.&rdquo;
+<br><strong>Step 1 (given):</strong> the loop streams a pair of arrays far larger than last-level cache.
+<br><strong>Step 2 (given):</strong> its arithmetic intensity is tiny (about one add per two loads), so it is bandwidth-bound.
+<br><strong>Step 3 (given):</strong> SIMD raises the compute ceiling, not the bandwidth ceiling.
+<br><strong>Step 4 (you):</strong> Explain why the speedup is ~1&times; (not a bug), what the profile would have shown before the change,
+and why the PR should be dropped despite the code being &ldquo;more advanced.&rdquo;</div>
+
+<div class="exercise" id="ex39.9"><span class="ex-label">39.9</span> <span class="ex-tag mixed">mixed</span>
+Each of these is a version of the same underlying trap. Name the trap they share, and for each say what evidence would have caught it: (a)
+rewriting a function that turns out to be 2% of runtime; (b) vectorizing a bandwidth-bound loop; (c) de-branching a branch the compiler
+already if-converted; (d) swapping in a faster <code>malloc</code> to speed up a scattered traversal.</div>
+
+<div class="exercise" id="ex39.10"><span class="ex-label">39.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;The fastest program is the one with the fewest
+instructions.&rdquo; (b) &ldquo;Optimizing a part that is 5% of runtime can, at best, give about 1.05&times; overall.&rdquo; (c)
+&ldquo;SIMD, branchless code, and custom allocators are interchangeable ways to make code faster.&rdquo; (d) &ldquo;You should re-measure
+after an optimization even if the change obviously should help.&rdquo; (e) &ldquo;A program is usually under several ceilings at once, so
+you should raise them all together.&rdquo;</div>
+
+<div class="exercise" id="ex39.11"><span class="ex-label">39.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the part. (a) Explain why every chapter's trap is the same trap — reasoning from a model of the hardware instead of measuring
+it — and give the one defense common to all of them. (b) The part reported speedups of 13&times;, 15&times;, and 22&times;, and also
+2.4&times; and a regression, using the <em>same</em> techniques — explain in one paragraph what decides which you get. (c) Argue why
+&ldquo;find the ceiling you're under and raise that one&rdquo; is a more durable skill than knowing any individual technique.</div>
+
+<div class="exercise" id="ex39.12"><span class="ex-label">39.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, run the full workflow once end to end. (a) Take a small program of your own with a plausible hot loop; profile or
+time it to find the dominant cost and baseline it as the minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials. (b)
+Identify the ceiling it is under using the &sect;39.2 tests (vary input size for cache cliffs; time scalar vs vectorized for compute; read
+the assembly for a surviving branch; check whether time is in the allocator or in a walk of its output), raise that one ceiling with the
+matching tool, and re-measure. (c) Report the before/after, the ceiling you identified and how, and — honestly — whether the change moved
+the number or taught you the ceiling was elsewhere; state your toolchain, CPU, and that these are wall-clock times if you lack
+<code>perf</code>.</div>
+
+</section>
+</section>

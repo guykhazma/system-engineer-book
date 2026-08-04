@@ -279,6 +279,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch34">Chapter 34 — Cache-Aware Design: Programming for Locality</a></li>
 <li class="toc-ch"><a href="#ch35">Chapter 35 — Data-Oriented Design: Laying Out Data for the Cache</a></li>
 <li class="toc-ch"><a href="#ch36">Chapter 36 — SIMD and Vectorization</a></li>
+<li class="toc-ch"><a href="#ch37">Chapter 37 — Branch Prediction and Speculative Execution</a></li>
+<li class="toc-ch"><a href="#ch38">Chapter 38 — The Cost of Dynamic Allocation</a></li>
+<li class="toc-ch"><a href="#ch39">Chapter 39 — Putting It Together: A Performance Workflow</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VII &mdash; I/O & Networking, Low-Level</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part VIII &mdash; Storage & the Disk</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part IX &mdash; Storage Engines</li>
@@ -14844,6 +14847,1144 @@ you lack <code>perf</code>.</div>
 </section>
 </section>
 
+<section class="chapter" id="ch37">
+<h1>Chapter 37 — Branch Prediction and Speculative Execution</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch02">Chapter 2</a> (the CPU up close — the pipeline that a
+misprediction flushes), <a href="#ch10">Chapter 10</a> (the optimizing compiler — <em>if-conversion</em> is one of its transforms, and it
+changes everything here), <a href="#ch36">Chapter 36</a> (SIMD and masks — how the vectorizer turns a branch into arithmetic),
+<a href="#ch33">Chapter 33</a> (measure first — this chapter's central claim is that you must, because the effect appears and vanishes
+with the build). &nbsp;·&nbsp; The last three chapters raised the memory and compute ceilings; this one opens a different cost the
+profiler can hand you — a branch the CPU guessed wrong — and shows why the honest number is, again, a measured one.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch02">Chapter 2</a> — what is an instruction <em>pipeline</em>, and why does a modern core
+have several instructions in flight at once rather than finishing one before starting the next? (2) <a href="#ch33">Chapter 33</a> —
+why do you report the minimum of several timed trials rather than a single run? (3) <em>Predict:</em> you sum only the elements
+<code>&gt;= 128</code> of a 32768-element array of random bytes, with a plain <code>if (data[i] &gt;= 128) sum += data[i];</code>. You
+then <em>sort</em> the array first and run the identical loop again. Same arithmetic, same element count. How much faster do you expect
+the sorted run: about the same, 2&times;, or something far larger? And does your answer depend on the compiler flags? Write your guesses;
+&sect;37.2 and &sect;37.4 answer them.</p>
+</aside>
+
+<p>A branch — an <code>if</code>, a loop test, a <code>switch</code>, a function return — is a fork in the instruction stream, and a
+modern CPU cannot afford to wait to learn which way it goes. The pipeline (Chapter 2) has a dozen or more instructions in flight at
+once, so by the time a branch's condition is actually computed the core has already fetched and begun executing the instructions after
+it — but <em>which</em> instructions? The ones on the taken path or the not-taken path? The core does not know yet, so it
+<strong>guesses</strong>, using a hardware <strong>branch predictor</strong>, and speculatively runs ahead down the predicted path. When
+the guess is right, the work is already done and the branch cost essentially nothing. When it is wrong, everything speculatively
+executed after the branch must be thrown away and the pipeline refilled from the correct target — a <strong>misprediction penalty</strong>
+of, on published figures, roughly 15&ndash;20 cycles on modern x86 (Agner Fog's microarchitecture manual). That is the cost this chapter
+is about: not the work the branch guards, but the guess it forces, and what happens when the data makes the guess unpredictable. This
+chapter proceeds in five steps: why a branch can cost more than the work it guards (&sect;37.1); the predictor, and the sorted-array
+experiment that made this famous, measured here (&sect;37.2); making the branch cheap — predication, <code>cmov</code>, and branchless
+code (&sect;37.3); what the compiler already did to your branch, and why the effect appears and vanishes with the build, so you must
+measure (&sect;37.4); and what to carry forward (&sect;37.5).</p>
+
+<p><strong>On the code in this chapter.</strong> As before the programs are C, compiled with gcc 11.4.0 and run in this environment on
+an Intel Core i7-12700H, timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> and reported as the minimum of several trials (Chapter
+33). Times are wall-clock seconds for a fixed amount of work and are illustrative of the effect, not a benchmark of the machine. Where a
+compiler decision is claimed — that a loop kept a real branch, used a conditional move, or vectorized with a mask — it is confirmed by
+reading gcc's own assembly output (<code>-S</code>) or its <code>-fopt-info-vec</code> report, quoted inline, not asserted. A
+hardware-counter profiler (<code>perf</code>, which would report branch-misprediction counts directly) is <em>not</em> installed here,
+so the evidence for a misprediction is wall-clock time plus the emitted instructions — which, as &sect;37.4 argues, is exactly the
+evidence you can actually ship a decision on. Published cycle figures (pipeline depth, misprediction penalty) are labelled as such and
+attributed; they are not measured here.</p>
+
+<h2>37.1 Why a branch can cost more than the work it guards</h2>
+
+<p>A pipelined core overlaps instructions: while one is executing, the next is being decoded and the one after that fetched, so several
+are in flight at once (Chapter 2). This is <strong>instruction-level parallelism</strong>, and it is most of why a modern core is fast.
+A branch threatens it. Consider <code>if (cond) A; else B;</code>: the core must keep fetching to keep the pipeline full, but the target
+address — the address of <code>A</code> or of <code>B</code> — is not known until <code>cond</code> is evaluated, several stages later.
+Stalling until then would drain the pipeline and throw away the parallelism, so instead the core <strong>predicts</strong> the outcome
+and speculatively executes down the guessed path, holding the results provisionally. If the prediction was right, those results are
+committed and the branch was, in effect, free. If it was wrong, the speculated instructions are <strong>squashed</strong> — their results
+discarded — and the front end restarts fetching from the correct target, leaving a bubble of a dozen-plus cycles while the pipeline
+refills. That refill is the misprediction penalty, and its size is roughly the depth of the pipeline: published figures put modern x86
+pipelines at on the order of 14&ndash;19 stages and the misprediction penalty at roughly 15&ndash;20 cycles (Agner Fog; Hennessy &amp;
+Patterson, ch.3). The crucial consequence is that the cost of a branch is <em>not</em> the cost of the comparison — a <code>cmp</code>
+is one cheap instruction — but the cost of guessing wrong, paid only on mispredictions. A branch the predictor gets right almost every
+time is nearly free; a branch it gets wrong half the time can dominate a loop, costing far more per iteration than the handful of
+arithmetic instructions inside it. Whether a branch is cheap or ruinous therefore depends not on the code but on the <em>data</em> — on
+whether the pattern of taken and not-taken outcomes is something the predictor can learn.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In one sentence each: what does a CPU do at a branch rather than wait for the condition, and what is thrown away when the guess is
+wrong? Is the expensive part the comparison or the misprediction? (Answer after the next section.)</p>
+</aside>
+
+<h2>37.2 The predictor, and the array that made branches famous</h2>
+
+<p>The branch predictor is a small hardware table that records, per branch, the recent history of which way it went, and bets it will
+go the same way again; modern predictors correlate on the pattern of surrounding branches too (the classic strategies are surveyed by
+J. E. Smith, ISCA 1981). It is startlingly good on <em>regular</em> patterns: a loop that runs a million iterations takes its
+back-edge a million times and is mispredicted essentially once, on the final exit; a branch that is almost always taken is learned in a
+few iterations. Where it fails is on branches whose outcome is <strong>data-dependent and irregular</strong> — where taken and
+not-taken alternate with no learnable pattern. The canonical demonstration is a single data-dependent branch inside a hot loop, run
+first over unsorted data and then over the same data sorted. Here is that experiment, run in this environment (gcc 11.4.0, minimum of
+several trials), summing the elements <code>&gt;= 128</code> of a 32768-element array of random bytes, 20000 passes:</p>
+
+<pre><code>for (i) if (data[i] &gt;= 128) sum += data[i];     // one data-dependent branch per element
+
+# built so the compiler keeps a REAL branch (see &sect;37.4 for why this flag is needed):
+$ gcc -O2 -fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert branch.c
+$ ./a.out unsorted     random order, branch ~50% taken :  7.64 s
+$ ./a.out sorted       sorted first, branch predictable :  0.50 s      # ~15x faster, identical arithmetic</code></pre>
+
+<p>Same instructions, same additions, same 32768 elements summed 20000 times — and the sorted run is about <strong>15&times;</strong>
+faster. Nothing about the arithmetic changed; what changed is the <em>predictability</em> of the branch. On the random array, whether
+<code>data[i] &gt;= 128</code> is true is a coin flip with no pattern, so the predictor is wrong on roughly half of 655 million branches,
+and each miss costs a pipeline refill; on the sorted array the branch is false for the whole first stretch (all the values below 128)
+and then true for the whole rest, so it flips exactly once and is predicted correctly essentially always. This is the famous &ldquo;why
+is processing a sorted array faster&rdquo; effect, and it is real — but read the flag on the compile line, because it is doing something
+essential that &sect;37.4 returns to: we had to <em>forbid</em> the compiler from removing the branch in order to see the effect at all.
+The lesson of the raw phenomenon stands on its own, though: <strong>an unpredictable data-dependent branch in a hot loop can be the
+dominant cost</strong>, dwarfing the work it guards, and the profiler that pointed you at this loop (Chapter 33) is telling you about
+mispredictions, not arithmetic.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is the sorted run ~15&times; faster when the arithmetic is identical? On which array is the branch predictable, and why? What
+single change to the data — not the code — turned a ruinous branch into a nearly free one? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>37.3 Making the branch cheap: predication, cmov, and branchless code</h2>
+
+<p>If the misprediction is the cost, the cure is to stop mispredicting — and there are three ways, in rough order of preference. The
+first is to <strong>make the branch predictable</strong>: if sorting or partitioning the data groups the outcomes (as above), or if the
+branch is almost always one way, the predictor handles it and you need do nothing. The second, when the branch is inherently a coin
+flip, is to <strong>remove the branch</strong> and compute both sides, selecting the result with data — <em>branchless</em> code. The
+value <code>data[i] &gt;= 128 ? data[i] : 0</code> can be produced with no control flow at all: subtract 128, use the sign bit as a
+mask, and AND it against the value, so the loop always does the same instructions regardless of the data and there is nothing to
+mispredict. The hardware form of this is the <strong>conditional move</strong> (<code>cmov</code>): an instruction that selects one of
+two values based on a flag without branching, so the pipeline never has to guess. Here is the branchless mask version, run over the same
+data:</p>
+
+<pre><code>int m = (data[i] - 128) &gt;&gt; 31;   // 0 if &gt;=128, -1 if &lt;128 (arithmetic shift = sign bit)
+sum += data[i] &amp; ~m;             // adds data[i] when &gt;=128, else 0 — no branch
+
+$ ./a.out unsorted branchless :  0.87 s      # data order no longer matters
+$ ./a.out sorted   branchless :  1.01 s      # ~same as unsorted: nothing to mispredict</code></pre>
+
+<p>The branchless version runs in about the same time — near 0.9 s — <em>regardless of whether the data is sorted</em>, because it has
+no data-dependent branch: it is immune to the 15&times; swing entirely. Notice the trade it makes. On the unsorted data it is a large
+win (0.9 s versus the 7.64 s of the mispredicting branch), because it converts an unpredictable branch into unconditional arithmetic.
+But on the <em>sorted</em> data it is actually a little <em>slower</em> than the well-predicted branch (about 0.9&ndash;1.0 s versus 0.50
+s), because the branchless code always does the work of both paths — the mask, the AND, the add — whereas a correctly predicted branch
+does the work of only the taken path and skips the rest for free. That is the fundamental tension: <strong>branchless code trades a
+possible misprediction for guaranteed work on both paths</strong>. It wins when the branch is unpredictable (the misprediction you avoid
+costs more than the extra arithmetic) and loses when the branch is predictable (you pay for both paths to avoid a misprediction that
+was not going to happen). Which regime you are in is, once again, a property of the data, and the honest way to decide is to measure both
+— not to assume branchless is always faster.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a branch is a bet on the data</span>
+<p><strong>1. In words.</strong> To keep the pipeline full, the CPU guesses which way each branch goes and runs ahead speculatively. A
+correct guess is free; a wrong guess throws away a pipeline's worth of work (~15&ndash;20 cycles). So a branch is cheap when its
+outcomes are predictable and expensive when they are a data-dependent coin flip — and the fix is either to make the pattern learnable or
+to remove the branch and always do the work of both sides.</p>
+<p><strong>2. As a picture.</strong> Figure 37.1: a pipeline with several instructions in flight; at a branch, a predictor picks a path
+and speculation fills the pipe. Right guess &rarr; commit; wrong guess &rarr; squash and refill (the bubble). Below, three bars for the
+same summing loop: a mispredicting branch on unsorted data (tall), the same branch on sorted data (short), and branchless code
+(medium, and the same height whatever the order).</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, same arithmetic: a real data-dependent branch ran <strong>7.64 s unsorted vs
+0.50 s sorted</strong> — a 15&times; swing driven only by predictability (&sect;37.2). Branchless mask code ran ~0.9 s <em>either
+way</em> (&sect;37.3): a huge win over the mispredicting branch, a slight loss to the well-predicted one. Predictability, not
+instruction count, decided the cost.</p>
+</aside>
+
+<p><em>(Answer to the &sect;37.1 quick check: at a branch the CPU predicts the outcome and speculatively executes down the guessed path
+rather than stalling until the condition is known; on a wrong guess it squashes — discards — everything speculatively executed after the
+branch and refills the pipeline from the correct target. The expensive part is the misprediction, not the comparison: the
+<code>cmp</code> is one cheap instruction, while a wrong guess costs a pipeline-depth's worth of cycles.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 230" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Speculation keeps the pipeline full; a wrong guess squashes it. Predictability, not instruction count, sets the cost.</text>
+<text x="12" y="38" font-size="9" fill="#14406b">pipeline (instructions in flight):</text>
+<rect x="150" y="30" width="34" height="16" fill="#eef1f4" stroke="#14406b"/><text x="156" y="42" font-size="8">fetch</text>
+<rect x="186" y="30" width="34" height="16" fill="#eef1f4" stroke="#14406b"/><text x="190" y="42" font-size="8">decode</text>
+<rect x="222" y="30" width="34" height="16" fill="#eef1f4" stroke="#14406b"/><text x="230" y="42" font-size="8">exec</text>
+<rect x="258" y="30" width="40" height="16" fill="#eef1f4" stroke="#14406b"/><text x="264" y="42" font-size="8">branch?</text>
+<rect x="300" y="30" width="120" height="16" fill="#dfeee0" stroke="#2f7d32"/><text x="306" y="42" font-size="8" fill="#2f7d32">speculated (predicted path)</text>
+<text x="300" y="60" font-size="8" fill="#2f7d32">right guess &rarr; commit (free)</text>
+<rect x="430" y="30" width="120" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="436" y="42" font-size="8" fill="#8c3a1d">wrong guess &rarr; squash + refill</text>
+<text x="430" y="60" font-size="8" fill="#8c3a1d">bubble ~15&ndash;20 cycles (published)</text>
+<text x="12" y="92" font-size="9" fill="#14406b">wall-clock for the same summing loop (32768 bytes, 20000 passes):</text>
+<text x="12" y="114" font-size="8" fill="#8c3a1d">real branch, unsorted (mispredicts):</text>
+<rect x="205" y="106" width="380" height="11" fill="#efb9a5" stroke="#8c3a1d"/><text x="360" y="115" font-size="8">7.64 s</text>
+<text x="12" y="140" font-size="8" fill="#2f7d32">real branch, sorted (predictable):</text>
+<rect x="205" y="132" width="25" height="11" fill="#cfe6cf" stroke="#2f7d32"/><text x="234" y="141" font-size="8">0.50 s  (15&times; faster, same arithmetic)</text>
+<text x="12" y="166" font-size="8" fill="#14406b">branchless mask, unsorted:</text>
+<rect x="205" y="158" width="43" height="11" fill="#cfe0ef" stroke="#14406b"/><text x="252" y="167" font-size="8">0.87 s</text>
+<text x="12" y="192" font-size="8" fill="#14406b">branchless mask, sorted:</text>
+<rect x="205" y="184" width="50" height="11" fill="#cfe0ef" stroke="#14406b"/><text x="259" y="193" font-size="8">1.01 s  (order no longer matters; both paths always computed)</text>
+</svg>
+<figcaption>Figure 37.1: The CPU speculates past a branch to keep the pipeline full; a misprediction squashes and refills it. The same
+summing loop swung 15&times; (7.64 &rarr; 0.50 s) purely on whether the data made the branch predictable; branchless code ran ~0.9 s
+either way, immune to order but always doing both paths' work (&sect;37.2&ndash;&sect;37.3). Wall-clock, illustrative.</figcaption>
+</figure>
+
+<h2>37.4 What the compiler already did, and why you must measure</h2>
+
+<p>Now the flag on the &sect;37.2 compile line, which has been waiting. The 15&times; effect required
+<code>-fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert</code> — flags that <em>forbid</em> the compiler from
+transforming the branch. Left to its own devices, gcc at plain <code>-O2</code> does not emit a branch for this loop at all: it applies
+<strong>if-conversion</strong> (Chapter 10's optimizer), turning <code>if (data[i] &gt;= 128) sum += data[i];</code> into a branchless
+conditional move. Reading the emitted assembly confirms it — the inner loop contains a <code>cmovg</code>, not a conditional jump — and
+the timings show the effect has evaporated:</p>
+
+<pre><code>$ gcc -O2 branch.c                        # compiler free to choose; emits cmov, not a branch
+$ ./a.out unsorted :  1.09 s              # (asm: inner loop uses cmovg, no conditional jump)
+$ ./a.out sorted   :  0.95 s              # ~same as unsorted: there is no branch to mispredict
+
+$ gcc -O3 -march=native branch.c          # now it VECTORIZES the loop with a mask
+  branch.c:18: optimized: loop vectorized using 32 byte vectors    # -fopt-info-vec
+$ ./a.out unsorted :  0.23 s
+$ ./a.out sorted   :  0.21 s              # AVX2 masked add: order irrelevant, and fastest of all</code></pre>
+
+<p>Three builds, three stories. At <code>-O2</code> the compiler already de-branched the loop into a <code>cmov</code>, so both orders
+run in ~1 s and the sorted-array effect is <em>gone</em> — the compiler did the &sect;37.3 branchless transform for you. At
+<code>-O3 -march=native</code> the vectorizer (Chapter 36) goes further and computes the sum with a masked AVX2 add — eight elements per
+instruction, no branch — and both orders run in ~0.2 s, faster than any scalar version. The famous 15&times; effect only appeared
+because we <em>forced</em> the compiler to keep a real branch; the code most people actually ship, compiled at <code>-O2</code> or
+above, never had the branch in the first place. This is the chapter's real lesson, and it is a Chapter 33 lesson: <strong>the cost of a
+branch is a property of the compiled build, not of the source</strong>. You cannot read a misprediction penalty off the C code, because
+whether there is even a branch to mispredict depends on if-conversion and vectorization decisions the compiler makes at your optimization
+level and target. Counting branches in the source and multiplying by a published cycle penalty gives a number that is often simply
+wrong — the branch may not exist in the binary. The only reliable evidence is to look at what the compiler emitted (read the assembly,
+or check <code>-fopt-info-vec</code>) and to <em>time the build you ship</em>. Where a real, unpredictable, un-convertible branch does
+survive — a data-dependent call through a function pointer, a <code>switch</code> the compiler keeps as a jump, a branch guarding
+side-effecting work it cannot speculate — the &sect;37.2 penalty is real and the &sect;37.3 fixes apply; but you learn which case you are
+in by measuring, not by reasoning from the source.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: counting branches in the source &mdash; the misprediction that the compiler already removed</span>
+<p>The seductive move is to read a hot loop, spot a data-dependent <code>if</code>, multiply by &ldquo;~15 cycles per misprediction,&rdquo;
+and rewrite it branchless — <em>without</em> checking whether the branch survives compilation. It usually does not. At <code>-O2</code>
+gcc turned the &sect;37.2 <code>if</code> into a <code>cmovg</code> (confirmed in the assembly), and at <code>-O3 -march=native</code>
+it vectorized the whole loop with a masked add; in both builds there is no branch to mispredict and the &ldquo;15&times; effect&rdquo;
+does not exist. Hand-writing branchless mask code on top of that buys nothing — the compiler already did it — and can even lose, because
+your version may block the vectorizer that would have done better. Worse, the branchless rewrite is a <em>net loss</em> whenever the
+branch was actually predictable (sorted or almost-always-one-way data): it forces the work of both paths to dodge a misprediction that
+was not happening, and the &sect;37.3 numbers show it running slower than the well-predicted branch. Two defenses. First, before
+optimizing a branch, confirm it exists in the binary — read the assembly for a conditional jump versus a <code>cmov</code>, or check the
+vectorization report — because the source is not the build (Chapter 10). Second, if a real branch does survive, decide branch-vs-branchless
+by <em>measuring both on representative data</em> (Chapter 33), since the right choice flips with predictability. Reasoning from a cycle
+penalty in a table, against a branch the compiler already deleted, is optimizing a cost that is not there — the control-flow version of
+timing a loop whose result is unused.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I read that unpredictable branches cost ~15 cycles each, and our hot filter loop has a
+data-dependent <code>if</code> that's basically a coin flip on the input. I rewrote it branchless with bit-masks and I'm about to send
+the PR — should speed up the whole pipeline.&rdquo; Cover the paragraph and respond in four or five sentences, drawing on
+&sect;37.1&ndash;&sect;37.4.</p>
+<p><em>Model answer.</em> &ldquo;The instinct is right that unpredictable branches are expensive, but before we merge, let's check the
+branch is actually in the binary — at <code>-O2</code> or <code>-O3</code> gcc very often converts a small <code>if</code> like that
+into a <code>cmov</code> or vectorizes it with a mask, in which case there's no branch to mispredict and your rewrite is doing by hand
+what the compiler already did (and it might even block the auto-vectorizer). So step one is read the assembly or the
+<code>-fopt-info-vec</code> report for the current build. Step two, if a real branch does survive, measure both versions on
+representative data, because branchless only wins when the branch is genuinely unpredictable — if the data is sorted or the condition is
+almost always one way, the predicted branch is faster and your always-both-paths version is a regression. Let's get those two numbers
+before the PR, so we're shipping a measured win and not a plausible-sounding rewrite of a cost that may not exist.&rdquo; Checking that
+the branch survives the compiler, then measuring branch-vs-branchless on real data, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;37.2 quick check: the sorted run is ~15&times; faster because the branch is predictable — false for
+the whole run of values below 128, then true for the rest, so it flips once and the predictor is right almost always; on the unsorted
+array the outcome is a coin flip with no pattern, so the predictor is wrong on ~half the branches and each miss costs a pipeline refill.
+The single change was to the data — sorting it — not to the code; the arithmetic is identical. And this only shows up when the
+compiler is forbidden to remove the branch, per &sect;37.4.)</em></p>
+
+<h2>37.5 What to carry forward</h2>
+
+<p>A <strong>branch</strong> forces the CPU to guess: to keep its deep pipeline full, the core predicts each branch's outcome and
+speculatively executes down the guessed path, committing the work if the guess was right and squashing a pipeline's worth of it if the
+guess was wrong — a <strong>misprediction penalty</strong> of roughly 15&ndash;20 cycles (published). So a branch is nearly free when its
+outcomes are predictable and can be the dominant cost when they are an irregular, data-dependent coin flip: the same summing loop swung
+<strong>15&times;</strong> (7.64 &rarr; 0.50 s) purely on whether the data made the branch learnable (&sect;37.2). The fixes, in order:
+make the branch predictable (sort or partition the data so the pattern is learnable); or remove it with <strong>branchless</strong> code
+or a <strong>conditional move</strong>, which is immune to data order but always pays for both paths — a win only when the branch is
+genuinely unpredictable (&sect;37.3). Above all, remember the twist that makes this a measurement discipline, not a cycle-counting one:
+<strong>the compiler has usually already removed your branch</strong>. At <code>-O2</code> gcc if-converted the example into a
+<code>cmov</code>; at <code>-O3 -march=native</code> it vectorized it away entirely; the famous effect only survived because we forbade
+both. So the cost of a branch is a property of the build, and the honest way to find it is to read the emitted instructions and time the
+binary you ship (&sect;37.4) — not to count <code>if</code>s in the source.</p>
+
+<p>This is the same through-line the part has followed. Chapter 33 said measure first; Chapters 34 and 35 raised the memory ceiling with
+locality and layout; Chapter 36 raised the compute ceiling with SIMD; and this chapter opened the <em>control</em> cost — the branch the
+CPU guessed wrong — only to find that the compiler often eliminates it before you can, so the discipline is to check the build rather
+than reason from the source. Two costs the profiler routinely hands you remain before the part closes. The next chapter opens the one
+Chapter 33 named alongside cache misses and mispredictions — <strong>the cost of dynamic allocation</strong>, where the time goes not
+into your loop at all but into <code>malloc</code> and <code>free</code> and the scattered memory they hand back (<a href="#ch38">Chapter
+38</a>). Then a final chapter (<a href="#ch39">Chapter 39</a>) ties the whole part into one workflow: given a profile, which ceiling are
+you under, and how do you raise it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a branch threatens pipeline parallelism, and what speculation and squashing are.</li>
+<li>State what a misprediction costs (order of magnitude), and that it is the penalty, not the comparison.</li>
+<li>Explain why the sorted array ran ~15&times; faster with identical arithmetic.</li>
+<li>Say when branchless code (or a <code>cmov</code>) wins and when it loses, in terms of predictability.</li>
+<li>Explain why the effect appeared only with if-conversion disabled, and what that says about source vs build.</li>
+<li>State how you would confirm whether a branch even exists in the binary.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why does a modern CPU predict branches and execute speculatively, and what is thrown away on a wrong guess? (&sect;37.1)</li>
+<li><strong>R2.</strong> In the sorted-vs-unsorted experiment, why is the sorted run ~15&times; faster when the arithmetic is identical? (&sect;37.2)</li>
+<li><strong>R3.</strong> What does branchless code (or <code>cmov</code>) trade away, and in which data regime does it win versus lose? (&sect;37.3)</li>
+<li><strong>R4.</strong> Why did the 15&times; effect require disabling if-conversion, and what does that prove about reading branch cost off the source? (&sect;37.4)</li>
+<li><strong>R5.</strong> How do you confirm whether a data-dependent <code>if</code> is actually a branch in the shipped binary? (&sect;37.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>John L. Hennessy &amp; David A. Patterson, <em>Computer Architecture: A Quantitative Approach</em>, 6th ed. (Morgan
+Kaufmann, 2017), ISBN 978-0-12-811905-1.</strong> Chapter 3 (&ldquo;Instruction-Level Parallelism and Its Exploitation&rdquo;) is the
+architectural source for &sect;37.1&ndash;&sect;37.2 — pipelines, speculation, dynamic branch prediction, and the misprediction penalty.
+First author John Hennessy; edition and ISBN verified via the publisher.</li>
+<li><strong>Agner Fog, <em>The microarchitecture of Intel, AMD, and VIA CPUs: An optimization guide for assembly programmers and compiler
+makers</em> (<code>agner.org/optimize</code>, continuously updated).</strong> The practical reference for the per-microarchitecture
+branch-prediction algorithms and the published pipeline-depth and misprediction-penalty figures used in &sect;37.1. Author Agner Fog;
+a living document, cited as such — consult the current version.</li>
+<li><strong>James E. Smith, &ldquo;A Study of Branch Prediction Strategies,&rdquo; in <em>Proceedings of the 8th Annual Symposium on
+Computer Architecture (ISCA '81)</em>, pp. 135&ndash;148 (1981).</strong> The classic survey of branch-prediction strategies behind
+&sect;37.2 — the history of how predictors learn patterns. First author James E. Smith; conference and pages verified; this legacy paper
+carries no resolvable DOI, so it is cited by venue and pages.</li>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 4 (processor architecture and pipelining) and Chapter 5 (optimizing program performance, including
+the effect of branches and the compiler's transformations) cover this chapter from the programmer's side. First author Randal Bryant;
+edition and ISBN verified via the publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex37.1"><span class="ex-label">37.1</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, explain why a deeply pipelined CPU cannot simply wait at a branch for the condition to be computed, and what it does
+instead.</div>
+
+<div class="exercise" id="ex37.2"><span class="ex-label">37.2</span> <span class="ex-tag warm">warm-up</span>
+What is a branch-misprediction penalty, roughly how many cycles is it on modern x86 (order of magnitude, and label it as a published
+figure), and why is it about the depth of the pipeline?</div>
+
+<div class="exercise" id="ex37.3"><span class="ex-label">37.3</span> <span class="ex-tag warm">warm-up</span>
+The comparison in <code>if (data[i] &gt;= 128)</code> is a single cheap instruction. Explain why, then, the branch can still be the most
+expensive thing in the loop.</div>
+
+<div class="exercise" id="ex37.4"><span class="ex-label">37.4</span> <span class="ex-tag core">core</span>
+The summing loop ran 7.64 s on unsorted data and 0.50 s on the same data sorted, with a real branch. (a) Explain the ~15&times;
+difference in terms of the predictor and the misprediction penalty. (b) Why is the branch predictable on the sorted array and not on the
+unsorted one? (c) The arithmetic and instruction count are identical in both runs — what, precisely, differs?</div>
+
+<div class="exercise" id="ex37.5"><span class="ex-label">37.5</span> <span class="ex-tag core">core</span>
+Branchless code. (a) Rewrite <code>if (x &gt;= 128) sum += x;</code> as branchless arithmetic using the sign bit as a mask, and explain
+why it has nothing to mispredict. (b) The branchless version ran ~0.9 s on both sorted and unsorted data, while the real branch ran 0.50
+s on sorted data — why is branchless <em>slower</em> here than the well-predicted branch? (c) State the rule for when branchless wins.</div>
+
+<div class="exercise" id="ex37.6"><span class="ex-label">37.6</span> <span class="ex-tag core">core</span>
+The 15&times; effect only appeared with <code>-fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert</code>. (a) What did the
+compiler do to the branch at plain <code>-O2</code>, and how would you confirm it from the binary? (b) What did it do at
+<code>-O3 -march=native</code>? (c) What does this say about estimating branch cost by reading the C source?</div>
+
+<div class="exercise" id="ex37.7"><span class="ex-label">37.7</span> <span class="ex-tag complexity">cost</span>
+A hot loop runs <var>K</var> iterations, each with one data-dependent branch, and a misprediction costs <var>p</var> cycles. (a) Write
+the extra cycles spent on mispredictions if the branch is mispredicted a fraction <var>f</var> of the time. (b) Contrast <var>f</var> =
+0.5 (coin flip) with <var>f</var> near 0 (predictable). (c) A branchless version does <var>w</var> extra cycles of both-paths work per
+iteration and never mispredicts; write the condition on <var>f</var>, <var>p</var>, <var>w</var> under which branchless is faster.</div>
+
+<div class="exercise" id="ex37.8"><span class="ex-label">37.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague benchmarks a data-dependent <code>if</code> in a hot loop, sees no difference
+between sorted and unsorted input, and concludes &ldquo;branch prediction is a myth on this CPU.&rdquo;
+<br><strong>Step 1 (given):</strong> they compiled at <code>-O2</code>, the default for their build.
+<br><strong>Step 2 (given):</strong> reading the assembly shows the inner loop uses <code>cmovg</code>, not a conditional jump.
+<br><strong>Step 3 (given):</strong> a conditional move is branchless — there is no prediction and nothing to mispredict.
+<br><strong>Step 4 (you):</strong> Explain why they saw no sorted-vs-unsorted difference, what single change would let them observe the
+effect, and why the correct conclusion is about the <em>build</em>, not the CPU.</div>
+
+<div class="exercise" id="ex37.9"><span class="ex-label">37.9</span> <span class="ex-tag mixed">mixed</span>
+For each branch, say whether the predictor is likely to handle it well or badly, and why: (a) a loop back-edge running 10 million
+iterations; (b) <code>if (rand() &amp; 1)</code> inside a hot loop; (c) <code>if (ptr != NULL)</code> where <code>ptr</code> is almost
+never null; (d) a <code>switch</code> on the next byte of compressed data with a uniform distribution over 8 cases.</div>
+
+<div class="exercise" id="ex37.10"><span class="ex-label">37.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A data-dependent <code>if</code> in C always costs a
+misprediction penalty at run time.&rdquo; (b) &ldquo;Branchless code is always faster than a branch.&rdquo; (c) &ldquo;A correctly
+predicted branch is nearly free.&rdquo; (d) &ldquo;<code>-O3 -march=native</code> can turn a scalar <code>if</code>-loop into a masked
+vector loop with no branch.&rdquo; (e) &ldquo;You can read a loop's misprediction cost off the C source without looking at the
+build.&rdquo;</div>
+
+<div class="exercise" id="ex37.11"><span class="ex-label">37.11</span> <span class="ex-tag stretch">stretch</span>
+Tie this chapter to the rest of the part. (a) A profile (Chapter 33) shows a hot loop, and you suspect branch misprediction; describe
+the sequence of checks — build? assembly? measurement? — you would run before rewriting anything. (b) Explain how &sect;37.4's masked
+vectorization connects branch elimination to Chapter 36 (SIMD). (c) Argue why &ldquo;a branch's cost is a property of the build and the
+data, not the source&rdquo; is a better mental model than &ldquo;branches are slow, so avoid them.&rdquo;</div>
+
+<div class="exercise" id="ex37.12"><span class="ex-label">37.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain with a vectorizing compiler): (a) Write the summing loop <code>if (data[i] &gt;= 128) sum +=
+data[i];</code> over a 32768-element random-byte array; compile once at plain <code>-O2</code> and once with if-conversion disabled
+(<code>-fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert</code>), and time each on unsorted and on sorted data as the
+minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials. (b) Report which build shows the sorted-vs-unsorted swing and
+which does not, and confirm by reading the assembly (look for <code>cmov</code> vs a conditional jump). (c) Add a branchless mask version
+and show it is order-independent. (d) State your toolchain and CPU, and note these are wall-clock times (no hardware counters) if you
+lack <code>perf</code>.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch38">
+<h1>Chapter 38 — The Cost of Dynamic Allocation</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch09">Chapter 9</a> (manual allocation — what <code>malloc</code> and
+<code>free</code> are and what goes wrong), <a href="#ch12">Chapter 12</a> (custom allocators — arenas, pools, and free-lists, built there
+for correctness and reused here for speed), <a href="#ch03">Chapter 3</a> (the memory hierarchy — why <em>where</em> the allocator puts
+your objects matters as much as how long the call took), <a href="#ch34">Chapter 34</a> (locality — the ceiling scattered allocation
+runs you into), <a href="#ch33">Chapter 33</a> (measure first). &nbsp;·&nbsp; The last chapter opened the control cost — a branch guessed
+wrong; this one opens the cost the profiler blames on nothing in your loop at all, because the time went into <code>malloc</code>,
+<code>free</code>, and the scattered memory they hand back.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch09">Chapter 9</a> — what does a general-purpose <code>malloc</code> have to <em>do</em> on a
+call beyond returning a pointer: how does it find a free block of the right size, and what does <code>free</code> have to track? (2)
+<a href="#ch12">Chapter 12</a> — what is an <em>arena</em> (bump) allocator, and why is its allocation just a pointer increment? (3)
+<em>Predict:</em> you allocate a million 32-byte objects, first with a <code>malloc</code> per object and then by bump-allocating them
+out of one big block (an arena). Two questions: how much faster is the arena's <em>per-object</em> cost — about the same, 2&times;, or
+more? And after you have them, you walk a linked list through all million objects: how much does it matter whether the objects are
+contiguous or scattered across the heap — a little, or a lot? Write your guesses; &sect;38.2 answers both.</p>
+</aside>
+
+<p>A call to <code>malloc</code> looks like it costs nothing — it returns a pointer and you move on — but it is a real computation, and
+sometimes an expensive one. A general-purpose allocator must, on each call, find a free block of at least the requested size in a heap
+shared by every other allocation in the program: it searches size-segregated free-lists, may split a larger block or coalesce freed
+neighbours, updates per-block bookkeeping (the size and status headers of Chapter 9), keeps it all thread-safe, and occasionally asks the
+kernel for more memory with a system call (Chapter 13). None of that is your program's work; it is the tax of asking a shared, general
+mechanism for a block of a general size at a general time. And there is a second cost that does not show up in the call at all:
+<code>malloc</code> is free to hand back blocks scattered anywhere in the heap, so a data structure built from many small allocations ends
+up spread across memory — and walking it then pays a cache miss per node (Chapter 3), which the profiler charges to your traversal loop,
+not to the allocator that scattered the data. This chapter is about both costs and their cure. It proceeds in five steps: why an
+allocation can cost more than the memory it returns (&sect;38.1); the two costs measured here — the call and the cache (&sect;38.2);
+making allocation cheap with arenas, pools, and free-lists (&sect;38.3); what the allocator already does for you, and why you must
+measure rather than assume (&sect;38.4); and what to carry forward (&sect;38.5).</p>
+
+<p><strong>On the code in this chapter.</strong> As before the programs are C, compiled with gcc 11.4.0 and run in this environment on an
+Intel Core i7-12700H, against the system allocator (glibc 2.35's <code>ptmalloc2</code>), timed with
+<code>clock_gettime(CLOCK_MONOTONIC)</code> and reported as the minimum of several trials (Chapter 33). Times are wall-clock and are
+illustrative of the effect, not a benchmark of the allocator. The cache sizes quoted (L1d 48&nbsp;KiB, L2 1.25&nbsp;MiB, L3 24&nbsp;MiB)
+are read from <code>/sys/devices/system/cpu/cpu0/cache</code> on this machine, so the pointer-chase working set below is chosen to exceed
+them. A hardware-counter profiler (<code>perf</code>, which would report cache-miss counts directly) is <em>not</em> installed here, so
+the evidence for the locality cost is wall-clock time plus the arithmetic that the scattered working set cannot fit in cache; the numbers
+depend on this allocator and this machine and are meant to show the <em>shape</em> of the cost, not a portable constant.</p>
+
+<h2>38.1 Why an allocation can cost more than the memory it returns</h2>
+
+<p>The stack costs nothing to allocate on: a function's locals appear by decrementing the stack pointer, one instruction, and vanish when
+the frame pops (Chapter 8). The heap is the opposite: it is a single pool of memory shared by every allocation in the program, with no
+implied order of freeing, so the allocator must actively <em>manage</em> it. On a <code>malloc(n)</code> it has to locate a free block of
+at least <code>n</code> bytes — typically by walking a <strong>free-list</strong> of available blocks, often segregated into size classes
+so the search is bounded — and if the block it finds is bigger than needed it <strong>splits</strong> it, returning part and keeping the
+remainder free. Each block carries a header recording its size and whether it is in use, so the allocator can find its neighbours; on
+<code>free</code> it reads that header, marks the block available, and often <strong>coalesces</strong> it with adjacent free blocks to
+fight fragmentation (Wilson et&nbsp;al.'s survey catalogues the strategies). All of this must be safe against other threads, so a shared
+allocator takes a lock or manipulates per-thread caches. And when the heap has no block to give, <code>malloc</code> crosses the
+<strong>system-call boundary</strong> (Chapter 13) — <code>brk</code> or <code>mmap</code> — to get more from the kernel, which is orders
+of magnitude more expensive than the common case. The point is that a general-purpose allocation is a small algorithm over shared
+mutable state, not a free handout: the classic account (Bryant &amp; O'Hallaron, ch.9) shows a real <code>malloc</code> is dozens of
+instructions of list-walking and bookkeeping in the good case and a syscall in the bad one. Whether that matters depends, as always, on
+how often you do it — a handful of allocations at startup is invisible; millions inside a hot loop are not.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name three things a general-purpose <code>malloc</code> may have to do on a single call beyond returning a pointer. Why is a stack
+allocation essentially free while a heap allocation is not? (Answer after the next section.)</p>
+</aside>
+
+<h2>38.2 The two costs, measured: the call and the cache</h2>
+
+<p>There are two distinct costs, and it is worth separating them because they have different cures. The first is the <strong>per-call
+cost</strong> of allocation and deallocation itself. Here, allocating a million 32-byte objects one <code>malloc</code> at a time and then
+freeing them all, versus bump-allocating them out of a single arena block and freeing the arena in one call, run in this environment
+(gcc 11.4.0, minimum of several trials):</p>
+
+<pre><code>1,000,000 objects of 32 bytes:
+                          allocate        free            per object (alloc+free)
+malloc / free (glibc) :  9.6 ns/op   +   8.6 ns/op    =   ~18 ns/object
+arena (bump pointer)  :  3.6 ns/op   +   ~0           =   ~3.6 ns/object   (one free() for all 1,000,000)</code></pre>
+
+<p>The arena is about <strong>5&times; cheaper per object</strong> on allocation-plus-free, and the asymmetry is even sharper than that
+average: arena allocation is a pointer increment (~3.6&nbsp;ns), and arena <em>deallocation</em> is a single <code>free()</code> of the
+whole block no matter how many objects it held, so the per-object free cost is essentially zero, versus ~8.6&nbsp;ns each for a million
+individual <code>free</code>s. That is the first cost, and it is real but bounded — a few nanoseconds per object. The second cost is
+larger and sneakier: <strong>locality</strong>. Because <code>malloc</code> can return blocks from anywhere in the heap, a structure built
+from many separate allocations is scattered across memory, and walking it pays a cache miss per node. Here is the same set of objects
+linked into a list and traversed, once when the nodes are contiguous (an arena, list order = memory order) and once when each node was
+<code>malloc</code>'d separately and linked in a shuffled order so consecutive nodes are far apart — a working set of ~244&nbsp;MiB, far
+larger than this machine's 24&nbsp;MiB L3:</p>
+
+<pre><code>traverse 4,000,000 nodes (64 bytes each, ~244 MiB &gt;&gt; 24 MiB L3), summing one field:
+contiguous (arena)      :   8.1 ns/node       (hardware prefetcher hides the latency; near-sequential)
+scattered (malloc+shuffle): 177 ns/node       (a cache miss, often a TLB miss, per node)
+                                              ~22x slower, identical pointer-chasing loop</code></pre>
+
+<p>Same loop, same number of nodes, same arithmetic — and the scattered layout is about <strong>22&times; slower</strong>, at ~177&nbsp;ns
+per node against ~8&nbsp;ns. Nothing in the traversal code changed; what changed is <em>where the allocator put the nodes</em>. On the
+contiguous arena the accesses march sequentially through memory, so the hardware prefetcher (Chapter 3) fetches the next line before the
+loop asks for it and most accesses hit cache; on the scattered heap each <code>p = p-&gt;next</code> jumps to an unpredictable address
+that is not in cache and not prefetchable, so the core stalls on DRAM — hundreds of cycles — for essentially every node. This is the cost
+that hides: a profiler points at the <em>traversal</em> loop as hot, and it is, but the reason is a memory layout decided long ago by how
+you allocated. The 22&times; here dwarfs the ~5&times; per-call cost, which is the chapter's real lesson — <strong>the expensive thing
+about dynamic allocation is usually not the call, it is the scattered memory the call hands back</strong>, and that cost is paid not at
+allocation time but on every later traversal.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Which was the larger cost here — the per-call overhead of <code>malloc</code>/<code>free</code> (~5&times;), or the locality penalty
+of scattered nodes (~22&times;)? Why does the contiguous traversal hit cache while the scattered one misses, when the loop is identical?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>38.3 Making allocation cheap: arenas, pools, and free-lists</h2>
+
+<p>The fixes are the custom allocators of Chapter 12, now motivated by speed rather than only control. Each attacks a specific cost, in
+rough order of how much structure you need. An <strong>arena</strong> (or <em>bump</em>, or <em>region</em>) allocator serves allocations
+by incrementing a pointer through one large block and frees nothing individually — you throw away the whole region at once when the phase
+that owns it ends. It wins on both costs at once: allocation is a pointer add (the ~3.6&nbsp;ns above), deallocation is one call, and
+because the objects are handed out consecutively they are <em>contiguous</em>, so later traversals get the ~8&nbsp;ns locality instead of
+177. Its constraint is its power: you cannot free one object, only the whole arena, so it fits phase- or request-scoped work — parse a
+document, serve a request, run a frame — where everything allocated in the phase dies together. A <strong>pool</strong> (or
+<em>slab</em>) allocator handles the case where objects are all the <em>same size</em> and are individually freed and reused: it carves a
+block into fixed-size slots and keeps a free-list of them, so both allocation and deallocation are an O(1) push/pop and the objects stay
+packed and cache-friendly. A general <strong>free-list</strong> allocator is the same idea for mixed sizes and is essentially what a
+general-purpose <code>malloc</code> already is — which is the hint that a hand-rolled allocator only helps when it can exploit something
+the general one cannot: a known lifetime (arena), a known fixed size (pool), or a known usage pattern. The measured payoff — the arena's
+~5&times; on the call and ~22&times; on traversal — comes precisely from discarding generality the shared allocator has to keep: it does
+not need to support freeing individual objects, arbitrary sizes, or interleaving with the rest of the program, and it buys speed and
+contiguity with those constraints (Berger, Zorn &amp; McKinley studied exactly this trade in real programs). The discipline is to reach
+for a custom allocator when the allocation pattern has such a structure to exploit, and to keep the general <code>malloc</code> when it
+does not.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: allocation is management, and scattering is the hidden cost</span>
+<p><strong>1. In words.</strong> A general <code>malloc</code> manages one shared heap: it searches free-lists, splits and coalesces
+blocks, locks, and sometimes calls the kernel — so a call is a small algorithm, not a handout. Worse, it can put your objects anywhere,
+so a structure of many small allocations is scattered, and every later walk of it pays a cache miss per node. A custom allocator that
+knows the lifetime (arena) or the size (pool) drops the generality, making the call a pointer bump and the objects contiguous.</p>
+<p><strong>2. As a picture.</strong> Figure 38.1: on the left a heap with objects scattered among free gaps, a traversal arrow zig-zagging
+across memory (miss, miss, miss); on the right an arena with the same objects packed consecutively, the arrow marching straight through
+(hit, hit, hit). Below, two bar pairs: per-object cost (malloc/free ~18&nbsp;ns vs arena ~3.6&nbsp;ns) and per-node traversal (scattered
+~177&nbsp;ns vs contiguous ~8&nbsp;ns).</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, one million 32-byte objects: <code>malloc</code>/<code>free</code> cost
+~18&nbsp;ns/object, an arena ~3.6&nbsp;ns with an O(1) bulk free — <strong>~5&times;</strong> (&sect;38.2). Then walking four million
+linked nodes: contiguous ~8&nbsp;ns/node, scattered ~177&nbsp;ns/node — <strong>~22&times;</strong> (&sect;38.2). The call is a few
+nanoseconds; the scattered memory it returns is the dominant cost, paid on every traversal.</p>
+</aside>
+
+<p><em>(Answer to the &sect;38.1 quick check: on a single call a general <code>malloc</code> may walk a size-segregated free-list to
+find a block, split a larger block or coalesce freed neighbours, update per-block size/status headers, take a lock or use a per-thread
+cache for thread-safety, and occasionally make a <code>brk</code>/<code>mmap</code> system call for more memory. A stack allocation is
+essentially free because it is a single decrement of the stack pointer with a statically known lifetime — the frame — whereas the heap is
+a shared pool with no implied freeing order, so it must be actively managed.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 250" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Scattered heap allocations miss cache on every traversal; an arena packs them contiguous.</text>
+<text x="12" y="38" font-size="9" fill="#8c3a1d">scattered (malloc): nodes spread among free gaps &mdash; the walk zig-zags across memory</text>
+<rect x="12" y="46" width="28" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><rect x="40" y="46" width="18" height="16" fill="#eef1f4" stroke="#b9c2cc"/><rect x="58" y="46" width="28" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><rect x="86" y="46" width="34" height="16" fill="#eef1f4" stroke="#b9c2cc"/><rect x="120" y="46" width="28" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><rect x="148" y="46" width="14" height="16" fill="#eef1f4" stroke="#b9c2cc"/><rect x="162" y="46" width="28" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><rect x="190" y="46" width="40" height="16" fill="#eef1f4" stroke="#b9c2cc"/><rect x="230" y="46" width="28" height="16" fill="#f6dcd2" stroke="#8c3a1d"/>
+<path d="M26 46 C 60 26, 60 26, 72 46" fill="none" stroke="#8c3a1d" stroke-width="1"/><path d="M72 62 C 110 82, 110 82, 134 62" fill="none" stroke="#8c3a1d" stroke-width="1"/><path d="M134 46 C 150 30, 160 30, 176 46" fill="none" stroke="#8c3a1d" stroke-width="1"/><path d="M176 62 C 210 82, 220 82, 244 62" fill="none" stroke="#8c3a1d" stroke-width="1"/>
+<text x="270" y="58" font-size="8" fill="#8c3a1d">miss, miss, miss &rarr; ~177 ns/node</text>
+<text x="12" y="92" font-size="9" fill="#2f7d32">arena: same objects packed consecutively &mdash; the walk marches straight through</text>
+<rect x="12" y="100" width="28" height="16" fill="#dfeee0" stroke="#2f7d32"/><rect x="40" y="100" width="28" height="16" fill="#dfeee0" stroke="#2f7d32"/><rect x="68" y="100" width="28" height="16" fill="#dfeee0" stroke="#2f7d32"/><rect x="96" y="100" width="28" height="16" fill="#dfeee0" stroke="#2f7d32"/><rect x="124" y="100" width="28" height="16" fill="#dfeee0" stroke="#2f7d32"/><rect x="152" y="100" width="28" height="16" fill="#dfeee0" stroke="#2f7d32"/><rect x="180" y="100" width="28" height="16" fill="#dfeee0" stroke="#2f7d32"/><rect x="208" y="100" width="28" height="16" fill="#dfeee0" stroke="#2f7d32"/>
+<path d="M40 108 L 236 108" fill="none" stroke="#2f7d32" stroke-width="1" marker-end="url(#a)"/>
+<text x="270" y="112" font-size="8" fill="#2f7d32">hit, hit, hit (prefetched) &rarr; ~8 ns/node</text>
+<text x="12" y="146" font-size="9" fill="#14406b">per-object cost (1,000,000 &times; 32 B):</text>
+<rect x="200" y="138" width="180" height="10" fill="#efb9a5" stroke="#8c3a1d"/><text x="384" y="146" font-size="8">malloc/free ~18 ns</text>
+<rect x="200" y="150" width="36" height="10" fill="#cfe6cf" stroke="#2f7d32"/><text x="240" y="158" font-size="8">arena ~3.6 ns (+O(1) bulk free) &mdash; ~5&times;</text>
+<text x="12" y="182" font-size="9" fill="#14406b">per-node traversal (4,000,000 nodes, 244 MiB):</text>
+<rect x="200" y="174" width="360" height="10" fill="#efb9a5" stroke="#8c3a1d"/><text x="360" y="182" font-size="8" fill="#ffffff">scattered ~177 ns</text>
+<rect x="200" y="186" width="16" height="10" fill="#cfe6cf" stroke="#2f7d32"/><text x="220" y="194" font-size="8">contiguous ~8 ns &mdash; ~22&times;</text>
+<text x="12" y="224" font-size="8" fill="#14406b">The call is a few nanoseconds; the scattered memory it returns is the dominant cost, paid on every walk.</text>
+</svg>
+<figcaption>Figure 38.1: Dynamic allocation has two costs. The per-call overhead of <code>malloc</code>/<code>free</code> (~18&nbsp;ns/object)
+is real but bounded; an arena cuts it ~5&times; and makes deallocation O(1). The larger cost is <em>locality</em>: because
+<code>malloc</code> scatters objects, traversing a structure built from many small allocations misses cache on every node (~177&nbsp;ns)
+versus a contiguous arena (~8&nbsp;ns) — ~22&times; on an identical loop (&sect;38.2). Wall-clock, illustrative.</figcaption>
+</figure>
+
+<h2>38.4 What the allocator already does, and why you must measure</h2>
+
+<p>Before hand-rolling an allocator, the same caution the last two chapters raised applies here: the general <code>malloc</code> is far
+better than its worst case, and much of the naive win may already be taken. Modern allocators keep <strong>per-thread caches</strong>
+(glibc's <code>tcache</code>, and the arena-per-thread design that gives <code>ptmalloc2</code> its name) so a common-size allocation
+that was recently freed is served from a thread-local free-list with no lock and no search — which is exactly why the
+&sect;38.2 <code>malloc</code>/<code>free</code> came in at ~18&nbsp;ns and not the hundreds a syscall would cost. When your allocation
+pattern is allocate-and-free-in-a-tight-loop of one size, the allocator's fast path is already close to a pool, and a hand-written pool
+may buy little; when it is many long-lived small objects of mixed size, freed in no particular order, the general allocator scatters them
+and the arena's contiguity win (&sect;38.2's 22&times;) is large. You cannot tell which regime you are in by reading the code — it
+depends on sizes, lifetimes, thread counts, and the allocator's own heuristics — so the rule is the part's rule: <strong>measure the
+allocation cost in the workload you actually run</strong>. A profiler that shows time in <code>malloc</code>/<code>free</code> tells you
+the per-call cost is real; a profiler that shows time in a traversal loop over freshly allocated data, with a high cache-miss rate, is
+pointing at the <em>locality</em> cost even though the allocator's name never appears. And there is a measurement trap specific to
+allocation: a microbenchmark that allocates a million objects and immediately frees each one will hit the <code>tcache</code> fast path
+and look cheap, hiding the fragmentation and scattering that the same allocations cause in a long-running program where they interleave
+with everything else. As always, the number you can act on comes from the representative workload, not the convenient microbenchmark —
+and the fix you reach for (cheaper calls, or better locality) depends on <em>which</em> of the two costs the measurement shows.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: blaming the allocator's speed &mdash; the cost that is really the scattered memory</span>
+<p>The seductive move is to see time in a hot loop that walks a linked structure, conclude &ldquo;allocation is slow,&rdquo; and either
+swap in a faster <code>malloc</code> or cache allocated objects to avoid the calls — attacking the ~5&times; per-call cost while ignoring
+the ~22&times; one. The per-call cost is rarely where the time is: at ~18&nbsp;ns an allocation, a program doing millions of them per
+second spends a percent or two in <code>malloc</code>. The time is in the <em>traversals</em>, and it is there because the objects are
+scattered — a cache miss per node (&sect;38.2), which no faster allocator fixes if it still hands back non-contiguous blocks. Two
+defenses. First, distinguish the two costs with the profile: is the time in <code>malloc</code>/<code>free</code> themselves (a per-call
+problem — batch, pool, or arena the calls) or in a loop over the allocated data with a high miss rate (a locality problem — the fix is a
+contiguous layout, Chapters 34&ndash;35, which an arena gives for free)? Second, remember that the largest allocation win is usually not a
+faster allocator but <em>fewer, more contiguous</em> allocations — an arena or a flat array instead of a graph of separately-<code>malloc</code>'d
+nodes — because it converts hundreds-of-cycles pointer chases into prefetchable sequential access. Optimizing the allocator's call speed
+against a workload whose real cost is scattered traversal is the allocation version of raising a ceiling you are not under.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our graph traversal is the hot loop in the profile, and it's full of pointer-chasing
+over nodes we <code>malloc</code>'d one at a time. I'm going to drop in a faster third-party <code>malloc</code> — that should speed up
+the traversal.&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;38.1&ndash;&sect;38.4.</p>
+<p><em>Model answer.</em> &ldquo;A faster <code>malloc</code> probably won't move the traversal, because the traversal doesn't call
+<code>malloc</code> — the allocation already happened. What's slow is that each node was allocated separately, so they're scattered
+across the heap and every <code>p = p-&gt;next</code> is a cache miss; on our numbers a scattered walk runs ~20&times; slower than a
+contiguous one over the same nodes, and that gap is memory latency, not allocator speed. The faster allocator would cut the
+<em>allocation</em> time, which is likely a percent or two of the run, not the traversal. The real fix is to make the nodes contiguous —
+allocate them out of an arena, or flatten the graph into arrays with indices instead of pointers — so the walk becomes prefetchable
+sequential access. Let's confirm with the profile that the time is in the traversal's cache misses, not in <code>malloc</code>, and then
+change the layout, not the allocator.&rdquo; Separating the per-call cost from the locality cost, and fixing layout rather than swapping
+allocators, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;38.2 quick check: the locality penalty of scattered nodes was far larger — ~22&times; on the traversal versus
+~5&times; on the per-call cost. The contiguous traversal hits cache because it walks memory sequentially, so the hardware prefetcher
+loads the next cache line before the loop needs it; the scattered traversal misses because each <code>next</code> pointer jumps to an
+unpredictable address that is neither in cache nor prefetchable, stalling on DRAM for essentially every node — the loop is identical, but
+the memory layout the allocator produced is not.)</em></p>
+
+<h2>38.5 What to carry forward</h2>
+
+<p><strong>Dynamic allocation</strong> has two costs, and they need different cures. The first is the <strong>per-call cost</strong>: a
+general-purpose <code>malloc</code> manages a shared heap — searching free-lists, splitting and coalescing, locking, and occasionally
+calling the kernel — so an allocation is a small algorithm, not a handout (Chapter 9). Measured here it is ~18&nbsp;ns per allocate-plus-free
+of a small object, which an arena cuts to ~3.6&nbsp;ns with an O(1) bulk free — about <strong>5&times;</strong> (&sect;38.2). The second,
+usually larger, cost is <strong>locality</strong>: because <code>malloc</code> scatters objects across the heap, a structure built from
+many small allocations is spread through memory, and traversing it pays a cache miss per node — here ~177&nbsp;ns/node scattered versus
+~8&nbsp;ns/node contiguous, about <strong>22&times;</strong> on an identical loop (&sect;38.2), a cost charged to the traversal but caused
+by the allocation. The fixes are Chapter 12's custom allocators, now for speed: an <strong>arena</strong> when everything in a phase dies
+together (pointer-bump allocation, bulk free, and contiguity for free), a <strong>pool</strong> when objects are one fixed size and
+individually reused, and the general <code>malloc</code> when the pattern has no such structure to exploit (&sect;38.3). Above all, the
+part's discipline: distinguish the two costs by measuring — time in <code>malloc</code> is a per-call problem, time in a high-miss
+traversal of allocated data is a locality problem — and remember that the biggest allocation win is usually not a faster allocator but
+<em>fewer, more contiguous</em> allocations (&sect;38.4).</p>
+
+<p>This is the same through-line the part has followed, now applied to memory you asked for by hand. Chapter 33 said measure first;
+Chapters 34 and 35 raised the memory ceiling with locality and layout; Chapter 36 raised the compute ceiling with SIMD; Chapter 37 opened
+the control cost of a mispredicted branch; and this chapter showed that dynamic allocation lands you right back on Chapter 34's ceiling —
+its dominant cost is the cache misses of the scattered memory it returns, so the cure is contiguity, the same lever as locality and
+layout. One chapter remains, and it does not add a new cost but ties all of them together: given a profile, the machine has several
+ceilings — instruction count, cache misses, branch mispredictions, allocation, bandwidth, vector width — and the engineering question is
+which one you are actually under and how you raise <em>that</em> one (<a href="#ch39">Chapter 39</a>). That capstone turns the part's
+scattered techniques into a single, ordered workflow.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>List three things a general-purpose <code>malloc</code> does on a call beyond returning a pointer, and why the stack is free.</li>
+<li>State the two distinct costs of dynamic allocation, and which one is usually larger.</li>
+<li>Explain why a scattered linked structure traverses far slower than a contiguous one, with the order of magnitude.</li>
+<li>Say what an arena and a pool each exploit, and when each applies.</li>
+<li>Explain why swapping in a faster <code>malloc</code> often does nothing for a pointer-chasing hot loop.</li>
+<li>State how you would tell the per-call cost from the locality cost using a profile.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does a general-purpose <code>malloc</code> have to do on a call, and why can that cost more than returning the memory? (&sect;38.1)</li>
+<li><strong>R2.</strong> What are the two costs of dynamic allocation, and roughly how big was each here (per-call vs locality)? (&sect;38.2)</li>
+<li><strong>R3.</strong> Why did the scattered traversal run ~22&times; slower than the contiguous one on an identical loop? (&sect;38.2)</li>
+<li><strong>R4.</strong> What does an arena exploit that a general <code>malloc</code> cannot, and what does a pool exploit? (&sect;38.3)</li>
+<li><strong>R5.</strong> How do you distinguish a per-call allocation cost from a locality cost in a profile, and why does that decide the fix? (&sect;38.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 9 (&ldquo;Virtual Memory,&rdquo; including dynamic memory allocation) is the source for
+&sect;38.1 — implicit and explicit free-lists, splitting and coalescing, headers, and what a real <code>malloc</code> costs. First author
+Randal Bryant; edition and ISBN verified via the publisher.</li>
+<li><strong>Emery D. Berger, Benjamin G. Zorn &amp; Kathryn S. McKinley, &ldquo;Reconsidering Custom Memory Allocation,&rdquo; in
+<em>Proceedings of OOPSLA 2002</em>, pp. 1&ndash;12, DOI 10.1145/582419.582421.</strong> The empirical study behind &sect;38.3 — when
+custom (region/arena) allocators actually beat a good general-purpose <code>malloc</code>, and when they do not. First author Emery
+Berger; DOI verified via the ACM Digital Library.</li>
+<li><strong>Paul R. Wilson, Mark S. Johnstone, Michael Neely &amp; David Boles, &ldquo;Dynamic Storage Allocation: A Survey and Critical
+Review,&rdquo; in <em>Memory Management (IWMM '95)</em>, LNCS 986, Springer, 1995, DOI 10.1007/3-540-60368-9_19.</strong> The
+comprehensive survey behind &sect;38.1 — free-list strategies, fragmentation, splitting and coalescing across three decades of allocator
+design. First author Paul Wilson; DOI verified via SpringerLink.</li>
+<li><strong>Ulrich Drepper, <em>What Every Programmer Should Know About Memory</em> (Red Hat technical report, 2007).</strong> The
+practical reference for &sect;38.2's locality cost — why a pointer-chase across scattered memory stalls on DRAM and defeats the
+prefetcher, and how cache and TLB behaviour dominate. Author Ulrich Drepper; a technical report (also serialized on LWN.net), carrying no
+DOI, so cited by author and year.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex38.1"><span class="ex-label">38.1</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, name three things a general-purpose <code>malloc</code> may have to do on a single call beyond handing back a pointer,
+and say why a stack allocation does none of them.</div>
+
+<div class="exercise" id="ex38.2"><span class="ex-label">38.2</span> <span class="ex-tag warm">warm-up</span>
+What are the <em>two</em> distinct costs of dynamic allocation described in this chapter? For each, say whether it is paid at allocation
+time or later.</div>
+
+<div class="exercise" id="ex38.3"><span class="ex-label">38.3</span> <span class="ex-tag warm">warm-up</span>
+An arena allocator's per-object deallocation cost was reported as essentially zero. Explain why, in terms of how an arena is freed.</div>
+
+<div class="exercise" id="ex38.4"><span class="ex-label">38.4</span> <span class="ex-tag core">core</span>
+Traversing four million linked nodes ran ~8&nbsp;ns/node contiguous and ~177&nbsp;ns/node scattered. (a) Explain the ~22&times; difference
+in terms of the cache and the hardware prefetcher. (b) Why does the working set (~244&nbsp;MiB) exceeding the 24&nbsp;MiB L3 matter to
+the result? (c) The traversal loop is byte-for-byte identical in both runs — what, precisely, differs, and who decided it?</div>
+
+<div class="exercise" id="ex38.5"><span class="ex-label">38.5</span> <span class="ex-tag core">core</span>
+The per-call cost was ~18&nbsp;ns/object for <code>malloc</code>/<code>free</code> and ~3.6&nbsp;ns for an arena. (a) Give two things the
+arena does <em>not</em> do that a general <code>malloc</code> must, which account for the difference. (b) The arena's allocation win was
+~2.7&times; but its allocate-plus-free win was ~5&times; — why is the free side a bigger win than the allocation side? (c) State the
+constraint an arena imposes in return for this speed, and one kind of workload it therefore suits.</div>
+
+<div class="exercise" id="ex38.6"><span class="ex-label">38.6</span> <span class="ex-tag core">core</span>
+For each allocation pattern, say which custom allocator (arena, pool, or none — keep general <code>malloc</code>) fits best, and why: (a)
+all objects allocated while parsing one request and all freed when the response is sent; (b) a stream of same-sized objects created and
+individually destroyed in no particular order over a long run; (c) a handful of long-lived objects of wildly varying sizes allocated at
+startup.</div>
+
+<div class="exercise" id="ex38.7"><span class="ex-label">38.7</span> <span class="ex-tag complexity">cost</span>
+A program allocates <var>N</var> small objects, each costing <var>c</var> nanoseconds to allocate, then traverses them
+<var>t</var> times, each traversal costing <var>m</var> nanoseconds per node. (a) Write the total time in terms of <var>N</var>,
+<var>c</var>, <var>t</var>, <var>m</var>. (b) Using the chapter's numbers (<var>c</var>&asymp;18, <var>m</var>&asymp;8 contiguous or 177
+scattered) with <var>t</var>=10, show that the layout choice dominates the allocator choice. (c) For what value of <var>t</var> would the
+per-call cost and the extra scattered-traversal cost be equal? Interpret the answer.</div>
+
+<div class="exercise" id="ex38.8"><span class="ex-label">38.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague microbenchmarks their allocator by allocating a million objects and immediately
+freeing each one in a tight loop, sees ~18&nbsp;ns/object, and concludes &ldquo;allocation is cheap, no need for an arena.&rdquo;
+<br><strong>Step 1 (given):</strong> allocate-then-immediately-free hits the allocator's per-thread cache (<code>tcache</code>) fast path,
+so it is served from a thread-local free-list with no lock and no search.
+<br><strong>Step 2 (given):</strong> in the real program the objects are long-lived and freed in no particular order, interleaved with
+other allocations.
+<br><strong>Step 3 (given):</strong> so in the real program they are scattered across the heap, and later traversals miss cache per node.
+<br><strong>Step 4 (you):</strong> Explain why the microbenchmark understates the real cost, what the colleague should measure instead,
+and which of the two costs the arena would actually fix here.</div>
+
+<div class="exercise" id="ex38.9"><span class="ex-label">38.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether the dominant cost is the per-call allocation overhead or the locality of the resulting layout, and why: (a) a
+server that <code>malloc</code>s and frees millions of tiny request buffers per second but never traverses them in bulk; (b) a graph of
+ten million nodes, each separately <code>malloc</code>'d, walked repeatedly; (c) a parser that allocates thousands of AST nodes per file
+and walks the tree many times; (d) a program that allocates one 1&nbsp;GiB buffer at startup and streams through it.</div>
+
+<div class="exercise" id="ex38.10"><span class="ex-label">38.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A faster <code>malloc</code> speeds up a
+pointer-chasing traversal over already-allocated nodes.&rdquo; (b) &ldquo;An arena can free individual objects.&rdquo; (c) &ldquo;The
+largest cost of dynamic allocation is usually the time inside <code>malloc</code>.&rdquo; (d) &ldquo;An arena makes allocated objects
+contiguous, which helps later traversals.&rdquo; (e) &ldquo;A microbenchmark that allocates then immediately frees each object faithfully
+represents allocation cost in a long-running program.&rdquo;</div>
+
+<div class="exercise" id="ex38.11"><span class="ex-label">38.11</span> <span class="ex-tag stretch">stretch</span>
+Tie this chapter to the part. (a) Explain why &ldquo;the cost of dynamic allocation&rdquo; is really, for most programs, a Chapter 34
+(locality) problem in disguise — and what that implies about the fix. (b) A profile shows 60% of runtime in one traversal loop over
+freshly built data structures; describe the checks — is the time in <code>malloc</code>? in cache misses? — you would run before
+changing anything. (c) Argue why &ldquo;allocate fewer, more contiguous objects&rdquo; is a better mental model than &ldquo;find a faster
+allocator.&rdquo;</div>
+
+<div class="exercise" id="ex38.12"><span class="ex-label">38.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Allocate <var>N</var> small objects one <code>malloc</code> at a time and free them, versus
+bump-allocating them from one arena block and freeing the block once; time both as the minimum of several
+<code>clock_gettime(CLOCK_MONOTONIC)</code> trials and report the per-object costs. (b) Link <var>N</var> nodes (choose <var>N</var> so
+the working set exceeds your last-level cache, which you can read from <code>/sys/devices/system/cpu/cpu0/cache</code>) into a list once
+contiguously and once in a shuffled order, traverse each, and report the ns/node and the ratio. (c) State your toolchain version, CPU,
+last-level cache size, and allocator, and note these are wall-clock times (no hardware counters) if you lack <code>perf</code>.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch39">
+<h1>Chapter 39 — Putting It Together: A Performance Workflow</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch33">Chapter 33</a> (measure first — the discipline this chapter turns
+into a full workflow), <a href="#ch34">Chapter 34</a> (locality — the cache ceiling), <a href="#ch36">Chapter 36</a> (SIMD and the
+roofline — the compute and bandwidth ceilings), <a href="#ch37">Chapter 37</a> (branch misprediction — the control ceiling),
+<a href="#ch38">Chapter 38</a> (allocation — the ceiling hiding in your traversals). &nbsp;·&nbsp; The last six chapters each raised one
+ceiling; this one is the map — given a profile, which ceiling are you actually under, and how do you raise <em>that</em> one without
+wasting effort on the others.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back across the part: (1) <a href="#ch33">Chapter 33</a> — why do you profile before optimizing rather than
+guess, and why report the minimum of several timed trials? (2) <a href="#ch36">Chapter 36</a> — what is the roofline idea: what two
+ceilings cap a loop, and what decides which one binds? (3) <em>Predict:</em> a profile says one function is 80% of runtime. You have five
+tools in hand — better locality, better layout, SIMD, branchless code, a custom allocator. Before you reach for any of them, what is the
+<em>first</em> question you should answer about that function, and why can the wrong first move make things slower? Write your guess;
+&sect;39.1 and &sect;39.2 answer it.</p>
+</aside>
+
+<p>Every chapter in this part measured one cost and raised one ceiling: cache misses (Chapters 34&ndash;35), compute throughput and
+memory bandwidth (Chapter 36), branch mispredictions (Chapter 37), and dynamic allocation (Chapter 38), all under the founding rule to
+measure first (Chapter 33). Taken singly, each is a technique; taken together, they are a <strong>decision problem</strong>, because a
+real program is under exactly one dominant ceiling at a time, and the whole art of performance engineering is finding which one and
+raising only that. This is not optional discipline — it is forced by arithmetic. A machine's speed is capped by whichever resource
+saturates first, so effort spent raising a ceiling you are not under buys nothing: vectorizing a memory-bound loop, de-branching a
+predictable branch, or replacing an allocator whose cost is really scattered traversal all fail for the same reason — they raise the
+wrong ceiling. This capstone assembles the part into one workflow. It proceeds in five steps: the loop that is the whole method — measure,
+find the dominant cost, identify its ceiling, raise that one, re-measure (&sect;39.1); reading a profile to name the ceiling, with the
+part's symptoms in one table (&sect;39.2); knowing when to stop, via Amdahl's law and the cost of premature optimization (&sect;39.3);
+the traps of the part collected — the ways each ceiling is misdiagnosed (&sect;39.4); and what to carry out of Performance Engineering
+(&sect;39.5).</p>
+
+<p><strong>On the code in this chapter.</strong> This is a synthesis chapter and introduces no new benchmark; every number it cites was
+measured earlier in this part, in this environment (gcc 11.4.0 on an Intel Core i7-12700H, wall-clock <code>clock_gettime(CLOCK_MONOTONIC)</code>
+as the minimum of several trials, with the caches and allocator read from the machine as noted in each chapter). A hardware-counter
+profiler (<code>perf</code>) is <em>not</em> installed here, which is itself part of the lesson: the workflow below is written to run on
+wall-clock time plus the compiler's own reports (assembly, <code>-fopt-info-vec</code>) — the evidence you can always get — and it names
+where percentage-level cache-miss and misprediction counters would sharpen a diagnosis if you have them. The published figures it
+references (pipeline-depth and misprediction penalties, Amdahl's law) are labelled as such and attributed; they are not measured here.</p>
+
+<h2>39.1 The workflow: find the ceiling, raise that one, re-measure</h2>
+
+<p>The entire method is a short loop, and its order is the point. <strong>First, measure</strong> — profile the real workload to find
+where time actually goes, and establish a baseline as the minimum of several trials (Chapter 33), because every later step is judged
+against it. <strong>Second, find the dominant cost</strong> — the one function, loop, or phase that is the largest share of runtime;
+Amdahl's law (&sect;39.3) says nothing else is worth touching yet. <strong>Third, identify the ceiling</strong> that dominant cost is
+under: is it compute-bound (saturating the arithmetic units), memory-bound (waiting on cache misses or DRAM bandwidth), control-bound
+(mispredicting a branch), or allocation-bound (in <code>malloc</code>/<code>free</code> or the scattered memory they returned)? This is
+the crux, and &sect;39.2 is a table for it. <strong>Fourth, raise that ceiling</strong> with the matching tool — locality and layout for
+cache misses (Chapters 34&ndash;35), SIMD for compute (Chapter 36), predictability or branchless code for mispredictions (Chapter 37), an
+arena or pool for allocation (Chapter 38) — and only that tool. <strong>Fifth, re-measure</strong> against the baseline: confirm the
+change moved the number, and then repeat, because raising one ceiling exposes the next. The ordering is not bureaucracy; it is what stops
+the two failure modes the part kept meeting. Skipping step one and optimizing by intuition rewrites cold code (Chapter 33's whole
+warning). Skipping step three — reaching for a favourite tool before naming the ceiling — is worse, because the tools are not
+interchangeable: SIMD does almost nothing for a bandwidth-bound loop (Chapter 36's 2.4&times; versus 13&times;), a branchless rewrite
+loses to a predictable branch (Chapter 37), and a faster allocator does nothing for a scattered traversal (Chapter 38). Each tool raises
+one specific ceiling, so you must name the ceiling first, and by measurement, not guess.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the five steps of the workflow in order. Which step is the one the part warns is most often skipped, and what goes wrong when
+you skip it? (Answer after the next section.)</p>
+</aside>
+
+<h2>39.2 Reading a profile: which ceiling are you under?</h2>
+
+<p>Naming the ceiling is a matter of matching a symptom to a cause, and the part supplies the symptoms. A loop that is
+<strong>compute-bound</strong> already touches data resident in cache and does substantial arithmetic per element; its throughput scales
+when you widen the arithmetic, so SIMD helps (the &sect;36.2 kernel: 13&times; scalar to AVX2), and the tell is that vectorizing moves the
+number. A loop that is <strong>memory-bound</strong> stalls waiting on data: if it streams arrays larger than cache, it is
+<em>bandwidth</em>-bound (the &sect;36.3 dot product: only 2.4&times; from SIMD, because it waits on DRAM), and if it chases pointers
+across scattered memory it is <em>latency</em>-bound (the &sect;38.2 traversal: 177 versus 8&nbsp;ns/node) — in both cases widening
+arithmetic does nothing and the fix is locality and layout, to move fewer bytes or touch them in order. A loop that is
+<strong>control-bound</strong> spends its time in mispredictions: the tell is a data-dependent branch that swings with input order (the
+&sect;37.2 loop: 15&times; sorted versus unsorted) — but only if the branch survived the compiler, which you confirm in the assembly
+before believing it. A phase that is <strong>allocation-bound</strong> shows time inside <code>malloc</code>/<code>free</code> (a
+per-call problem) or, more often, time in a traversal of freshly allocated data with a high miss rate (a locality problem in disguise,
+&sect;38.4). The discipline is that these are distinguished by <em>measurement</em> — varying input size to find cache cliffs, timing
+scalar versus vectorized to see if compute binds, reading the assembly to see if a branch exists, checking whether time is in the
+allocator or in the walk of what it returned — not by staring at source, because the same C can be any of them depending on data sizes
+and what the compiler emitted. Where hardware counters are available (<code>perf</code>) they name the ceiling directly — cache-miss
+rate, misprediction rate, instructions-per-cycle — and are worth using; where they are not, as here, wall-clock experiments and the
+compiler's reports still resolve the question, which is the whole reason the part insisted the honest number is a measured one.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: raise the ceiling you are under, not the one you know best</span>
+<p><strong>1. In words.</strong> A program runs at the speed of its slowest resource, so performance work is diagnosis before treatment:
+profile to find the dominant cost, identify which ceiling it is under (compute, cache, bandwidth, control, allocation), raise exactly that
+one, and re-measure. Reaching for a familiar tool before naming the ceiling raises the wrong roof and buys nothing — or loses.</p>
+<p><strong>2. As a picture.</strong> Figure 39.1: a flow — <em>measure &rarr; dominant cost? &rarr; which ceiling? &rarr; matching fix
+&rarr; re-measure &rarr; repeat</em> — beside a table mapping each symptom (scales with SIMD; stalls on a streamed array; stalls on a
+pointer chase; swings with branch order; time in <code>malloc</code> or in a walk of fresh data) to its ceiling and its one right
+tool.</p>
+<p><strong>3. As numbers/contrast.</strong> The same part, five ceilings, one machine: SIMD gave <strong>13&times;</strong> on a
+compute-bound kernel but only <strong>2.4&times;</strong> on a bandwidth-bound one (Chapter 36); a real branch swung <strong>15&times;</strong>
+on predictability (Chapter 37); a scattered traversal ran <strong>22&times;</strong> slower than a contiguous one (Chapter 38). Each
+number is large only when it matches the ceiling — the proof that naming the ceiling first is the whole game.</p>
+</aside>
+
+<p><em>(Answer to the &sect;39.1 quick check: the five steps are (1) measure and baseline, (2) find the dominant cost, (3) identify its
+ceiling, (4) raise that ceiling with the matching tool, (5) re-measure and repeat. The most-often-skipped step is (3), identifying the
+ceiling: skip it and you reach for a favourite tool — SIMD, branchless code, a new allocator — that may raise a ceiling you are not
+under, doing nothing on a memory-bound loop or even losing on a predictable branch, because the tools are not interchangeable.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 270" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The workflow, and the symptom-to-ceiling table it turns on.</text>
+<rect x="12" y="28" width="86" height="22" fill="#eef1f4" stroke="#14406b"/><text x="20" y="43" font-size="9">1. measure</text>
+<rect x="108" y="28" width="104" height="22" fill="#eef1f4" stroke="#14406b"/><text x="116" y="43" font-size="9">2. dominant cost?</text>
+<rect x="222" y="28" width="104" height="22" fill="#fff3d6" stroke="#8a6d1d"/><text x="230" y="43" font-size="9">3. which ceiling?</text>
+<rect x="336" y="28" width="96" height="22" fill="#dfeee0" stroke="#2f7d32"/><text x="344" y="43" font-size="9">4. raise THAT one</text>
+<rect x="442" y="28" width="92" height="22" fill="#eef1f4" stroke="#14406b"/><text x="450" y="43" font-size="9">5. re-measure</text>
+<path d="M98 39 L 108 39" stroke="#14406b" stroke-width="1"/><path d="M212 39 L 222 39" stroke="#14406b" stroke-width="1"/><path d="M326 39 L 336 39" stroke="#14406b" stroke-width="1"/><path d="M432 39 L 442 39" stroke="#14406b" stroke-width="1"/>
+<path d="M488 50 C 488 70, 60 70, 55 52" fill="none" stroke="#14406b" stroke-width="1" stroke-dasharray="3,2"/><text x="250" y="70" font-size="8" fill="#14406b">repeat: the next ceiling</text>
+<line x1="12" y1="92" x2="620" y2="92" stroke="#b9c2cc"/>
+<text x="12" y="108" font-size="9" fill="#14406b">symptom</text><text x="300" y="108" font-size="9" fill="#8a6d1d">ceiling</text><text x="430" y="108" font-size="9" fill="#2f7d32">the one right tool</text>
+<text x="12" y="128" font-size="8">throughput scales when you widen arithmetic (cache-resident, math-heavy)</text><text x="300" y="128" font-size="8" fill="#8a6d1d">compute</text><text x="430" y="128" font-size="8" fill="#2f7d32">SIMD (Ch 36) &mdash; 13&times;</text>
+<text x="12" y="146" font-size="8">stalls streaming an array larger than cache</text><text x="300" y="146" font-size="8" fill="#8a6d1d">bandwidth</text><text x="430" y="146" font-size="8" fill="#2f7d32">locality / layout (Ch 34&ndash;35)</text>
+<text x="12" y="164" font-size="8">stalls chasing pointers across scattered memory</text><text x="300" y="164" font-size="8" fill="#8a6d1d">latency</text><text x="430" y="164" font-size="8" fill="#2f7d32">contiguity / arena (Ch 38) &mdash; 22&times;</text>
+<text x="12" y="182" font-size="8">time swings with branch order; a surviving data-dependent branch</text><text x="300" y="182" font-size="8" fill="#8a6d1d">control</text><text x="430" y="182" font-size="8" fill="#2f7d32">predictable / branchless (Ch 37) &mdash; 15&times;</text>
+<text x="12" y="200" font-size="8">time in malloc/free, or in a walk of freshly allocated data</text><text x="300" y="200" font-size="8" fill="#8a6d1d">allocation</text><text x="430" y="200" font-size="8" fill="#2f7d32">arena / pool (Ch 38) &mdash; 5&times;</text>
+<line x1="12" y1="212" x2="620" y2="212" stroke="#b9c2cc"/>
+<text x="12" y="230" font-size="8" fill="#8c3a1d">Wrong first move: raise a ceiling you are not under &rarr; SIMD on a bandwidth-bound loop = 2.4&times;, not 13&times;.</text>
+<text x="12" y="248" font-size="8" fill="#14406b">Each large number in this part appeared only when the tool matched the ceiling. Diagnosis before treatment.</text>
+</svg>
+<figcaption>Figure 39.1: The performance workflow (top) and the symptom-to-ceiling table it turns on (bottom). A program runs at the speed
+of its slowest resource, so the method is diagnosis before treatment: profile, name the ceiling, raise <em>that</em> one, re-measure. The
+part's large speedups (13&times;, 15&times;, 22&times;) each appeared only when the tool matched the ceiling; the wrong first move raises a
+roof you are not under (&sect;39.1&ndash;&sect;39.2).</figcaption>
+</figure>
+
+<h2>39.3 Knowing when to stop: Amdahl's law and the 5% part</h2>
+
+<p>The workflow's second step — optimize the dominant cost, nothing else yet — is not a preference; it is <strong>Amdahl's law</strong>
+(Amdahl, 1967). If a part of the program takes a fraction <em>p</em> of the runtime and you speed <em>that part</em> up by a factor
+<em>s</em>, the whole program speeds up by only 1&nbsp;/&nbsp;((1&minus;<em>p</em>)&nbsp;+&nbsp;<em>p</em>/<em>s</em>). The consequence is
+brutal and clarifying: the overall speedup is bounded by 1&nbsp;/&nbsp;(1&minus;<em>p</em>) no matter how large <em>s</em> is, so a part
+that is 5% of runtime yields at most a 1&nbsp;/&nbsp;0.95&nbsp;&asymp;&nbsp;1.05&times; overall <em>even if you make it infinitely
+fast</em>. This is the arithmetic behind the phrase the part has used repeatedly — &ldquo;optimizing the 5% part&rdquo; — and behind
+Knuth's older warning that <em>premature optimization is the root of all evil</em> (Knuth, 1974): effort spent on code that is not the
+dominant cost is capped at a rounding error before it begins, and it is not free — it adds complexity, risks bugs, and can block the
+compiler (a hand-written branchless loop that defeats the vectorizer, Chapter 37). So the discipline has two edges. One edge says
+<em>start</em> at the dominant cost, because that is where the ceiling of achievable speedup is highest. The other says <em>stop</em> when
+the remaining costs are small: once the dominant cost is raised and the profile flattens — no single part is a large share — Amdahl's law
+says the next change is bounded low, and the right engineering move is often to stop optimizing and spend the complexity budget elsewhere.
+Knowing when to stop is as much a part of the workflow as knowing where to start: the goal is not the fastest possible code but code fast
+enough that the dominant cost no longer dominates, reached by the fewest changes that measurably move the baseline.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A function is 10% of runtime and you make it 100&times; faster. What is the overall speedup, roughly? What does Amdahl's law say is the
+ceiling on optimizing a part that is 5% of runtime, and what does that imply about where to start? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>39.4 The traps of the part, in one place</h2>
+
+<p>Each chapter of this part ended with a trap, and collected they are one trap wearing five costumes: <strong>acting on a model of the
+hardware instead of a measurement of it</strong>. Chapter 33's trap was optimizing without profiling — rewriting code that a profile
+would have shown to be cold. Chapter 34's was assuming an algorithm with fewer operations is faster when a cache-hostile access pattern
+makes it slower — the model counted operations, the machine counted misses. Chapter 36's was counting vector lanes — &ldquo;8 lanes, so
+8&times;&rdquo; — when the loop was bandwidth-bound and gained 2.4&times;, or compute-bound and gained more than 8&times; via FMA; the lane
+count is a model, the ceiling is measured. Chapter 37's was counting branches in the source and multiplying by a cycle penalty, against a
+branch the compiler had already if-converted away — the source is a model, the binary is the fact. Chapter 38's was blaming the
+allocator's speed for time that was really the scattered memory it returned — the call is a small model, the traversal's cache misses are
+the fact. The unifying lesson is that the machine has too many interacting layers — compiler, cache hierarchy, predictor, allocator,
+memory bus — for a mental model to reliably predict where time goes; the layers routinely conspire to make the intuitive answer wrong
+(the branch that was compiled away, the SIMD the memory bus ate, the algorithm the cache punished). The defense is the same in every case:
+before optimizing, get evidence of what the machine actually does — a profile, a timed experiment, the emitted assembly, the vectorization
+report — and after optimizing, re-measure to confirm the change helped. Every large number in this part came from measuring the machine;
+every trap came from trusting a model of it.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: optimizing to a story &mdash; the change that is plausible, measured against nothing</span>
+<p>The final and most general trap is the one under all the others: shipping an optimization because it <em>sounds</em> right — fewer
+instructions, more lanes, no branch, a faster allocator — without a before-and-after measurement of the workload it is supposed to help.
+Every specific trap in this part is an instance: the vectorized memory-bound loop, the de-branched predictable branch, the swapped
+allocator on a scattered traversal, the rewritten cold function. Each is plausible; each is measured against nothing; each raises a
+ceiling the program was not under, so the profile does not move — and worse, the added complexity stays. Two defenses close the part.
+First, tie every optimization to a number: a profile that names the dominant cost before, and a re-measured baseline that shows the change
+moved it after — no number, no merge (Chapter 33). Second, respect Amdahl's law as a gate: if the part you are optimizing is not the
+dominant cost, the best case is a rounding error, so the change has to justify its complexity against a ceiling that is provably low.
+Optimizing to a story rather than a measurement is how fast-sounding code that is not actually faster — and is now harder to read — gets
+written; the whole part exists to replace the story with the number.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate opens a PR: &ldquo;Rewrote the hot path — vectorized the inner loop with intrinsics, made the filter
+branchless, and swapped in a faster allocator. Should be a big speedup across the board.&rdquo; No before/after numbers are attached.
+Cover the paragraph and respond in four or five sentences, drawing on &sect;39.1&ndash;&sect;39.4.</p>
+<p><em>Model answer.</em> &ldquo;Three real techniques, but I can't tell which one is actually helping without numbers — and they don't
+all raise the same ceiling, so some may be doing nothing or losing. Can you attach the profile that identified the hot path and a
+before/after on the representative workload? Specifically: is the inner loop compute-bound (then SIMD earns its keep) or memory-bound
+(then it's ~1&times; and the real fix is layout); did the branch even survive the old build, or did the compiler already if-convert it, in
+which case branchless can be a regression on predictable data; and is the allocator time in <code>malloc</code> itself or in traversing
+what it returned, because a faster allocator only helps the former. Let's land the measured win — the one or two changes the profile
+actually moves — and drop the rest, so we're not carrying complexity for speedups that aren't there.&rdquo; Asking which ceiling each
+change raises, and gating the merge on a measured before/after, is the senior register — and the whole part in one review.</p>
+</aside>
+
+<p><em>(Answer to the &sect;39.3 quick check: a function that is 10% of runtime made 100&times; faster gives an overall speedup of
+1&nbsp;/&nbsp;(0.90&nbsp;+&nbsp;0.10/100)&nbsp;&asymp;&nbsp;1.11&times; — the 90% you did not touch dominates. Amdahl's law caps optimizing a
+5%-of-runtime part at 1&nbsp;/&nbsp;0.95&nbsp;&asymp;&nbsp;1.05&times; even at infinite speedup, which is why you start at the dominant
+cost — the part with the highest ceiling on achievable speedup — and why optimizing a small part is bounded to a rounding error before you
+begin.)</em></p>
+
+<h2>39.5 What to carry forward</h2>
+
+<p>Performance engineering is a <strong>diagnosis discipline</strong>, and this part is one method repeated against five ceilings. The
+method: <strong>measure</strong> the real workload and baseline it (Chapter 33); find the <strong>dominant cost</strong>, because Amdahl's
+law caps everything else low (&sect;39.3); <strong>identify the ceiling</strong> that cost is under — compute, cache, bandwidth, control,
+or allocation (&sect;39.2); <strong>raise that one</strong> with its matching tool and only that tool — locality and layout for the memory
+ceilings (Chapters 34&ndash;35), SIMD for compute (Chapter 36), predictability or branchless code for control (Chapter 37), an arena or
+pool for allocation (Chapter 38); and <strong>re-measure</strong>, then repeat on the ceiling that surfaces next. The part's large numbers
+— 13&times; from SIMD, 15&times; from branch predictability, 22&times; from contiguity — were each large only because the tool matched
+the ceiling; the same tools against the wrong ceiling gave 2.4&times;, a regression, or nothing. That is the through-line to carry out:
+the machine has several ceilings, and engineering performance is finding, by measurement, which one you are actually under, and raising
+<em>that</em> one — never reasoning from a model of the hardware when you can get evidence of what it does, and never shipping an
+optimization that is not tied to a before-and-after number.</p>
+
+<p>This closes Volume 1's turn toward the CPU and its memory. The part began by refusing to guess and ends with a workflow that never has
+to: given a profile, you can now name the ceiling and reach for the one tool that raises it. But every cost this part measured lived
+<em>inside</em> the machine — in caches, pipelines, vector units, and the heap — where the program runs alone against silicon. The next
+part crosses the boundary where the program meets the outside world: <strong>I/O and networking</strong>, where the costs are no longer
+cycles and cache lines but system calls, disk and network latency, and the blocking that stalls a whole thread while it waits — a new
+cost model, and a new set of &ldquo;where does the time go&rdquo; questions, with the same measure-first discipline carried across. The
+machine is understood; now it must talk to the world.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the five steps of the performance workflow in order, and why the order matters.</li>
+<li>Match each symptom (scales with SIMD, stalls on a stream, chases scattered pointers, swings with branch order, time in the allocator) to its ceiling and tool.</li>
+<li>State Amdahl's law and compute the ceiling on optimizing a 5%-of-runtime part.</li>
+<li>Explain why each tool in the part fails against the wrong ceiling, with an example.</li>
+<li>Name the single trap under all five chapters' traps, and the defense against it.</li>
+<li>Say when to <em>stop</em> optimizing, in Amdahl terms.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are the five steps of the workflow, and which is most often skipped with what consequence? (&sect;39.1)</li>
+<li><strong>R2.</strong> Give the symptom that identifies each of the compute, bandwidth, latency, control, and allocation ceilings. (&sect;39.2)</li>
+<li><strong>R3.</strong> State Amdahl's law and the ceiling it puts on optimizing a 5%-of-runtime part. (&sect;39.3)</li>
+<li><strong>R4.</strong> What single trap underlies all five chapters' traps, and what is the defense? (&sect;39.4)</li>
+<li><strong>R5.</strong> Why did the part's tools give large speedups in some cases and near-nothing in others — what decides it? (&sect;39.2, &sect;39.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Gene M. Amdahl, &ldquo;Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities,&rdquo; in
+<em>AFIPS '67 Spring Joint Computer Conference</em>, pp. 483&ndash;485 (1967), DOI 10.1145/1465482.1465560.</strong> The origin of
+&sect;39.3's law bounding overall speedup by the fraction you do not optimize — the arithmetic behind &ldquo;start at the dominant
+cost.&rdquo; First author Gene Amdahl; DOI verified via the ACM Digital Library.</li>
+<li><strong>Donald E. Knuth, &ldquo;Structured Programming with go to Statements,&rdquo; <em>ACM Computing Surveys</em> 6(4),
+pp. 261&ndash;301 (1974), DOI 10.1145/356635.356640.</strong> The source of &ldquo;premature optimization is the root of all evil&rdquo;
+(&sect;39.3) — and its less-quoted second half, that the critical few percent are worth optimizing well. First author Donald Knuth; DOI
+verified via the ACM Digital Library.</li>
+<li><strong>Samuel Williams, Andrew Waterman &amp; David Patterson, &ldquo;Roofline: An Insightful Visual Performance Model for Multicore
+Architectures,&rdquo; <em>Communications of the ACM</em> 52(4), 65&ndash;76 (2009), DOI 10.1145/1498765.1498785.</strong> The compute-vs-bandwidth
+ceiling model of &sect;39.2 — arithmetic intensity deciding which roof binds. First author Samuel Williams; DOI verified via the ACM
+Digital Library.</li>
+<li><strong>Brendan Gregg, <em>Systems Performance: Enterprise and the Cloud</em>, 2nd ed. (Addison-Wesley, 2020),
+ISBN 978-0-13-682015-4.</strong> A practitioner's reference for the whole workflow of &sect;39.1&ndash;&sect;39.2 — methodologies
+(including the USE method), tools, and reading profiles across the stack. First author Brendan Gregg; edition and ISBN verified via the
+publisher.</li>
+<li><strong>John L. Hennessy &amp; David A. Patterson, <em>Computer Architecture: A Quantitative Approach</em>, 6th ed. (Morgan Kaufmann,
+2017), ISBN 978-0-12-811905-1.</strong> The architectural ground under every ceiling in this part — pipelines, caches, memory, and
+data-level parallelism. First author John Hennessy; edition and ISBN verified via the publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex39.1"><span class="ex-label">39.1</span> <span class="ex-tag warm">warm-up</span>
+State the five steps of the performance workflow in order, in one line each.</div>
+
+<div class="exercise" id="ex39.2"><span class="ex-label">39.2</span> <span class="ex-tag warm">warm-up</span>
+Why must you identify the ceiling <em>before</em> choosing a tool? Give one example from the part of a tool that fails against the wrong
+ceiling.</div>
+
+<div class="exercise" id="ex39.3"><span class="ex-label">39.3</span> <span class="ex-tag warm">warm-up</span>
+For each symptom, name the ceiling: (a) throughput scales when you widen the arithmetic; (b) a loop stalls streaming an array far larger
+than cache; (c) time swings 15&times; with the sort order of the input; (d) a pointer-chasing walk over separately-allocated nodes is
+slow.</div>
+
+<div class="exercise" id="ex39.4"><span class="ex-label">39.4</span> <span class="ex-tag core">core</span>
+Amdahl's law. (a) State it in terms of the optimized fraction <em>p</em> and the local speedup <em>s</em>. (b) A function is 20% of
+runtime; you make it 4&times; faster. Compute the overall speedup. (c) What is the maximum overall speedup from optimizing that same 20%
+function, no matter how fast you make it, and what does that imply about where to look next?</div>
+
+<div class="exercise" id="ex39.5"><span class="ex-label">39.5</span> <span class="ex-tag core">core</span>
+A profile shows one loop at 70% of runtime, chasing pointers through a graph of separately-<code>malloc</code>'d nodes, over a working set
+far larger than L3. (a) Which ceiling is it under, and how would you confirm? (b) Which tool from the part raises that ceiling, and which
+tools would <em>not</em> help here? (c) After the fix the same loop is now 30% of runtime and the profile is flat — what does Amdahl's law
+advise?</div>
+
+<div class="exercise" id="ex39.6"><span class="ex-label">39.6</span> <span class="ex-tag core">core</span>
+For each, name the ceiling and the one tool, and say which of the part's numbers it echoes: (a) a cache-resident, math-heavy kernel with
+independent lanes; (b) a 64&nbsp;MiB-streaming dot product; (c) a data-dependent branch that survived compilation and swings with input
+order; (d) a phase spending its time in a traversal of freshly built, scattered data structures.</div>
+
+<div class="exercise" id="ex39.7"><span class="ex-label">39.7</span> <span class="ex-tag complexity">cost</span>
+A program has two hot parts: part A is 60% of runtime, part B is 30%. You can raise either ceiling for the same effort, achieving a
+5&times; local speedup on whichever you pick. (a) Compute the overall speedup from optimizing A alone, and from B alone. (b) Which should
+you do first, and why does Amdahl's law make the choice obvious? (c) After doing the better one, recompute the fractions and say whether
+the other is now worth doing.</div>
+
+<div class="exercise" id="ex39.8"><span class="ex-label">39.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague ships a PR that hand-vectorizes an inner loop with AVX2 intrinsics and reports
+&ldquo;no measurable speedup, but the code is more advanced.&rdquo;
+<br><strong>Step 1 (given):</strong> the loop streams a pair of arrays far larger than last-level cache.
+<br><strong>Step 2 (given):</strong> its arithmetic intensity is tiny (about one add per two loads), so it is bandwidth-bound.
+<br><strong>Step 3 (given):</strong> SIMD raises the compute ceiling, not the bandwidth ceiling.
+<br><strong>Step 4 (you):</strong> Explain why the speedup is ~1&times; (not a bug), what the profile would have shown before the change,
+and why the PR should be dropped despite the code being &ldquo;more advanced.&rdquo;</div>
+
+<div class="exercise" id="ex39.9"><span class="ex-label">39.9</span> <span class="ex-tag mixed">mixed</span>
+Each of these is a version of the same underlying trap. Name the trap they share, and for each say what evidence would have caught it: (a)
+rewriting a function that turns out to be 2% of runtime; (b) vectorizing a bandwidth-bound loop; (c) de-branching a branch the compiler
+already if-converted; (d) swapping in a faster <code>malloc</code> to speed up a scattered traversal.</div>
+
+<div class="exercise" id="ex39.10"><span class="ex-label">39.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;The fastest program is the one with the fewest
+instructions.&rdquo; (b) &ldquo;Optimizing a part that is 5% of runtime can, at best, give about 1.05&times; overall.&rdquo; (c)
+&ldquo;SIMD, branchless code, and custom allocators are interchangeable ways to make code faster.&rdquo; (d) &ldquo;You should re-measure
+after an optimization even if the change obviously should help.&rdquo; (e) &ldquo;A program is usually under several ceilings at once, so
+you should raise them all together.&rdquo;</div>
+
+<div class="exercise" id="ex39.11"><span class="ex-label">39.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the part. (a) Explain why every chapter's trap is the same trap — reasoning from a model of the hardware instead of measuring
+it — and give the one defense common to all of them. (b) The part reported speedups of 13&times;, 15&times;, and 22&times;, and also
+2.4&times; and a regression, using the <em>same</em> techniques — explain in one paragraph what decides which you get. (c) Argue why
+&ldquo;find the ceiling you're under and raise that one&rdquo; is a more durable skill than knowing any individual technique.</div>
+
+<div class="exercise" id="ex39.12"><span class="ex-label">39.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, run the full workflow once end to end. (a) Take a small program of your own with a plausible hot loop; profile or
+time it to find the dominant cost and baseline it as the minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials. (b)
+Identify the ceiling it is under using the &sect;39.2 tests (vary input size for cache cliffs; time scalar vs vectorized for compute; read
+the assembly for a surviving branch; check whether time is in the allocator or in a walk of its output), raise that one ceiling with the
+matching tool, and re-measure. (c) Report the before/after, the ceiling you identified and how, and — honestly — whether the change moved
+the number or taught you the ceiling was elsewhere; state your toolchain, CPU, and that these are wall-clock times if you lack
+<code>perf</code>.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VII</div><h1>I/O & Networking, Low-Level</h1><p class='part-blurb'>Files, sockets, blocking vs async, epoll/io_uring, zero-copy — the systems substrate under every data pipeline and service.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part VIII</div><h1>Storage & the Disk</h1><p class='part-blurb'>Pages, files, the buffer pool, and the storage manager — the foundation you build a database on.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part IX</div><h1>Storage Engines</h1><p class='part-blurb'>B-trees and LSM-trees implemented and analyzed — the two families and when each wins.</p></div>
@@ -19088,6 +20229,362 @@ little even with it, explained by low arithmetic intensity (bandwidth-bound). (c
 noting these are wall-clock throughputs (no hardware counters) if <code>perf</code> is unavailable. <em>Tempting wrong answer:</em>
 &ldquo;report the first run&rdquo; — cold-start noise; report the minimum of several trials (Chapter 33). <strong>Feed-forward:</strong>
 &sect;36.2&ndash;&sect;36.4.</div>
+
+</section>
+
+<section class="solutions" id="sol37">
+<h1>Chapter 37 — Solutions</h1>
+
+<div class="solution" id="sol37.1"><span class="sol-label">37.1</span>
+A deeply pipelined core has many instructions in flight at once (Chapter 2), so stalling at every branch until its condition is computed
+would drain the pipeline and throw away the instruction-level parallelism that makes the core fast. Instead it <strong>predicts</strong>
+the outcome with a hardware branch predictor and speculatively executes down the guessed path, committing the results if the guess was
+right and squashing them if it was wrong. <em>Tempting wrong answer:</em> &ldquo;it just evaluates the condition first&rdquo; — it cannot;
+the condition is often not ready for many cycles, and waiting for it is exactly the stall speculation exists to avoid.
+<strong>Feed-forward:</strong> &sect;37.1.</div>
+
+<div class="solution" id="sol37.2"><span class="sol-label">37.2</span>
+The misprediction penalty is the cost of a wrong guess: the speculatively executed instructions after the branch are squashed and the
+front end refills the pipeline from the correct target. On modern x86 it is roughly <strong>15&ndash;20 cycles</strong> — a published
+figure (Agner Fog; Hennessy &amp; Patterson), not measured here, since <code>perf</code> is unavailable. It is about the depth of the
+pipeline because that is how many stages must be re-primed before useful work resumes. <em>Tempting wrong answer:</em> &ldquo;it is the
+cost of the comparison&rdquo; — the <code>cmp</code> is one cheap instruction; the penalty is the refill. <strong>Feed-forward:</strong>
+&sect;37.1.</div>
+
+<div class="solution" id="sol37.3"><span class="sol-label">37.3</span>
+Because the branch's cost is not the comparison but the <em>misprediction</em> the comparison's outcome can trigger. If the branch is a
+data-dependent coin flip, the predictor is wrong on about half of the iterations and each miss costs a pipeline-depth refill
+(~15&ndash;20 cycles), which dwarfs the handful of arithmetic instructions the branch guards. So the same branch is nearly free when
+predictable and dominant when not — the cost lives in the data, not the opcode. <em>Tempting wrong answer:</em> &ldquo;a branch is
+always cheap because <code>cmp</code> is cheap&rdquo; — that conflates the one-cycle comparison with the pipeline-refill penalty a wrong
+guess pays. <strong>Feed-forward:</strong> &sect;37.1&ndash;&sect;37.2.</div>
+
+<div class="solution" id="sol37.4"><span class="sol-label">37.4</span>
+(a) On unsorted data the branch is a ~50/50 coin flip with no learnable pattern, so the predictor misses roughly half of the ~655&nbsp;million
+branches and each miss costs a ~15&ndash;20-cycle refill; the accumulated penalty is essentially the whole 15&times; gap. On sorted data
+the branch is false for the entire run of values below 128 and then true for the rest, so it flips once and is predicted correctly almost
+always. (b) It is predictable on the sorted array because the outcomes arrive in two long runs the predictor learns immediately;
+unpredictable on the unsorted array because consecutive outcomes are independent. (c) Nothing about the arithmetic, the instruction
+count, or the number of elements summed differs — only the <em>predictability</em> of the branch, which is a property of the data order.
+<em>Tempting wrong answer:</em> &ldquo;sorting makes the arithmetic cheaper&rdquo; — the arithmetic is bit-for-bit identical; only
+prediction changed. <strong>Feed-forward:</strong> &sect;37.2.</div>
+
+<div class="solution" id="sol37.5"><span class="sol-label">37.5</span>
+(a) <code>int m = (x - 128) &gt;&gt; 31; sum += x &amp; ~m;</code> — the arithmetic right shift turns the sign of <code>x-128</code> into an
+all-ones or all-zeros mask, which is ANDed against <code>x</code>, so the loop always executes the same instructions regardless of the
+data: there is no conditional jump, hence nothing to predict or mispredict. (b) On sorted data the real branch is predicted correctly
+almost always, so it does the work of only the taken path and skips the rest for free (0.50&nbsp;s); the branchless version always
+computes both paths' work — the subtract, the shift, the AND, the add — on every element (~0.9&nbsp;s), so it loses to a well-predicted
+branch. (c) Branchless wins only when the branch is genuinely unpredictable, i.e. when the misprediction it avoids costs more than the
+extra both-paths arithmetic it always pays. <em>Tempting wrong answer:</em> &ldquo;branchless is always faster because it has no
+branch&rdquo; — it pays for both paths every iteration and loses to a predictable branch. <strong>Feed-forward:</strong> &sect;37.3.</div>
+
+<div class="solution" id="sol37.6"><span class="sol-label">37.6</span>
+(a) At plain <code>-O2</code> gcc applied <strong>if-conversion</strong>, turning the <code>if</code> into a conditional move
+(<code>cmovg</code>) — a branchless select — so no branch survives; confirm it by reading the emitted assembly (<code>gcc -S</code>) and
+finding <code>cmovg</code> where a conditional jump would be. (b) At <code>-O3 -march=native</code> it vectorized the loop with a masked
+AVX2 add (8 elements per instruction, no branch), confirmable with <code>-fopt-info-vec</code>. (c) You cannot read branch cost off the C
+source: whether a branch even exists in the binary depends on if-conversion and vectorization decisions the compiler makes at your
+optimization level and target, so counting <code>if</code>s and multiplying by a cycle penalty often prices a branch that is not there.
+<em>Tempting wrong answer:</em> &ldquo;the source has an <code>if</code>, so there is a branch&rdquo; — the build, not the source, decides.
+<strong>Feed-forward:</strong> &sect;37.4.</div>
+
+<div class="solution" id="sol37.7"><span class="sol-label">37.7</span>
+(a) The extra cycles spent on mispredictions are approximately <var>K</var>&nbsp;&middot;&nbsp;<var>f</var>&nbsp;&middot;&nbsp;<var>p</var>.
+(b) At <var>f</var>&nbsp;=&nbsp;0.5 this is <var>K</var>&nbsp;&middot;&nbsp;0.5&nbsp;&middot;&nbsp;<var>p</var> — a large per-iteration tax
+that, with <var>p</var>&nbsp;&asymp;&nbsp;15&ndash;20, dwarfs a few-cycle loop body; at <var>f</var>&nbsp;&asymp;&nbsp;0 it is ~0 and the
+branch is essentially free. (c) Branchless does <var>w</var> extra both-paths cycles per iteration and never mispredicts, costing
+<var>K</var>&nbsp;&middot;&nbsp;<var>w</var>; it is faster than the branch when
+<var>K</var>&nbsp;&middot;&nbsp;<var>w</var>&nbsp;&lt;&nbsp;<var>K</var>&nbsp;&middot;&nbsp;<var>f</var>&nbsp;&middot;&nbsp;<var>p</var>, i.e.
+when <var>w</var>&nbsp;&lt;&nbsp;<var>f</var>&nbsp;&middot;&nbsp;<var>p</var>. So the more unpredictable the branch (larger <var>f</var>)
+and the deeper the pipeline (larger <var>p</var>), the more room branchless has to win. <em>Tempting wrong answer:</em> &ldquo;branchless
+always wins because <var>f</var>&middot;<var>p</var> is large&rdquo; — only when <var>w</var>&nbsp;&lt;&nbsp;<var>f</var>&middot;<var>p</var>;
+a predictable branch (small <var>f</var>) flips the inequality. <strong>Feed-forward:</strong> &sect;37.3.</div>
+
+<div class="solution" id="sol37.8"><span class="sol-label">37.8</span>
+<strong>Step 4:</strong> They saw no sorted-vs-unsorted difference because at <code>-O2</code> the compiler if-converted the
+<code>if</code> into a <code>cmovg</code>, so there was no branch in the binary to mispredict — with nothing to predict, data order is
+irrelevant. The single change that would let them observe the effect is to forbid if-conversion
+(<code>-fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert</code>) so a real conditional jump survives; then the sorted run
+is dramatically faster. The correct conclusion is about the <em>build</em>, not the CPU: branch prediction is present and working, but
+this build removed the branch, so &ldquo;prediction is a myth on this CPU&rdquo; mistakes a compiler transform for a hardware fact.
+<em>Tempting wrong answer:</em> &ldquo;the CPU's predictor is broken or absent&rdquo; — the predictor is fine; the branch was compiled
+away. <strong>Feed-forward:</strong> &sect;37.4.</div>
+
+<div class="solution" id="sol37.9"><span class="sol-label">37.9</span>
+(a) <strong>Well</strong> — a loop back-edge taken 10&nbsp;million times is mispredicted essentially once, on the final exit; it is the most
+predictable branch there is. (b) <strong>Badly</strong> — <code>rand() &amp; 1</code> is a 50/50 coin flip with no pattern, the worst case
+(~50% misprediction). (c) <strong>Well</strong> — a branch that is almost always the same way is learned in a few iterations and predicted
+right almost always. (d) <strong>Badly</strong> — a uniform distribution over 8 cases is near-random with no learnable pattern, so a
+<code>switch</code> the compiler keeps as a data-dependent jump mispredicts most of the time. <em>Tempting wrong answer:</em> &ldquo;loops
+are unpredictable because they branch every iteration&rdquo; — the back-edge is precisely the branch the predictor gets right.
+<strong>Feed-forward:</strong> &sect;37.2.</div>
+
+<div class="solution" id="sol37.10"><span class="sol-label">37.10</span>
+(a) <strong>False</strong> — only if the branch survives compilation and is actually mispredicted; the compiler often if-converts or
+vectorizes it away, and a predictable branch costs nearly nothing. (b) <strong>False</strong> — branchless loses to a well-predicted
+branch because it always does both paths' work. (c) <strong>True</strong> — a correctly predicted branch commits already-completed
+speculative work and costs essentially nothing. (d) <strong>True</strong> — <code>-O3 -march=native</code> can turn a scalar
+<code>if</code>-loop into a masked vector loop with no branch (&sect;37.4). (e) <strong>False</strong> — whether there is even a branch to
+mispredict depends on the build, so you must read the emitted assembly and time the binary. <em>Tempting wrong answer:</em> marking (a)
+true from &ldquo;it is a branch in the source&rdquo; — the build, not the source, decides whether the branch exists.
+<strong>Feed-forward:</strong> &sect;37.1&ndash;&sect;37.4.</div>
+
+<div class="solution" id="sol37.11"><span class="sol-label">37.11</span>
+(a) In order: first confirm the branch exists in the shipped build — read the emitted assembly for a conditional jump versus a
+<code>cmov</code>, or check <code>-fopt-info-vec</code> for vectorization; if no branch survives, there is nothing to rewrite. If a real
+branch does survive, measure branch versus branchless on representative data (Chapter 33), because the right choice flips with
+predictability; only then change code. (b) &sect;37.4's masked vectorization is branch elimination carried further: instead of a
+<code>cmov</code> selecting one scalar, the vectorizer computes all lanes and blends them with a mask, so a data-dependent <code>if</code>
+becomes uniform SIMD arithmetic — the same &ldquo;remove the branch, do both paths&rdquo; idea as Chapter 36, applied across lanes. (c)
+&ldquo;Branches are slow, avoid them&rdquo; leads you to rewrite branches the compiler already deleted and to make predictable branches
+slower with always-both-paths code; &ldquo;the cost is a property of the build and the data&rdquo; tells you to check the binary and
+measure predictability first, which is where the real decision lives. <em>Tempting wrong answer:</em> &ldquo;always rewrite the hot
+branch branchless&rdquo; — pointless if the branch is not in the binary, and a regression if it is predictable.
+<strong>Feed-forward:</strong> &sect;37.4&ndash;&sect;37.5.</div>
+
+<div class="solution" id="sol37.12"><span class="sol-label">37.12</span>
+Platform-specific. A correct write-up reports: (a) the summing loop at plain <code>-O2</code> showing little or no sorted-vs-unsorted
+difference (the compiler if-converted to a <code>cmov</code>) and the if-conversion-disabled build showing a large swing (sorted much
+faster), with the assembly confirming <code>cmov</code> versus a conditional jump. (b) a branchless mask version running the same time on
+both orders, order-independent. (c) the toolchain version and CPU, noting these are wall-clock minimum-of-trials times with no hardware
+counters if <code>perf</code> is unavailable. <em>Tempting wrong answer:</em> &ldquo;report the <code>-O2</code> build as proof that
+prediction does not matter&rdquo; — that build has no branch; you must disable if-conversion to observe the effect at all.
+<strong>Feed-forward:</strong> &sect;37.4.</div>
+
+</section>
+
+<section class="solutions" id="sol38">
+<h1>Chapter 38 — Solutions</h1>
+
+<div class="solution" id="sol38.1"><span class="sol-label">38.1</span>
+On a single call a general-purpose <code>malloc</code> may walk a size-segregated free-list to find a block, split a larger block (or on
+<code>free</code> coalesce adjacent free ones), update the block's size/status header, take a lock or use a per-thread cache for
+thread-safety, and occasionally make a <code>brk</code>/<code>mmap</code> system call for more memory. A stack allocation does none of
+this because it is a single decrement of the stack pointer with a statically known lifetime — the frame — so there is no shared pool to
+search or manage. <em>Tempting wrong answer:</em> &ldquo;<code>malloc</code> just returns the next free address&rdquo; — there is no
+&ldquo;next&rdquo; in a shared heap with arbitrary free order; it must search and manage. <strong>Feed-forward:</strong> &sect;38.1.</div>
+
+<div class="solution" id="sol38.2"><span class="sol-label">38.2</span>
+The two costs are the <strong>per-call cost</strong> of <code>malloc</code>/<code>free</code> — the free-list search, splitting/coalescing,
+locking, and occasional syscall — paid at allocation and deallocation time; and the <strong>locality cost</strong> of the scattered
+memory the allocator returns, paid <em>later</em>, on every traversal of the allocated structure, as a cache miss per node. The first is
+bounded (a few nanoseconds a call); the second is usually larger. <em>Tempting wrong answer:</em> &ldquo;the only cost is the time in
+<code>malloc</code>&rdquo; — that ignores the larger, deferred locality cost charged to your traversal loops.
+<strong>Feed-forward:</strong> &sect;38.2.</div>
+
+<div class="solution" id="sol38.3"><span class="sol-label">38.3</span>
+An arena is freed all at once: you release the single underlying block with one <code>free()</code> (or reset the bump pointer),
+discarding every object it held in one operation, regardless of how many there were. So the deallocation cost is O(1) for the whole
+region rather than O(1) <em>per object</em> — amortized over a million objects, the per-object free cost is essentially zero, versus a
+separate <code>free</code> call (with its header read and coalescing) for each object under a general allocator. <em>Tempting wrong
+answer:</em> &ldquo;the arena frees each object very quickly&rdquo; — it does not free them individually at all; it drops the whole
+region. <strong>Feed-forward:</strong> &sect;38.3.</div>
+
+<div class="solution" id="sol38.4"><span class="sol-label">38.4</span>
+(a) On the contiguous layout the accesses march sequentially through memory, so the hardware prefetcher fetches the next cache line
+before the loop asks for it and nearly every access hits cache (~8&nbsp;ns); on the scattered layout each <code>p = p-&gt;next</code>
+jumps to an unpredictable address that is neither cached nor prefetchable, so the core stalls on DRAM — often plus a TLB miss — for
+essentially every node (~177&nbsp;ns), giving ~22&times;. (b) If the ~244&nbsp;MiB working set fit in the 24&nbsp;MiB L3, even scattered
+accesses would mostly hit cache and the gap would shrink or vanish; exceeding L3 is what forces the scattered walk to DRAM and exposes
+the latency. (c) Only the <em>memory layout</em> of the nodes differs — contiguous versus scattered — and the <code>malloc</code>-per-node
+allocation pattern, not the loop, decided it. <em>Tempting wrong answer:</em> &ldquo;the scattered loop does more work&rdquo; — identical
+instructions and node count; it waits on memory, it does not compute more. <strong>Feed-forward:</strong> &sect;38.2.</div>
+
+<div class="solution" id="sol38.5"><span class="sol-label">38.5</span>
+(a) The arena does not search a free-list for a suitably sized block (it just increments a pointer) and does not maintain per-object
+headers or coalesce on free (it drops the whole region), and it need not support freeing objects individually or interleaving with the
+rest of the program. (b) The free side is a bigger win because a general allocator does per-object work on every <code>free</code> — read
+the header, mark free, coalesce — whereas the arena frees a million objects with one <code>free()</code>, so the arena's per-object free
+cost is ~0 against ~8.6&nbsp;ns, a larger ratio than the allocation side. (c) In return the arena cannot free individual objects, only the
+whole region; it therefore suits phase- or request-scoped work where everything allocated in a phase dies together (parse a document,
+serve a request, render a frame). <em>Tempting wrong answer:</em> &ldquo;the arena is just a faster <code>malloc</code>&rdquo; — it is
+faster precisely because it drops generality (individual free, arbitrary reuse) the general allocator must keep.
+<strong>Feed-forward:</strong> &sect;38.3.</div>
+
+<div class="solution" id="sol38.6"><span class="sol-label">38.6</span>
+(a) <strong>Arena</strong> — everything allocated while handling the request dies together when the response is sent, exactly the
+phase-scoped lifetime an arena exploits (pointer-bump allocation, O(1) bulk free, contiguity). (b) <strong>Pool</strong> (slab) — a stream
+of same-sized objects individually created and destroyed is the fixed-size, individually-reused pattern a pool serves with O(1) push/pop
+and packed layout. (c) <strong>None — keep general <code>malloc</code></strong> — a handful of long-lived, wildly-varying-size objects at
+startup has no lifetime or size structure to exploit and negligible allocation volume, so a custom allocator buys nothing.
+<em>Tempting wrong answer:</em> &ldquo;always use an arena, it's fastest&rdquo; — an arena cannot free individual objects, so it is wrong
+for (b)'s long-run individual reuse. <strong>Feed-forward:</strong> &sect;38.3.</div>
+
+<div class="solution" id="sol38.7"><span class="sol-label">38.7</span>
+(a) Total time &asymp; <var>N</var>&nbsp;&middot;&nbsp;<var>c</var> (allocation) +
+<var>t</var>&nbsp;&middot;&nbsp;<var>N</var>&nbsp;&middot;&nbsp;<var>m</var> (traversals). (b) With <var>t</var>=10: allocation is
+<var>N</var>&middot;18 = 18<var>N</var> ns whichever allocator (or 3.6<var>N</var> with the arena); traversal is
+10&middot;<var>N</var>&middot;8 = 80<var>N</var> ns contiguous versus 10&middot;<var>N</var>&middot;177 = 1770<var>N</var> ns scattered.
+The layout choice changes the total by ~1690<var>N</var> ns, more than a hundred times the ~14.4<var>N</var> ns saved by switching
+allocator — layout dominates. (c) Setting the per-call cost equal to the extra scattered-traversal cost:
+<var>N</var>&middot;<var>c</var> = <var>t</var>&middot;<var>N</var>&middot;(177&minus;8), so
+<var>t</var> = 18/169 &asymp; 0.11. Interpretation: even a fraction of a single traversal's extra scattering cost already exceeds the
+entire per-call cost, so any program that walks the data even once is dominated by locality, not by allocation speed.
+<em>Tempting wrong answer:</em> &ldquo;the per-call cost <var>N</var>&middot;<var>c</var> is the big term&rdquo; — it is dwarfed as soon as
+<var>t</var>&nbsp;&geq;&nbsp;1 with scattered layout. <strong>Feed-forward:</strong> &sect;38.2.</div>
+
+<div class="solution" id="sol38.8"><span class="sol-label">38.8</span>
+<strong>Step 4:</strong> The microbenchmark understates the real cost because its allocate-then-immediately-free pattern stays on the
+<code>tcache</code> fast path — no lock, no search, and (crucially) the objects never accumulate, so it never exposes the scattering and
+fragmentation that long-lived, out-of-order allocations cause in the real program. The colleague should measure the <em>representative</em>
+workload — objects kept live and traversed as the program actually uses them — and watch for time in the traversal loops with a high
+cache-miss rate, not just time inside <code>malloc</code>. The arena would fix the <em>locality</em> cost here, not the per-call cost: it
+packs the objects contiguously so the later traversals hit cache, which is where the real time is going — the ~18&nbsp;ns per call was
+never the problem. <em>Tempting wrong answer:</em> &ldquo;the benchmark proves allocation is cheap&rdquo; — it proves the fast path is
+cheap, not that the real program's scattered layout is. <strong>Feed-forward:</strong> &sect;38.4.</div>
+
+<div class="solution" id="sol38.9"><span class="sol-label">38.9</span>
+(a) <strong>Per-call overhead</strong> — millions of tiny allocate/free per second with no bulk traversal means the cost is the calls
+themselves (pool or batch them). (b) <strong>Locality</strong> — ten million separately-<code>malloc</code>'d nodes walked repeatedly is
+the classic scattered pointer-chase; the traversals' cache misses dominate (arena or flatten to arrays). (c) <strong>Locality</strong> —
+allocating thousands of AST nodes but walking the tree many times means the repeated traversals, not the one-time allocation, cost the
+most (arena the nodes for contiguity). (d) <strong>Neither, really</strong> — one large allocation has trivial per-call cost and a single
+contiguous buffer streams with good locality; the cost, if any, is bandwidth, not allocation. <em>Tempting wrong answer:</em> calling (a)
+a locality problem — it never traverses in bulk, so scattering is irrelevant; the calls are the cost. <strong>Feed-forward:</strong>
+&sect;38.2, &sect;38.4.</div>
+
+<div class="solution" id="sol38.10"><span class="sol-label">38.10</span>
+(a) <strong>False</strong> — the traversal does not call <code>malloc</code>; a faster allocator cannot fix cache misses over
+already-scattered nodes. (b) <strong>False</strong> — an arena frees only the whole region, never individual objects. (c) <strong>False</strong>
+— the largest cost is usually the locality of the scattered result, paid in traversals, not the time inside <code>malloc</code>. (d)
+<strong>True</strong> — an arena hands out objects consecutively, so they are contiguous and later traversals prefetch and hit cache. (e)
+<strong>False</strong> — allocate-then-immediately-free hits the <code>tcache</code> fast path and hides the scattering a long-running
+program suffers. <em>Tempting wrong answer:</em> marking (a) true from &ldquo;allocation is slow, so a faster allocator must help&rdquo; —
+the slow part is the traversal's memory latency, not allocation. <strong>Feed-forward:</strong> &sect;38.1&ndash;&sect;38.4.</div>
+
+<div class="solution" id="sol38.11"><span class="sol-label">38.11</span>
+(a) For most programs the dominant allocation cost is not the call but the cache misses of traversing the scattered objects the call
+returned — which is exactly Chapter 34's locality ceiling — so the fix is a contiguous layout (an arena, or a flat array with indices
+instead of a graph of pointers), not a faster allocator. (b) Check, in order: is the time actually in <code>malloc</code>/<code>free</code>
+(a per-call problem) or in the traversal loop (a locality problem)? If the traversal, is its cache-miss rate high and the working set
+larger than last-level cache? Only after confirming it is scattered-traversal latency, not allocation, would you change the layout. (c)
+&ldquo;Allocate fewer, more contiguous objects&rdquo; targets the real cost — memory latency on traversal — and is achievable with an
+arena or array; &ldquo;find a faster allocator&rdquo; optimizes the few-percent per-call cost and leaves the scattered layout, and its
+cache misses, untouched. <em>Tempting wrong answer:</em> &ldquo;profile, see time near allocation, swap the allocator&rdquo; — the time is
+near the <em>allocated data's</em> traversal, not the allocator. <strong>Feed-forward:</strong> &sect;38.4&ndash;&sect;38.5.</div>
+
+<div class="solution" id="sol38.12"><span class="sol-label">38.12</span>
+Platform-specific. A correct write-up reports: (a) per-object costs for <code>malloc</code>/<code>free</code> versus an arena, with the
+arena a few times cheaper on allocation and dramatically cheaper on free (one region <code>free()</code> for all <var>N</var>). (b) a
+contiguous versus shuffled linked traversal with the working set chosen above last-level cache, showing the contiguous walk a large factor
+faster (order 10&ndash;20&times;) and attributing it to prefetchable sequential access versus a cache miss per node. (c) the toolchain
+version, CPU, last-level cache size (from <code>/sys</code>), and allocator, noting these are wall-clock minimum-of-trials times with no
+hardware counters if <code>perf</code> is unavailable. <em>Tempting wrong answer:</em> &ldquo;report the allocate-then-free microbenchmark
+as the allocation cost&rdquo; — it hits the fast path; keep the objects live and traverse them to see the real cost.
+<strong>Feed-forward:</strong> &sect;38.2, &sect;38.4.</div>
+
+</section>
+
+<section class="solutions" id="sol39">
+<h1>Chapter 39 — Solutions</h1>
+
+<div class="solution" id="sol39.1"><span class="sol-label">39.1</span>
+(1) <strong>Measure</strong> the real workload and set a baseline (minimum of several trials). (2) Find the <strong>dominant cost</strong> —
+the largest share of runtime. (3) <strong>Identify the ceiling</strong> that cost is under (compute, cache, bandwidth, control,
+allocation). (4) <strong>Raise that ceiling</strong> with its matching tool, and only that tool. (5) <strong>Re-measure</strong> against
+the baseline and repeat on the next ceiling. <em>Tempting wrong answer:</em> &ldquo;pick the fastest technique and apply it&rdquo; — that
+skips steps 1&ndash;3, the diagnosis that decides which technique is even relevant. <strong>Feed-forward:</strong> &sect;39.1.</div>
+
+<div class="solution" id="sol39.2"><span class="sol-label">39.2</span>
+Because the tools are not interchangeable — each raises one specific ceiling, so applying one before naming the ceiling risks raising a
+roof the program is not under, which does nothing or loses. Example: SIMD on the &sect;36.3 bandwidth-bound dot product gave only
+2.4&times;, not the 13&times; it gave a compute-bound kernel, because the loop waited on DRAM, not the adder (other valid examples:
+branchless code losing to a predictable branch, Chapter 37; a faster allocator doing nothing for a scattered traversal, Chapter 38).
+<em>Tempting wrong answer:</em> &ldquo;identify the ceiling afterward, once the tool didn't help&rdquo; — that wastes the effort and the
+added complexity the workflow exists to avoid. <strong>Feed-forward:</strong> &sect;39.1&ndash;&sect;39.2.</div>
+
+<div class="solution" id="sol39.3"><span class="sol-label">39.3</span>
+(a) <strong>Compute</strong>-bound — widening arithmetic (SIMD) moves the number. (b) <strong>Bandwidth</strong>-bound — streaming an array
+larger than cache waits on DRAM. (c) <strong>Control</strong>-bound — a data-dependent branch swinging with input order is misprediction.
+(d) <strong>Latency</strong>-bound (a memory ceiling) — a scattered pointer chase misses cache per node. <em>Tempting wrong answer:</em>
+calling (b) compute-bound because &ldquo;it does arithmetic&rdquo; — it does, but it is limited by byte delivery, not by the adder.
+<strong>Feed-forward:</strong> &sect;39.2.</div>
+
+<div class="solution" id="sol39.4"><span class="sol-label">39.4</span>
+(a) Overall speedup = 1&nbsp;/&nbsp;((1&minus;<em>p</em>)&nbsp;+&nbsp;<em>p</em>/<em>s</em>), where <em>p</em> is the fraction of runtime
+optimized and <em>s</em> the local speedup. (b) With <em>p</em>=0.20, <em>s</em>=4: 1&nbsp;/&nbsp;(0.80&nbsp;+&nbsp;0.20/4) =
+1&nbsp;/&nbsp;0.85 &asymp; <strong>1.18&times;</strong>. (c) The maximum, at <em>s</em>&nbsp;&rarr;&nbsp;&infin;, is
+1&nbsp;/&nbsp;(1&minus;0.20) = 1.25&times; — so even infinite speedup on this function caps the program at 1.25&times;, which says the
+other 80% is where the larger remaining gains live: look there next. <em>Tempting wrong answer:</em> &ldquo;4&times; on 20% gives about
+4&times;&rdquo; — no; the 80% you did not touch dominates, giving only ~1.18&times;. <strong>Feed-forward:</strong> &sect;39.3.</div>
+
+<div class="solution" id="sol39.5"><span class="sol-label">39.5</span>
+(a) It is <strong>latency</strong>-bound (a memory ceiling): a pointer chase over scattered nodes with a working set beyond L3 misses
+cache on essentially every node; confirm by checking that time is in the traversal (not in <code>malloc</code>), that the miss rate is
+high (or, without <code>perf</code>, that shrinking the working set below cache collapses the time), and that access is non-sequential.
+(b) The fix is <strong>contiguity</strong> — an arena or a flat array with indices instead of pointers (Chapter 38, echoing Chapters
+34&ndash;35) so the walk prefetches; SIMD, branchless code, and a faster allocator would <em>not</em> help, because none of them changes
+the scattered layout. (c) With the loop now 30% and the profile flat, Amdahl's law says the next single change is bounded low — stop
+optimizing this, or move to whatever the new dominant cost is if one emerges. <em>Tempting wrong answer:</em> &ldquo;swap in a faster
+allocator&rdquo; — the time is in the traversal's cache misses, not in allocation. <strong>Feed-forward:</strong> &sect;39.2&ndash;&sect;39.3.</div>
+
+<div class="solution" id="sol39.6"><span class="sol-label">39.6</span>
+(a) <strong>Compute</strong> ceiling → SIMD; echoes the 13&times; kernel of &sect;36.2. (b) <strong>Bandwidth</strong> ceiling → locality/layout
+(SIMD barely helps); echoes the 2.4&times; dot product of &sect;36.3. (c) <strong>Control</strong> ceiling → make the branch predictable
+or branchless; echoes the 15&times; swing of &sect;37.2. (d) <strong>Allocation/locality</strong> ceiling → arena or flatten for
+contiguity; echoes the 22&times; scattered-vs-contiguous traversal of &sect;38.2. <em>Tempting wrong answer:</em> giving (b) SIMD as the
+fix &ldquo;because it's arithmetic&rdquo; — it is bandwidth-bound, so lanes don't help; layout does. <strong>Feed-forward:</strong>
+&sect;39.2.</div>
+
+<div class="solution" id="sol39.7"><span class="sol-label">39.7</span>
+(a) Optimizing A (<em>p</em>=0.60, <em>s</em>=5): 1&nbsp;/&nbsp;(0.40&nbsp;+&nbsp;0.60/5) = 1&nbsp;/&nbsp;0.52 &asymp;
+<strong>1.92&times;</strong>. Optimizing B (<em>p</em>=0.30, <em>s</em>=5): 1&nbsp;/&nbsp;(0.70&nbsp;+&nbsp;0.30/5) = 1&nbsp;/&nbsp;0.76
+&asymp; <strong>1.32&times;</strong>. (b) Do <strong>A</strong> first — for the same effort and same local speedup, the larger fraction
+yields the larger overall gain; Amdahl's law makes the bigger share always the better target. (c) After speeding A 5&times;, A's time
+falls to 0.12 of the original while the rest (the 0.40 of non-A work) is unchanged, so the new runtime is 0.52 of the original; B is now
+0.30&nbsp;/&nbsp;0.52 &asymp; 58% of the new runtime, so B has become the dominant cost and is now clearly worth doing. <em>Tempting wrong answer:</em>
+&ldquo;do B first because it's easier to reason about&rdquo; — effort is equal by assumption, so the larger fraction wins.
+<strong>Feed-forward:</strong> &sect;39.3.</div>
+
+<div class="solution" id="sol39.8"><span class="sol-label">39.8</span>
+<strong>Step 4:</strong> The ~1&times; is expected, not a bug: the loop is bandwidth-bound, so it is limited by how fast DRAM delivers
+bytes, and SIMD widens the arithmetic — a ceiling the loop was never under — so the memory bus caps it at roughly the scalar throughput.
+A profile beforehand would have shown the loop stalled on memory (a high miss rate or, without <code>perf</code>, throughput flat as you
+widen the arithmetic and rising only if you shrink the working set below cache), identifying the bandwidth ceiling before any code was
+written. The PR should be dropped despite the &ldquo;more advanced&rdquo; code because it adds CPU-specific complexity for no measured
+gain, and the real lever — if the loop must be faster — is moving fewer bytes (locality and layout, Chapters 34&ndash;35), not more lanes.
+<em>Tempting wrong answer:</em> &ldquo;keep it, advanced code is better&rdquo; — complexity with no measured speedup is a net loss.
+<strong>Feed-forward:</strong> &sect;39.2, &sect;39.4.</div>
+
+<div class="solution" id="sol39.9"><span class="sol-label">39.9</span>
+The shared trap is <strong>acting on a model of the hardware instead of a measurement of it</strong> — reasoning from &ldquo;fewer
+instructions,&rdquo; &ldquo;more lanes,&rdquo; &ldquo;no branch,&rdquo; or &ldquo;faster allocator&rdquo; without evidence. What would have
+caught each: (a) a profile showing the function is 2% of runtime (Amdahl caps the win at ~1.02&times;); (b) timing scalar vs vectorized,
+or noting the working set exceeds cache — the number does not move; (c) reading the emitted assembly and finding a <code>cmov</code>, not
+a conditional jump, so there is no branch to remove; (d) a profile showing the time is in the traversal's cache misses, not in
+<code>malloc</code>. <em>Tempting wrong answer:</em> treating them as four unrelated mistakes — they are one mistake (no measurement) in
+four costumes. <strong>Feed-forward:</strong> &sect;39.4.</div>
+
+<div class="solution" id="sol39.10"><span class="sol-label">39.10</span>
+(a) <strong>False</strong> — the fastest program is the one that raises the ceiling it is actually under; a cache-hostile loop with fewer
+instructions can be slower than a cache-friendly one with more (Chapter 34). (b) <strong>True</strong> — 1&nbsp;/&nbsp;0.95 &asymp; 1.05&times;
+is the Amdahl ceiling for a 5% part. (c) <strong>False</strong> — each raises a different ceiling (compute, control, allocation) and does
+little or nothing against the others. (d) <strong>True</strong> — re-measuring is mandatory; the layers routinely make the &ldquo;obvious&rdquo;
+change do nothing or lose. (e) <strong>False</strong> — a program is under one dominant ceiling at a time; raise that one, re-measure, and
+the next surfaces. <em>Tempting wrong answer:</em> marking (a) true from the instruction-count intuition — the machine counts stalls, not
+just instructions. <strong>Feed-forward:</strong> &sect;39.1&ndash;&sect;39.4.</div>
+
+<div class="solution" id="sol39.11"><span class="sol-label">39.11</span>
+(a) Every trap is reasoning from a model of the hardware — operation counts, lane counts, source branches, allocator speed — when the
+machine's interacting layers (compiler, cache, predictor, allocator, bus) routinely make the intuitive answer wrong; the one common
+defense is evidence: profile and time before, re-measure after. (b) What decides the outcome is whether the tool matches the ceiling the
+loop is actually under: SIMD gave 13&times; on a compute-bound kernel but 2.4&times; on a bandwidth-bound one; a branch swung 15&times;
+when it survived and was unpredictable but nothing when the compiler removed it; contiguity gave 22&times; on a scattered traversal — same
+techniques, different ceilings, so the match, not the technique, sets the number. (c) Techniques change with hardware and language, but
+&ldquo;find the binding ceiling and raise that one&rdquo; is the invariant method that tells you <em>which</em> technique to reach for and
+when to stop — it survives every new tool and every new machine. <em>Tempting wrong answer:</em> &ldquo;master all the techniques and
+apply them everywhere&rdquo; — without diagnosis that is how the regressions in (b) get shipped. <strong>Feed-forward:</strong>
+&sect;39.4&ndash;&sect;39.5.</div>
+
+<div class="solution" id="sol39.12"><span class="sol-label">39.12</span>
+Open-ended and platform-specific. A correct write-up: (a) names a real hot loop found by profiling or timing and gives a baseline as the
+minimum of several trials; (b) identifies the ceiling with an actual test — a cache cliff as input size crosses last-level cache, a
+scalar-vs-vectorized timing, the emitted assembly for a surviving branch, or whether time is in the allocator versus the traversal — then
+applies only the matching tool and re-measures; (c) reports before/after honestly, including the outcome (common and valuable) that the
+change did <em>not</em> move the number and the ceiling was elsewhere, plus toolchain, CPU, and the note that these are wall-clock times if
+<code>perf</code> is unavailable. <em>Tempting wrong answer:</em> &ldquo;apply SIMD and report the speedup&rdquo; — that skips the
+diagnosis and may raise a ceiling the loop is not under. <strong>Feed-forward:</strong> &sect;39.1&ndash;&sect;39.2.</div>
 
 </section>
 </body></html>

@@ -1,0 +1,121 @@
+<section class="solutions" id="sol38">
+<h1>Chapter 38 — Solutions</h1>
+
+<div class="solution" id="sol38.1"><span class="sol-label">38.1</span>
+On a single call a general-purpose <code>malloc</code> may walk a size-segregated free-list to find a block, split a larger block (or on
+<code>free</code> coalesce adjacent free ones), update the block's size/status header, take a lock or use a per-thread cache for
+thread-safety, and occasionally make a <code>brk</code>/<code>mmap</code> system call for more memory. A stack allocation does none of
+this because it is a single decrement of the stack pointer with a statically known lifetime — the frame — so there is no shared pool to
+search or manage. <em>Tempting wrong answer:</em> &ldquo;<code>malloc</code> just returns the next free address&rdquo; — there is no
+&ldquo;next&rdquo; in a shared heap with arbitrary free order; it must search and manage. <strong>Feed-forward:</strong> &sect;38.1.</div>
+
+<div class="solution" id="sol38.2"><span class="sol-label">38.2</span>
+The two costs are the <strong>per-call cost</strong> of <code>malloc</code>/<code>free</code> — the free-list search, splitting/coalescing,
+locking, and occasional syscall — paid at allocation and deallocation time; and the <strong>locality cost</strong> of the scattered
+memory the allocator returns, paid <em>later</em>, on every traversal of the allocated structure, as a cache miss per node. The first is
+bounded (a few nanoseconds a call); the second is usually larger. <em>Tempting wrong answer:</em> &ldquo;the only cost is the time in
+<code>malloc</code>&rdquo; — that ignores the larger, deferred locality cost charged to your traversal loops.
+<strong>Feed-forward:</strong> &sect;38.2.</div>
+
+<div class="solution" id="sol38.3"><span class="sol-label">38.3</span>
+An arena is freed all at once: you release the single underlying block with one <code>free()</code> (or reset the bump pointer),
+discarding every object it held in one operation, regardless of how many there were. So the deallocation cost is O(1) for the whole
+region rather than O(1) <em>per object</em> — amortized over a million objects, the per-object free cost is essentially zero, versus a
+separate <code>free</code> call (with its header read and coalescing) for each object under a general allocator. <em>Tempting wrong
+answer:</em> &ldquo;the arena frees each object very quickly&rdquo; — it does not free them individually at all; it drops the whole
+region. <strong>Feed-forward:</strong> &sect;38.3.</div>
+
+<div class="solution" id="sol38.4"><span class="sol-label">38.4</span>
+(a) On the contiguous layout the accesses march sequentially through memory, so the hardware prefetcher fetches the next cache line
+before the loop asks for it and nearly every access hits cache (~8&nbsp;ns); on the scattered layout each <code>p = p-&gt;next</code>
+jumps to an unpredictable address that is neither cached nor prefetchable, so the core stalls on DRAM — often plus a TLB miss — for
+essentially every node (~177&nbsp;ns), giving ~22&times;. (b) If the ~244&nbsp;MiB working set fit in the 24&nbsp;MiB L3, even scattered
+accesses would mostly hit cache and the gap would shrink or vanish; exceeding L3 is what forces the scattered walk to DRAM and exposes
+the latency. (c) Only the <em>memory layout</em> of the nodes differs — contiguous versus scattered — and the <code>malloc</code>-per-node
+allocation pattern, not the loop, decided it. <em>Tempting wrong answer:</em> &ldquo;the scattered loop does more work&rdquo; — identical
+instructions and node count; it waits on memory, it does not compute more. <strong>Feed-forward:</strong> &sect;38.2.</div>
+
+<div class="solution" id="sol38.5"><span class="sol-label">38.5</span>
+(a) The arena does not search a free-list for a suitably sized block (it just increments a pointer) and does not maintain per-object
+headers or coalesce on free (it drops the whole region), and it need not support freeing objects individually or interleaving with the
+rest of the program. (b) The free side is a bigger win because a general allocator does per-object work on every <code>free</code> — read
+the header, mark free, coalesce — whereas the arena frees a million objects with one <code>free()</code>, so the arena's per-object free
+cost is ~0 against ~8.6&nbsp;ns, a larger ratio than the allocation side. (c) In return the arena cannot free individual objects, only the
+whole region; it therefore suits phase- or request-scoped work where everything allocated in a phase dies together (parse a document,
+serve a request, render a frame). <em>Tempting wrong answer:</em> &ldquo;the arena is just a faster <code>malloc</code>&rdquo; — it is
+faster precisely because it drops generality (individual free, arbitrary reuse) the general allocator must keep.
+<strong>Feed-forward:</strong> &sect;38.3.</div>
+
+<div class="solution" id="sol38.6"><span class="sol-label">38.6</span>
+(a) <strong>Arena</strong> — everything allocated while handling the request dies together when the response is sent, exactly the
+phase-scoped lifetime an arena exploits (pointer-bump allocation, O(1) bulk free, contiguity). (b) <strong>Pool</strong> (slab) — a stream
+of same-sized objects individually created and destroyed is the fixed-size, individually-reused pattern a pool serves with O(1) push/pop
+and packed layout. (c) <strong>None — keep general <code>malloc</code></strong> — a handful of long-lived, wildly-varying-size objects at
+startup has no lifetime or size structure to exploit and negligible allocation volume, so a custom allocator buys nothing.
+<em>Tempting wrong answer:</em> &ldquo;always use an arena, it's fastest&rdquo; — an arena cannot free individual objects, so it is wrong
+for (b)'s long-run individual reuse. <strong>Feed-forward:</strong> &sect;38.3.</div>
+
+<div class="solution" id="sol38.7"><span class="sol-label">38.7</span>
+(a) Total time &asymp; <var>N</var>&nbsp;&middot;&nbsp;<var>c</var> (allocation) +
+<var>t</var>&nbsp;&middot;&nbsp;<var>N</var>&nbsp;&middot;&nbsp;<var>m</var> (traversals). (b) With <var>t</var>=10: allocation is
+<var>N</var>&middot;18 = 18<var>N</var> ns whichever allocator (or 3.6<var>N</var> with the arena); traversal is
+10&middot;<var>N</var>&middot;8 = 80<var>N</var> ns contiguous versus 10&middot;<var>N</var>&middot;177 = 1770<var>N</var> ns scattered.
+The layout choice changes the total by ~1690<var>N</var> ns, more than a hundred times the ~14.4<var>N</var> ns saved by switching
+allocator — layout dominates. (c) Setting the per-call cost equal to the extra scattered-traversal cost:
+<var>N</var>&middot;<var>c</var> = <var>t</var>&middot;<var>N</var>&middot;(177&minus;8), so
+<var>t</var> = 18/169 &asymp; 0.11. Interpretation: even a fraction of a single traversal's extra scattering cost already exceeds the
+entire per-call cost, so any program that walks the data even once is dominated by locality, not by allocation speed.
+<em>Tempting wrong answer:</em> &ldquo;the per-call cost <var>N</var>&middot;<var>c</var> is the big term&rdquo; — it is dwarfed as soon as
+<var>t</var>&nbsp;&geq;&nbsp;1 with scattered layout. <strong>Feed-forward:</strong> &sect;38.2.</div>
+
+<div class="solution" id="sol38.8"><span class="sol-label">38.8</span>
+<strong>Step 4:</strong> The microbenchmark understates the real cost because its allocate-then-immediately-free pattern stays on the
+<code>tcache</code> fast path — no lock, no search, and (crucially) the objects never accumulate, so it never exposes the scattering and
+fragmentation that long-lived, out-of-order allocations cause in the real program. The colleague should measure the <em>representative</em>
+workload — objects kept live and traversed as the program actually uses them — and watch for time in the traversal loops with a high
+cache-miss rate, not just time inside <code>malloc</code>. The arena would fix the <em>locality</em> cost here, not the per-call cost: it
+packs the objects contiguously so the later traversals hit cache, which is where the real time is going — the ~18&nbsp;ns per call was
+never the problem. <em>Tempting wrong answer:</em> &ldquo;the benchmark proves allocation is cheap&rdquo; — it proves the fast path is
+cheap, not that the real program's scattered layout is. <strong>Feed-forward:</strong> &sect;38.4.</div>
+
+<div class="solution" id="sol38.9"><span class="sol-label">38.9</span>
+(a) <strong>Per-call overhead</strong> — millions of tiny allocate/free per second with no bulk traversal means the cost is the calls
+themselves (pool or batch them). (b) <strong>Locality</strong> — ten million separately-<code>malloc</code>'d nodes walked repeatedly is
+the classic scattered pointer-chase; the traversals' cache misses dominate (arena or flatten to arrays). (c) <strong>Locality</strong> —
+allocating thousands of AST nodes but walking the tree many times means the repeated traversals, not the one-time allocation, cost the
+most (arena the nodes for contiguity). (d) <strong>Neither, really</strong> — one large allocation has trivial per-call cost and a single
+contiguous buffer streams with good locality; the cost, if any, is bandwidth, not allocation. <em>Tempting wrong answer:</em> calling (a)
+a locality problem — it never traverses in bulk, so scattering is irrelevant; the calls are the cost. <strong>Feed-forward:</strong>
+&sect;38.2, &sect;38.4.</div>
+
+<div class="solution" id="sol38.10"><span class="sol-label">38.10</span>
+(a) <strong>False</strong> — the traversal does not call <code>malloc</code>; a faster allocator cannot fix cache misses over
+already-scattered nodes. (b) <strong>False</strong> — an arena frees only the whole region, never individual objects. (c) <strong>False</strong>
+— the largest cost is usually the locality of the scattered result, paid in traversals, not the time inside <code>malloc</code>. (d)
+<strong>True</strong> — an arena hands out objects consecutively, so they are contiguous and later traversals prefetch and hit cache. (e)
+<strong>False</strong> — allocate-then-immediately-free hits the <code>tcache</code> fast path and hides the scattering a long-running
+program suffers. <em>Tempting wrong answer:</em> marking (a) true from &ldquo;allocation is slow, so a faster allocator must help&rdquo; —
+the slow part is the traversal's memory latency, not allocation. <strong>Feed-forward:</strong> &sect;38.1&ndash;&sect;38.4.</div>
+
+<div class="solution" id="sol38.11"><span class="sol-label">38.11</span>
+(a) For most programs the dominant allocation cost is not the call but the cache misses of traversing the scattered objects the call
+returned — which is exactly Chapter 34's locality ceiling — so the fix is a contiguous layout (an arena, or a flat array with indices
+instead of a graph of pointers), not a faster allocator. (b) Check, in order: is the time actually in <code>malloc</code>/<code>free</code>
+(a per-call problem) or in the traversal loop (a locality problem)? If the traversal, is its cache-miss rate high and the working set
+larger than last-level cache? Only after confirming it is scattered-traversal latency, not allocation, would you change the layout. (c)
+&ldquo;Allocate fewer, more contiguous objects&rdquo; targets the real cost — memory latency on traversal — and is achievable with an
+arena or array; &ldquo;find a faster allocator&rdquo; optimizes the few-percent per-call cost and leaves the scattered layout, and its
+cache misses, untouched. <em>Tempting wrong answer:</em> &ldquo;profile, see time near allocation, swap the allocator&rdquo; — the time is
+near the <em>allocated data's</em> traversal, not the allocator. <strong>Feed-forward:</strong> &sect;38.4&ndash;&sect;38.5.</div>
+
+<div class="solution" id="sol38.12"><span class="sol-label">38.12</span>
+Platform-specific. A correct write-up reports: (a) per-object costs for <code>malloc</code>/<code>free</code> versus an arena, with the
+arena a few times cheaper on allocation and dramatically cheaper on free (one region <code>free()</code> for all <var>N</var>). (b) a
+contiguous versus shuffled linked traversal with the working set chosen above last-level cache, showing the contiguous walk a large factor
+faster (order 10&ndash;20&times;) and attributing it to prefetchable sequential access versus a cache miss per node. (c) the toolchain
+version, CPU, last-level cache size (from <code>/sys</code>), and allocator, noting these are wall-clock minimum-of-trials times with no
+hardware counters if <code>perf</code> is unavailable. <em>Tempting wrong answer:</em> &ldquo;report the allocate-then-free microbenchmark
+as the allocation cost&rdquo; — it hits the fast path; keep the objects live and traverse them to see the real cost.
+<strong>Feed-forward:</strong> &sect;38.2, &sect;38.4.</div>
+
+</section>

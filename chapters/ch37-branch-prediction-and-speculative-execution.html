@@ -1,0 +1,398 @@
+<section class="chapter" id="ch37">
+<h1>Chapter 37 — Branch Prediction and Speculative Execution</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch02">Chapter 2</a> (the CPU up close — the pipeline that a
+misprediction flushes), <a href="#ch10">Chapter 10</a> (the optimizing compiler — <em>if-conversion</em> is one of its transforms, and it
+changes everything here), <a href="#ch36">Chapter 36</a> (SIMD and masks — how the vectorizer turns a branch into arithmetic),
+<a href="#ch33">Chapter 33</a> (measure first — this chapter's central claim is that you must, because the effect appears and vanishes
+with the build). &nbsp;·&nbsp; The last three chapters raised the memory and compute ceilings; this one opens a different cost the
+profiler can hand you — a branch the CPU guessed wrong — and shows why the honest number is, again, a measured one.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch02">Chapter 2</a> — what is an instruction <em>pipeline</em>, and why does a modern core
+have several instructions in flight at once rather than finishing one before starting the next? (2) <a href="#ch33">Chapter 33</a> —
+why do you report the minimum of several timed trials rather than a single run? (3) <em>Predict:</em> you sum only the elements
+<code>&gt;= 128</code> of a 32768-element array of random bytes, with a plain <code>if (data[i] &gt;= 128) sum += data[i];</code>. You
+then <em>sort</em> the array first and run the identical loop again. Same arithmetic, same element count. How much faster do you expect
+the sorted run: about the same, 2&times;, or something far larger? And does your answer depend on the compiler flags? Write your guesses;
+&sect;37.2 and &sect;37.4 answer them.</p>
+</aside>
+
+<p>A branch — an <code>if</code>, a loop test, a <code>switch</code>, a function return — is a fork in the instruction stream, and a
+modern CPU cannot afford to wait to learn which way it goes. The pipeline (Chapter 2) has a dozen or more instructions in flight at
+once, so by the time a branch's condition is actually computed the core has already fetched and begun executing the instructions after
+it — but <em>which</em> instructions? The ones on the taken path or the not-taken path? The core does not know yet, so it
+<strong>guesses</strong>, using a hardware <strong>branch predictor</strong>, and speculatively runs ahead down the predicted path. When
+the guess is right, the work is already done and the branch cost essentially nothing. When it is wrong, everything speculatively
+executed after the branch must be thrown away and the pipeline refilled from the correct target — a <strong>misprediction penalty</strong>
+of, on published figures, roughly 15&ndash;20 cycles on modern x86 (Agner Fog's microarchitecture manual). That is the cost this chapter
+is about: not the work the branch guards, but the guess it forces, and what happens when the data makes the guess unpredictable. This
+chapter proceeds in five steps: why a branch can cost more than the work it guards (&sect;37.1); the predictor, and the sorted-array
+experiment that made this famous, measured here (&sect;37.2); making the branch cheap — predication, <code>cmov</code>, and branchless
+code (&sect;37.3); what the compiler already did to your branch, and why the effect appears and vanishes with the build, so you must
+measure (&sect;37.4); and what to carry forward (&sect;37.5).</p>
+
+<p><strong>On the code in this chapter.</strong> As before the programs are C, compiled with gcc 11.4.0 and run in this environment on
+an Intel Core i7-12700H, timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> and reported as the minimum of several trials (Chapter
+33). Times are wall-clock seconds for a fixed amount of work and are illustrative of the effect, not a benchmark of the machine. Where a
+compiler decision is claimed — that a loop kept a real branch, used a conditional move, or vectorized with a mask — it is confirmed by
+reading gcc's own assembly output (<code>-S</code>) or its <code>-fopt-info-vec</code> report, quoted inline, not asserted. A
+hardware-counter profiler (<code>perf</code>, which would report branch-misprediction counts directly) is <em>not</em> installed here,
+so the evidence for a misprediction is wall-clock time plus the emitted instructions — which, as &sect;37.4 argues, is exactly the
+evidence you can actually ship a decision on. Published cycle figures (pipeline depth, misprediction penalty) are labelled as such and
+attributed; they are not measured here.</p>
+
+<h2>37.1 Why a branch can cost more than the work it guards</h2>
+
+<p>A pipelined core overlaps instructions: while one is executing, the next is being decoded and the one after that fetched, so several
+are in flight at once (Chapter 2). This is <strong>instruction-level parallelism</strong>, and it is most of why a modern core is fast.
+A branch threatens it. Consider <code>if (cond) A; else B;</code>: the core must keep fetching to keep the pipeline full, but the target
+address — the address of <code>A</code> or of <code>B</code> — is not known until <code>cond</code> is evaluated, several stages later.
+Stalling until then would drain the pipeline and throw away the parallelism, so instead the core <strong>predicts</strong> the outcome
+and speculatively executes down the guessed path, holding the results provisionally. If the prediction was right, those results are
+committed and the branch was, in effect, free. If it was wrong, the speculated instructions are <strong>squashed</strong> — their results
+discarded — and the front end restarts fetching from the correct target, leaving a bubble of a dozen-plus cycles while the pipeline
+refills. That refill is the misprediction penalty, and its size is roughly the depth of the pipeline: published figures put modern x86
+pipelines at on the order of 14&ndash;19 stages and the misprediction penalty at roughly 15&ndash;20 cycles (Agner Fog; Hennessy &amp;
+Patterson, ch.3). The crucial consequence is that the cost of a branch is <em>not</em> the cost of the comparison — a <code>cmp</code>
+is one cheap instruction — but the cost of guessing wrong, paid only on mispredictions. A branch the predictor gets right almost every
+time is nearly free; a branch it gets wrong half the time can dominate a loop, costing far more per iteration than the handful of
+arithmetic instructions inside it. Whether a branch is cheap or ruinous therefore depends not on the code but on the <em>data</em> — on
+whether the pattern of taken and not-taken outcomes is something the predictor can learn.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In one sentence each: what does a CPU do at a branch rather than wait for the condition, and what is thrown away when the guess is
+wrong? Is the expensive part the comparison or the misprediction? (Answer after the next section.)</p>
+</aside>
+
+<h2>37.2 The predictor, and the array that made branches famous</h2>
+
+<p>The branch predictor is a small hardware table that records, per branch, the recent history of which way it went, and bets it will
+go the same way again; modern predictors correlate on the pattern of surrounding branches too (the classic strategies are surveyed by
+J. E. Smith, ISCA 1981). It is startlingly good on <em>regular</em> patterns: a loop that runs a million iterations takes its
+back-edge a million times and is mispredicted essentially once, on the final exit; a branch that is almost always taken is learned in a
+few iterations. Where it fails is on branches whose outcome is <strong>data-dependent and irregular</strong> — where taken and
+not-taken alternate with no learnable pattern. The canonical demonstration is a single data-dependent branch inside a hot loop, run
+first over unsorted data and then over the same data sorted. Here is that experiment, run in this environment (gcc 11.4.0, minimum of
+several trials), summing the elements <code>&gt;= 128</code> of a 32768-element array of random bytes, 20000 passes:</p>
+
+<pre><code>for (i) if (data[i] &gt;= 128) sum += data[i];     // one data-dependent branch per element
+
+# built so the compiler keeps a REAL branch (see &sect;37.4 for why this flag is needed):
+$ gcc -O2 -fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert branch.c
+$ ./a.out unsorted     random order, branch ~50% taken :  7.64 s
+$ ./a.out sorted       sorted first, branch predictable :  0.50 s      # ~15x faster, identical arithmetic</code></pre>
+
+<p>Same instructions, same additions, same 32768 elements summed 20000 times — and the sorted run is about <strong>15&times;</strong>
+faster. Nothing about the arithmetic changed; what changed is the <em>predictability</em> of the branch. On the random array, whether
+<code>data[i] &gt;= 128</code> is true is a coin flip with no pattern, so the predictor is wrong on roughly half of 655 million branches,
+and each miss costs a pipeline refill; on the sorted array the branch is false for the whole first stretch (all the values below 128)
+and then true for the whole rest, so it flips exactly once and is predicted correctly essentially always. This is the famous &ldquo;why
+is processing a sorted array faster&rdquo; effect, and it is real — but read the flag on the compile line, because it is doing something
+essential that &sect;37.4 returns to: we had to <em>forbid</em> the compiler from removing the branch in order to see the effect at all.
+The lesson of the raw phenomenon stands on its own, though: <strong>an unpredictable data-dependent branch in a hot loop can be the
+dominant cost</strong>, dwarfing the work it guards, and the profiler that pointed you at this loop (Chapter 33) is telling you about
+mispredictions, not arithmetic.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is the sorted run ~15&times; faster when the arithmetic is identical? On which array is the branch predictable, and why? What
+single change to the data — not the code — turned a ruinous branch into a nearly free one? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>37.3 Making the branch cheap: predication, cmov, and branchless code</h2>
+
+<p>If the misprediction is the cost, the cure is to stop mispredicting — and there are three ways, in rough order of preference. The
+first is to <strong>make the branch predictable</strong>: if sorting or partitioning the data groups the outcomes (as above), or if the
+branch is almost always one way, the predictor handles it and you need do nothing. The second, when the branch is inherently a coin
+flip, is to <strong>remove the branch</strong> and compute both sides, selecting the result with data — <em>branchless</em> code. The
+value <code>data[i] &gt;= 128 ? data[i] : 0</code> can be produced with no control flow at all: subtract 128, use the sign bit as a
+mask, and AND it against the value, so the loop always does the same instructions regardless of the data and there is nothing to
+mispredict. The hardware form of this is the <strong>conditional move</strong> (<code>cmov</code>): an instruction that selects one of
+two values based on a flag without branching, so the pipeline never has to guess. Here is the branchless mask version, run over the same
+data:</p>
+
+<pre><code>int m = (data[i] - 128) &gt;&gt; 31;   // 0 if &gt;=128, -1 if &lt;128 (arithmetic shift = sign bit)
+sum += data[i] &amp; ~m;             // adds data[i] when &gt;=128, else 0 — no branch
+
+$ ./a.out unsorted branchless :  0.87 s      # data order no longer matters
+$ ./a.out sorted   branchless :  1.01 s      # ~same as unsorted: nothing to mispredict</code></pre>
+
+<p>The branchless version runs in about the same time — near 0.9 s — <em>regardless of whether the data is sorted</em>, because it has
+no data-dependent branch: it is immune to the 15&times; swing entirely. Notice the trade it makes. On the unsorted data it is a large
+win (0.9 s versus the 7.64 s of the mispredicting branch), because it converts an unpredictable branch into unconditional arithmetic.
+But on the <em>sorted</em> data it is actually a little <em>slower</em> than the well-predicted branch (about 0.9&ndash;1.0 s versus 0.50
+s), because the branchless code always does the work of both paths — the mask, the AND, the add — whereas a correctly predicted branch
+does the work of only the taken path and skips the rest for free. That is the fundamental tension: <strong>branchless code trades a
+possible misprediction for guaranteed work on both paths</strong>. It wins when the branch is unpredictable (the misprediction you avoid
+costs more than the extra arithmetic) and loses when the branch is predictable (you pay for both paths to avoid a misprediction that
+was not going to happen). Which regime you are in is, once again, a property of the data, and the honest way to decide is to measure both
+— not to assume branchless is always faster.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a branch is a bet on the data</span>
+<p><strong>1. In words.</strong> To keep the pipeline full, the CPU guesses which way each branch goes and runs ahead speculatively. A
+correct guess is free; a wrong guess throws away a pipeline's worth of work (~15&ndash;20 cycles). So a branch is cheap when its
+outcomes are predictable and expensive when they are a data-dependent coin flip — and the fix is either to make the pattern learnable or
+to remove the branch and always do the work of both sides.</p>
+<p><strong>2. As a picture.</strong> Figure 37.1: a pipeline with several instructions in flight; at a branch, a predictor picks a path
+and speculation fills the pipe. Right guess &rarr; commit; wrong guess &rarr; squash and refill (the bubble). Below, three bars for the
+same summing loop: a mispredicting branch on unsorted data (tall), the same branch on sorted data (short), and branchless code
+(medium, and the same height whatever the order).</p>
+<p><strong>3. As numbers/contrast.</strong> Same machine, same arithmetic: a real data-dependent branch ran <strong>7.64 s unsorted vs
+0.50 s sorted</strong> — a 15&times; swing driven only by predictability (&sect;37.2). Branchless mask code ran ~0.9 s <em>either
+way</em> (&sect;37.3): a huge win over the mispredicting branch, a slight loss to the well-predicted one. Predictability, not
+instruction count, decided the cost.</p>
+</aside>
+
+<p><em>(Answer to the &sect;37.1 quick check: at a branch the CPU predicts the outcome and speculatively executes down the guessed path
+rather than stalling until the condition is known; on a wrong guess it squashes — discards — everything speculatively executed after the
+branch and refills the pipeline from the correct target. The expensive part is the misprediction, not the comparison: the
+<code>cmp</code> is one cheap instruction, while a wrong guess costs a pipeline-depth's worth of cycles.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 230" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Speculation keeps the pipeline full; a wrong guess squashes it. Predictability, not instruction count, sets the cost.</text>
+<text x="12" y="38" font-size="9" fill="#14406b">pipeline (instructions in flight):</text>
+<rect x="150" y="30" width="34" height="16" fill="#eef1f4" stroke="#14406b"/><text x="156" y="42" font-size="8">fetch</text>
+<rect x="186" y="30" width="34" height="16" fill="#eef1f4" stroke="#14406b"/><text x="190" y="42" font-size="8">decode</text>
+<rect x="222" y="30" width="34" height="16" fill="#eef1f4" stroke="#14406b"/><text x="230" y="42" font-size="8">exec</text>
+<rect x="258" y="30" width="40" height="16" fill="#eef1f4" stroke="#14406b"/><text x="264" y="42" font-size="8">branch?</text>
+<rect x="300" y="30" width="120" height="16" fill="#dfeee0" stroke="#2f7d32"/><text x="306" y="42" font-size="8" fill="#2f7d32">speculated (predicted path)</text>
+<text x="300" y="60" font-size="8" fill="#2f7d32">right guess &rarr; commit (free)</text>
+<rect x="430" y="30" width="120" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="436" y="42" font-size="8" fill="#8c3a1d">wrong guess &rarr; squash + refill</text>
+<text x="430" y="60" font-size="8" fill="#8c3a1d">bubble ~15&ndash;20 cycles (published)</text>
+<text x="12" y="92" font-size="9" fill="#14406b">wall-clock for the same summing loop (32768 bytes, 20000 passes):</text>
+<text x="12" y="114" font-size="8" fill="#8c3a1d">real branch, unsorted (mispredicts):</text>
+<rect x="205" y="106" width="380" height="11" fill="#efb9a5" stroke="#8c3a1d"/><text x="360" y="115" font-size="8">7.64 s</text>
+<text x="12" y="140" font-size="8" fill="#2f7d32">real branch, sorted (predictable):</text>
+<rect x="205" y="132" width="25" height="11" fill="#cfe6cf" stroke="#2f7d32"/><text x="234" y="141" font-size="8">0.50 s  (15&times; faster, same arithmetic)</text>
+<text x="12" y="166" font-size="8" fill="#14406b">branchless mask, unsorted:</text>
+<rect x="205" y="158" width="43" height="11" fill="#cfe0ef" stroke="#14406b"/><text x="252" y="167" font-size="8">0.87 s</text>
+<text x="12" y="192" font-size="8" fill="#14406b">branchless mask, sorted:</text>
+<rect x="205" y="184" width="50" height="11" fill="#cfe0ef" stroke="#14406b"/><text x="259" y="193" font-size="8">1.01 s  (order no longer matters; both paths always computed)</text>
+</svg>
+<figcaption>Figure 37.1: The CPU speculates past a branch to keep the pipeline full; a misprediction squashes and refills it. The same
+summing loop swung 15&times; (7.64 &rarr; 0.50 s) purely on whether the data made the branch predictable; branchless code ran ~0.9 s
+either way, immune to order but always doing both paths' work (&sect;37.2&ndash;&sect;37.3). Wall-clock, illustrative.</figcaption>
+</figure>
+
+<h2>37.4 What the compiler already did, and why you must measure</h2>
+
+<p>Now the flag on the &sect;37.2 compile line, which has been waiting. The 15&times; effect required
+<code>-fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert</code> — flags that <em>forbid</em> the compiler from
+transforming the branch. Left to its own devices, gcc at plain <code>-O2</code> does not emit a branch for this loop at all: it applies
+<strong>if-conversion</strong> (Chapter 10's optimizer), turning <code>if (data[i] &gt;= 128) sum += data[i];</code> into a branchless
+conditional move. Reading the emitted assembly confirms it — the inner loop contains a <code>cmovg</code>, not a conditional jump — and
+the timings show the effect has evaporated:</p>
+
+<pre><code>$ gcc -O2 branch.c                        # compiler free to choose; emits cmov, not a branch
+$ ./a.out unsorted :  1.09 s              # (asm: inner loop uses cmovg, no conditional jump)
+$ ./a.out sorted   :  0.95 s              # ~same as unsorted: there is no branch to mispredict
+
+$ gcc -O3 -march=native branch.c          # now it VECTORIZES the loop with a mask
+  branch.c:18: optimized: loop vectorized using 32 byte vectors    # -fopt-info-vec
+$ ./a.out unsorted :  0.23 s
+$ ./a.out sorted   :  0.21 s              # AVX2 masked add: order irrelevant, and fastest of all</code></pre>
+
+<p>Three builds, three stories. At <code>-O2</code> the compiler already de-branched the loop into a <code>cmov</code>, so both orders
+run in ~1 s and the sorted-array effect is <em>gone</em> — the compiler did the &sect;37.3 branchless transform for you. At
+<code>-O3 -march=native</code> the vectorizer (Chapter 36) goes further and computes the sum with a masked AVX2 add — eight elements per
+instruction, no branch — and both orders run in ~0.2 s, faster than any scalar version. The famous 15&times; effect only appeared
+because we <em>forced</em> the compiler to keep a real branch; the code most people actually ship, compiled at <code>-O2</code> or
+above, never had the branch in the first place. This is the chapter's real lesson, and it is a Chapter 33 lesson: <strong>the cost of a
+branch is a property of the compiled build, not of the source</strong>. You cannot read a misprediction penalty off the C code, because
+whether there is even a branch to mispredict depends on if-conversion and vectorization decisions the compiler makes at your optimization
+level and target. Counting branches in the source and multiplying by a published cycle penalty gives a number that is often simply
+wrong — the branch may not exist in the binary. The only reliable evidence is to look at what the compiler emitted (read the assembly,
+or check <code>-fopt-info-vec</code>) and to <em>time the build you ship</em>. Where a real, unpredictable, un-convertible branch does
+survive — a data-dependent call through a function pointer, a <code>switch</code> the compiler keeps as a jump, a branch guarding
+side-effecting work it cannot speculate — the &sect;37.2 penalty is real and the &sect;37.3 fixes apply; but you learn which case you are
+in by measuring, not by reasoning from the source.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: counting branches in the source &mdash; the misprediction that the compiler already removed</span>
+<p>The seductive move is to read a hot loop, spot a data-dependent <code>if</code>, multiply by &ldquo;~15 cycles per misprediction,&rdquo;
+and rewrite it branchless — <em>without</em> checking whether the branch survives compilation. It usually does not. At <code>-O2</code>
+gcc turned the &sect;37.2 <code>if</code> into a <code>cmovg</code> (confirmed in the assembly), and at <code>-O3 -march=native</code>
+it vectorized the whole loop with a masked add; in both builds there is no branch to mispredict and the &ldquo;15&times; effect&rdquo;
+does not exist. Hand-writing branchless mask code on top of that buys nothing — the compiler already did it — and can even lose, because
+your version may block the vectorizer that would have done better. Worse, the branchless rewrite is a <em>net loss</em> whenever the
+branch was actually predictable (sorted or almost-always-one-way data): it forces the work of both paths to dodge a misprediction that
+was not happening, and the &sect;37.3 numbers show it running slower than the well-predicted branch. Two defenses. First, before
+optimizing a branch, confirm it exists in the binary — read the assembly for a conditional jump versus a <code>cmov</code>, or check the
+vectorization report — because the source is not the build (Chapter 10). Second, if a real branch does survive, decide branch-vs-branchless
+by <em>measuring both on representative data</em> (Chapter 33), since the right choice flips with predictability. Reasoning from a cycle
+penalty in a table, against a branch the compiler already deleted, is optimizing a cost that is not there — the control-flow version of
+timing a loop whose result is unused.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I read that unpredictable branches cost ~15 cycles each, and our hot filter loop has a
+data-dependent <code>if</code> that's basically a coin flip on the input. I rewrote it branchless with bit-masks and I'm about to send
+the PR — should speed up the whole pipeline.&rdquo; Cover the paragraph and respond in four or five sentences, drawing on
+&sect;37.1&ndash;&sect;37.4.</p>
+<p><em>Model answer.</em> &ldquo;The instinct is right that unpredictable branches are expensive, but before we merge, let's check the
+branch is actually in the binary — at <code>-O2</code> or <code>-O3</code> gcc very often converts a small <code>if</code> like that
+into a <code>cmov</code> or vectorizes it with a mask, in which case there's no branch to mispredict and your rewrite is doing by hand
+what the compiler already did (and it might even block the auto-vectorizer). So step one is read the assembly or the
+<code>-fopt-info-vec</code> report for the current build. Step two, if a real branch does survive, measure both versions on
+representative data, because branchless only wins when the branch is genuinely unpredictable — if the data is sorted or the condition is
+almost always one way, the predicted branch is faster and your always-both-paths version is a regression. Let's get those two numbers
+before the PR, so we're shipping a measured win and not a plausible-sounding rewrite of a cost that may not exist.&rdquo; Checking that
+the branch survives the compiler, then measuring branch-vs-branchless on real data, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;37.2 quick check: the sorted run is ~15&times; faster because the branch is predictable — false for
+the whole run of values below 128, then true for the rest, so it flips once and the predictor is right almost always; on the unsorted
+array the outcome is a coin flip with no pattern, so the predictor is wrong on ~half the branches and each miss costs a pipeline refill.
+The single change was to the data — sorting it — not to the code; the arithmetic is identical. And this only shows up when the
+compiler is forbidden to remove the branch, per &sect;37.4.)</em></p>
+
+<h2>37.5 What to carry forward</h2>
+
+<p>A <strong>branch</strong> forces the CPU to guess: to keep its deep pipeline full, the core predicts each branch's outcome and
+speculatively executes down the guessed path, committing the work if the guess was right and squashing a pipeline's worth of it if the
+guess was wrong — a <strong>misprediction penalty</strong> of roughly 15&ndash;20 cycles (published). So a branch is nearly free when its
+outcomes are predictable and can be the dominant cost when they are an irregular, data-dependent coin flip: the same summing loop swung
+<strong>15&times;</strong> (7.64 &rarr; 0.50 s) purely on whether the data made the branch learnable (&sect;37.2). The fixes, in order:
+make the branch predictable (sort or partition the data so the pattern is learnable); or remove it with <strong>branchless</strong> code
+or a <strong>conditional move</strong>, which is immune to data order but always pays for both paths — a win only when the branch is
+genuinely unpredictable (&sect;37.3). Above all, remember the twist that makes this a measurement discipline, not a cycle-counting one:
+<strong>the compiler has usually already removed your branch</strong>. At <code>-O2</code> gcc if-converted the example into a
+<code>cmov</code>; at <code>-O3 -march=native</code> it vectorized it away entirely; the famous effect only survived because we forbade
+both. So the cost of a branch is a property of the build, and the honest way to find it is to read the emitted instructions and time the
+binary you ship (&sect;37.4) — not to count <code>if</code>s in the source.</p>
+
+<p>This is the same through-line the part has followed. Chapter 33 said measure first; Chapters 34 and 35 raised the memory ceiling with
+locality and layout; Chapter 36 raised the compute ceiling with SIMD; and this chapter opened the <em>control</em> cost — the branch the
+CPU guessed wrong — only to find that the compiler often eliminates it before you can, so the discipline is to check the build rather
+than reason from the source. Two costs the profiler routinely hands you remain before the part closes. The next chapter opens the one
+Chapter 33 named alongside cache misses and mispredictions — <strong>the cost of dynamic allocation</strong>, where the time goes not
+into your loop at all but into <code>malloc</code> and <code>free</code> and the scattered memory they hand back (<a href="#ch38">Chapter
+38</a>). Then a final chapter (<a href="#ch39">Chapter 39</a>) ties the whole part into one workflow: given a profile, which ceiling are
+you under, and how do you raise it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a branch threatens pipeline parallelism, and what speculation and squashing are.</li>
+<li>State what a misprediction costs (order of magnitude), and that it is the penalty, not the comparison.</li>
+<li>Explain why the sorted array ran ~15&times; faster with identical arithmetic.</li>
+<li>Say when branchless code (or a <code>cmov</code>) wins and when it loses, in terms of predictability.</li>
+<li>Explain why the effect appeared only with if-conversion disabled, and what that says about source vs build.</li>
+<li>State how you would confirm whether a branch even exists in the binary.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why does a modern CPU predict branches and execute speculatively, and what is thrown away on a wrong guess? (&sect;37.1)</li>
+<li><strong>R2.</strong> In the sorted-vs-unsorted experiment, why is the sorted run ~15&times; faster when the arithmetic is identical? (&sect;37.2)</li>
+<li><strong>R3.</strong> What does branchless code (or <code>cmov</code>) trade away, and in which data regime does it win versus lose? (&sect;37.3)</li>
+<li><strong>R4.</strong> Why did the 15&times; effect require disabling if-conversion, and what does that prove about reading branch cost off the source? (&sect;37.4)</li>
+<li><strong>R5.</strong> How do you confirm whether a data-dependent <code>if</code> is actually a branch in the shipped binary? (&sect;37.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>John L. Hennessy &amp; David A. Patterson, <em>Computer Architecture: A Quantitative Approach</em>, 6th ed. (Morgan
+Kaufmann, 2017), ISBN 978-0-12-811905-1.</strong> Chapter 3 (&ldquo;Instruction-Level Parallelism and Its Exploitation&rdquo;) is the
+architectural source for &sect;37.1&ndash;&sect;37.2 — pipelines, speculation, dynamic branch prediction, and the misprediction penalty.
+First author John Hennessy; edition and ISBN verified via the publisher.</li>
+<li><strong>Agner Fog, <em>The microarchitecture of Intel, AMD, and VIA CPUs: An optimization guide for assembly programmers and compiler
+makers</em> (<code>agner.org/optimize</code>, continuously updated).</strong> The practical reference for the per-microarchitecture
+branch-prediction algorithms and the published pipeline-depth and misprediction-penalty figures used in &sect;37.1. Author Agner Fog;
+a living document, cited as such — consult the current version.</li>
+<li><strong>James E. Smith, &ldquo;A Study of Branch Prediction Strategies,&rdquo; in <em>Proceedings of the 8th Annual Symposium on
+Computer Architecture (ISCA '81)</em>, pp. 135&ndash;148 (1981).</strong> The classic survey of branch-prediction strategies behind
+&sect;37.2 — the history of how predictors learn patterns. First author James E. Smith; conference and pages verified; this legacy paper
+carries no resolvable DOI, so it is cited by venue and pages.</li>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2015),
+ISBN 978-0-13-409266-9.</strong> Chapter 4 (processor architecture and pipelining) and Chapter 5 (optimizing program performance, including
+the effect of branches and the compiler's transformations) cover this chapter from the programmer's side. First author Randal Bryant;
+edition and ISBN verified via the publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex37.1"><span class="ex-label">37.1</span> <span class="ex-tag warm">warm-up</span>
+In two sentences, explain why a deeply pipelined CPU cannot simply wait at a branch for the condition to be computed, and what it does
+instead.</div>
+
+<div class="exercise" id="ex37.2"><span class="ex-label">37.2</span> <span class="ex-tag warm">warm-up</span>
+What is a branch-misprediction penalty, roughly how many cycles is it on modern x86 (order of magnitude, and label it as a published
+figure), and why is it about the depth of the pipeline?</div>
+
+<div class="exercise" id="ex37.3"><span class="ex-label">37.3</span> <span class="ex-tag warm">warm-up</span>
+The comparison in <code>if (data[i] &gt;= 128)</code> is a single cheap instruction. Explain why, then, the branch can still be the most
+expensive thing in the loop.</div>
+
+<div class="exercise" id="ex37.4"><span class="ex-label">37.4</span> <span class="ex-tag core">core</span>
+The summing loop ran 7.64 s on unsorted data and 0.50 s on the same data sorted, with a real branch. (a) Explain the ~15&times;
+difference in terms of the predictor and the misprediction penalty. (b) Why is the branch predictable on the sorted array and not on the
+unsorted one? (c) The arithmetic and instruction count are identical in both runs — what, precisely, differs?</div>
+
+<div class="exercise" id="ex37.5"><span class="ex-label">37.5</span> <span class="ex-tag core">core</span>
+Branchless code. (a) Rewrite <code>if (x &gt;= 128) sum += x;</code> as branchless arithmetic using the sign bit as a mask, and explain
+why it has nothing to mispredict. (b) The branchless version ran ~0.9 s on both sorted and unsorted data, while the real branch ran 0.50
+s on sorted data — why is branchless <em>slower</em> here than the well-predicted branch? (c) State the rule for when branchless wins.</div>
+
+<div class="exercise" id="ex37.6"><span class="ex-label">37.6</span> <span class="ex-tag core">core</span>
+The 15&times; effect only appeared with <code>-fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert</code>. (a) What did the
+compiler do to the branch at plain <code>-O2</code>, and how would you confirm it from the binary? (b) What did it do at
+<code>-O3 -march=native</code>? (c) What does this say about estimating branch cost by reading the C source?</div>
+
+<div class="exercise" id="ex37.7"><span class="ex-label">37.7</span> <span class="ex-tag complexity">cost</span>
+A hot loop runs <var>K</var> iterations, each with one data-dependent branch, and a misprediction costs <var>p</var> cycles. (a) Write
+the extra cycles spent on mispredictions if the branch is mispredicted a fraction <var>f</var> of the time. (b) Contrast <var>f</var> =
+0.5 (coin flip) with <var>f</var> near 0 (predictable). (c) A branchless version does <var>w</var> extra cycles of both-paths work per
+iteration and never mispredicts; write the condition on <var>f</var>, <var>p</var>, <var>w</var> under which branchless is faster.</div>
+
+<div class="exercise" id="ex37.8"><span class="ex-label">37.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A colleague benchmarks a data-dependent <code>if</code> in a hot loop, sees no difference
+between sorted and unsorted input, and concludes &ldquo;branch prediction is a myth on this CPU.&rdquo;
+<br><strong>Step 1 (given):</strong> they compiled at <code>-O2</code>, the default for their build.
+<br><strong>Step 2 (given):</strong> reading the assembly shows the inner loop uses <code>cmovg</code>, not a conditional jump.
+<br><strong>Step 3 (given):</strong> a conditional move is branchless — there is no prediction and nothing to mispredict.
+<br><strong>Step 4 (you):</strong> Explain why they saw no sorted-vs-unsorted difference, what single change would let them observe the
+effect, and why the correct conclusion is about the <em>build</em>, not the CPU.</div>
+
+<div class="exercise" id="ex37.9"><span class="ex-label">37.9</span> <span class="ex-tag mixed">mixed</span>
+For each branch, say whether the predictor is likely to handle it well or badly, and why: (a) a loop back-edge running 10 million
+iterations; (b) <code>if (rand() &amp; 1)</code> inside a hot loop; (c) <code>if (ptr != NULL)</code> where <code>ptr</code> is almost
+never null; (d) a <code>switch</code> on the next byte of compressed data with a uniform distribution over 8 cases.</div>
+
+<div class="exercise" id="ex37.10"><span class="ex-label">37.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A data-dependent <code>if</code> in C always costs a
+misprediction penalty at run time.&rdquo; (b) &ldquo;Branchless code is always faster than a branch.&rdquo; (c) &ldquo;A correctly
+predicted branch is nearly free.&rdquo; (d) &ldquo;<code>-O3 -march=native</code> can turn a scalar <code>if</code>-loop into a masked
+vector loop with no branch.&rdquo; (e) &ldquo;You can read a loop's misprediction cost off the C source without looking at the
+build.&rdquo;</div>
+
+<div class="exercise" id="ex37.11"><span class="ex-label">37.11</span> <span class="ex-tag stretch">stretch</span>
+Tie this chapter to the rest of the part. (a) A profile (Chapter 33) shows a hot loop, and you suspect branch misprediction; describe
+the sequence of checks — build? assembly? measurement? — you would run before rewriting anything. (b) Explain how &sect;37.4's masked
+vectorization connects branch elimination to Chapter 36 (SIMD). (c) Argue why &ldquo;a branch's cost is a property of the build and the
+data, not the source&rdquo; is a better mental model than &ldquo;branches are slow, so avoid them.&rdquo;</div>
+
+<div class="exercise" id="ex37.12"><span class="ex-label">37.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain with a vectorizing compiler): (a) Write the summing loop <code>if (data[i] &gt;= 128) sum +=
+data[i];</code> over a 32768-element random-byte array; compile once at plain <code>-O2</code> and once with if-conversion disabled
+(<code>-fno-if-conversion -fno-if-conversion2 -fno-tree-loop-if-convert</code>), and time each on unsorted and on sorted data as the
+minimum of several <code>clock_gettime(CLOCK_MONOTONIC)</code> trials. (b) Report which build shows the sorted-vs-unsorted swing and
+which does not, and confirm by reading the assembly (look for <code>cmov</code> vs a conditional jump). (c) Add a branchless mask version
+and show it is order-independent. (d) State your toolchain and CPU, and note these are wall-clock times (no hardware counters) if you
+lack <code>perf</code>.</div>
+
+</section>
+</section>

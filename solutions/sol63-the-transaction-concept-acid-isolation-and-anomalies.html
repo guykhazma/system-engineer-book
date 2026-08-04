@@ -1,0 +1,84 @@
+<section class="solutions" id="sol63">
+<h1>Chapter 63 — Solutions</h1>
+
+<div class="solution" id="sol63.1"><span class="sol-label">63.1</span>
+<strong>Atomicity</strong> — all of a transaction's changes take effect or none do. <strong>Consistency</strong> — a transaction preserves the application's
+invariants. <strong>Isolation</strong> — concurrent transactions do not see each other's uncommitted state. <strong>Durability</strong> — committed changes survive
+any failure. <em>Tempting wrong answer:</em> &ldquo;Consistency means the replicas agree&rdquo; — that is a distributed-systems sense; in ACID it means invariants
+are preserved across the transaction. <strong>Feed-forward:</strong> &sect;63.1.</div>
+
+<div class="solution" id="sol63.2"><span class="sol-label">63.2</span>
+Part&nbsp;X built <strong>Atomicity</strong> (undo) and <strong>Durability</strong> (the WAL and ARIES); Part&nbsp;XI is about <strong>Isolation</strong>. <em>Tempting
+wrong answer:</em> &ldquo;Part&nbsp;X built consistency&rdquo; — consistency is the application's contract, upheld <em>using</em> the other properties; the two
+Part&nbsp;X mechanized are atomicity and durability. <strong>Feed-forward:</strong> &sect;63.1.</div>
+
+<div class="solution" id="sol63.3"><span class="sol-label">63.3</span>
+Serializability means an interleaved schedule's effect equals that of <em>some</em> serial order of the same transactions — the correctness gold standard for
+concurrency. <em>Tempting wrong answer:</em> &ldquo;serializable means the transactions ran one at a time&rdquo; — they may interleave heavily; what matters is
+that the <em>effect</em> equals some serial order. <strong>Feed-forward:</strong> &sect;63.1.</div>
+
+<div class="solution" id="sol63.4"><span class="sol-label">63.4</span>
+(a) T1 reads 100; T2 reads 100; T1 writes 110; T2 writes 120 (computed against the 100 it read, not T1's 110) — T1's +10 is overwritten and lost. (b) Every
+operation was legal, every value read was committed, no constraint was violated, and both transactions committed, so recovery reproduces exactly this state —
+nothing &ldquo;failed.&rdquo; (c) Raise isolation to REPEATABLE READ or SERIALIZABLE (which forbid the lost update), or make the update atomic in the database
+(<code>UPDATE ... SET bal = bal + n</code> under one lock). <em>Tempting wrong answer:</em> &ldquo;a UNIQUE or CHECK constraint would catch it&rdquo; — no
+constraint is violated; the final value is a legal number, just the wrong one. <strong>Feed-forward:</strong> &sect;63.2.</div>
+
+<div class="solution" id="sol63.5"><span class="sol-label">63.5</span>
+<strong>Dirty read:</strong> T2 reads T1's uncommitted 50, which T1 then rolls back — observed 50 vs committed 100. <strong>Lost update:</strong> two
+read-modify-writes, T2's write overwrites T1's — 120 vs serial 130. <strong>Non-repeatable read:</strong> T1 reads a row, T2 updates and commits, T1 re-reads —
+100 then 200. <strong>Phantom:</strong> T1 runs a predicate query, T2 inserts a matching row and commits, T1 re-runs — SUM 120 then 150. <em>Tempting wrong
+answer:</em> &ldquo;the non-repeatable read and phantom are the same&rdquo; — one is a changed existing row, the other a newly inserted row matching a predicate.
+<strong>Feed-forward:</strong> &sect;63.3.</div>
+
+<div class="solution" id="sol63.6"><span class="sol-label">63.6</span>
+(a) A non-repeatable read is an <em>existing</em> row changing value between two reads; a phantom is a <em>new</em> row appearing in a predicate's result set
+between two queries. (b) Locking the rows you read pins their values, preventing the non-repeatable read; but a phantom is a row that did not exist when you read,
+so there was no row to lock. (c) You must lock the <em>predicate</em> (or a range covering it), which is more expensive because it constrains rows that do not yet
+exist, blocking inserts that would match. <em>Tempting wrong answer:</em> &ldquo;lock the table to stop phantoms&rdquo; — a predicate/range lock is the targeted
+mechanism; a full table lock works but needlessly serializes unrelated inserts. <strong>Feed-forward:</strong> &sect;63.3.</div>
+
+<div class="solution" id="sol63.7"><span class="sol-label">63.7</span>
+(a) READ UNCOMMITTED — none; READ COMMITTED — dirty read; REPEATABLE READ — dirty read, non-repeatable read, lost update; SERIALIZABLE — all four including the
+phantom. (b) READ COMMITTED only forbids reading uncommitted data; both writers in a lost update read <em>committed</em> values, so the level is satisfied while the
+update still vanishes. (c) SERIALIZABLE must prevent phantoms, which requires locking predicates or ranges (not just rows), constraining rows that do not yet
+exist and serializing more. <em>Tempting wrong answer:</em> &ldquo;REPEATABLE READ forbids phantoms&rdquo; — it forbids non-repeatable reads and lost updates but
+still permits phantoms; SERIALIZABLE adds the phantom. <strong>Feed-forward:</strong> &sect;63.4.</div>
+
+<div class="solution" id="sol63.8"><span class="sol-label">63.8</span>
+<strong>Step 3:</strong> The second query returns S&nbsp;+&nbsp;40 — larger than the first, because the newly inserted EU order matches the predicate. This is a
+<strong>phantom</strong>. SERIALIZABLE would prevent it (REPEATABLE READ would not, since it still permits phantoms). Row-locking the rows read by the first query
+does <em>not</em> prevent it because the inserted row did not exist at the first query, so there was no row to lock; only a predicate/range lock on
+<code>region='EU'</code> would block the insert. <em>Tempting wrong answer:</em> &ldquo;REPEATABLE READ fixes it because the reads are repeated&rdquo; — repeatable
+read stabilizes existing rows, not the appearance of new ones. <strong>Feed-forward:</strong> &sect;63.3&ndash;&sect;63.4.</div>
+
+<div class="solution" id="sol63.9"><span class="sol-label">63.9</span>
+(a) <strong>Dirty read</strong> — reading a value later rolled back. (b) <strong>Serializability</strong> — effect equals some serial order. (c) <strong>Lost
+update</strong> — one write overwrites another. (d) <strong>Phantom</strong> — a predicate query returning a larger set after an insert. (e) <strong>READ
+COMMITTED</strong> — forbids dirty reads and nothing else. <em>Tempting wrong answer:</em> calling (d) a non-repeatable read — a non-repeatable read is a changed
+existing row, not a new row appearing. <strong>Feed-forward:</strong> &sect;63.3&ndash;&sect;63.4.</div>
+
+<div class="solution" id="sol63.10"><span class="sol-label">63.10</span>
+(a) <strong>True</strong> — with one transaction at a time, none can see another's in-progress state. (b) <strong>False</strong> — recovery preserves committed
+writes but does not order concurrent ones; the lost update commits cleanly. (c) <strong>False</strong> — READ COMMITTED permits non-repeatable reads; it only
+forbids dirty reads. (d) <strong>True</strong> — a phantom is a newly inserted (or deleted) row matching a predicate, not a change to an existing one. (e)
+<strong>True</strong> — that is the definition of serializable. <em>Tempting wrong answer:</em> marking (b) true because &ldquo;the database is ACID&rdquo; — the I
+must be enforced separately; A and D do not imply it. <strong>Feed-forward:</strong> &sect;63.1&ndash;&sect;63.4.</div>
+
+<div class="solution" id="sol63.11"><span class="sol-label">63.11</span>
+(a) The lost update satisfied atomicity (each transaction was all-or-nothing) and durability (both writes survive), yet the result is wrong — so correctness under
+concurrency is a property those two do not provide, proving isolation is separate. (b) Snapshot isolation gives each transaction a consistent snapshot and forbids
+the four named anomalies, but two transactions can each read the snapshot, update <em>different</em> rows based on what they read, and commit — a &ldquo;write
+skew&rdquo; whose combined effect matches no serial order; forbidding the enumerated anomalies is weaker than requiring serial-equivalence. (c) A lock on the
+balance held by T1 from its read until commit would block T2's read (or write), forcing T2 to act on T1's committed 110 and reach 130; the cost is that T2 waits,
+reducing concurrency on that row. <em>Tempting wrong answer:</em> &ldquo;snapshot isolation is serializable because it blocks the four anomalies&rdquo; — write
+skew shows it is not. <strong>Feed-forward:</strong> &sect;63.2, &sect;63.4.</div>
+
+<div class="solution" id="sol63.12"><span class="sol-label">63.12</span>
+Open-ended and platform-specific. A correct write-up: (a) encodes four interleaved schedules, one per anomaly, each reporting observed vs serial-equivalent; (b)
+asserts each observed value differs from the correct one (dirty read 50 vs 100, lost update 120 vs 130, non-repeatable 100 vs 200, phantom 120 vs 150); (c) adds a
+rule blocking T2's read until T1's write commits, showing the lost update reaches 130, and identifies the rule as approximating a level that forbids the lost update
+(REPEATABLE READ / SERIALIZABLE) at the cost of T2 waiting. <em>Tempting wrong answer:</em> &ldquo;measure throughput to show the anomaly&rdquo; — the anomaly is a
+structural mismatch between observed and serial-equivalent values, not a timing. <strong>Feed-forward:</strong> &sect;63.2&ndash;&sect;63.4.</div>
+
+</section>

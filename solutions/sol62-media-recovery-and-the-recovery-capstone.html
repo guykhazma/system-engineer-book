@@ -1,0 +1,83 @@
+<section class="solutions" id="sol62">
+<h1>Chapter 62 — Solutions</h1>
+
+<div class="solution" id="sol62.1"><span class="sol-label">62.1</span>
+<strong>Transaction failure</strong> (an abort) — handled by undo. <strong>System failure</strong> (a crash) — handled by ARIES's redo and undo over the surviving
+disk. <strong>Media failure</strong> (the disk lost or corrupted) — handled by restoring a backup and rolling the archived log forward. <em>Tempting wrong
+answer:</em> &ldquo;a crash and a media failure are the same failure&rdquo; — a crash preserves the disk; a media failure destroys it, which is why one needs ARIES
+and the other needs copies kept elsewhere. <strong>Feed-forward:</strong> &sect;62.1.</div>
+
+<div class="solution" id="sol62.2"><span class="sol-label">62.2</span>
+A <strong>backup</strong> — a copy of the data pages as of a past LSN, giving a known-good base — and an <strong>archived log</strong> — a copy of the log records
+on separate storage, spanning from the backup forward, giving every change since. <em>Tempting wrong answer:</em> &ldquo;just the backup; the log is only for
+crashes&rdquo; — a backup alone loses everything after it; the archive is what rolls forward to the present. <strong>Feed-forward:</strong> &sect;62.2.</div>
+
+<div class="solution" id="sol62.3"><span class="sol-label">62.3</span>
+A full roll-forward replays the archived log to the end, reaching the pre-failure state; point-in-time recovery stops the roll-forward at a chosen moment,
+reaching an earlier state and excluding later records. <em>Tempting wrong answer:</em> &ldquo;PITR undoes records after the point&rdquo; — it never replays them
+in the first place; there is nothing to undo. <strong>Feed-forward:</strong> &sect;62.3.</div>
+
+<div class="solution" id="sol62.4"><span class="sol-label">62.4</span>
+(a) ARIES reads the data pages and the log, both from stable storage. (b) A media failure destroys that storage, so the pages and log are gone — the run shows an
+empty store <code>{}</code>, with no page to compare a page LSN against and no record to redo. (c) The write-ahead log gives crash recovery because a crash
+preserves the disk the log lives on; it gives no media protection because the disk's loss takes the log with it. <em>Tempting wrong answer:</em> &ldquo;ARIES
+could rebuild the pages from the log&rdquo; — the log died with the disk; there is nothing to rebuild from. <strong>Feed-forward:</strong> &sect;62.1.</div>
+
+<div class="solution" id="sol62.5"><span class="sol-label">62.5</span>
+(a) Restoring the backup alone reaches the backup instant — <code>{P1:100, P2:200}</code> as of LSN&nbsp;2 — losing every change after it (LSNs&nbsp;3&ndash;6). (b)
+Replaying the archived log onto it re-applies those changes, rolling the state forward from the backup toward the present. (c) The backup bounds how much log must
+be replayed and the archive bounds how much data is lost, so together they reach any moment the archive spans. <em>Tempting wrong answer:</em> &ldquo;the backup
+already has the recent changes&rdquo; — it is frozen at its LSN; only the archive carries what came after. <strong>Feed-forward:</strong> &sect;62.2.</div>
+
+<div class="solution" id="sol62.6"><span class="sol-label">62.6</span>
+(a) Because the six records describe exactly the changes that followed the backup, so replaying them onto the backup reproduces the live disk at the crash —
+<code>{P1:999, P2:1}</code>. (b) The records are idempotent physiological redo records (Chapter 61), so replaying them onto the restored pages is safe and
+deterministic. (c) A backup at LSN&nbsp;4 would need only records 5&ndash;6 replayed to reach the same end state — a shorter roll-forward, hence faster restore.
+<em>Tempting wrong answer:</em> &ldquo;replaying the log could double-apply a change&rdquo; — idempotence prevents that; each record applies to the state it
+describes. <strong>Feed-forward:</strong> &sect;62.3.</div>
+
+<div class="solution" id="sol62.7"><span class="sol-label">62.7</span>
+(a) Stopping at LSN&nbsp;4 replays only records 1&ndash;4 (through the legitimate transfer), reaching <code>{P1:150, P2:150}</code>; the bad writes at
+LSN&nbsp;5&ndash;6 are never replayed. (b) PITR addresses a valid-but-wrong change the disk recorded correctly (a bad migration, an errant bulk update); crash
+recovery and full roll-forward would loyally reproduce it, because the disk did exactly what it was told. (c) The recovery-point objective is set by how far the
+archive lags; the recovery-time objective by how much log must be replayed since the last backup. <em>Tempting wrong answer:</em> &ldquo;ARIES would undo the bad
+migration since it wasn't a real transaction&rdquo; — it <em>was</em> a committed transaction; only PITR's early stop excludes it. <strong>Feed-forward:</strong>
+&sect;62.3.</div>
+
+<div class="solution" id="sol62.8"><span class="sol-label">62.8</span>
+<strong>Step 3:</strong> Roll-forward must stop at LSN&nbsp;16 — replaying records 11 through 16 and <em>not</em> 17 through 20. This reaches the state just before
+the mistaken delete because record 17 (the delete) is never applied, while a full roll-forward to LSN&nbsp;20 would replay 17 and faithfully reproduce the delete,
+since the disk recorded it as a legitimate committed change. No later record is undone; they are simply not replayed. <em>Tempting wrong answer:</em> &ldquo;stop
+at 17 so the delete is included but nothing after&rdquo; — stopping <em>at</em> 17 replays 17 and reproduces the mistake; you must stop before it, at 16.
+<strong>Feed-forward:</strong> &sect;62.3.</div>
+
+<div class="solution" id="sol62.9"><span class="sol-label">62.9</span>
+(a) <strong>Media failure</strong> — a dead drive taking pages and log. (b) <strong>Backup</strong> — a copy of the pages as of a past LSN. (c) <strong>Point-in-time
+recovery</strong> — stopping roll-forward before a bad migration. (d) <strong>Transaction failure</strong> — an abort reversed by undo. (e) <strong>Archived
+log</strong> — log records on independent storage. <em>Tempting wrong answer:</em> calling (a) a &ldquo;system failure&rdquo; — a system failure (crash) spares the
+disk; a dead drive is a media failure. <strong>Feed-forward:</strong> &sect;62.1&ndash;&sect;62.3.</div>
+
+<div class="solution" id="sol62.10"><span class="sol-label">62.10</span>
+(a) <strong>False</strong> — ARIES needs the surviving disk; a destroyed disk needs a backup and archived log. (b) <strong>True</strong> — a backup alone loses
+everything after it. (c) <strong>True</strong> — PITR stops roll-forward before a correctly-recorded write, which crash recovery would reproduce. (d)
+<strong>False</strong> — an archive on the same volume dies with it; it must be on independent storage. (e) <strong>True</strong> — roll-forward replays the
+archived log onto the restored backup. <em>Tempting wrong answer:</em> marking (a) true because &ldquo;recovery is provably correct&rdquo; — correct only when the
+disk survives. <strong>Feed-forward:</strong> &sect;62.1&ndash;&sect;62.3.</div>
+
+<div class="solution" id="sol62.11"><span class="sol-label">62.11</span>
+(a) Incremental backups copy only the pages changed since the last backup, so each backup is cheap and frequent, but restore must apply the last full backup plus
+every incremental since, trading a slower, multi-step restore for lower backup cost and I/O. (b) If a stretch of archived log is missing, roll-forward cannot cross
+the gap — every change after it is unreachable, so recovery halts at the gap's start; detect it by checking that archived-log LSNs are contiguous (no missing
+range) as part of the periodic test-restore, before a real disaster needs them. (c) A single node's mechanisms do not cover the loss of the <em>whole node or
+site</em> (fire, region outage) while it must stay available, nor divergence between replicas — that is <strong>replication and distributed systems</strong>
+(Volume&nbsp;3), beyond durability. <em>Tempting wrong answer:</em> &ldquo;incremental backups have no downside&rdquo; — they trade a slower, more fragile restore
+for cheaper backups. <strong>Feed-forward:</strong> &sect;62.4.</div>
+
+<div class="solution" id="sol62.12"><span class="sol-label">62.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a page store with a redo log, runs a workload, takes a full backup partway, and archives the log
+separately; (b) discards the on-disk pages, restores the backup, rolls the archived log forward, and asserts the result equals the pre-failure state (this chapter:
+<code>{P1:999, P2:1}</code>); (c) repeats with roll-forward stopped before a bad write and asserts the earlier state (<code>{P1:150, P2:150}</code>), explaining
+that an archive on the same discarded disk would have been destroyed with it, leaving only the stale backup. <em>Tempting wrong answer:</em> &ldquo;keep the
+archive with the database for convenience&rdquo; — that is exactly the failure the lab exists to expose. <strong>Feed-forward:</strong> &sect;62.2&ndash;&sect;62.4.</div>
+
+</section>

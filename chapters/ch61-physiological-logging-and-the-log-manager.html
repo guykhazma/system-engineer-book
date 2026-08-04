@@ -1,0 +1,354 @@
+<section class="chapter" id="ch61">
+<h1>Chapter 61 — Physiological Logging and the Log Manager</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch58">Chapter 58</a> (redo, undo, the LSN, and the page LSN — the numbering that makes redo
+idempotent), <a href="#ch60">Chapter 60</a> (ARIES, repeat history, and compensation records — recovery replays log records, so each must be safe to replay),
+<a href="#ch57">Chapter 57</a> (write-ahead logging and the durability contract — force the log before the commit returns), <a href="#ch41">Chapter 41</a>
+(<code>fsync</code> and durability — the syscall a commit ultimately waits on). &nbsp;·&nbsp; The last four chapters assumed a log <em>existed</em> and asked how
+to recover from it. This chapter asks the two questions we deferred: <strong>what</strong> should each log record actually contain — a byte-image, an operation,
+or a middle ground — and <strong>how</strong> does the log get to disk cheaply, since every commit waits on it. The answers, <strong>physiological
+logging</strong> and the <strong>group-committing log manager</strong>, are why ARIES's records are small and why a busy database can commit thousands of
+transactions a second without one <code>fsync</code> per commit.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch58">Chapter 58</a> — what does redo compare to decide whether to re-apply a record, and what property of redo does that comparison
+buy? (2) <a href="#ch60">Chapter 60</a> — during recovery, how many times might a single redo record be applied, and why can that number be more than one? (3)
+<em>Predict:</em> suppose a redo record says only &ldquo;add 5 to the counter on page&nbsp;P&rdquo; and, after a crash, recovery replays it — but that add had
+<em>already</em> reached the page before the crash. What is the counter now, and what would the record or the page have to carry so that replaying it a second
+time is harmless? Write your guess; &sect;61.2&ndash;&sect;61.3 answer it.</p>
+</aside>
+
+<p>A recovery algorithm is only as good as the records it replays, and the last four chapters quietly assumed those records were exactly what redo and undo
+needed: idempotent, self-contained, and cheap to produce. This chapter earns that assumption. There are three ways to describe a change in a log record.
+<strong>Physical logging</strong> records the affected bytes — the before-image and after-image of the page (or the changed region) — so redo means &ldquo;write
+these bytes&rdquo; and undo means &ldquo;write those bytes back.&rdquo; <strong>Logical logging</strong> records the <em>operation</em> — &ldquo;insert row
+(5,&nbsp;&lsquo;Ann&rsquo;) into table&nbsp;T,&rdquo; &ldquo;add 5 to the counter&rdquo; — so redo means &ldquo;do the operation again&rdquo; and undo means
+&ldquo;do its inverse.&rdquo; <strong>Physiological logging</strong>, the term Härder and Reuter coined in 1983 and the scheme ARIES assumes, is the middle
+ground: <em>physical across pages, logical within a page</em> — each record names one page and describes the change as an operation on that page's contents
+(&ldquo;insert this record into slot&nbsp;3&rdquo;), gated by the page LSN. This chapter contrasts the three (&sect;61.1); shows why pure physical logging is
+idempotent but bulky and pure logical logging is compact but not safely replayable (&sect;61.2); builds the physiological compromise — page-oriented redo with
+logical undo — and demonstrates its idempotence on a running store (&sect;61.3); and then turns to the <strong>log manager</strong> that writes these records:
+the log buffer, force-log-at-commit, and the <strong>group commit</strong> that amortizes the <code>fsync</code> every commit waits on (&sect;61.4). By the end
+you know both what to put in a log record and how to get it durable without paying a disk sync per transaction.</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) in two parts. The first
+part is a <em>structural</em> demonstration of idempotence: it applies a physical redo record, a logical redo record, and a physiological redo record <em>twice</em>
+each — the double-apply that a crash during redo forces (Chapter 60) — and reports which survive unchanged. Physical and physiological survive; the logical
+increment double-counts. The second part is a small <em>wall-clock</em> measurement of the log manager: it writes sixty-four commit records to a real file,
+once with an <code>fsync</code> per commit and once with an <code>fsync</code> per group of eight, and reports both the <code>fsync</code> count (deterministic
+and structural) and the elapsed time (a genuine timing via <code>time.perf_counter</code>, which varies run to run and reflects this machine's filesystem, not a
+universal constant). The idempotence results are structural facts; the timing is illustrative of a real effect, reported as measured here.</p>
+
+<h2>61.1 What a log record records: physical, logical, physiological</h2>
+
+<p>Every log record answers one question — <em>what changed?</em> — and there are three granularities of answer, differing in how much they lean on the page's
+current contents. <strong>Physical logging</strong> is the most literal: the record carries the bytes. A physical record says &ldquo;page&nbsp;P, offset&nbsp;120,
+before = <code>0x00A4</code>, after = <code>0x00C8</code>&rdquo; (or, coarser, the whole before- and after-image of the page). Redo overwrites with the
+after-image; undo overwrites with the before-image. It depends on nothing but the page identity and the recorded bytes. <strong>Logical logging</strong> is the
+most abstract: the record carries the operation and its arguments — &ldquo;<code>INSERT INTO accounts VALUES (5, 100)</code>,&rdquo; &ldquo;increment
+counter&nbsp;c by 5&rdquo; — and redo <em>re-executes</em> the operation while undo executes its logical inverse (&ldquo;delete row&nbsp;5,&rdquo; &ldquo;decrement
+by 5&rdquo;). It says nothing about bytes or pages; it trusts the operation to reproduce the effect against whatever state it finds.</p>
+
+<p><strong>Physiological logging</strong> sits between them, and the name (Härder &amp; Reuter 1983) is the definition: <em>physical to a page, logical within
+it</em>. Each record names exactly one page — that is the &ldquo;physical&rdquo; half, and it means a record's replay is confined to a single page whose page LSN
+can gate it — but describes the change as a small operation <em>on that page's structure</em> rather than as raw bytes: &ldquo;insert this record into the page's
+slot array,&rdquo; &ldquo;delete the slot at index&nbsp;3,&rdquo; &ldquo;set field <code>c</code> to&nbsp;20.&rdquo; That is the &ldquo;logical&rdquo; half, and it is
+what keeps the records small: the page's slot directory reshuffles itself around the insert, and the record does not have to spell out every byte that moved. The
+page LSN (Chapter 58) makes this middle ground safe: because a physiological record touches one page and that page carries the LSN of the last change applied to
+it, redo can compare and skip, exactly as it does for a physical record. Physiological logging thus keeps the idempotence of physical logging (one page, page-LSN
+gated) while approaching the compactness of logical logging (an operation, not a byte dump). The next section shows why neither extreme will do.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Give the one-line definition of each: physical, logical, and physiological logging. Which one does ARIES assume, and what does its name (&ldquo;physical to a
+page, logical within it&rdquo;) mean concretely for how a record's replay is bounded? (Answer in &sect;61.2.)</p>
+</aside>
+
+<h2>61.2 Physical and logical logging: the idempotence/compactness trade</h2>
+
+<p>The two extremes trade the same two properties against each other: <strong>idempotence</strong> (can a record be replayed any number of times and leave the
+same result?) and <strong>compactness</strong> (how many bytes does a change cost in the log?). Physical logging wins idempotence and loses compactness. A
+physical redo record is idempotent almost by definition: writing the after-image once or five times leaves identical bytes, so a crash during redo that replays
+the record is harmless even without the page LSN — the record is self-inverse against itself. But it is bulky and brittle. A one-field change can drag a
+full-page image into the log; worse, a physical record is tied to an exact byte layout, so if a page is reorganized (a B-tree split shuffles slots, Chapter 51),
+a byte-offset record from before the reorganization describes bytes that no longer mean what they meant. Physical logging over-specifies, and the log pays for it
+in volume and in fragility to structural change.</p>
+
+<p>Logical logging wins compactness and loses idempotence — and losing idempotence is fatal for a redo record. A logical record is tiny: &ldquo;increment
+<code>c</code> by 5&rdquo; is a few bytes regardless of page size. But its effect depends on the current state, so replaying it is <em>not</em> safe. This is the
+opener made concrete, and the program shows it: apply the redo record &ldquo;add 5 to <code>b</code>&rdquo; once and <code>b</code> becomes 5; a crash during redo
+forces the replay (Chapter 60 — a redo record may be applied more than once), and applying it again makes <code>b</code>&nbsp;=&nbsp;10. The counter is
+double-counted; the record had no way to know it had already taken effect.</p>
+
+<pre><code>== Idempotence: apply each redo record TWICE (a crash-during-redo replays it) ==
+  physical   after double-apply: {'a': 1, 'b': 2}  idempotent: True
+  logical    once: {'b': 5}  twice: {'b': 10}  idempotent: False
+  physiolog. once: {'b': 5} lsn 20  twice: {'b': 5} lsn 20  idempotent: True
+  record size (illustrative): physical full-page ~64 B vs physiological ~19 B</code></pre>
+
+<p>Read the three lines. The <em>physical</em> record carries the after-image <code>{a:1,&nbsp;b:2}</code>; applied twice, the page still holds
+<code>{a:1,&nbsp;b:2}</code> — <em>idempotent: True</em>, but it shipped the whole image to get there. The <em>logical</em> record carries only the operation
+&ldquo;add 5&rdquo;; applied twice it reaches <code>{b:10}</code> when the truth is <code>{b:5}</code> — <em>idempotent: False</em>, compact but unreplayable. The
+<em>physiological</em> record (next section) carries the operation <em>and</em> is gated by the page LSN: applied twice, the second apply sees the record's LSN is
+no longer greater than the page LSN and skips, so the page stays <code>{b:5}</code> — <em>idempotent: True</em> — while the record is a fraction of the physical
+one (about 19 bytes versus 64 in this illustrative encoding). Neither extreme is acceptable for a redo log: physical is safe but expensive, logical is cheap but
+unsafe. The resolution is not to pick one but to combine their good halves.</p>
+
+<p><em>(Answer to the &sect;61.1 quick check: physical logging records the changed bytes, before- and after-images; logical logging records the operation and its
+arguments; physiological logging records an operation on one named page. ARIES assumes physiological — &ldquo;physical to a page&rdquo; means each record touches
+exactly one page, so the page's LSN can gate its replay, and &ldquo;logical within it&rdquo; means the change is an operation on that page's structure, not a byte
+dump, which keeps the record small.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: physical, logical, physiological</span>
+<p><strong>1. In words.</strong> Physical logs the bytes (idempotent, bulky, brittle to layout). Logical logs the operation (compact, but not idempotent —
+depends on current state). Physiological logs an operation on one named page (compact <em>and</em> idempotent, because the page LSN gates the single page it
+touches). ARIES uses physiological redo; undo can be logical within the page.</p>
+<p><strong>2. As a picture.</strong> Figure 61.1: a change to one field, drawn three ways. Physical: a wide box holding the whole page's before- and after-bytes.
+Logical: a tiny box, &ldquo;+5,&rdquo; floating free of any page. Physiological: a small box, &ldquo;set&nbsp;<code>b</code>=5,&rdquo; anchored to page&nbsp;P with
+its LSN stamped on the corner — small like the logical one, but tied to a page and its LSN like the physical one.</p>
+<p><strong>3. As numbers.</strong> Double-applying each redo record (the crash-during-redo case): physical stays <code>{a:1,b:2}</code> — <em>idempotent</em>;
+logical goes <code>{b:5}</code> then <code>{b:10}</code> — <em>not idempotent</em>; physiological stays <code>{b:5}</code> because the page LSN (20) is no longer
+below the record's LSN on the second try — <em>idempotent</em>. Record size, illustratively: ~64&nbsp;B physical versus ~19&nbsp;B physiological
+(&sect;61.2&ndash;&sect;61.3).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 190" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">One field change, three ways to log it &#8212; physical (bytes), logical (operation), physiological (operation on a page).</text>
+<text x="20" y="52" font-size="10" fill="#7a5c00">PHYSICAL</text>
+<rect x="90" y="40" width="180" height="30" fill="#fff4d6" stroke="#b58900"/>
+<text x="98" y="59" font-size="8" fill="#7a5c00">P: before[all bytes] &#8594; after[all bytes]</text>
+<text x="300" y="59" font-size="8" fill="#555">idempotent, bulky</text>
+<text x="20" y="102" font-size="10" fill="#b23">LOGICAL</text>
+<rect x="90" y="90" width="70" height="30" fill="#fde3e3" stroke="#b23"/>
+<text x="112" y="109" font-size="9" fill="#b23">+5</text>
+<text x="300" y="109" font-size="8" fill="#555">compact, NOT idempotent (no page/LSN)</text>
+<text x="20" y="152" font-size="10" fill="#2f7d32">PHYSIOLOGICAL</text>
+<rect x="90" y="140" width="120" height="30" fill="#dff0df" stroke="#2f7d32"/>
+<text x="98" y="159" font-size="8" fill="#2f7d32">P: set b=5</text>
+<rect x="190" y="140" width="20" height="14" fill="#cfe8cf" stroke="#2f7d32"/><text x="192" y="151" font-size="7" fill="#2f7d32">LSN</text>
+<text x="300" y="159" font-size="8" fill="#555">compact AND idempotent (one page, page-LSN gated)</text>
+</svg>
+<figcaption>Figure 61.1: the same one-field change logged three ways. Physical carries all the bytes (safe to replay, but large). Logical carries just the operation
+(small, but replaying it double-counts). Physiological carries the operation bound to one page with its LSN — small like logical, replay-safe like physical.</figcaption>
+</figure>
+
+<h2>61.3 Physiological logging: page-oriented redo, logical undo</h2>
+
+<p>Physiological logging takes the compact half of logical and the safe half of physical, and the page LSN is the hinge. A physiological redo record names one
+page and carries an operation on that page's structure; because it touches exactly one page, that page's page LSN can gate it, and redo applies the record only
+when its LSN exceeds the page LSN — the same idempotence machinery Chapter 58 built and Chapter 60 relied on. In the program, the physiological record
+&ldquo;insert <code>b</code>=5&rdquo; is applied against a page whose page LSN is 10, with the record at LSN&nbsp;20: the first apply sees 20&nbsp;&gt;&nbsp;10,
+performs the insert, and advances the page LSN to 20; the replayed second apply sees 20&nbsp;is not&nbsp;&gt;&nbsp;20 and skips. The record stayed small — it
+described an operation, not a page image — yet it replayed safely, because the page LSN, not the record's internal form, is what makes redo idempotent. This is
+the crucial realization: <em>idempotence does not require physical records; it requires a per-page high-water mark</em>, and a physiological record supplies a
+change small enough to be cheap while staying bound to a single page so that mark applies.</p>
+
+<p>ARIES pairs <strong>page-oriented redo</strong> with <strong>logical undo</strong>, and the asymmetry is deliberate. Redo is page-oriented — each redo record
+is confined to one page and gated by its LSN — because redo must be idempotent and restartable, and confinement to a page is what lets the page LSN do that job.
+Undo can be <em>logical</em> — an operation whose effect may span more than one page as the structure has since changed — because undo runs against the live,
+reconstructed structure (repeat history has already rebuilt it, Chapter 60) and, being logged through compensation records, is itself made restartable by the
+undoNextLSN chain rather than by a per-page mark. The classic case is a B-tree insert (Chapter 51): the physical slot where a key landed may have moved after a
+later split, so undoing the insert &ldquo;delete key&nbsp;5&rdquo; is a <em>logical</em> operation that re-locates the key in the tree as it is now, not a physical
+rewrite of the page as it was. Physiological logging is precisely what makes this split of duties possible: redo is physical-enough (one page, LSN-gated) to be
+idempotent, and undo is logical-enough to survive the structure changing underneath it. That combination is why real engines log physiologically, and it is the
+form every record in Chapters 57&ndash;60 tacitly had.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: logical redo without a page-LSN gate &mdash; the double-applied increment that corrupts on the next crash</span>
+<p>The tempting economy is to log redo <em>logically</em> to shrink the log: instead of &ldquo;page&nbsp;P, set counter to&nbsp;42,&rdquo; log the operation
+&ldquo;increment the counter by&nbsp;5&rdquo; — a handful of bytes, no page image, no offsets. It replays perfectly in testing, because testing usually replays each
+record once. Then a crash lands <em>during</em> redo (Chapter 60: repeat history can be interrupted and restarted), recovery re-runs, and the increment that had
+already reached the page is applied a second time. The counter is now 5 too high, silently — no error, no crash, just a wrong number that every later transaction
+reads and propagates. The same corruption hits any non-self-inverse logical redo: an append, a running total, a free-space counter on a page header. The record
+had no way to detect that its effect was already present, because a bare logical operation carries no notion of &ldquo;already applied.&rdquo; The fix is the
+physiological discipline: bind every <strong>redo</strong> record to a single page and gate it with that page's <strong>page LSN</strong>, so replay compares the
+record's LSN to the page's and skips when the change is already there. You may still describe the change as an operation (that is what keeps the record small) —
+but it must be an operation <em>on one page</em>, under the LSN gate. Logical form is fine for undo, which is made restartable by compensation records; it is
+poison for redo, which is made restartable only by the page LSN. Logical redo without a page-LSN gate is a log that shrinks beautifully and corrupts on the first
+crash that interrupts recovery.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes simplifying the log: &ldquo;Let's just log full page images for every change — before and after. It's dead simple,
+it's always idempotent, and we never have to reason about slot operations or logical undo. Storage is cheap. Why are we bothering with this physiological scheme
+at all?&rdquo; Cover the paragraph and answer in four or five sentences, drawing on &sect;61.2 and &sect;61.3.</p>
+<p><em>Model answer.</em> &ldquo;Full page images are idempotent, you're right, and if the log were free I'd agree. But every change now drags a whole page into
+the log even when one field moved, so the log volume — and the bandwidth of the <code>fsync</code> on the commit path — balloons by the page-to-field ratio,
+which on a 8&nbsp;KB page and a small update is enormous. It's also brittle: a physical byte-image is tied to an exact layout, so a later page reorganization
+makes an old image describe bytes that no longer mean the same thing. Physiological logging keeps the good half of your idea — each redo record still touches one
+page and is gated by that page's LSN, so it's just as idempotent — while logging the <em>operation</em> on the page rather than the whole image, which is a
+fraction of the size and survives reorganization. Undo can then be logical, relocating a key in the structure as it is now. We're not avoiding simplicity; we're
+avoiding paying page-sized log writes and byte-layout fragility for field-sized changes.&rdquo; Naming log volume, the commit-path <code>fsync</code>, and the
+physical/physiological distinction is the senior register.</p>
+</aside>
+
+<h2>61.4 The log manager: the log buffer, force-log-at-commit, and group commit</h2>
+
+<p>Knowing <em>what</em> to log leaves the second question: how does the log get to disk, given that the durability contract (Chapter 57) makes every commit wait
+for its records to be truly on stable storage? The <strong>log manager</strong> owns this path. Records are first appended to an in-memory <strong>log
+buffer</strong> — a sequential region that grows as transactions run — and periodically flushed to the log file. The rule that makes recovery correct is
+<strong>force-log-at-commit</strong> (write-ahead logging's commit half): before a transaction's commit is acknowledged to the client, all of its log records up
+to and including the commit record must be forced to durable storage with an <code>fsync</code> (Chapter 41). That single <code>fsync</code> is the price of
+durability, and on real storage it is expensive — a round-trip to a device that must guarantee the bytes survive power loss. Paid once per commit, it caps
+throughput at roughly one commit per sync latency, which for a spinning disk was milliseconds and even for flash is far slower than the rate at which
+transactions can otherwise complete.</p>
+
+<p><strong>Group commit</strong> breaks that cap. The observation is that an <code>fsync</code> flushes <em>everything</em> in the log up to a point, so many
+transactions' commit records can ride a single sync. Rather than each committer issuing its own <code>fsync</code>, the log manager lets commit records accumulate
+briefly and forces them together: one <code>fsync</code> makes a whole <em>group</em> of commits durable at once. Each transaction still blocks until the sync that
+covers its commit record completes — durability is not weakened, every acknowledged commit is genuinely on disk — but the <em>cost</em> of the sync is shared. The
+program measures it: sixty-four commits with one <code>fsync</code> each versus one <code>fsync</code> per group of eight.</p>
+
+<pre><code>== Group commit: many transactions, force-log-at-commit, one fsync per group ==
+  64 commits, one fsync each   : fsyncs=64  wall=0.1595 s
+  64 commits, groups of 8       : fsyncs=8  wall=0.0215 s
+  fsyncs reduced 8x; both durable (every commit is on disk before it returns)</code></pre>
+
+<p>The structural fact is the <code>fsync</code> count: 64 versus 8, an eight-fold reduction, exactly the group size — and it is deterministic, the same on any
+machine. The wall-clock figures (0.1595&nbsp;s versus 0.0215&nbsp;s on this machine's filesystem, roughly seven-fold here) are a genuine measurement of the effect
+but not a universal constant: the ratio tracks how dominant the sync is relative to the rest of the commit, which depends on the device. What does not change is the
+shape: group commit trades a small amount of <em>latency</em> (a committer may wait a moment for its group to fill) for a large gain in <em>throughput</em> (the
+expensive sync is amortized over the group), without ever weakening durability, because every acknowledged commit still waited for a real sync that covered its
+record. This is why a production log manager batches: the durability contract demands a force before every commit returns, and group commit is how to honor it
+without paying a separate disk sync per transaction. The log buffer, force-log-at-commit, and group commit are the three moving parts of the path that Chapters
+57&ndash;60 assumed but never opened.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does force-log-at-commit require before a commit is acknowledged, and why does that cap throughput at one commit per sync latency? How does group commit
+raise the cap without weakening durability — what is shared, and what does each committer still wait for? (Answer below.)</p>
+</aside>
+
+<h2>61.5 What to carry forward</h2>
+
+<p>A log record answers &ldquo;what changed?&rdquo; at one of three granularities. <strong>Physical logging</strong> records the bytes: idempotent by
+construction, but bulky and brittle to page layout (&sect;61.2). <strong>Logical logging</strong> records the operation: compact, but not idempotent — replaying
+&ldquo;add 5&rdquo; double-counts, fatal for a redo record (&sect;61.2). <strong>Physiological logging</strong> (Härder &amp; Reuter 1983), the scheme ARIES
+assumes, is the middle ground — <em>physical to a page, logical within it</em> — so each redo record touches one page, is gated by that page's <strong>page
+LSN</strong> (hence idempotent), yet describes an operation rather than a page image (hence compact) (&sect;61.1, &sect;61.3). ARIES pairs <strong>page-oriented
+redo</strong> (LSN-gated, restartable per page) with <strong>logical undo</strong> (restartable via compensation records, able to relocate a change in a structure
+that has since moved) (&sect;61.3). The <strong>log manager</strong> writes these records through a <strong>log buffer</strong>, honors
+<strong>force-log-at-commit</strong>, and uses <strong>group commit</strong> to amortize the per-commit <code>fsync</code> over a batch — an eight-fold
+<code>fsync</code> reduction in the run, with durability intact (&sect;61.4). The named trap: logical redo without a page-LSN gate corrupts on the first crash that
+interrupts recovery, because the double-applied operation cannot detect that it already took effect.</p>
+
+<p>With this chapter the shape of a real write-ahead log is complete: physiological records, small and idempotent, written by a batching log manager that keeps
+the commit path fast without breaking the durability contract. Only one gap remains in the durability-and-recovery story, and it is the failure ARIES itself
+does not cover. Every algorithm so far assumed the <em>disk survived</em> the crash — that recovery could read the data pages and the log back off stable storage.
+The next chapter removes that assumption: what happens when the disk itself is <strong>lost or corrupted</strong>, so there are no pages and no log to recover
+from? That is <strong>media recovery</strong>, and it needs two things this part has not yet named — a <strong>backup</strong> and an <strong>archived log</strong>
+— to roll a database forward from a copy rather than repair it in place. Chapter 62 builds it, and in doing so closes Part X, before Part XI turns from keeping a
+database's word across failures to keeping it across <em>concurrency</em> — the isolation half of the transaction that recovery alone never provided.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Give the one-line definition of physical, logical, and physiological logging.</li>
+<li>Explain why logical redo is not idempotent, and what physiological logging adds to make it safe.</li>
+<li>State what &ldquo;physical to a page, logical within it&rdquo; means for how a redo record's replay is bounded.</li>
+<li>Say why ARIES pairs page-oriented redo with logical undo — what each half needs to be restartable.</li>
+<li>Describe force-log-at-commit and why it caps throughput at one commit per sync latency.</li>
+<li>Explain how group commit raises the cap without weakening durability.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Define the three logging granularities and give one strength and one weakness of each. (&sect;61.1&ndash;&sect;61.2)</li>
+<li><strong>R2.</strong> Why does the logical redo record in the run reach <code>{b:10}</code> while the physiological one stays <code>{b:5}</code>? (&sect;61.2&ndash;&sect;61.3)</li>
+<li><strong>R3.</strong> What makes physiological redo idempotent — the record's form, or something about the page? (&sect;61.3)</li>
+<li><strong>R4.</strong> Why can undo be logical while redo must be page-oriented? (&sect;61.3)</li>
+<li><strong>R5.</strong> What does group commit share across a batch, what does each committer still wait for, and what did the run measure? (&sect;61.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Theo H&#228;rder &amp; Andreas Reuter, &ldquo;Principles of Transaction-Oriented Database Recovery,&rdquo; <em>ACM Computing Surveys</em> 15(4),
+1983, pp. 287&ndash;317, DOI 10.1145/289.291.</strong> The paper that coined <em>physiological logging</em> and gave recovery its terminological framework
+(materialized database, propagation, checkpoint) — and the source of the ACID acronym. First authors Theo H&#228;rder and Andreas Reuter; venue, volume, issue,
+pages, year, and DOI verified via the ACM Digital Library and DBLP, and the DOI resolves.</li>
+<li><strong>C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh &amp; Peter Schwarz, &ldquo;ARIES: A Transaction Recovery Method Supporting Fine-Granularity
+Locking and Partial Rollbacks Using Write-Ahead Logging,&rdquo; <em>ACM Transactions on Database Systems</em> 17(1), 1992, pp. 94&ndash;162, DOI
+10.1145/128765.128770.</strong> Specifies page-oriented redo and logical undo over physiological log records — the concrete design this chapter follows. First
+author C. Mohan; venue, volume, issue, pages, year, and DOI verified via the ACM Digital Library and DBLP, and the DOI resolves.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992, ISBN 978-1-55860-190-1.</strong> The
+definitive treatment of the log manager, force-log-at-commit, and group commit, with the buffer and flush machinery worked in full. Authors, publisher, year, and
+ISBN verified via the publisher listing and the Library of Congress record.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and Trends in
+Databases</em> 1(2), 2007, pp. 141&ndash;259, DOI 10.1561/1900000002.</strong> Situates the log manager and group commit inside a complete engine, alongside the
+buffer and transaction managers. First author Joseph M. Hellerstein; venue, volume, issue, pages, year, and DOI verified via now publishers and the ACM Digital
+Library, and the DOI resolves.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex61.1"><span class="ex-label">61.1</span> <span class="ex-tag warm">warm-up</span>
+Give the one-line definition of physical, logical, and physiological logging.</div>
+
+<div class="exercise" id="ex61.2"><span class="ex-label">61.2</span> <span class="ex-tag warm">warm-up</span>
+Which logging granularity does ARIES assume, and what does &ldquo;physical to a page, logical within it&rdquo; mean?</div>
+
+<div class="exercise" id="ex61.3"><span class="ex-label">61.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does force-log-at-commit require before a commit returns?</div>
+
+<div class="exercise" id="ex61.4"><span class="ex-label">61.4</span> <span class="ex-tag core">core</span>
+Idempotence. (a) Why is a physical redo record idempotent even without the page LSN? (b) Why is a logical redo record <em>not</em> idempotent? (c) What does
+physiological logging add so that a compact, operation-style record becomes safe to replay?</div>
+
+<div class="exercise" id="ex61.5"><span class="ex-label">61.5</span> <span class="ex-tag core">core</span>
+The run's idempotence output. Using the three lines (physical stays <code>{a:1,b:2}</code>; logical goes <code>{b:5}</code> then <code>{b:10}</code>;
+physiological stays <code>{b:5}</code> with page LSN 20): (a) explain why the logical line reaches 10; (b) explain what the physiological line's second apply
+compares and why it skips; (c) state what the record-size numbers (~64&nbsp;B vs ~19&nbsp;B) illustrate.</div>
+
+<div class="exercise" id="ex61.6"><span class="ex-label">61.6</span> <span class="ex-tag core">core</span>
+Redo versus undo. (a) Why must redo be page-oriented and LSN-gated? (b) Why can undo be logical? (c) Give the B-tree example: why is undoing an insert a logical
+operation rather than a physical page rewrite?</div>
+
+<div class="exercise" id="ex61.7"><span class="ex-label">61.7</span> <span class="ex-tag core">core</span>
+Group commit. (a) What does a single <code>fsync</code> flush, and why does that let many commits share it? (b) What does each committing transaction still wait
+for, so durability is not weakened? (c) What does group commit trade, and in which direction (latency vs throughput)?</div>
+
+<div class="exercise" id="ex61.8"><span class="ex-label">61.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A page has page LSN 30. Redo replays, in order, three records for that page: LSN 25 (set&nbsp;<code>a</code>=1),
+LSN 35 (set&nbsp;<code>b</code>=2), LSN 35 again (the same record, because a crash forced a re-run).
+<br><strong>Step 1 (given):</strong> record 25 has LSN 25&nbsp;&le;&nbsp;30, so redo skips it — already on the page.
+<br><strong>Step 2 (given):</strong> record 35 has LSN 35&nbsp;&gt;&nbsp;30, so redo applies it and advances the page LSN to 35.
+<br><strong>Step 3 (you):</strong> State what the third record (LSN 35, replayed) does, what the page LSN is afterward, and why the page contents are unchanged by
+that third application — naming the property this demonstrates.</div>
+
+<div class="exercise" id="ex61.9"><span class="ex-label">61.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the concept — <em>physical logging</em>, <em>logical logging</em>, <em>physiological logging</em>, <em>force-log-at-commit</em>, or <em>group
+commit</em> — and why: (a) &ldquo;insert this record into slot&nbsp;3 of page&nbsp;P,&rdquo; gated by the page LSN; (b) forcing many commits' records durable with
+one <code>fsync</code>; (c) recording the whole before- and after-image of a page; (d) recording only &ldquo;increment&nbsp;c by 5&rdquo;; (e) the rule that a
+commit's records must be on stable storage before the commit is acknowledged.</div>
+
+<div class="exercise" id="ex61.10"><span class="ex-label">61.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Logical redo records are idempotent.&rdquo; (b) &ldquo;Physiological logging
+keeps a redo record confined to one page.&rdquo; (c) &ldquo;Group commit weakens durability by acknowledging commits before they are on disk.&rdquo; (d) &ldquo;A
+physical redo record can be replayed safely because it carries the after-image.&rdquo; (e) &ldquo;ARIES undo must be page-oriented, just like redo.&rdquo;</div>
+
+<div class="exercise" id="ex61.11"><span class="ex-label">61.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) Group commit reduces <code>fsync</code> count but adds a small wait for a group to fill; sketch how you would choose the group-fill
+timeout, and what workload signal tells you it is too long or too short. (b) Physiological redo is confined to one page, but some operations (a B-tree split)
+touch two pages atomically; sketch how you would log a two-page structural change so redo stays idempotent per page. (c) The wall-clock numbers here (0.1595&nbsp;s
+vs 0.0215&nbsp;s) came from one machine's filesystem; explain why the <code>fsync</code> <em>count</em> (64 vs 8) is the portable claim and the times are not.</div>
+
+<div class="exercise" id="ex61.12"><span class="ex-label">61.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build three redo records for the same one-field change — a physical after-image, a logical operation, and a
+physiological page-plus-operation with an LSN — and apply each <em>twice</em>; assert the physical and physiological results are unchanged by the second apply and
+the logical one double-counts. (b) Write N commit records to a real file two ways — one <code>fsync</code> per commit and one per group of G — and report the
+<code>fsync</code> count and elapsed time for each. (c) Explain which of your numbers is a structural constant (independent of machine) and which is a measurement,
+and why the durability guarantee is identical in both commit modes.</div>
+
+</section>
+</section>

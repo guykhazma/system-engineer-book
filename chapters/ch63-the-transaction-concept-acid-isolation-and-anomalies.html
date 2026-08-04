@@ -1,0 +1,341 @@
+<section class="chapter" id="ch63">
+<h1>Chapter 63 — The Transaction Concept: ACID, Isolation, and Anomalies</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch57">Chapter 57</a> (write-ahead logging and the durability contract — the D of ACID, built),
+<a href="#ch60">Chapter 60</a> (ARIES — atomicity and durability across a crash; its full name promised <em>isolation</em> too), <a href="#ch62">Chapter 62</a>
+(the recovery capstone — durability complete, and the note that it only ever concerned <em>one writer</em>). &nbsp;·&nbsp; Part&nbsp;X kept a database's word to a
+single writer across every failure. It said nothing about what happens when <strong>many</strong> transactions run at once and can observe each other's
+half-finished work. This chapter opens Part&nbsp;XI by naming the whole contract a transaction offers — <strong>ACID</strong> — and then the failures that appear
+the moment transactions <em>interleave</em> without control: the <strong>dirty read</strong>, the <strong>lost update</strong>, the <strong>non-repeatable
+read</strong>, and the <strong>phantom</strong>. These anomalies, and the <strong>isolation levels</strong> that trade them away for concurrency, are the subject
+the rest of the part implements.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch62">Chapter 62</a> — the durability machinery guaranteed every committed write survived every failure; what did it say about what
+<em>concurrent</em> transactions may observe of each other mid-flight? (2) <a href="#ch60">Chapter 60</a> — ARIES stands for Algorithm for Recovery <em>and
+Isolation</em>; which letter of ACID is the &ldquo;isolation&rdquo; half, and did recovery provide it? (3) <em>Predict:</em> two money transfers run at the same
+time. Each reads the same balance of 100, each adds 10, each writes the result back. What final balance does the account hold, what <em>should</em> it hold, and
+what went wrong? Write your guess; &sect;63.2&ndash;&sect;63.3 answer it.</p>
+</aside>
+
+<p>A <strong>transaction</strong> is a unit of work a database treats as indivisible, and Jim Gray's 1981 paper named the concept and its guarantees. Härder and
+Reuter's 1983 acronym <strong>ACID</strong> gives the four: <strong>Atomicity</strong> — all of a transaction's changes take effect or none do, no partial state
+survives (Chapter 60's undo). <strong>Consistency</strong> — a transaction moves the database from one state satisfying its invariants to another that also does;
+the application defines the invariants, and the transaction promises not to break them. <strong>Isolation</strong> — concurrent transactions do not see each
+other's uncommitted, in-progress state; each runs <em>as if</em> alone. <strong>Durability</strong> — once committed, a transaction's changes survive any failure
+(all of Part&nbsp;X). Part&nbsp;X delivered A and D end to end. This chapter is about I — the property that, unlike the others, is fundamentally about
+<em>concurrency</em>, and the one that recovery never touched. When transactions run one at a time, isolation is free. The instant they overlap, a scheduler that
+interleaves their reads and writes can produce results no serial order ever would — the <strong>anomalies</strong>. This chapter defines the transaction and ACID
+(&sect;63.1); shows why concurrency needs control at all, with the lost-update interleaving (&sect;63.2); walks the four classic anomalies on a running scheduler
+(&sect;63.3); and lays out the <strong>isolation levels</strong> — the ANSI ladder as refined by Berenson et&nbsp;al. 1995 — each forbidding one more anomaly at
+the cost of concurrency (&sect;63.4). By the end you can name what can go wrong and how much a given isolation level actually prevents — the vocabulary the rest
+of the part uses to build 2PL, MVCC, and optimistic concurrency control.</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) that is a
+<em>structural</em> scheduler demonstration, not a real database. It encodes four explicit interleaved schedules over a tiny in-memory store — one per anomaly —
+and for each reports the value a transaction <em>observed</em> against the correct, serial-equivalent value, so the anomaly shows up as a mismatch. Dirty read: a
+transaction reads 50 that is later rolled back to 100. Lost update: two increments of 100 yield 120 where a serial run reaches 130. Non-repeatable read: the same
+row reads 100 then 200. Phantom: the same predicate sums 120 then 150 after an insert. It then prints the ANSI isolation ladder as refined by Berenson
+et&nbsp;al. 1995. Each result is deterministic — a fixed schedule either exhibits the anomaly or it does not, and each does — so this is a structural
+demonstration of how interleavings misbehave, not a timing or a claim about any particular engine's defaults.</p>
+
+<h2>63.1 The transaction: ACID and the all-or-nothing contract</h2>
+
+<p>A transaction is the database's unit of agreement with the application: a group of reads and writes that must be treated as one indivisible action, however
+many individual operations it contains. The canonical example is a transfer — debit one account, credit another — which must happen fully or not at all; a state
+where the debit landed but the credit did not is not a slow transaction, it is <em>money destroyed</em>. Gray's 1981 &ldquo;transaction concept&rdquo; formalized
+this: the transaction is the boundary at which a database makes its guarantees, and those guarantees are the four letters of ACID (Härder &amp; Reuter 1983).
+<strong>Atomicity</strong> and <strong>Durability</strong> are the two Part&nbsp;X built: atomicity says a crash or abort leaves no partial transaction (undo
+erases the losers), durability says a commit survives any crash (the WAL and ARIES). <strong>Consistency</strong> is the application's contract — the transaction,
+if run alone on a valid state, leaves a valid state — and the database's job is to preserve it under the other three properties. <strong>Isolation</strong> is the
+new one: it says concurrent transactions must not see one another's uncommitted work; each must behave as though it had the database to itself.</p>
+
+<p>Isolation is different in kind from the others, and the difference is why it takes a whole part. Atomicity, consistency, and durability are properties of
+<em>one</em> transaction against failure; isolation is a property of <em>many</em> transactions against each other. Run transactions strictly one at a time — a
+serial schedule — and isolation is automatic and free: no transaction can see another's in-progress state because no other is in progress. But serial execution
+wastes a machine that can do many things at once, so real databases <em>interleave</em> transactions, running each a little at a time. Interleaving is where the
+performance lives and where the danger lives, because a scheduler that mixes one transaction's reads and writes with another's can produce outcomes that no serial
+order could — the anomalies. The gold standard isolation aims at is <strong>serializability</strong>: an interleaved schedule is acceptable if its effect equals
+<em>some</em> serial order of the same transactions. Anything less admits some anomaly. The rest of this chapter is about what those anomalies are and how much a
+given level of isolation gives up to avoid them; the rest of the part is about the mechanisms — locking, versioning, validation — that enforce a chosen level.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the four ACID properties and, in a phrase each, what they promise. Which two did Part&nbsp;X build, and why is isolation different in kind from the other
+three? (Answer in &sect;63.2.)</p>
+</aside>
+
+<h2>63.2 Why concurrency needs control: the interleaving that goes wrong</h2>
+
+<p>To see why isolation needs enforcing, watch the simplest interleaving break the simplest invariant. Two transactions each perform a read-modify-write on the
+same balance: read it, add an amount, write it back. Run serially, the effects add up — 100, then 110, then 130. Interleaved so that both read <em>before</em>
+either writes, one write silently overwrites the other. This is the opener, and the program's <em>lost update</em> line is exactly it:</p>
+
+<pre><code>Anomaly              observed        vs correct/serial   anomaly?
+  lost update        x = 120          serial 130           True</code></pre>
+
+<p>Trace it. Balance starts at 100. Transaction&nbsp;T1 reads 100; transaction&nbsp;T2 also reads 100 — both captured the same starting value before either
+wrote. T1 computes 100+10 and writes 110; T2 computes 100+20 (against the 100 <em>it</em> read, not T1's 110) and writes 120. T1's update is gone — overwritten by
+a transaction that never saw it. A serial run would have reached 130 (100, then +10, then +20); the interleaving reached 120. Ten units of money vanished, with no
+crash, no error, no violated constraint the database could see — every individual operation was legal, and durability preserved every write that <em>was</em>
+made. This is the crux: <em>recovery cannot save you here, because nothing failed</em>. Both transactions committed; the log is perfectly consistent with what ran;
+ARIES would reproduce exactly this wrong answer. The bug is not in any single transaction and not in any failure — it is in the <em>interleaving</em>, and the
+only thing that prevents it is a concurrency-control mechanism that stops T2 from acting on a value T1 was about to change (or detects the conflict and aborts one
+of them). This is why isolation is a first-class problem: correctness under concurrency is not a property recovery provides or the application can easily code
+around; it must be enforced by the database's scheduler.</p>
+
+<p><em>(Answer to the &sect;63.1 quick check: the four ACID properties are Atomicity — all or nothing; Consistency — invariants preserved; Isolation —
+concurrent transactions do not see each other's uncommitted state; Durability — commits survive failure. Part&nbsp;X built Atomicity and Durability. Isolation is
+different in kind because it is a property of many transactions against each other, not of one transaction against failure — so it is automatic under serial
+execution and must be actively enforced the moment transactions interleave.)</em></p>
+
+<aside class="warning">
+<span class="box-title">Trap: the isolation level that felt strong enough &mdash; the lost update READ COMMITTED lets through</span>
+<p>The comfortable assumption is that setting a database to <strong>READ COMMITTED</strong> — the default in many engines — makes concurrent updates safe, because
+&ldquo;we only ever read committed data.&rdquo; It does prevent the <em>dirty read</em>: you will never see another transaction's uncommitted value. But it does
+<em>nothing</em> for the lost update above. Both transactions read a committed 100, both compute against it, and the second write clobbers the first — every value
+read was committed, so READ COMMITTED is satisfied, and the money still disappears. The same level also permits non-repeatable reads and phantoms. The trap is
+reading the level's name as a guarantee of correctness rather than as the precise, narrow thing it is: READ COMMITTED forbids exactly one anomaly (dirty reads)
+and leaves the other three. The fixes are to raise isolation to a level that forbids the anomaly you actually face — <strong>REPEATABLE READ</strong> or
+<strong>SERIALIZABLE</strong> for the lost update — or to make the update atomic at the database (a single <code>UPDATE accounts SET bal = bal + 10</code> that
+reads and writes under one lock, rather than a read in the application followed by a write). What you must not do is assume a level protects against an anomaly it
+does not name. Every isolation level is a specific set of anomalies forbidden and a specific set permitted; treating &ldquo;committed&rdquo; as a synonym for
+&ldquo;correct&rdquo; is how a lost update ships to production and is discovered only when the numbers stop adding up.</p>
+</aside>
+
+<h2>63.3 The four anomalies: dirty read, lost update, non-repeatable read, phantom</h2>
+
+<p>There are four classic anomalies, and each is a specific way an interleaving lets one transaction observe another's activity that a serial order never would.
+The program produces all four, each as a mismatch between what a transaction observed and the correct value:</p>
+
+<pre><code>Anomaly              observed        vs correct/serial   anomaly?
+  dirty read         read 50          committed 100        True
+  lost update        x = 120          serial 130           True
+  non-repeatable rd  100 then 200      same row            True
+  phantom            SUM 120 then 150   same predicate      True</code></pre>
+
+<p>Take them in turn. A <strong>dirty read</strong> is reading another transaction's <em>uncommitted</em> value. Here T1 withdraws 50, dropping the balance to 50
+in its uncommitted workspace; T2 reads that 50; then T1 aborts and the balance rolls back to 100. T2 acted on a value that never truly existed — <em>read 50</em>
+against a <em>committed 100</em>. A <strong>lost update</strong> (&sect;63.2) is two read-modify-writes where one overwrites the other: 120 where a serial run
+reaches 130. A <strong>non-repeatable read</strong> is reading the <em>same row twice</em> and getting different values because another transaction committed a
+change in between: T1 reads x=100, T2 updates it to 200 and commits, T1 reads x=200 — the row it already read changed underneath it, so a computation depending on
+x reading the same value twice is broken. A <strong>phantom</strong> is the same anomaly for a <em>set</em> defined by a predicate rather than a single row: T1
+runs <code>SUM(amt) WHERE acct='A'</code> and gets 120; T2 <em>inserts</em> a new row that also matches <code>acct='A'</code> and commits; T1 re-runs the same
+query and gets 150. No row T1 read changed — the difference is a <em>new</em> row that appeared, a phantom, matching a predicate T1 thought it had already
+answered. The distinction between the non-repeatable read and the phantom is exactly the distinction between an <em>update to an existing row</em> and an
+<em>insert of a new one</em>, and it matters because they need different mechanisms to prevent: locking the rows you read stops non-repeatable reads, but you
+cannot lock a row that does not exist yet, so stopping phantoms needs locking the <em>predicate</em> (or a range), which is why phantoms are the hardest of the
+four and the reason predicate locks (Eswaran et&nbsp;al. 1976) were invented. Four anomalies, four ways an interleaving betrays a transaction that assumed it ran
+alone.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: four anomalies, one cause &mdash; uncontrolled interleaving</span>
+<p><strong>1. In words.</strong> Dirty read: seeing uncommitted data that may roll back. Lost update: two read-modify-writes, one overwrites the other.
+Non-repeatable read: the same row read twice returns different committed values. Phantom: the same predicate query returns a different <em>set</em> because a row
+was inserted. All four come from interleaving reads and writes of transactions that each assumed they ran alone.</p>
+<p><strong>2. As a picture.</strong> Figure 63.1: four two-lane timelines, T1 above and T2 below. Dirty read: T2's read arrow crosses into T1's uncommitted region
+before T1's abort. Lost update: both read arrows precede both write arrows; T2's write lands on top. Non-repeatable read: T1's two reads bracket T2's committed
+write. Phantom: T1's two queries bracket T2's insert of a new matching row (drawn as a fresh box appearing between the reads).</p>
+<p><strong>3. As numbers.</strong> Dirty read: observed 50 vs committed 100. Lost update: 120 vs serial 130. Non-repeatable read: 100 then 200 on the same row.
+Phantom: SUM 120 then 150 on the same predicate. Each is a mismatch between what a transaction saw and what a serial order would have given
+(&sect;63.2&ndash;&sect;63.3).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Four anomalies from uncontrolled interleaving &#8212; each a read that a serial order would never have returned.</text>
+<text x="14" y="46" font-size="9" fill="#333">DIRTY READ</text>
+<line x1="120" y1="42" x2="300" y2="42" stroke="#b58900"/><text x="122" y="36" font-size="7" fill="#7a5c00">T1 write 50 (uncommitted) &#8594; ABORT</text>
+<line x1="120" y1="56" x2="300" y2="56" stroke="#2f7d32"/><text x="122" y="68" font-size="7" fill="#2f7d32">T2 reads 50 (never existed)</text>
+<text x="14" y="96" font-size="9" fill="#333">LOST UPDATE</text>
+<line x1="120" y1="92" x2="360" y2="92" stroke="#b58900"/><text x="122" y="86" font-size="7" fill="#7a5c00">T1 read 100 ... write 110</text>
+<line x1="120" y1="106" x2="360" y2="106" stroke="#2f7d32"/><text x="122" y="118" font-size="7" fill="#2f7d32">T2 read 100 ... write 120 (overwrites)</text>
+<text x="14" y="146" font-size="9" fill="#333">NON-REPEATABLE</text>
+<line x1="140" y1="142" x2="380" y2="142" stroke="#b58900"/><text x="142" y="136" font-size="7" fill="#7a5c00">T1 read x=100 ........ read x=200</text>
+<line x1="240" y1="150" x2="240" y2="134" stroke="#2f7d32" stroke-width="2"/><text x="246" y="158" font-size="7" fill="#2f7d32">T2 write 200, commit</text>
+<text x="14" y="190" font-size="9" fill="#333">PHANTOM</text>
+<line x1="140" y1="186" x2="380" y2="186" stroke="#b58900"/><text x="142" y="180" font-size="7" fill="#7a5c00">T1 SUM=120 ........ SUM=150</text>
+<rect x="235" y="180" width="12" height="10" fill="#dff0df" stroke="#2f7d32"/><text x="250" y="189" font-size="7" fill="#2f7d32">T2 inserts a new matching row</text>
+</svg>
+<figcaption>Figure 63.1: the four anomalies as interleaved timelines. Each shows a transaction (amber) observing something a serial order would never return, because
+another transaction (green) acted in between — an uncommitted read, an overwrite, an updated row, or an inserted phantom.</figcaption>
+</figure>
+
+<h2>63.4 Isolation levels: the ANSI ladder and what each forbids</h2>
+
+<p>Since preventing every anomaly costs concurrency, the SQL standard offers a <em>ladder</em> of isolation levels, each forbidding one more anomaly than the last,
+so an application can buy exactly the correctness it needs and no more. The program prints the ladder, as refined by Berenson et&nbsp;al. 1995:</p>
+
+<pre><code>Isolation ladder (ANSI, as refined by Berenson et al. 1995): each level forbids one more.
+  READ UNCOMMITTED forbids: none of the below
+  READ COMMITTED   forbids: dirty read
+  REPEATABLE READ  forbids: dirty read, non-repeatable read, lost update
+  SERIALIZABLE     forbids: dirty read, non-repeatable read, lost update, phantom</code></pre>
+
+<p>Read the ladder from the bottom. <strong>READ UNCOMMITTED</strong> forbids none of the four — it permits even dirty reads, trading all isolation for maximum
+concurrency, useful only for approximate, read-only reporting where a transient wrong value is tolerable. <strong>READ COMMITTED</strong> forbids the dirty read:
+you never see uncommitted data, but the same row can still change between two reads (non-repeatable), a set can still grow (phantom), and updates can still be lost
+— this is the default in many engines and the source of the &sect;63.2 trap. <strong>REPEATABLE READ</strong> additionally forbids the non-repeatable read (and, in
+Berenson et&nbsp;al.'s refinement, the lost update): rows you have read stay stable for your transaction's life, but <em>new</em> rows matching a predicate can
+still appear, so phantoms remain. <strong>SERIALIZABLE</strong> forbids all four, including the phantom: the execution is equivalent to <em>some</em> serial order,
+the correctness gold standard of &sect;63.1 — and the most expensive, because preventing phantoms means locking predicates or ranges, not just rows. The ANSI
+standard originally defined the levels by three phenomena (dirty read, non-repeatable read, phantom); Berenson et&nbsp;al. 1995 showed those definitions were
+ambiguous and incomplete — missing the lost update and mis-specifying the levels under real locking — and refined them, which is why this book states the ladder in
+their corrected form. The practical reading is the one the trap insisted on: an isolation level is a precise set of anomalies forbidden, not a vague strength
+rating, and choosing one is choosing exactly which anomalies you can tolerate in exchange for how much concurrency. The mechanisms that <em>enforce</em> these
+levels — two-phase locking, multiversion concurrency control, optimistic validation — are the subject of the chapters that follow; this chapter gives you the
+anomalies they exist to prevent and the ladder that names how far to go.</p>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate reports a bug: &ldquo;Our balance-update endpoint occasionally loses an increment under load. We're on READ COMMITTED, which
+the docs say means we only read committed data — so how is an update getting lost? Committed reads should be safe.&rdquo; Cover the paragraph and answer in four or
+five sentences, drawing on &sect;63.2 and &sect;63.4.</p>
+<p><em>Model answer.</em> &ldquo;READ COMMITTED does exactly one thing: it stops you reading <em>uncommitted</em> data. It does not stop a <strong>lost
+update</strong>. Two requests each read a committed balance, each add their increment to the value they read, and the second write overwrites the first — every
+read was committed, so the level is satisfied, and an increment still vanishes. The name protects against dirty reads, not against concurrent read-modify-write.
+Two real fixes: raise isolation to REPEATABLE READ or SERIALIZABLE, which forbid the lost update, or — better and cheaper — make the update atomic in the database
+with <code>UPDATE accounts SET bal = bal + :n</code> so the read and write happen under one lock instead of reading in the app and writing back later. What we
+can't do is treat &lsquo;committed&rsquo; as &lsquo;correct&rsquo;; each isolation level forbids a specific list of anomalies, and this one isn't on READ
+COMMITTED's list.&rdquo; Naming the anomaly, what the level actually forbids, and the atomic-update fix is the senior register.</p>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Which anomaly does READ COMMITTED forbid, and which three does it permit? What does SERIALIZABLE add over REPEATABLE READ, and why is that addition the most
+expensive step on the ladder? (Answer below.)</p>
+</aside>
+
+<h2>63.5 What to carry forward</h2>
+
+<p>A <strong>transaction</strong> is a database's indivisible unit of work (Gray 1981), and its contract is <strong>ACID</strong> (Härder &amp; Reuter 1983):
+<strong>Atomicity</strong> (all or nothing), <strong>Consistency</strong> (invariants preserved), <strong>Isolation</strong> (concurrent transactions do not see
+each other's uncommitted state), <strong>Durability</strong> (commits survive failure). Part&nbsp;X built A and D; Part&nbsp;XI is about I, which is different in
+kind — a property of many transactions against each other, free under serial execution but requiring active enforcement the moment they interleave (&sect;63.1).
+Uncontrolled interleaving produces <strong>anomalies</strong> that no serial order would, and recovery cannot help because nothing failed — the
+<strong>lost update</strong> reaches 120 where a serial run reaches 130, and both transactions committed cleanly (&sect;63.2). The four classic anomalies are the
+<strong>dirty read</strong> (uncommitted data, later rolled back: read 50 vs committed 100), the <strong>lost update</strong> (one write overwrites another), the
+<strong>non-repeatable read</strong> (a row changes between two reads: 100 then 200), and the <strong>phantom</strong> (a set grows between two predicate queries:
+SUM 120 then 150) — the last hardest because you cannot lock a row that does not yet exist (&sect;63.3). The <strong>isolation levels</strong> form a ladder, each
+forbidding one more anomaly at the cost of concurrency: READ UNCOMMITTED (none), READ COMMITTED (dirty read), REPEATABLE READ (also non-repeatable read and lost
+update), SERIALIZABLE (also phantom), stated in Berenson et&nbsp;al.'s 1995 corrected form (&sect;63.4). The named trap: reading an isolation level's name as a
+guarantee of correctness rather than the specific, narrow set of anomalies it forbids — READ COMMITTED still permits the lost update.</p>
+
+<p>This chapter is the vocabulary the rest of Part&nbsp;XI speaks. You now know what a transaction promises, what goes wrong when transactions overlap without
+control, and how the isolation levels name a chosen point on the correctness/concurrency trade. What you do <em>not</em> yet have is any mechanism that
+<em>enforces</em> a level — so far the anomalies are just described, and the ladder is just a specification. The chapters ahead build the enforcement. First comes
+the theory that makes &ldquo;equivalent to some serial order&rdquo; precise and checkable — <strong>serializability</strong> and the conflict graph — so a
+scheduler can decide whether an interleaving is safe. Then come the three mechanisms real systems use to guarantee it: <strong>two-phase locking</strong>, which
+makes transactions acquire and release locks in a disciplined order (its foundations in Eswaran et&nbsp;al. 1976); <strong>multiversion concurrency control</strong>,
+which lets readers see a consistent snapshot without blocking writers; and <strong>optimistic concurrency control</strong>, which runs transactions freely and
+validates at commit. Each enforces isolation a different way, with a different cost profile, and each is the answer to the question this chapter only posed: given
+that interleaving can corrupt, how does a database interleave <em>safely</em>? The anomalies you can now name are exactly what those mechanisms exist to prevent.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Name the four ACID properties and what each promises.</li>
+<li>Explain why isolation is different in kind from atomicity, consistency, and durability.</li>
+<li>Trace the lost update and say why recovery cannot prevent it.</li>
+<li>Define all four anomalies and give the read-vs-serial mismatch for each.</li>
+<li>Say why the phantom is harder to prevent than the non-repeatable read.</li>
+<li>List the four isolation levels and the anomalies each forbids.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> State the four ACID properties; which two did Part&nbsp;X build? (&sect;63.1)</li>
+<li><strong>R2.</strong> Walk the lost update from the run (100, +10, +20) and explain why it reaches 120 not 130. (&sect;63.2)</li>
+<li><strong>R3.</strong> Define the four anomalies and give each one's observed-vs-serial mismatch. (&sect;63.3)</li>
+<li><strong>R4.</strong> Why does preventing phantoms need predicate or range locking, not just row locking? (&sect;63.3)</li>
+<li><strong>R5.</strong> List the isolation ladder and what each level forbids, in Berenson et&nbsp;al.'s corrected form. (&sect;63.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Jim Gray, &ldquo;The Transaction Concept: Virtues and Limitations,&rdquo; <em>Proceedings of the 7th International Conference on Very Large Data
+Bases (VLDB)</em>, 1981, pp. 144&ndash;154.</strong> The invited paper that named and framed the transaction as a unit of atomic, durable, isolated work — the
+origin of the concept this chapter opens with. Author, title, venue (VLDB 1981), and pages verified via DBLP and the ACM Digital Library; this proceedings paper
+predates DOI assignment, so it is cited by venue and pages rather than a DOI.</li>
+<li><strong>Theo H&#228;rder &amp; Andreas Reuter, &ldquo;Principles of Transaction-Oriented Database Recovery,&rdquo; <em>ACM Computing Surveys</em> 15(4),
+1983, pp. 287&ndash;317, DOI 10.1145/289.291.</strong> The paper that coined the <strong>ACID</strong> acronym and defined the four properties this chapter builds
+on. First authors Theo H&#228;rder and Andreas Reuter; venue, volume, issue, pages, year, and DOI verified via the ACM Digital Library and DBLP, and the DOI
+resolves.</li>
+<li><strong>Kapali P. Eswaran, Jim N. Gray, Raymond A. Lorie &amp; Irving L. Traiger, &ldquo;The Notions of Consistency and Predicate Locks in a Database
+System,&rdquo; <em>Communications of the ACM</em> 19(11), 1976, pp. 624&ndash;633, DOI 10.1145/360363.360369.</strong> The foundational paper on serializability
+and predicate locks — why stopping phantoms needs locking a predicate, not a row, and the two-phase discipline the next chapters build on. First author Kapali P.
+Eswaran; venue, volume, issue, pages, year, and DOI verified via the ACM Digital Library and DBLP, and the DOI resolves.</li>
+<li><strong>Hal Berenson, Phil Bernstein, Jim Gray, Jim Melton, Elizabeth O'Neil &amp; Patrick O'Neil, &ldquo;A Critique of ANSI SQL Isolation Levels,&rdquo;
+<em>Proceedings of the 1995 ACM SIGMOD International Conference on Management of Data</em>, 1995, pp. 1&ndash;10, DOI 10.1145/223784.223785.</strong> Shows the
+ANSI isolation-level definitions are ambiguous and incomplete, adds the lost update and snapshot isolation, and gives the corrected ladder this chapter states.
+First author Hal Berenson; venue, year, and DOI verified via the ACM Digital Library and DBLP, and the DOI resolves.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex63.1"><span class="ex-label">63.1</span> <span class="ex-tag warm">warm-up</span>
+Name the four ACID properties and, in a phrase each, what they promise.</div>
+
+<div class="exercise" id="ex63.2"><span class="ex-label">63.2</span> <span class="ex-tag warm">warm-up</span>
+Which two ACID properties did Part&nbsp;X build, and which one is the subject of Part&nbsp;XI?</div>
+
+<div class="exercise" id="ex63.3"><span class="ex-label">63.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is serializability?</div>
+
+<div class="exercise" id="ex63.4"><span class="ex-label">63.4</span> <span class="ex-tag core">core</span>
+The lost update. Using the run (T1 and T2 both read 100; result 120; serial 130): (a) trace the four operations in order and show where T1's update is lost. (b)
+Why does no isolation, constraint, or recovery mechanism flag this as an error? (c) Give two distinct fixes.</div>
+
+<div class="exercise" id="ex63.5"><span class="ex-label">63.5</span> <span class="ex-tag core">core</span>
+The four anomalies. For each — dirty read, lost update, non-repeatable read, phantom — state (i) the interleaving that causes it and (ii) the observed-vs-correct
+mismatch from the run.</div>
+
+<div class="exercise" id="ex63.6"><span class="ex-label">63.6</span> <span class="ex-tag core">core</span>
+Non-repeatable read vs phantom. (a) What is the precise difference between them? (b) Why does locking the rows you read prevent one but not the other? (c) What
+must you lock to prevent the phantom, and why is that more expensive?</div>
+
+<div class="exercise" id="ex63.7"><span class="ex-label">63.7</span> <span class="ex-tag core">core</span>
+The ladder. (a) List the four isolation levels bottom to top and the anomalies each forbids (Berenson et&nbsp;al.'s form). (b) Why is READ COMMITTED not enough to
+prevent a lost update? (c) Why is SERIALIZABLE the most expensive level?</div>
+
+<div class="exercise" id="ex63.8"><span class="ex-label">63.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A report transaction runs <code>SELECT SUM(amt) FROM orders WHERE region='EU'</code>, then later re-runs the same
+query in the same transaction. Between the two, another transaction inserts a new EU order for 40 and commits.
+<br><strong>Step 1 (given):</strong> the first query returns some total S.
+<br><strong>Step 2 (given):</strong> the inserted row matches the predicate <code>region='EU'</code>.
+<br><strong>Step 3 (you):</strong> State what the second query returns relative to S, name the anomaly, say which isolation level would prevent it, and explain
+why row-locking the rows read by the first query would <em>not</em> prevent it.</div>
+
+<div class="exercise" id="ex63.9"><span class="ex-label">63.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the concept — <em>dirty read</em>, <em>lost update</em>, <em>non-repeatable read</em>, <em>phantom</em>, <em>serializability</em>, or an <em>isolation
+level</em> — and why: (a) reading a value another transaction later rolls back; (b) an interleaving whose effect equals some serial order; (c) two read-modify-writes
+where one overwrites the other; (d) the same predicate query returning a larger set after an insert; (e) the level that forbids dirty reads but nothing else.</div>
+
+<div class="exercise" id="ex63.10"><span class="ex-label">63.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Isolation is automatic under serial execution.&rdquo; (b) &ldquo;Recovery
+prevents lost updates.&rdquo; (c) &ldquo;READ COMMITTED prevents non-repeatable reads.&rdquo; (d) &ldquo;A phantom involves a newly inserted row, not a change to
+an existing one.&rdquo; (e) &ldquo;SERIALIZABLE means the schedule equals some serial order of the transactions.&rdquo;</div>
+
+<div class="exercise" id="ex63.11"><span class="ex-label">63.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) The lost update committed cleanly and durably; explain in one or two sentences why this proves isolation is a separate guarantee from
+atomicity and durability, not a consequence of them. (b) Berenson et&nbsp;al. 1995 added <em>snapshot isolation</em>, which forbids the four ANSI anomalies yet
+still permits a &ldquo;write skew&rdquo; that is not serializable; sketch why forbidding the four named anomalies is not the same as guaranteeing serializability.
+(c) The next chapters enforce isolation with locking, versioning, and validation; for the lost update specifically, sketch how a lock on the balance would prevent
+it and what concurrency that lock costs.</div>
+
+<div class="exercise" id="ex63.12"><span class="ex-label">63.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build a tiny store and encode four explicit interleaved schedules, one per anomaly, each reporting the value a transaction
+observed against the serial-equivalent value. (b) Assert each schedule exhibits its anomaly (observed &ne; correct). (c) Then, for the lost update, add a rule that
+blocks the second transaction's read until the first's write commits, and show the anomaly disappears (result 130) — explaining which isolation level your rule
+approximates and what it costs in concurrency.</div>
+
+</section>
+</section>

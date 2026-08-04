@@ -1,0 +1,89 @@
+<section class="solutions" id="sol61">
+<h1>Chapter 61 — Solutions</h1>
+
+<div class="solution" id="sol61.1"><span class="sol-label">61.1</span>
+<strong>Physical</strong> — record the changed bytes (before- and after-images). <strong>Logical</strong> — record the operation and its arguments (&ldquo;increment
+c by 5&rdquo;). <strong>Physiological</strong> — record an operation on one named page (&ldquo;insert into slot 3 of page P&rdquo;), gated by that page's LSN.
+<em>Tempting wrong answer:</em> &ldquo;physiological means logging both the bytes and the operation&rdquo; — it means physical <em>to a page</em>, logical
+<em>within</em> it: one page, an operation, not a byte dump. <strong>Feed-forward:</strong> &sect;61.1.</div>
+
+<div class="solution" id="sol61.2"><span class="sol-label">61.2</span>
+ARIES assumes <strong>physiological</strong> logging. &ldquo;Physical to a page&rdquo; means each record touches exactly one page, so that page's page LSN can gate
+its replay; &ldquo;logical within it&rdquo; means the change is described as an operation on the page's structure, not as raw bytes, which keeps the record small.
+<em>Tempting wrong answer:</em> &ldquo;ARIES logs physically for safety&rdquo; — pure physical is safe but bulky and brittle; physiological gets the same
+per-page idempotence far more compactly. <strong>Feed-forward:</strong> &sect;61.1&ndash;&sect;61.3.</div>
+
+<div class="solution" id="sol61.3"><span class="sol-label">61.3</span>
+All of a transaction's log records up to and including its commit record must be forced to durable storage (an <code>fsync</code>) before the commit is
+acknowledged to the client. <em>Tempting wrong answer:</em> &ldquo;the data pages must be forced&rdquo; — no; that is the whole point of no-force (Chapter 57).
+Only the <em>log</em> is forced at commit; the pages follow lazily. <strong>Feed-forward:</strong> &sect;61.4.</div>
+
+<div class="solution" id="sol61.4"><span class="sol-label">61.4</span>
+(a) A physical redo record carries the after-image, so writing it once or many times leaves identical bytes — self-inverse against itself. (b) A logical record
+carries an operation whose effect depends on current state (&ldquo;add 5&rdquo;), so a second application changes the result again. (c) Physiological logging binds
+the operation to one page and gates it with the page LSN, so replay compares LSNs and skips a change already present. <em>Tempting wrong answer:</em> &ldquo;logical
+redo is idempotent if the operation is deterministic&rdquo; — determinism is not idempotence; &ldquo;add 5&rdquo; is deterministic yet double-counts.
+<strong>Feed-forward:</strong> &sect;61.2&ndash;&sect;61.3.</div>
+
+<div class="solution" id="sol61.5"><span class="sol-label">61.5</span>
+(a) The logical record &ldquo;add 5 to <code>b</code>&rdquo; carries no notion of &ldquo;already applied,&rdquo; so the forced second apply adds another 5, reaching
+<code>{b:10}</code>. (b) The physiological record's second apply compares its LSN (20) to the page LSN (now 20); since 20 is not greater than 20, it skips, leaving
+<code>{b:5}</code>. (c) The sizes (~64&nbsp;B physical vs ~19&nbsp;B physiological) illustrate that logging an operation on a page is far smaller than logging the
+page image, while still being replay-safe. <em>Tempting wrong answer:</em> &ldquo;the physiological record stays 5 because the operation is a no-op the second
+time&rdquo; — the operation is not a no-op; the page-LSN gate skips it. <strong>Feed-forward:</strong> &sect;61.2&ndash;&sect;61.3.</div>
+
+<div class="solution" id="sol61.6"><span class="sol-label">61.6</span>
+(a) Redo must be idempotent and restartable, and confining a record to one page lets that page's LSN gate replays — the only mechanism that makes redo safe to
+repeat. (b) Undo is made restartable by compensation records and their undoNextLSN chain (Chapter 60), not by a per-page mark, so it can span pages and act on the
+live structure. (c) A B-tree insert's key may have moved to another page after a later split, so undoing it (&ldquo;delete key 5&rdquo;) must re-locate the key in
+the tree as it is now — a logical operation, not a physical rewrite of the original page. <em>Tempting wrong answer:</em> &ldquo;undo is logical because it is
+simpler&rdquo; — it is logical because the structure may have changed; a physical undo would target bytes that have since moved. <strong>Feed-forward:</strong>
+&sect;61.3.</div>
+
+<div class="solution" id="sol61.7"><span class="sol-label">61.7</span>
+(a) An <code>fsync</code> flushes everything in the log up to a point, so all commit records accumulated before it become durable together — many commits ride one
+sync. (b) Each transaction still blocks until the sync that covers <em>its</em> commit record completes, so no commit is acknowledged before it is genuinely on
+disk. (c) Group commit trades a little latency (waiting for a group to fill) for throughput (the expensive sync amortized over the group). <em>Tempting wrong
+answer:</em> &ldquo;group commit lets a commit return before its sync&rdquo; — no; it shares the sync, it does not skip it. <strong>Feed-forward:</strong>
+&sect;61.4.</div>
+
+<div class="solution" id="sol61.8"><span class="sol-label">61.8</span>
+<strong>Step 3:</strong> The third record (LSN 35, replayed) is compared against the page LSN, which is now 35; since 35 is not greater than 35, redo skips it.
+The page LSN stays 35 and the page contents are unchanged, because the change at LSN 35 was already applied by Step 2. This demonstrates <strong>idempotence via
+the page LSN</strong>: a redo record has no effect once its LSN is at or below the page's. <em>Tempting wrong answer:</em> &ldquo;the third record applies again and
+sets <code>b</code>=2 a second time, advancing the LSN to 36&rdquo; — replay does not invent a new LSN, and the gate skips the already-applied record.
+<strong>Feed-forward:</strong> &sect;61.3.</div>
+
+<div class="solution" id="sol61.9"><span class="sol-label">61.9</span>
+(a) <strong>Physiological logging</strong> — an operation on one page, LSN-gated. (b) <strong>Group commit</strong> — many commits, one <code>fsync</code>. (c)
+<strong>Physical logging</strong> — whole before/after page image. (d) <strong>Logical logging</strong> — just the operation. (e)
+<strong>Force-log-at-commit</strong> — records durable before acknowledgment. <em>Tempting wrong answer:</em> calling (a) &ldquo;logical&rdquo; — it is logical
+<em>within a page</em>, i.e. physiological; a bare logical record would not name the page or ride the page LSN. <strong>Feed-forward:</strong>
+&sect;61.1&ndash;&sect;61.4.</div>
+
+<div class="solution" id="sol61.10"><span class="sol-label">61.10</span>
+(a) <strong>False</strong> — logical redo is not idempotent; replaying &ldquo;add 5&rdquo; double-counts. (b) <strong>True</strong> — physiological logging binds
+each redo record to a single page. (c) <strong>False</strong> — group commit shares the sync but never acknowledges a commit before its record is durable. (d)
+<strong>True</strong> — carrying the after-image is exactly what makes physical redo self-inverse against itself. (e) <strong>False</strong> — ARIES undo is
+logical; only redo is page-oriented. <em>Tempting wrong answer:</em> marking (a) true because the operation is deterministic — deterministic is not idempotent.
+<strong>Feed-forward:</strong> &sect;61.2&ndash;&sect;61.4.</div>
+
+<div class="solution" id="sol61.11"><span class="sol-label">61.11</span>
+(a) Choose the group-fill timeout by watching commit latency versus throughput: too long and single committers stall waiting for a group that never fills (latency
+spikes at low load); too short and the sync is barely amortized (throughput stays near one-per-sync at high load). A good policy adapts — flush when the group
+reaches a size <em>or</em> a small timer expires, whichever comes first. (b) Log a two-page split as two physiological redo records, one per page, each LSN-gated,
+plus enough information (or a nested top-action) that recovery either applies both or neither; each page's redo stays idempotent because each record is confined
+to its own page and gated by its own page LSN. (c) The <code>fsync</code> count is fixed by the arithmetic (N commits, groups of G, gives ceil(N/G) syncs) and is
+identical on any machine; the times depend on the device's sync latency and the rest of the commit path, so they are a measurement, not a constant. <em>Tempting
+wrong answer:</em> &ldquo;pick the largest timeout for maximum batching&rdquo; — that maximizes throughput but can ruin latency at low load, where groups fill
+slowly. <strong>Feed-forward:</strong> &sect;61.4.</div>
+
+<div class="solution" id="sol61.12"><span class="sol-label">61.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds three records for one change and applies each twice, asserting physical and physiological are
+unchanged (the page LSN gates the physiological replay) while the logical one double-counts; (b) writes N commit records with one <code>fsync</code> per commit and
+one per group of G, reporting <code>fsync</code> count and elapsed time; (c) identifies the <code>fsync</code> count as the structural constant (ceil(N/G),
+machine-independent) and the times as measurements, and notes durability is identical because both modes force every commit's record before acknowledging it.
+<em>Tempting wrong answer:</em> &ldquo;report only the elapsed times as the result&rdquo; — the portable, reproducible claim is the sync count and the idempotence
+outcomes; the times illustrate the effect on one machine. <strong>Feed-forward:</strong> &sect;61.4.</div>
+
+</section>

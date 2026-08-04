@@ -1,0 +1,341 @@
+<section class="chapter" id="ch62">
+<h1>Chapter 62 — Media Recovery and the Recovery Capstone</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch57">Chapter 57</a> (write-ahead logging and the durability contract — force the log, then the
+pages may follow), <a href="#ch59">Chapter 59</a> (checkpoints and the RedoLSN — bounding <em>crash</em> recovery), <a href="#ch60">Chapter 60</a> (ARIES —
+recovery that reads the surviving disk and log), <a href="#ch61">Chapter 61</a> (physiological records and the log manager — the log this chapter archives).
+&nbsp;·&nbsp; Every recovery method in this part assumed one thing: the <em>disk survived</em>. Analysis, redo, and undo all read pages and log records back off
+stable storage. This chapter removes that assumption. When the disk itself is <strong>lost or corrupted</strong> — a failed drive, a bad controller, a
+fat-fingered <code>rm</code> — there are no pages and no log to recover from, and ARIES has nothing to work with. <strong>Media recovery</strong> is how a
+database survives that: rebuild from a <strong>backup</strong> and an <strong>archived log</strong> kept on separate storage. This is also the capstone of Part X,
+where write-ahead logging, the LSN, the checkpoint, ARIES, and now media recovery assemble into one durability story.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch60">Chapter 60</a> — what two durable inputs does ARIES read to recover, and where do they live? (2) <a href="#ch57">Chapter 57</a>
+— after a crash, what does the durability contract guarantee is on disk for every committed transaction? (3) <em>Predict:</em> the disk is physically destroyed —
+no data pages and no log survive on it. ARIES needs both to run, so it cannot help. What two things, if you had kept them <em>somewhere else</em>, would let you
+rebuild the database — and to what moment in time could you rebuild it? Write your guess; &sect;62.2&ndash;&sect;62.3 answer it.</p>
+</aside>
+
+<p>Härder and Reuter's 1983 taxonomy names three classes of failure a database must survive, and this part has, until now, addressed only two. A
+<strong>transaction failure</strong> (an abort, a constraint violation) is handled by undo. A <strong>system failure</strong> (a crash: power loss, a kernel
+panic) loses volatile memory but not the disk, and is handled by ARIES's three passes reading the surviving pages and log. The third is <strong>media
+failure</strong>: the stable storage itself is lost or corrupted, so the data pages and the log that lived on it are gone. No amount of redo or undo helps,
+because there is nothing to read. Recovery from media failure needs inputs that were deliberately kept <em>off</em> the failed medium: a <strong>backup</strong>
+(a copy of the database as of some past moment) and an <strong>archived log</strong> (a copy of the log records, on separate storage, spanning from the backup
+forward). Media recovery <em>restores</em> the backup and then <em>rolls the archived log forward</em> onto it, re-applying every logged change from the backup's
+moment to the point you want to reach. This chapter distinguishes the failure classes and why media failure is different (&sect;62.1); introduces backups and the
+archived log, the two ingredients (&sect;62.2); performs roll-forward and <strong>point-in-time recovery</strong>, stopping at a chosen moment (&sect;62.3); and
+then steps back for the capstone (&sect;62.4), assembling the whole part — the durability contract, the LSN and page LSN, the checkpoint, ARIES, and media
+recovery — into one account of how a database keeps its word across every failure. By the end, Part X is complete.</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) implementing a small
+page store with a redo log. It runs a workload, takes a full <em>backup</em> of the pages partway through, keeps <em>archiving</em> the log, and then simulates a
+<strong>media failure</strong> by discarding the on-disk pages entirely — leaving ARIES nothing to recover from. It then performs media recovery two ways: restore
+the backup and roll the archived log forward to the <em>end</em> (reaching the exact pre-failure state), and restore the backup and roll forward only to a chosen
+<em>point in time</em> (reaching an earlier state that excludes some later writes). It also shows what a backup <em>without</em> a log can reach — only the backup
+instant, losing everything after. This is a deterministic, structural demonstration: each recovery either reaches the expected state or it does not, and it does.
+There is no wall-clock claim here; the guarantee is state equality, not speed.</p>
+
+<h2>62.1 Beyond a crash: when the disk itself is lost</h2>
+
+<p>The recovery this part built is powerless against a lost disk, and it is worth being precise about why. ARIES's inputs are the data pages and the log, both
+read back from stable storage after the failure. A <em>crash</em> — a system failure — destroys only the volatile buffer pool; the disk is intact, so ARIES can
+scan the log from the checkpoint, redo forward, and undo backward, exactly as Chapter 60 showed. A <em>media failure</em> destroys the stable storage itself: the
+drive fails, the volume is corrupted, a region of the log is unreadable. Now the pages ARIES would repair are gone and the log it would replay is gone with them.
+Running ARIES accomplishes nothing — there is no page to compare a page LSN against, no record to redo. The program makes the point starkly by discarding the
+on-disk pages and observing that recovery has an empty store to work from:</p>
+
+<pre><code>Backup taken at lsn 2 -&gt; {'P1': {'bal': 100}, 'P2': {'bal': 200}}
+Live disk before failure   : {'P1': {'bal': 999}, 'P2': {'bal': 1}}  (latest lsn 6 )
+After media failure         : {}   &lt;- ARIES has nothing to recover from</code></pre>
+
+<p>The database had run to LSN&nbsp;6 with live pages <code>P1={bal:999}</code>, <code>P2={bal:1}</code>. The media failure leaves <code>{}</code> — no pages at
+all. This is qualitatively different from a crash, which would have left those pages (or older versions of them) on disk for ARIES to reconcile with the log. The
+lesson is that <em>durability against a crash and durability against media loss are different guarantees requiring different mechanisms</em>. The write-ahead log
+on the same disk buys crash durability, because a crash preserves the disk; it buys <em>nothing</em> against the disk's own loss, because the log dies with it.
+Surviving media failure demands copies kept elsewhere — which is what the rest of the chapter builds. The failure taxonomy is not academic: it tells you exactly
+which mechanism defends against which failure, and it explains why a system with flawless ARIES recovery can still lose everything to a single dead drive that
+took the only copy of the log with it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name Härder and Reuter's three failure classes and the mechanism that handles each. Why is the write-ahead log — which gives perfect crash recovery —
+useless against a media failure? (Answer in &sect;62.2.)</p>
+</aside>
+
+<h2>62.2 Backups and the archived log: the two ingredients</h2>
+
+<p>Media recovery has exactly two ingredients, and each answers a different half of the problem. A <strong>backup</strong> is a copy of the database — the data
+pages — as of some past moment, taken to separate storage. It gives recovery a starting point that survived the failed medium: a known-good state as of the
+backup's LSN. But a backup alone is stale — the database kept running after it was taken — so restoring only the backup loses every change since. The program
+shows exactly that loss:</p>
+
+<pre><code>Backup only, no archived log : {'P1': {'bal': 100}, 'P2': {'bal': 200}}  -&gt; lost every change after lsn 2</code></pre>
+
+<p>The backup was taken at LSN&nbsp;2, holding <code>P1={bal:100}</code>, <code>P2={bal:200}</code>. Restoring only it rewinds the database to that instant and
+discards LSNs&nbsp;3 through&nbsp;6 — the transfers and later writes are simply gone. This is the recovery-point cost of backups: on their own, they lose all work
+back to the last one. The second ingredient closes the gap. An <strong>archived log</strong> is a copy of the log records, kept on separate storage, spanning
+continuously from the backup forward. Because the log records every change (Chapter 61 made them physiological and idempotent), replaying the archived log onto
+the restored backup re-creates every change that happened after the backup — <em>rolling forward</em> from the backup's moment toward the present. The backup
+supplies the base; the archived log supplies everything since. Together they can rebuild the database to any moment the archive covers. Crucially the archived log
+must live on <em>different</em> storage than the primary — an archive on the same disk that failed is no archive at all, which is the named trap of this chapter.
+The two ingredients are complementary: the backup bounds how much log you must replay (you start from it, not from the beginning of time), and the archived log
+bounds how much data you lose (you roll forward from the backup, not stop at it).</p>
+
+<p><em>(Answer to the &sect;62.1 quick check: the three classes are transaction failure — handled by undo; system failure, a crash — handled by ARIES's redo and
+undo over the surviving disk; and media failure — handled by restoring a backup and rolling the archived log forward. The write-ahead log gives perfect crash
+recovery because a crash preserves the disk the log lives on; it is useless against media failure because the disk's loss takes the log with it, leaving nothing
+to replay.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: crash recovery, media recovery, point-in-time recovery</span>
+<p><strong>1. In words.</strong> Crash recovery runs ARIES over the surviving disk to reach the exact pre-crash committed state. Media recovery restores a backup
+and rolls the archived log forward to reach that same state after the disk is lost. Point-in-time recovery is media recovery that <em>stops early</em>, at a chosen
+moment, to reach an earlier state — the tool for undoing a bad batch that a healthy disk faithfully recorded.</p>
+<p><strong>2. As a picture.</strong> Figure 62.1: a timeline with a &ldquo;backup&rdquo; marker at LSN&nbsp;2 and log records 3&ndash;6 strung along it. Crash
+recovery: an arrow over the live disk to LSN&nbsp;6. Media recovery: restore the backup box, then a roll-forward arrow replaying 3&ndash;6 to LSN&nbsp;6.
+Point-in-time recovery: the same roll-forward arrow, but stopping at LSN&nbsp;4, leaving 5&ndash;6 unreplayed.</p>
+<p><strong>3. As numbers.</strong> Backup at LSN&nbsp;2 = <code>{P1:100, P2:200}</code>. Roll forward to the end: <code>{P1:999, P2:1}</code> — equals the
+pre-failure live disk, <em>True</em>, six records replayed. Roll forward to LSN&nbsp;4 (PITR): <code>{P1:150, P2:150}</code> — equals the state at LSN&nbsp;4,
+<em>True</em>, four records replayed, the bad writes at LSN&nbsp;5&ndash;6 excluded. Backup only: <code>{P1:100, P2:200}</code> — everything after LSN&nbsp;2 lost
+(&sect;62.2&ndash;&sect;62.3).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 190" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Media recovery: restore a backup, then roll the archived log forward &#8212; to the end, or to a point in time.</text>
+<line x1="60" y1="70" x2="600" y2="70" stroke="#333"/>
+<rect x="80" y="60" width="46" height="20" fill="#dbe7f5" stroke="#14406b"/><text x="86" y="74" font-size="8" fill="#14406b">BACKUP</text>
+<text x="92" y="52" font-size="8" fill="#14406b">lsn 2</text>
+<circle cx="220" cy="70" r="4" fill="#2f7d32"/><text x="206" y="90" font-size="8" fill="#2f7d32">3</text>
+<circle cx="300" cy="70" r="4" fill="#2f7d32"/><text x="286" y="90" font-size="8" fill="#2f7d32">4</text>
+<line x1="300" y1="58" x2="300" y2="82" stroke="#b58900" stroke-width="2"/><text x="288" y="46" font-size="8" fill="#7a5c00">PITR stop</text>
+<circle cx="420" cy="70" r="4" fill="#b23"/><text x="406" y="90" font-size="8" fill="#b23">5</text>
+<circle cx="500" cy="70" r="4" fill="#b23"/><text x="486" y="90" font-size="8" fill="#b23">6</text>
+<text x="410" y="106" font-size="8" fill="#b23">bad writes</text>
+<path d="M 128 130 L 500 130" stroke="#2f7d32" fill="none" marker-end="url(#b)"/>
+<text x="132" y="146" font-size="8" fill="#2f7d32">roll forward to end &#8594; {P1:999, P2:1}</text>
+<path d="M 128 160 L 300 160" stroke="#b58900" fill="none" marker-end="url(#b)"/>
+<text x="132" y="176" font-size="8" fill="#7a5c00">roll forward to lsn 4 (PITR) &#8594; {P1:150, P2:150}</text>
+<defs><marker id="b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#333"/></marker></defs>
+</svg>
+<figcaption>Figure 62.1: media recovery restores the backup (LSN&nbsp;2) and replays the archived log forward. To the end (green) it reaches the pre-failure
+state; stopped at LSN&nbsp;4 (amber) it reaches an earlier state, excluding the bad writes at LSN&nbsp;5&ndash;6 — point-in-time recovery.</figcaption>
+</figure>
+
+<h2>62.3 Roll forward and point-in-time recovery</h2>
+
+<p>Rolling forward is redo against a restored backup rather than a surviving disk. Recovery loads the backup pages and replays the archived log records in LSN
+order, applying each change; because the records are idempotent (Chapter 61), replaying them onto the backup reconstructs exactly the changes that followed it.
+Replayed to the end of the archive, roll-forward reaches the precise pre-failure state:</p>
+
+<pre><code>Restore backup + replay all : {'P1': {'bal': 999}, 'P2': {'bal': 1}}  (6 records replayed)
+  equals pre-failure live disk: True</code></pre>
+
+<p>From the backup <code>{P1:100, P2:200}</code> at LSN&nbsp;2, replaying all six records lands on <code>{P1:999, P2:1}</code> — identical to the live disk the
+media failure destroyed. The database is whole again, rebuilt entirely from copies that were kept elsewhere. But roll-forward has a power crash recovery does not:
+it can <em>stop early</em>. <strong>Point-in-time recovery</strong> (PITR) replays the archived log only up to a chosen moment — an LSN, or a wall-clock timestamp
+recorded in the log — and halts, reaching the state as of that moment rather than the end. This is the tool for a failure the disk recorded faithfully: a bad
+migration, an erroneous bulk update, a deletion run against the wrong table. The disk did exactly what it was told; ARIES would loyally reproduce the damage. PITR
+rewinds instead, rolling forward to just <em>before</em> the mistake:</p>
+
+<pre><code>PITR: replay backup..lsn 4  : {'P1': {'bal': 150}, 'P2': {'bal': 150}}  (4 records replayed)
+  equals the state at lsn 4   : True  (bad writes at lsn 5-6 excluded)</code></pre>
+
+<p>Stopping at LSN&nbsp;4 reaches <code>{P1:150, P2:150}</code> — the state after the legitimate transfer but before the bad writes at LSN&nbsp;5&ndash;6, which
+are simply never replayed. This is why backups plus an archived log are more than a media-failure defense: together they let you reconstruct the database as of
+<em>any</em> moment the archive spans, which is the mechanism behind recovering from human error and corruption that a single live disk, however durable, cannot
+undo. The recovery-point objective — how much data you can afford to lose — is set by how far behind the archive lags; the recovery-time objective — how fast you
+can be back — is set by how much log must be replayed since the last backup, which is exactly why backups are taken periodically rather than once. Roll-forward
+and PITR are the same operation with a different stopping rule: replay the archive from the backup, either to the end or to the moment you choose.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the log on the disk you lost &mdash; an archive that dies with the medium it was meant to survive</span>
+<p>The seductive convenience is to keep the archived log next to the database — same volume, same array, same host — because it is simplest and the log is
+&ldquo;already there.&rdquo; It passes every crash-recovery test, because a crash preserves the disk and the log with it. Then the medium itself fails — the drive
+dies, the array is corrupted, the host is destroyed — and the archive you were counting on for media recovery dies in the same event, because it never left the
+thing it was supposed to survive. Now the backup, however faithfully taken, can only be restored to <em>its</em> moment; every change since is unrecoverable,
+because the only record of those changes went down with the disk. This is not a hypothetical: it is the difference between a real disaster-recovery plan and one
+that works only for failures that spare the disk. The fix is a rule with no exceptions: the <strong>archived log and the backups must live on storage that fails
+independently of the primary</strong> — a different volume at minimum, a different machine better, a different site or provider for true disaster recovery. And
+because a backup you have never restored is a hypothesis, the archive and backups must be periodically <em>test-restored</em>: roll a backup forward through the
+archive on separate hardware and assert it reaches the expected state, exactly as the program does. A backup that has never been restored and an archive that
+shares the disk it protects are the two ways a recovery plan looks complete and fails in the one event it existed for.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate pushes back on the backup schedule: &ldquo;We already have ARIES and a write-ahead log — recovery is provably correct across
+a crash. Why are we spending money and I/O on backups and log archiving to separate storage? Isn't the log we already write enough?&rdquo; Cover the paragraph and
+answer in four or five sentences, drawing on &sect;62.1 and &sect;62.2.</p>
+<p><em>Model answer.</em> &ldquo;ARIES and the WAL give us perfect recovery from a <em>crash</em> — a power loss or panic — because a crash keeps the disk, so we
+can read the pages and log back and reconcile them. They give us nothing against the disk itself being lost or corrupted, because then the pages <em>and</em> the
+log are gone together; there's nothing to replay. That's a different failure class, and it needs copies kept somewhere the failure can't reach: a
+<strong>backup</strong> for a known-good base, and an <strong>archived log</strong> on independent storage so we can roll forward from the backup to the present.
+As a bonus, those two also let us do point-in-time recovery — rewinding to just before a bad migration that a healthy disk would have faithfully reproduced. The
+one rule is that the archive can't live on the disk it protects, and we have to test-restore it, or it's just a hypothesis.&rdquo; Naming the failure classes,
+independent storage, and PITR is the senior register.</p>
+</aside>
+
+<h2>62.4 The recovery capstone: the whole durability story in one pass</h2>
+
+<p>Part X set out to answer one question: how does a database keep its promises across failure? The pieces are now all in hand, and they compose into a single
+chain. A transaction commits, and the <strong>durability contract</strong> (Chapter 57) forces its log records to stable storage before the commit returns —
+write-ahead logging, log before data, so a crash can never acknowledge work it cannot recover. Those records are <strong>physiological</strong> (Chapter 61):
+small operations on single pages, each stamped with an <strong>LSN</strong>, each page carrying the <strong>page LSN</strong> of its last change (Chapter 58) —
+the numbering that makes redo idempotent and undo precise. To keep recovery from scanning the whole log, the database writes <strong>checkpoints</strong>
+(Chapter 59), each recording a <strong>RedoLSN</strong> that bounds where redo must begin. When a crash strikes, <strong>ARIES</strong> (Chapter 60) runs three
+passes over the surviving disk: analysis rebuilds the tables and finds the losers and the RedoLSN, redo <em>repeats history</em> from there, and undo rolls the
+losers back, logging <strong>compensation records</strong> so recovery survives a crash within recovery. And when the disk itself is lost, <strong>media
+recovery</strong> (this chapter) restores a backup and rolls the archived log forward — to the present, or to any point in time — from copies kept where the
+failure could not reach.</p>
+
+<p>Trace one durable value through the whole chain and the design's coherence shows. A committed balance of&nbsp;150 is safe across a <em>crash</em> because its
+log record was forced before commit (contract), redo will re-apply it if its page was lost from memory (LSN gate), and it will not be re-applied if already on
+disk (page LSN) — recovery starting near the end because a checkpoint bounded it (RedoLSN), and reaching the exact committed state because ARIES repeats history
+then undoes losers. The <em>same</em> balance is safe across a <em>media failure</em> because it lives in a backup or in the archived log on independent storage,
+and roll-forward reconstructs it; and it can be recovered to <em>before</em> a later mistake because PITR stops the roll-forward at the chosen moment. Each
+mechanism defends a different failure, and together they cover the space Härder and Reuter mapped: transaction, system, and media failure, each with its
+mechanism, no gap between them. That completeness is the point of the part — not any single algorithm, but the way the durability contract, the LSN, the
+checkpoint, ARIES, and media recovery interlock so that a committed change survives every failure a single node can suffer. In the program, that whole story
+reduces to one checkable claim: a database destroyed at the media level is rebuilt, from copies alone, to the exact state it held — and, if you choose, to any
+earlier state it passed through.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Trace a committed value of 150 across (a) a crash and (b) a media failure: name the mechanism that preserves it in each case. Then say what point-in-time
+recovery adds that neither crash recovery nor full media roll-forward provides. (Answer below.)</p>
+</aside>
+
+<h2>62.5 What to carry forward</h2>
+
+<p>Härder and Reuter's taxonomy names three failure classes: <strong>transaction failure</strong> (undo), <strong>system failure</strong> — a crash (ARIES over
+the surviving disk), and <strong>media failure</strong> — the disk lost or corrupted (&sect;62.1). Media failure defeats ARIES because its inputs, the pages and
+the log, die with the disk (&sect;62.1). <strong>Media recovery</strong> rebuilds from two ingredients kept on independent storage: a <strong>backup</strong> (a
+known-good base as of some past LSN) and an <strong>archived log</strong> (the records since, on separate media) (&sect;62.2). Recovery <em>restores</em> the
+backup and <em>rolls the archived log forward</em> — to the end, reaching the exact pre-failure state (six records replayed to <code>{P1:999, P2:1}</code>), or
+via <strong>point-in-time recovery</strong> to a chosen moment (four records replayed to <code>{P1:150, P2:150}</code>, excluding a later bad write) (&sect;62.3).
+The capstone (&sect;62.4) assembles the whole part: the durability contract, the LSN and page LSN, the checkpoint and RedoLSN, ARIES's three passes with
+compensation records, and media recovery — each defending a different failure, together covering every failure a single node can suffer. The named trap: an
+archived log kept on the disk it protects dies with that disk, and a backup never test-restored is only a hypothesis.</p>
+
+<p>Part X is complete. A steal + no-force database — tuned for buffer-pool and commit performance — nonetheless keeps every committed write and erases every
+uncommitted one across a transaction abort, a crash, a crash <em>during</em> recovery, and even the loss of the disk itself. That is durability, the D of ACID,
+built end to end. But durability was only ever half of what a transaction promises. Everything in this part concerned <em>one writer's</em> word kept across a
+failure; none of it addressed what happens when <em>many</em> transactions run at once and can see each other's half-finished work. ARIES's own full name —
+Algorithm for Recovery <em>and Isolation</em> — pointed here all along. <a href="#ch63">Chapter 63</a> opens Part&nbsp;XI, <strong>Transactions and Concurrency
+Control</strong>, with the other half of the transaction: the ACID properties in full, the <strong>anomalies</strong> that appear when transactions interleave
+without control — the dirty read, the lost update, the non-repeatable read, the phantom — and the <strong>isolation levels</strong> that trade correctness for
+concurrency. Durability is how a database keeps its word to one writer across a crash; isolation is how it keeps its word to many writers at once, and it is the
+subject of everything that follows.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Name the three failure classes and the mechanism that handles each.</li>
+<li>Explain why the write-ahead log is useless against a media failure.</li>
+<li>State the two ingredients of media recovery and what each contributes.</li>
+<li>Describe roll-forward and how point-in-time recovery differs from it.</li>
+<li>Say why the archived log must live on storage independent of the primary.</li>
+<li>Trace a committed value across a crash and across a media failure, naming the mechanism each time.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> List Härder and Reuter's three failure classes and their mechanisms. (&sect;62.1)</li>
+<li><strong>R2.</strong> Why does a media failure leave ARIES nothing to do, per the run's <code>{}</code> line? (&sect;62.1)</li>
+<li><strong>R3.</strong> What does a backup alone reach, and why does the archived log close the gap? (&sect;62.2)</li>
+<li><strong>R4.</strong> Walk the run's PITR: why does stopping at LSN&nbsp;4 reach <code>{P1:150, P2:150}</code> and exclude the later writes? (&sect;62.3)</li>
+<li><strong>R5.</strong> Assemble the capstone: name each mechanism from the durability contract to media recovery and the failure it defends. (&sect;62.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Theo H&#228;rder &amp; Andreas Reuter, &ldquo;Principles of Transaction-Oriented Database Recovery,&rdquo; <em>ACM Computing Surveys</em> 15(4),
+1983, pp. 287&ndash;317, DOI 10.1145/289.291.</strong> The failure taxonomy (transaction, system, media) and the recovery framework this chapter's structure
+follows — the conceptual source for distinguishing crash recovery from media recovery. First authors Theo H&#228;rder and Andreas Reuter; venue, volume, issue,
+pages, year, and DOI verified via the ACM Digital Library and DBLP, and the DOI resolves.</li>
+<li><strong>C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh &amp; Peter Schwarz, &ldquo;ARIES: A Transaction Recovery Method Supporting Fine-Granularity
+Locking and Partial Rollbacks Using Write-Ahead Logging,&rdquo; <em>ACM Transactions on Database Systems</em> 17(1), 1992, pp. 94&ndash;162, DOI
+10.1145/128765.128770.</strong> ARIES treats media recovery within the same log-based framework as crash recovery, via archived logs and image copies — the
+bridge this chapter formalizes. First author C. Mohan; venue, volume, issue, pages, year, and DOI verified via the ACM Digital Library and DBLP, and the DOI
+resolves.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992, ISBN 978-1-55860-190-1.</strong> The
+definitive treatment of backups, archive logging, and media recovery, with the operational detail (fuzzy dumps, archive management) omitted here. Authors,
+publisher, year, and ISBN verified via the publisher listing and the Library of Congress record.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003, ISBN 978-0-07-246563-1.</strong> A
+textbook treatment of media recovery and the backup-plus-log roll-forward this chapter demonstrates, worked on small examples. Authors and edition verified via
+the McGraw-Hill catalog and the Library of Congress record.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex62.1"><span class="ex-label">62.1</span> <span class="ex-tag warm">warm-up</span>
+Name Härder and Reuter's three failure classes and the mechanism that handles each.</div>
+
+<div class="exercise" id="ex62.2"><span class="ex-label">62.2</span> <span class="ex-tag warm">warm-up</span>
+What are the two ingredients of media recovery, and what does each contribute?</div>
+
+<div class="exercise" id="ex62.3"><span class="ex-label">62.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, how does point-in-time recovery differ from a full roll-forward?</div>
+
+<div class="exercise" id="ex62.4"><span class="ex-label">62.4</span> <span class="ex-tag core">core</span>
+Why ARIES fails here. (a) What two inputs does ARIES read, and where do they live? (b) Why does a media failure leave it nothing to do, per the run's
+<code>{}</code> line? (c) Why does the same write-ahead log give perfect crash recovery yet no media protection?</div>
+
+<div class="exercise" id="ex62.5"><span class="ex-label">62.5</span> <span class="ex-tag core">core</span>
+The two ingredients. (a) What does restoring the backup alone reach, and what is lost (use the run: backup at LSN&nbsp;2)? (b) What does replaying the archived log
+onto it add? (c) Why must the two together be able to reach any moment the archive spans?</div>
+
+<div class="exercise" id="ex62.6"><span class="ex-label">62.6</span> <span class="ex-tag core">core</span>
+Roll-forward. Using the run (backup <code>{P1:100, P2:200}</code> at LSN&nbsp;2; replay to end reaches <code>{P1:999, P2:1}</code>): (a) why does replaying all six
+records reconstruct the exact pre-failure disk? (b) what property of the log records makes replaying them onto the backup safe? (c) what would change if the backup
+had been taken at LSN&nbsp;4 instead?</div>
+
+<div class="exercise" id="ex62.7"><span class="ex-label">62.7</span> <span class="ex-tag core">core</span>
+Point-in-time recovery. (a) Why does stopping at LSN&nbsp;4 reach <code>{P1:150, P2:150}</code>? (b) What failure does PITR address that neither crash recovery nor
+full roll-forward can — and why can they not? (c) What sets the recovery-point objective, and what sets the recovery-time objective?</div>
+
+<div class="exercise" id="ex62.8"><span class="ex-label">62.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A backup was taken at LSN&nbsp;10. The archived log holds records 11&ndash;20; record 17 was a mistaken mass delete.
+You must recover to just before the mistake.
+<br><strong>Step 1 (given):</strong> restore the backup pages as of LSN&nbsp;10 on separate hardware.
+<br><strong>Step 2 (given):</strong> roll the archived log forward, replaying records in LSN order.
+<br><strong>Step 3 (you):</strong> State at which LSN roll-forward must stop, which records are replayed and which are not, and why this reaches the state just
+before the mistake while a full roll-forward to LSN&nbsp;20 would reproduce it.</div>
+
+<div class="exercise" id="ex62.9"><span class="ex-label">62.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the concept — <em>transaction failure</em>, <em>system failure</em>, <em>media failure</em>, <em>backup</em>, <em>archived log</em>, or
+<em>point-in-time recovery</em> — and why: (a) a dead drive that takes the pages and log with it; (b) a copy of the pages as of a past LSN; (c) stopping
+roll-forward before a bad migration; (d) a transaction abort reversed by undo; (e) the copy of the log records kept on independent storage.</div>
+
+<div class="exercise" id="ex62.10"><span class="ex-label">62.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;ARIES can recover a database whose disk was physically destroyed.&rdquo; (b)
+&ldquo;A backup with no archived log loses every change since the backup.&rdquo; (c) &ldquo;Point-in-time recovery can rewind to before a write the disk recorded
+correctly.&rdquo; (d) &ldquo;It is safe to keep the archived log on the same volume as the database.&rdquo; (e) &ldquo;Roll-forward replays the archived log onto
+the restored backup.&rdquo;</div>
+
+<div class="exercise" id="ex62.11"><span class="ex-label">62.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) A full backup daily plus continuous log archiving gives a recovery-point objective near zero but a slow restore; sketch how
+<em>incremental</em> backups change the restore-time/backup-cost trade. (b) The archive must be replayable from the backup's LSN forward with no gap; sketch what
+breaks if a stretch of archived log is missing, and how you would detect the gap before you need it. (c) The capstone claims each failure class has its mechanism
+with no gap between them; give one failure that a <em>single node's</em> mechanisms do not cover, and name what part of the book (beyond durability) must address
+it.</div>
+
+<div class="exercise" id="ex62.12"><span class="ex-label">62.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build a page store with a redo log; run a workload, take a full backup partway through, and keep the log archived
+separately. (b) Discard the on-disk pages to simulate a media failure, then restore the backup and roll the archived log forward, asserting the result equals the
+pre-failure state. (c) Repeat, stopping roll-forward at a chosen LSN before a deliberately &ldquo;bad&rdquo; write, and assert you reach the earlier state that
+excludes it — then explain why an archive kept on the same disk you discarded would have made all of this impossible.</div>
+
+</section>
+</section>

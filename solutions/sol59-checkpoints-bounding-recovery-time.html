@@ -1,0 +1,90 @@
+<section class="solutions" id="sol59">
+<h1>Chapter 59 — Solutions</h1>
+
+<div class="solution" id="sol59.1"><span class="sol-label">59.1</span>
+Because recovery scans the log from the first record, its cost is proportional to the log's total length, which grows the longer the database runs — so a
+long-lived, reliable system takes longer to recover. <em>Tempting wrong answer:</em> &ldquo;because more data means more to reload&rdquo; — it is the log length
+(number of records scanned), not the data size, that drives the cost; almost all of those records describe already-durable changes. <strong>Feed-forward:</strong>
+&sect;59.1.</div>
+
+<div class="solution" id="sol59.2"><span class="sol-label">59.2</span>
+The <strong>active-transaction table</strong> (transactions in flight, each with its most recent LSN) — used by analysis to identify losers and by undo to know
+where to start rolling each back; and the <strong>dirty-page table</strong> (dirty pages, each with its recLSN) — used to compute the RedoLSN, where redo
+begins. <em>Tempting wrong answer:</em> &ldquo;a list of committed transactions&rdquo; — the checkpoint records the <em>active</em> ones; committed ones are
+settled and need no tracking. <strong>Feed-forward:</strong> &sect;59.3.</div>
+
+<div class="solution" id="sol59.3"><span class="sol-label">59.3</span>
+A page's recLSN is the LSN of the <em>oldest</em> log record whose change might not yet be on that page — set when the page first goes from clean to dirty, and
+cleared when the page is flushed. <em>Tempting wrong answer:</em> &ldquo;the LSN of the page's most recent change&rdquo; — that is the page LSN; the recLSN is the
+oldest un-flushed change, and confusing the two silently loses data. <strong>Feed-forward:</strong> &sect;59.3&ndash;&sect;59.4.</div>
+
+<div class="solution" id="sol59.4"><span class="sol-label">59.4</span>
+(a) A sharp checkpoint quiesces the system (waits for all in-flight transactions to finish, refusing new work) and flushes every dirty page to disk before
+writing the checkpoint record. (b) The two costs: the quiesce is an unbounded stall (one long transaction holds the system hostage), and the full flush is a
+burst of scattered random writes (~19&nbsp;MB/s) — exactly what no-force exists to avoid. (c) A fuzzy checkpoint records only the active-transaction and
+dirty-page tables; it can be taken without pausing or flushing because it merely snapshots the current state of play rather than forcing the disk up to date.
+<em>Tempting wrong answer:</em> &ldquo;a fuzzy checkpoint is just a less frequent sharp one&rdquo; — the difference is <em>what</em> it does (record tables vs
+quiesce-and-flush), not how often. <strong>Feed-forward:</strong> &sect;59.2&ndash;&sect;59.3.</div>
+
+<div class="solution" id="sol59.5"><span class="sol-label">59.5</span>
+(a) The workload is skewed — a small hot set takes most writes — and the background flusher steadily writes back the rest, so only the ~16 hot pages remain
+dirty; clean pages have left the dirty-page table. (b) The RedoLSN (1,964) sits near the log's end (2,041), so redo scans only the 77 records at or after it
+instead of all 2,040 — about 96.2% skipped. (c) The RedoLSN would stay near the end (the flusher keeps the dirty set and thus the minimum recLSN recent), so
+recovery would still scan roughly 77 records — recovery time stays bounded regardless of total log length. <em>Tempting wrong answer:</em> &ldquo;a billion-record
+log means a billion-record recovery&rdquo; — that is exactly what the checkpoint prevents; recovery tracks the un-flushed tail, not the history.
+<strong>Feed-forward:</strong> &sect;59.3.</div>
+
+<div class="solution" id="sol59.6"><span class="sol-label">59.6</span>
+(a) Invariant: every change with an LSN below a page's recLSN is already on that page. (b) The RedoLSN is the minimum recLSN across dirty pages, so below it no
+page can have an un-flushed change — either the change's page is not dirty (already flushed) or it predates that page's recLSN (on the page by the invariant).
+(c) Hence any change with LSN below the RedoLSN is guaranteed durable, and redo may skip it without loss. <em>Tempting wrong answer:</em> &ldquo;start redo at the
+checkpoint LSN&rdquo; — the checkpoint LSN can be later than the RedoLSN; starting there would skip un-flushed changes made before the checkpoint but after their
+page went dirty. <strong>Feed-forward:</strong> &sect;59.4.</div>
+
+<div class="solution" id="sol59.7"><span class="sol-label">59.7</span>
+(a) More frequent checkpoints cost extra work and log space, and — to keep the RedoLSN near the end — push the flusher to write dirty pages back sooner, giving
+up some no-force batching. (b) Rare checkpoints let the dirty set grow and the RedoLSN drift back, lengthening recovery. (c) Recovery time depends on the
+distance from the RedoLSN to the log's end (the un-flushed, unresolved work); a background flusher holds the dirty set — and thus the RedoLSN — within a target,
+bounding it. <em>Tempting wrong answer:</em> &ldquo;checkpoint as often as possible&rdquo; — past a point the steady-state overhead and lost batching outweigh
+the recovery savings; it is a tuned trade-off. <strong>Feed-forward:</strong> &sect;59.4.</div>
+
+<div class="solution" id="sol59.8"><span class="sol-label">59.8</span>
+<strong>Step 4:</strong> With the RedoLSN at 150, redo begins after change A (LSN 100), so if A never reached <code>P</code>'s on-disk copy it is
+<em>never re-applied</em> — the committed change A is silently lost. Recovery reports success because nothing detects the gap: the log replayed cleanly from the
+(wrong) RedoLSN and no invariant was checked. This is the most dangerous class of bug because it is a <em>silent</em> data loss — the database comes back
+&ldquo;healthy&rdquo; and short of committed writes, so it is discovered late, if ever. The one-line fix: set recLSN to the oldest un-flushed change (100), i.e.,
+the LSN at which the page first went dirty, not its current page LSN. <em>Tempting wrong answer:</em> &ldquo;redo will catch A because it scans the whole log&rdquo;
+— redo starts at the RedoLSN precisely to avoid scanning the whole log; the wrong recLSN moves that start past A. <strong>Feed-forward:</strong> &sect;59.4.</div>
+
+<div class="solution" id="sol59.9"><span class="sol-label">59.9</span>
+(a) <strong>RedoLSN</strong> — where redo begins. (b) <strong>Sharp checkpoint</strong> — quiesce and flush everything first. (c) <strong>recLSN</strong> —
+per-page oldest-un-flushed LSN. (d) <strong>Fuzzy checkpoint</strong> — record the tables without pausing. (e) <strong>Dirty-page table</strong> — the pages that
+might need redoing. <em>Tempting wrong answer:</em> confusing (c) recLSN with the page LSN — recLSN is the oldest un-flushed change, the page LSN the newest
+applied. <strong>Feed-forward:</strong> &sect;59.2&ndash;&sect;59.4.</div>
+
+<div class="solution" id="sol59.10"><span class="sol-label">59.10</span>
+(a) <strong>False</strong> — a fuzzy checkpoint flushes nothing; it only records the tables (that is why dirty pages remain and it is &ldquo;fuzzy&rdquo;). (b)
+<strong>False</strong> — dirty pages persist, so the on-disk data is <em>not</em> fully up to date after a fuzzy checkpoint. (c) <strong>True</strong> — the
+RedoLSN is the minimum recLSN. (d) <strong>False</strong> — recovery time depends on the distance from the RedoLSN to the log's end, not the total log length.
+(e) <strong>True</strong> — too-early recLSN redoes durable changes: slower, still correct. <em>Tempting wrong answer:</em> marking (b) true because a checkpoint
+&ldquo;sounds like&rdquo; a consistent snapshot — a <em>sharp</em> checkpoint leaves the disk clean, but a fuzzy one deliberately does not.
+<strong>Feed-forward:</strong> &sect;59.2&ndash;&sect;59.4.</div>
+
+<div class="solution" id="sol59.11"><span class="sol-label">59.11</span>
+(a) The database keeps running after the checkpoint is written — pages are dirtied and flushed — so the recorded table is stale by the crash; analysis replays
+the log forward from the checkpoint, adding pages to the dirty-page table when it sees their first change and (in full ARIES) accounting for flushes, so it
+rebuilds the table as of the crash. (b) Records before the checkpoint may still describe changes on pages that are still dirty (recLSN before the checkpoint),
+so they are needed for redo; only records behind the RedoLSN are provably durable and safe to recycle. (c) Undo starts from a loser's most recent LSN and walks
+its changes backward (via the per-record back-pointer); the checkpoint's recorded last-LSN per active transaction is where that walk begins.
+<em>Tempting wrong answer:</em> &ldquo;the checkpoint's table is authoritative, so analysis can trust it as-is&rdquo; — it is a stale starting point that the forward replay must
+update. <strong>Feed-forward:</strong> &sect;59.5.</div>
+
+<div class="solution" id="sol59.12"><span class="sol-label">59.12</span>
+Open-ended and platform-specific. A correct write-up: (a) models a running store with a background flusher and a correct per-page recLSN (oldest un-flushed
+change); (b) takes a fuzzy checkpoint snapshotting the dirty-page table, computes the RedoLSN as the minimum recLSN, and counts records at or after it versus in
+the whole log; (c) reports the skipped fraction (this chapter: ~96%), asserts that no change below the RedoLSN is still dirty, and explains that this structural
+assertion — not elapsed time — is the evidence that the checkpoint both bounds recovery (few records scanned) and loses nothing (no un-flushed change skipped).
+<em>Tempting wrong answer:</em> &ldquo;time the recovery to prove the checkpoint helps&rdquo; — the guarantee is the record-count reduction and the safety
+assertion, both structural. <strong>Feed-forward:</strong> &sect;59.3&ndash;&sect;59.4.</div>
+
+</section>

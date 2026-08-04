@@ -304,6 +304,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch56">Chapter 56 — Choosing a Storage Engine: B-Tree or LSM, and at What Settings</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part X &mdash; Durability & Recovery</li>
 <li class="toc-ch"><a href="#ch57">Chapter 57 — Write-Ahead Logging: The Durability Contract</a></li>
+<li class="toc-ch"><a href="#ch58">Chapter 58 — Redo, Undo, and the Log Sequence Number</a></li>
+<li class="toc-ch"><a href="#ch59">Chapter 59 — Checkpoints: Bounding Recovery Time</a></li>
+<li class="toc-ch"><a href="#ch60">Chapter 60 — ARIES: Analysis, Redo, and Undo</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XI &mdash; Transactions & Concurrency Control</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XII &mdash; Query Processing & Execution</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XIII &mdash; Query Optimization</li>
@@ -22591,6 +22594,1060 @@ structural demonstration of durability — the recovered state matches or it doe
 </section>
 </section>
 
+<section class="chapter" id="ch58">
+<h1>Chapter 58 — Redo, Undo, and the Log Sequence Number</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch57">Chapter 57</a> (write-ahead logging, redo recovery, and the write-ahead rule — the
+mechanism this chapter completes), <a href="#ch48">Chapter 48</a> (the buffer pool and page eviction — the moment an uncommitted change can be
+<em>stolen</em> to disk), <a href="#ch41">Chapter 41</a> (<code>fsync</code> and stable storage — what &ldquo;durable&rdquo; actually requires),
+<a href="#ch46">Chapter 46</a> (sequential ~916&nbsp;MB/s versus random ~19&nbsp;MB/s — why the log is one file). &nbsp;·&nbsp; Chapter 57's store logged
+only <em>redo</em> and every logged change had already been acknowledged, so recovery was a clean replay. A real database is messier: transactions abort,
+and a page holding an <em>uncommitted</em> change can reach disk before the transaction that made it commits. This chapter adds the missing half —
+<strong>undo</strong> — and the numbering, the <strong>log sequence number</strong>, that makes both halves correct and idempotent.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch57">Chapter 57</a> — what is the write-ahead rule, and what did the redo log let recovery reconstruct? (2)
+<a href="#ch48">Chapter 48</a> — when the buffer pool needs a free frame and evicts a <em>dirty</em> page, what happens to that page's contents, even if the
+transaction that dirtied it has not committed? (3) <em>Predict:</em> a transaction updates a row, its dirty page is evicted to disk, and then the
+transaction aborts (or the machine crashes) before it commits. The redo log can re-apply committed changes, but this change was never committed and it is
+already <em>on disk</em>. What extra information would recovery need to remove it, and where would that information have to live? Write your guess;
+&sect;58.2&ndash;&sect;58.3 answer it.</p>
+</aside>
+
+<p>Chapter 57 proved that a forced redo log makes acknowledged writes survive a crash. It did so by assuming two things that a real engine cannot: that
+every logged change belonged to a transaction that <em>committed</em>, and that recovery could safely replay from the very beginning into an empty store.
+Drop the first assumption and a new failure appears. Transactions are not single writes; a <strong>transaction</strong> is a group of changes that must take
+effect all-or-nothing (the A of ACID, atomicity), bracketed by a <em>begin</em> and either a <em>commit</em> or an <em>abort</em>. Between those brackets its
+changes are provisional — and yet the buffer pool, which knows nothing of transactions, may evict a dirty page holding one of them to make room, writing a
+provisional change to disk (Chapter 48). If that transaction then aborts, or the machine crashes before it commits, the change is durable but
+<em>wrong</em>: it belongs to a transaction whose effects must vanish entirely. Redo cannot fix this — redo re-applies changes, it does not remove them.
+The database needs the opposite operation, <strong>undo</strong>: the ability to roll a change back, which means the log must record not only the
+<em>new</em> value (redo information) but also the <em>old</em> value it replaced (undo information). This chapter builds that: the transaction and why
+undo is unavoidable (&sect;58.1); the buffer-policy space — <strong>steal</strong> and <strong>no-force</strong> — that decides exactly when redo and undo
+are each required (&sect;58.2); a working store that logs both and rolls back an uncommitted transaction after a crash (&sect;58.3); and the
+<strong>log sequence number</strong> and its on-page twin, the <strong>page LSN</strong>, that make redo idempotent and recovery safe to restart
+(&sect;58.4). By the end, recovery is correct under the messy reality that Chapter 57 assumed away, and the stage is set for ARIES.</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) that builds a
+tiny page store whose write-ahead log carries <em>both</em> redo (the after-image) and undo (the before-image) for each change, every record stamped with a
+monotonic <strong>LSN</strong>; each data page carries a <strong>page LSN</strong>, the LSN of the last change applied to it. It runs a workload of two
+transactions — one that commits, one that does not — arranges for one page to be <em>stolen</em> to disk carrying the uncommitted change while another
+committed change is <em>lost</em> from memory, then recovers: a redo pass that repeats history (skipping changes already on their page, by comparing LSNs)
+and an undo pass that rolls back the uncommitted transaction. It prints how many records redo applied versus skipped, how many updates undo reversed, and
+checks that the recovered state <em>exactly</em> equals the committed-only state. This is a deterministic, structural demonstration — the recovered state
+either matches the committed-only expectation or it does not, and it does — not a wall-clock timing (<code>perf</code> is not installed on this machine, and
+the point is correctness). Performance facts (sequential versus random) are Chapter 46's measured figures, cited, not re-measured.</p>
+
+<h2>58.1 The transaction, and why redo alone is not enough</h2>
+
+<p>Chapter 57's log recorded independent, already-committed operations. Real work comes in <strong>transactions</strong>: a bracketed group of changes —
+<em>begin</em>, some updates, then <em>commit</em> or <em>abort</em> — that the database must make atomic, so that either all of the group's changes take
+effect or none do. Commit is the promise-keeping point of Chapter 57: once a transaction commits, its changes must survive (durability), which is why the
+commit forces the log. But atomicity introduces a symmetric obligation on the other side. A transaction that <em>aborts</em> — because the application asked
+to roll back, or a constraint failed, or the transaction was chosen to break a deadlock (a hazard we meet in the next part) — must leave <em>no</em> trace:
+every change it made must be reversed as if it never happened. And a transaction that is simply <em>in flight</em> when the machine crashes is, for recovery's
+purposes, an abort it never got to request: it never reached commit, so by atomicity its changes must not survive. Call such a transaction a
+<strong>loser</strong> — active at the crash, never committed — and its opposite, a committed transaction, a <strong>winner</strong>.</p>
+
+<p>Now the problem. Redo, from Chapter 57, re-applies logged changes to reconstruct state that was lost from memory — it is exactly what a winner needs, so
+its committed changes survive even if their pages never reached disk. But a loser needs the reverse. Suppose a loser updated a row, its dirty page was
+evicted to disk by the buffer pool (Chapter 48 — the pool has no idea the transaction is uncommitted; it just needs a free frame), and then the machine
+crashed. The change is now durably on disk, attached to a transaction that must have <em>no</em> effect. Redo cannot help: replaying the log re-applies the
+change, and doing nothing leaves it in place — either way the loser's write persists, violating atomicity. The only fix is to <em>remove</em> it, to restore
+the value the page held before the loser touched it. That is <strong>undo</strong>, and it needs information redo never had: the <em>before-image</em>, the
+old value. So a real log records two things per change — the new value (redo) <em>and</em> the old value (undo) — and recovery is two passes, not one: redo
+to restore winners' lost changes, undo to erase losers' surviving ones. This is the answer forming to the opener: the extra information is the before-image,
+and it has to live in the log, forced ahead of the change just like the after-image, so that after a crash the database can always find what to roll back to.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define a <em>loser</em> transaction and a <em>winner</em>, and say which recovery operation each one needs. Why can redo never substitute for undo when a
+loser's change has already reached disk? (Answer in &sect;58.2.)</p>
+</aside>
+
+<h2>58.2 Steal and no-force: the policy space that decides redo and undo</h2>
+
+<p>Whether recovery needs redo, undo, both, or neither is not arbitrary — it is fixed by two independent buffer-pool policy choices, a taxonomy owed to
+H&#228;rder and Reuter (1983). The first choice: may the buffer pool write a page dirtied by a still-uncommitted transaction back to disk? If yes, the policy
+is <strong>steal</strong> (a frame can be &ldquo;stolen&rdquo; from an uncommitted transaction and reused); if no, <strong>no-steal</strong> (dirty pages are
+pinned in memory until their transaction commits). The second choice: must all of a transaction's changes be forced to disk at commit? If yes, the policy is
+<strong>force</strong>; if no — Chapter 57's answer — <strong>no-force</strong> (commit forces only the log, and data pages drift to disk lazily). Each
+choice pins one recovery need. <strong>Steal implies undo</strong>: if an uncommitted change can reach disk, a crash can leave that change durable with its
+transaction unfinished, so recovery must be able to roll it back. <strong>No-force implies redo</strong>: if a committed transaction's data pages need not be
+on disk at commit, a crash can lose a committed change from memory, so recovery must be able to re-apply it. The two mirror the two threats of Chapter 57.1 —
+inconsistency from surviving uncommitted work (undo's job) and lost committed work (redo's job).</p>
+
+<p>Laid out as a matrix (Figure 58.1), the four combinations demand different recovery machinery. <em>No-steal + force</em> needs neither redo nor undo — no
+uncommitted change ever reaches disk (nothing to undo) and every committed change is on disk at commit (nothing to redo) — but it is the policy Chapter 57
+already ruled out: forcing scattered data on every commit caps throughput at the random-write rate (~19&nbsp;MB/s), and pinning every dirty page until commit
+strangles the buffer pool, unable to evict anything a long transaction is holding. Relaxing either constraint buys performance at the price of a recovery
+obligation. The design every serious engine actually chooses — and the one ARIES is built for — is the most permissive corner, <strong>steal + no-force</strong>:
+the buffer pool evicts freely (great memory behavior) and commit forces only the log (great commit throughput), and the bill is that recovery must implement
+<em>both</em> redo and undo. That is why this chapter needs both, and why the before-image and after-image both go in the log. This is the answer to the
+opener and the quick check: because the engine chose steal, an uncommitted change can be on disk, so recovery keeps the before-image in the log to undo it;
+redo can never do that job because redo only re-applies, and re-applying the loser's change is the opposite of removing it.</p>
+
+<p><em>(Answer to the &sect;58.1 quick check: a loser is a transaction active at the crash that never committed; a winner is one that committed. A winner
+needs <strong>redo</strong> — re-apply its changes in case they were lost from memory; a loser needs <strong>undo</strong> — remove its changes in case they
+reached disk. Redo cannot substitute for undo because redo only re-applies a change, and the loser's change must be <strong>erased</strong>, which requires the
+old value the change overwrote.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: log the before-image and the after-image; redo winners, undo losers</span>
+<p><strong>1. In words.</strong> Because the engine steals (uncommitted changes may reach disk) and does not force (committed changes may not), recovery must
+both re-apply committed changes that were lost and roll back uncommitted changes that survived. So every log record carries both the new value (redo) and the
+old value (undo); recovery redoes to restore, then undoes to erase.</p>
+<p><strong>2. As a picture.</strong> Figure 58.1: a 2&times;2 matrix, steal/no-steal against force/no-force. Each cell is labelled with the recovery it
+needs — neither, redo only, undo only, or both. The steal + no-force cell (both) is highlighted: the corner every real engine chooses, the corner this book
+builds.</p>
+<p><strong>3. As numbers.</strong> The store logs 4 update records across two transactions; one commits, one (a loser) does not. After a crash, the redo
+pass re-applies 2 records and skips 2 already on their page (by LSN), and the undo pass reverses the loser's 2 updates; the recovered state equals the
+committed-only state exactly — <em>True</em> (&sect;58.3).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 620 250" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The recovery you owe is fixed by two buffer-pool policies: STEAL demands undo, NO-FORCE demands redo.</text>
+<text x="150" y="52" font-size="10" fill="#333">FORCE data at commit</text>
+<text x="330" y="52" font-size="10" fill="#333">NO-FORCE (log only)</text>
+<text x="20" y="100" font-size="10" fill="#333" transform="rotate(-90 20 100)">NO-STEAL</text>
+<text x="20" y="185" font-size="10" fill="#333" transform="rotate(-90 20 185)">STEAL</text>
+<rect x="140" y="62" width="150" height="70" fill="#eef3f9" stroke="#14406b"/>
+<text x="150" y="90" font-size="10" fill="#14406b">neither redo</text><text x="150" y="106" font-size="10" fill="#14406b">nor undo</text>
+<text x="150" y="124" font-size="8" fill="#8c3a1d">(but forces on commit: slow)</text>
+<rect x="300" y="62" width="200" height="70" fill="#f7f2e6" stroke="#b58900"/>
+<text x="310" y="90" font-size="10" fill="#7a5c00">REDO only</text>
+<text x="310" y="108" font-size="8" fill="#7a5c00">committed change may be lost</text>
+<rect x="140" y="140" width="150" height="70" fill="#f7f2e6" stroke="#b58900"/>
+<text x="150" y="168" font-size="10" fill="#7a5c00">UNDO only</text>
+<text x="150" y="186" font-size="8" fill="#7a5c00">uncommitted change may survive</text>
+<rect x="300" y="140" width="200" height="70" fill="#dff0df" stroke="#2f7d32" stroke-width="2"/>
+<text x="310" y="164" font-size="10" fill="#2f7d32">REDO + UNDO</text>
+<text x="310" y="182" font-size="8" fill="#2f7d32">the corner every real engine picks;</text>
+<text x="310" y="196" font-size="8" fill="#2f7d32">the corner ARIES is built for</text>
+<text x="520" y="180" font-size="14" fill="#2f7d32">&#9733;</text>
+</svg>
+<figcaption>Figure 58.1: the steal/no-force policy matrix (H&#228;rder &amp; Reuter 1983). Steal makes undo mandatory (an uncommitted change can reach disk);
+no-force makes redo mandatory (a committed change can be missing from disk). Real engines choose steal + no-force — best buffer and commit behavior — and
+pay with both redo and undo, the machinery of this chapter and ARIES.</figcaption>
+</figure>
+
+<h2>58.3 A store that logs both: rolling back a loser after a crash</h2>
+
+<p>The working store makes redo and undo concrete under steal + no-force. It keeps data in pages; each change appends a log record carrying the page, key,
+<em>before</em>-image (undo), and <em>after</em>-image (redo), and — following the write-ahead rule — the record is logged before the page is touched. Two
+transactions run: <code>T1</code> writes <code>P1.a=1</code> and <code>P2.c=5</code> and commits; <code>T2</code> writes <code>P1.a=99</code> and
+<code>P2.z=7</code> and then the machine crashes before <code>T2</code> commits. To exercise both recovery passes, the durable state at the crash is chosen
+to mirror what a real buffer pool would leave: page <code>P1</code> was <em>stolen</em> to disk after <code>T2</code>'s write (so on disk <code>P1.a=99</code>,
+an uncommitted value that must be undone), while page <code>P2</code> was never flushed (so <code>T1</code>'s committed <code>P2.c=5</code> is <em>lost</em>
+from memory and must be redone). Recovery runs analysis to find the loser, a redo pass to repeat history, and an undo pass to roll the loser back:</p>
+
+<pre><code>redo + undo, the LSN and the page LSN
+  log records: 4   committed txns: ['T1']
+  on-disk P1 after STEAL (holds uncommitted T2 a=99): {'a': 99}
+  loser transactions (no commit, must be undone): ['T2']
+  redo pass: applied 2, skipped-as-already-present 2
+  undo pass: reversed 2 loser updates
+  recovered live cells: {('P1', 'a'): 1, ('P2', 'c'): 5}
+  expected (committed-only): {('P1', 'a'): 1, ('P2', 'c'): 5}
+  recovery == committed-only state: True
+  second redo pass re-applies: 0 records (idempotent)
+</code></pre>
+
+<p>Read the two passes in order. <strong>Redo</strong> re-applies every logged change whose LSN is greater than its page's page LSN — repeating history so
+that any change missing from disk is restored. Here it <em>applies 2</em>: <code>T1</code>'s <code>P2.c=5</code> (a committed change lost with the unflushed
+page — precisely what no-force forces recovery to redo) and, notably, <code>T2</code>'s <code>P2.z=7</code>, a loser's change that was also lost. Redo repeats
+<em>all</em> history, winners and losers alike, before undo sorts them out — an ARIES idea we return to in Chapter 60. It <em>skips 2</em>: the changes already
+on page <code>P1</code>, whose page LSN already covers them, so re-applying would be wasted work (and, as &sect;58.4 shows, the skip is what makes redo safe to
+repeat). <strong>Undo</strong> then walks the loser <code>T2</code>'s changes in reverse and restores each before-image: <code>P1.a</code> back to
+<code>1</code> (erasing the stolen <code>99</code>) and <code>P2.z</code> back to nothing (deleting the insert) — <em>2 updates reversed</em>. The result is
+exactly the committed-only state, <code>P1.a=1, P2.c=5</code> — <em>True</em>: <code>T1</code>'s work survived in full, <code>T2</code>'s vanished without
+trace, atomicity and durability both kept. And the final line previews &sect;58.4: run redo again on the recovered pages and it re-applies <em>0</em>
+records, because every change is now covered by its page LSN — recovery is idempotent, safe to run twice.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: undo without a before-image, or applying the change before logging it</span>
+<p>The two commonest ways to break undo are to not have the information it needs, or to have it too late. First, <strong>the missing before-image</strong>: a
+tempting &ldquo;optimization&rdquo; is to log only the new value (redo) — it is smaller, and Chapter 57's store did exactly that. But under steal, a loser's
+change can be on disk, and rolling it back requires the value the page held <em>before</em> the change; a redo-only log simply does not contain it, so the
+uncommitted write can never be removed and atomicity is lost the first time a stolen page belongs to an aborted transaction. A steal engine must log the
+before-image. Second, <strong>the undo-logging rule</strong>: the before-image must reach the log <em>before</em> the change reaches the data page on disk —
+the same write-ahead ordering as redo, and for a symmetric reason. If a data page carrying an uncommitted change were flushed before its undo record was
+durable, a crash in between would leave a change on disk with no logged before-image to reverse it to — an unrecoverable, unrollbackable state, the exact
+inconsistency of Chapter 57.1. Third, a subtler one: <strong>undo is not &ldquo;write the old value back and forget it.&rdquo;</strong> If recovery crashes
+<em>during</em> undo and a naive re-run simply re-undoes from scratch, it may try to roll back changes it already rolled back, or roll back past a value
+another action depends on. Real undo logs its own progress so it can resume, not restart — the compensation-log-record idea of Chapter 60. The honest posture:
+under steal you owe a before-image, logged ahead of the change, and an undo that records what it has already reversed — anything less is a rollback that works
+in tests and corrupts under a crash mid-recovery.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Our log records are twice as big as they need to be because we store the old value <em>and</em> the new
+value for every update. Let's drop the old value — recovery just replays the log to rebuild state, so the new value is all we ever need.&rdquo; Cover the
+paragraph and answer in four or five sentences, drawing on &sect;58.1&ndash;&sect;58.3.</p>
+<p><em>Model answer.</em> &ldquo;The old value isn't redundant — it's the <strong>undo</strong> information, and we need it precisely because we <strong>steal</strong>.
+Our buffer pool evicts dirty pages without knowing whether their transaction has committed, so an <em>uncommitted</em> change can land on disk; if that
+transaction then aborts or we crash before it commits, atomicity says its change must disappear, and removing it means restoring the value the page held
+before — the old value we'd be dropping. Redo can't do that job: replaying the log re-applies the change, the opposite of erasing it. So a redo-only log is
+fine only under no-steal, where uncommitted changes never reach disk; the moment we steal — and we do, for buffer-pool performance — we owe both images. If
+log size is the worry, the answer is compression or physiological logging, not throwing away the before-image.&rdquo; Naming steal, undo, and the
+atomicity obligation is the senior register.</p>
+</aside>
+
+<h2>58.4 The log sequence number: making redo idempotent and recovery restartable</h2>
+
+<p>One number underpins the whole scheme: the <strong>log sequence number</strong> (LSN), a monotonically increasing identifier assigned to every log record
+as it is appended. Because it only ever grows, an LSN doubles as a position in the log and a timestamp of relative order — record 500 happened before record
+501 — and that lets recovery answer the question that makes redo safe: <em>is this logged change already reflected on its data page?</em> The trick is to store,
+on each data page, the LSN of the most recent log record applied to it — the <strong>page LSN</strong> — and to write it to disk <em>with</em> the page. Now
+recovery has a per-page high-water mark. During redo it compares each log record's LSN against the page LSN of the page it targets: if the record's LSN is
+less than or equal to the page LSN, the change is already on the page (the page was flushed after that change), so recovery <em>skips</em> it; only records
+newer than the page LSN are re-applied. This is exactly the &ldquo;skipped 2&rdquo; and the &ldquo;second redo re-applies 0&rdquo; of &sect;58.3. The
+consequence is <strong>idempotence</strong>: applying the redo pass once or ten times reaches the same state, because after the first application every record
+is at or below its page LSN and every subsequent pass skips it.</p>
+
+<p>Idempotence is not a nicety; it is what makes recovery correct at all, because recovery can itself be interrupted. A crash can strike <em>during</em>
+recovery — the power is no more reliable while the database is recovering than while it is running — and the only way a second recovery attempt can be safe is
+if re-applying already-applied changes is a no-op. Without the page LSN, redo would have no way to tell an already-applied change from a missing one; it would
+blindly re-apply, and a change that is not idempotent on its own (an increment, an append, a structural pointer update) would be corrupted by the second
+application. The page LSN turns &ldquo;replay the log&rdquo; from a fragile one-shot into a repeatable operation, which is the property Chapter 60 leans on
+completely: ARIES redoes <em>all</em> history on every recovery, however many times recovery restarts, and the page LSN is what keeps that safe. Two rules,
+then, carry forward: the LSN orders the log and stamps each page so redo knows what to skip; and recovery, being interruptible, must be idempotent — which the
+page LSN delivers for redo and which, for undo, will require the compensation records of Chapter 60. Correct because ordered and skippable; safe because
+repeatable.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What is a page LSN, and how does comparing it to a log record's LSN let redo skip a change that is already on disk? Why does that skipping make recovery
+safe to run more than once, and why does an interruptible recovery need that property? (Answer below.)</p>
+</aside>
+
+<h2>58.5 What to carry forward</h2>
+
+<p>Work comes in <strong>transactions</strong> — atomic, bracketed by begin and commit/abort — which splits recovery's job in two: committed <strong>winners</strong>
+need <strong>redo</strong> (re-apply changes lost from memory), and uncommitted <strong>losers</strong> need <strong>undo</strong> (erase changes that reached
+disk), so the log must carry both a before-image and an after-image per change (&sect;58.1). Which of redo and undo you owe is fixed by two buffer policies
+(H&#228;rder &amp; Reuter 1983): <strong>steal</strong> (evict uncommitted dirty pages) forces undo, <strong>no-force</strong> (commit forces only the log)
+forces redo, and every real engine picks <strong>steal + no-force</strong> — best buffer and commit behavior — so it owes both (&sect;58.2). A store logging
+both images lost a committed change and gained a stolen uncommitted one; recovery redid 2 changes (repeating all history), skipped 2 already on their page,
+and undid the loser's 2, landing exactly on the committed-only state (&sect;58.3). The <strong>log sequence number</strong> orders the log, and its on-page
+copy, the <strong>page LSN</strong>, lets redo skip changes already durable — making redo <strong>idempotent</strong> and recovery safe to restart, which
+matters because a crash can strike during recovery (&sect;58.4). The named trap: a redo-only log under steal cannot roll back, and an undo that restarts rather
+than resumes corrupts on a mid-recovery crash.</p>
+
+<p>Two loose ends drive the rest of the part. First, &sect;58.3's recovery still scanned the log from the very beginning to find winners, losers, and lost
+changes — fine for four records, impossible for a log that has grown for months. The fix is the <strong>checkpoint</strong>: a periodic record of which
+transactions are active and which pages are dirty, letting recovery start its scan near the end of the log instead of at record one — Chapter 59. Second, this
+chapter's undo simply overwrote before-images and, as the trap warned, a crash <em>during</em> undo would leave it unable to resume cleanly; and analysis, redo,
+and undo were sketched as three separate loops rather than one disciplined protocol. The algorithm that unifies all of it — a checkpoint-anchored analysis pass,
+a redo pass that repeats history using the page LSN, and an undo pass that logs <strong>compensation records</strong> so undo is itself redoable and restartable
+— is <strong>ARIES</strong> (Mohan et&nbsp;al. 1992), the subject of Chapter 60. Redo, undo, and the LSN are its three ingredients; the next two chapters
+assemble them into a recovery method that is correct even when the crash lands in the middle of recovery.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Define a transaction, a winner, and a loser, and say which recovery operation each needs.</li>
+<li>Explain why a steal policy makes undo mandatory, and give the failure it prevents.</li>
+<li>Explain why a no-force policy makes redo mandatory.</li>
+<li>State which corner of the steal/force matrix real engines pick and what it costs them.</li>
+<li>Say what a page LSN is and how it lets redo skip an already-applied change.</li>
+<li>Explain why recovery must be idempotent, tying it to a crash during recovery.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why is a redo-only log insufficient once a transaction can abort or crash mid-flight? (&sect;58.1)</li>
+<li><strong>R2.</strong> State the steal/no-force taxonomy and which recovery operation each policy makes mandatory. (&sect;58.2)</li>
+<li><strong>R3.</strong> Walk through the store's run: what was redone, what was skipped, what was undone, and why the result is committed-only. (&sect;58.3)</li>
+<li><strong>R4.</strong> What is a page LSN and how does it make redo idempotent? (&sect;58.4)</li>
+<li><strong>R5.</strong> Why must recovery be safe to restart, and what property of redo delivers that? (&sect;58.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Theo H&#228;rder &amp; Andreas Reuter, &ldquo;Principles of Transaction-Oriented Database Recovery,&rdquo; <em>ACM Computing Surveys</em> 15(4),
+1983, pp. 287&ndash;317, DOI 10.1145/289.291.</strong> The paper that named the steal/no-steal and force/no-force policy space of &sect;58.2 (and coined the
+ACID acronym); the source for why steal implies undo and no-force implies redo. First author Theo H&#228;rder; venue, volume, issue, pages, year, and DOI
+verified via DBLP and the ACM Digital Library, and the DOI resolves.</li>
+<li><strong>C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh &amp; Peter Schwarz, &ldquo;ARIES: A Transaction Recovery Method Supporting
+Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging,&rdquo; <em>ACM Transactions on Database Systems</em> 17(1), 1992, pp.
+94&ndash;162, DOI 10.1145/128765.128770.</strong> The algorithm that assembles redo, undo, the LSN, and the page LSN into a complete recovery method
+(Chapter 60); the origin of the page-LSN comparison that makes redo idempotent. First author C. Mohan; venue, volume, issue, pages, year, and DOI verified
+via the ACM Digital Library and DBLP, and the DOI resolves.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992, ISBN 978-1-55860-190-1.</strong>
+The definitive treatment of transactions, logging, and the redo/undo obligations of each policy — the full development behind &sect;58.1&ndash;&sect;58.2.
+Authors, publisher, year, and ISBN verified via the publisher listing and the Library of Congress record.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, pp. 141&ndash;259, DOI 10.1561/1900000002.</strong> A concise modern account of where logging and the LSN sit in a full
+engine, and how the buffer pool and log manager cooperate under steal + no-force. First author Joseph M. Hellerstein; venue, volume, issue, pages, year, and
+DOI verified via now publishers and the ACM Digital Library, and the DOI resolves.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex58.1"><span class="ex-label">58.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define a transaction, a winner, and a loser.</div>
+
+<div class="exercise" id="ex58.2"><span class="ex-label">58.2</span> <span class="ex-tag warm">warm-up</span>
+What two pieces of information must a log record carry to support both redo and undo, and which is which?</div>
+
+<div class="exercise" id="ex58.3"><span class="ex-label">58.3</span> <span class="ex-tag warm">warm-up</span>
+Define the steal and no-force policies in one sentence each.</div>
+
+<div class="exercise" id="ex58.4"><span class="ex-label">58.4</span> <span class="ex-tag core">core</span>
+Redo versus undo. (a) Which recovery operation does a winner need, and why? (b) Which does a loser need, and why? (c) Explain concretely why redo cannot do
+undo's job when a loser's change has already reached disk.</div>
+
+<div class="exercise" id="ex58.5"><span class="ex-label">58.5</span> <span class="ex-tag core">core</span>
+The policy matrix. (a) For each of the four steal/no-steal &times; force/no-force cells, state which of redo and undo it requires. (b) Which cell needs
+neither, and why is it nonetheless a poor choice? (c) Which cell do real engines pick, what does it buy, and what recovery bill does it pay?</div>
+
+<div class="exercise" id="ex58.6"><span class="ex-label">58.6</span> <span class="ex-tag core">core</span>
+The store's run. Using the output (4 records, one committing transaction, redo applies 2 and skips 2, undo reverses 2): (a) which committed change was redone
+and why was it missing from disk? (b) why did redo also re-apply a loser's change? (c) what did undo restore, and why is the final state committed-only?</div>
+
+<div class="exercise" id="ex58.7"><span class="ex-label">58.7</span> <span class="ex-tag core">core</span>
+The page LSN. (a) What is stored in a page LSN and when is it updated? (b) Give the exact comparison redo uses to decide whether to skip a log record. (c)
+Explain why this makes the redo pass idempotent.</div>
+
+<div class="exercise" id="ex58.8"><span class="ex-label">58.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team runs a steal + no-force engine but, to shrink the log, records only the after-image (redo) for each
+update.
+<br><strong>Step 1 (given):</strong> transaction <code>T</code> updates row <code>r</code> from <code>5</code> to <code>8</code>; the log records only
+<code>r=8</code>.
+<br><strong>Step 2 (given):</strong> the buffer pool steals <code>r</code>'s dirty page to disk before <code>T</code> commits.
+<br><strong>Step 3 (given):</strong> <code>T</code> aborts (or the machine crashes before <code>T</code> commits), so <code>T</code> is a loser.
+<br><strong>Step 4 (you):</strong> Explain what recovery must now do to <code>r</code>, why the redo-only log makes it impossible, exactly what information
+was missing, and the one-line fix.</div>
+
+<div class="exercise" id="ex58.9"><span class="ex-label">58.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>steal</em>, <em>no-force</em>, <em>redo</em>, <em>undo</em>, or <em>page LSN</em> — and why: (a) re-applying a
+committed change that never reached disk; (b) rolling back an aborted transaction's change; (c) the policy that lets the buffer pool evict an uncommitted
+dirty page; (d) the policy under which commit forces only the log; (e) the per-page value that lets redo skip an already-applied change.</div>
+
+<div class="exercise" id="ex58.10"><span class="ex-label">58.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A no-steal policy makes undo unnecessary.&rdquo; (b) &ldquo;Under no-force,
+a committed transaction's data pages are guaranteed on disk at commit.&rdquo; (c) &ldquo;Redo re-applies changes; undo removes them.&rdquo; (d) &ldquo;The page
+LSN is stored only in the log, not on the page.&rdquo; (e) &ldquo;Because recovery can itself crash, redo must be idempotent.&rdquo;</div>
+
+<div class="exercise" id="ex58.11"><span class="ex-label">58.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) The store scanned the whole log to find losers and lost changes; explain why that does not scale and what a <em>checkpoint</em> would
+record to bound it. (b) The undo pass here simply overwrote before-images; explain what could go wrong if a crash struck midway through undo and a re-run
+started undo from scratch, and why a record of undo's own progress is needed. (c) Redo repeated <em>all</em> history, including losers' changes, before undo
+ran; give one reason a recovery algorithm might deliberately redo losers' changes rather than skip them (hint: consider what the page LSN needs to be correct).</div>
+
+<div class="exercise" id="ex58.12"><span class="ex-label">58.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build a page store whose log records carry both a before-image and an after-image, each stamped with a monotonic LSN,
+and stamp each page with a page LSN. (b) Run two transactions — one committing, one not — arrange for one page to be flushed carrying the uncommitted change
+and another committed change to be lost, then recover with a redo pass (skipping records at or below the page LSN) and an undo pass (restoring the loser's
+before-images). (c) Assert the recovered state equals the committed-only state, run redo a second time and confirm it applies zero records, and explain why
+that second-pass result is the evidence that recovery is idempotent.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch59">
+<h1>Chapter 59 — Checkpoints: Bounding Recovery Time</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch57">Chapter 57</a> (replaying the whole log from the beginning — the recovery this
+chapter must bound), <a href="#ch58">Chapter 58</a> (redo, undo, the page LSN, and the dirty page — the state a checkpoint summarizes),
+<a href="#ch48">Chapter 48</a> (the buffer pool and background flushing — the process that makes checkpoints possible), <a href="#ch41">Chapter 41</a>
+(<code>fsync</code> and durability — what a checkpoint must and must not force). &nbsp;·&nbsp; Chapters 57&ndash;58 gave a correct recovery, but a naive one:
+it scans the log from record one. That is fine for a thousand records and ruinous for a log that has grown for months. The <strong>checkpoint</strong> is how a
+database bounds recovery time — a periodic record that lets recovery start its scan near the end of the log instead of the beginning, without ever weakening
+the durability contract.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch57">Chapter 57</a> and <a href="#ch58">Chapter 58</a> — after a crash, where did recovery begin scanning the log, and what work
+did it do for each record? (2) <a href="#ch48">Chapter 48</a> — a <em>dirty</em> page holds changes in memory not yet on disk; what background process writes
+dirty pages back, and once a page is written back and clean, do its changes still need redoing after a crash? (3) <em>Predict:</em> a log has grown to a
+billion records, but only the last few thousand describe changes that might not yet be on their data pages. What could the database write down periodically so
+that recovery skips the billion-record prefix and replays only the tail — and what would it have to record for that skip to be <em>safe</em>? Write your guess;
+&sect;59.3&ndash;&sect;59.4 answer it.</p>
+</aside>
+
+<p>Recovery in Chapters 57 and 58 worked, but paid a price hidden by the small examples: it scanned the log from the very first record. Redo had to re-examine
+every logged change, if only to skip it by the page LSN; analysis had to see every transaction to know who committed. For a store that has been running for
+months, the log holds hundreds of millions of records, the overwhelming majority describing changes that reached their data pages long ago — durable,
+irrelevant to recovery, and yet re-scanned on every crash. Recovery time would grow with the entire history of the database, so the longer a system had run
+reliably, the longer it would take to come back from a failure — an absurd and unacceptable coupling. The fix is to periodically record a summary of what
+recovery would otherwise have to reconstruct from scratch — which transactions are active and which pages are dirty — so that recovery can begin near the end
+of the log, at a known-safe point, and ignore the long durable prefix. That summary is a <strong>checkpoint</strong>. This chapter builds it: why replay-from-the-start
+does not scale and what recovery actually needs to know (&sect;59.1); the simple <strong>sharp checkpoint</strong> that works but freezes the database, and why
+that is unacceptable (&sect;59.2); the <strong>fuzzy checkpoint</strong> that records the active-transaction and dirty-page tables without stalling, letting
+recovery start at a computed <strong>RedoLSN</strong> — demonstrated on a log where a checkpoint lets redo skip the overwhelming majority of records
+(&sect;59.3); and the <strong>recLSN</strong> that makes the skip correct, plus the frequency trade-off it creates (&sect;59.4). The result bounds recovery time
+to the work since the last checkpoint, whatever the log's total length.</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) that models a
+running store: 2,040 update records across 200 pages under a skewed workload (a small hot set takes most writes), with a background flusher that periodically
+writes back the oldest-dirtied page, and a <strong>fuzzy checkpoint</strong> taken near the end that snapshots the dirty-page table. It computes the
+<strong>RedoLSN</strong> — the smallest recLSN in that table — and counts how many log records redo must consider starting from record one (no checkpoint)
+versus starting from the RedoLSN (with checkpoint), reporting the fraction skipped. It also verifies that no change below the RedoLSN is still un-flushed, so
+the skip loses nothing. This is a deterministic, structural demonstration — the record counts and the safety guard are exact, computed properties of the
+constructed log, not sampled measurements — not a wall-clock timing (<code>perf</code> is not installed on this machine, and the quantity of interest is
+records-scanned, a structural count). The point is which records recovery can safely ignore, established by construction, not the elapsed time of a run.</p>
+
+<h2>59.1 Why replaying from the beginning does not scale</h2>
+
+<p>Recovery's cost, in Chapters 57 and 58, was proportional to the length of the log, because both the analysis and redo passes began at the first record.
+That coupling is the problem. A busy database appends log records forever; the log is a history of <em>every</em> change ever made, and left unchecked it grows
+without bound (in practice old segments are archived or recycled, but recovery still cannot assume the live log is short). Yet almost none of that history is
+relevant to recovery. Consider what recovery actually needs to reconstruct. For <strong>redo</strong>, it needs the changes that might <em>not</em> be on their
+data pages yet — but the buffer pool has been flushing dirty pages back all along (Chapter 48), so a change made an hour ago on a page that was written back
+half an hour ago is already durable; redoing it is pure waste, correctly skipped by the page LSN but only after the record has been read. For
+<strong>analysis</strong>, recovery needs to know which transactions were in flight at the crash — but a transaction that committed and ended millions of
+records ago is settled; its fate is not in doubt. So the vast prefix of the log describes changes already on disk and transactions already resolved. The only
+records that matter are recent ones: changes to pages still dirty in the buffer pool, and transactions still active. If the database could record, from time to
+time, <em>which pages are still dirty</em> and <em>which transactions are still active</em>, recovery could start from that record and ignore everything before
+it — turning recovery cost from &ldquo;proportional to all history&rdquo; into &ldquo;proportional to the work since the last such record.&rdquo; That record
+is the checkpoint, and the two tables it must contain are exactly those two lists.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does recovery cost, without checkpoints, grow with the total length of the log rather than with the amount of un-flushed work? Name the two things a
+checkpoint would have to record so recovery could start near the end of the log. (Answer in &sect;59.2.)</p>
+</aside>
+
+<h2>59.2 The sharp checkpoint, and why it freezes the database</h2>
+
+<p>The most direct way to make a checkpoint is to force the database into a clean, known state and write down that it is clean. A <strong>sharp</strong> (or
+quiescent) checkpoint does exactly that: stop accepting new operations, wait for all in-flight transactions to finish, flush <em>every</em> dirty page in the
+buffer pool to disk, and then append a checkpoint record. After it, the on-disk data is completely up to date — no page is dirty, no transaction is in flight —
+so recovery from a crash need only start at that checkpoint record: there is provably nothing before it to redo (every earlier change is on its page) and no
+earlier transaction to undo (all finished). It is simple and correct, and it is used nowhere serious, because of what it costs to <em>take</em>. Quiescing the
+database means refusing new work until every current transaction commits or aborts — an unbounded stall, since one long-running transaction holds the whole
+system hostage — and flushing every dirty page means a burst of exactly the scattered random writes (Chapter 46, ~19&nbsp;MB/s) that no-force existed to avoid,
+now concentrated into one stop-the-world event. A checkpoint frequent enough to keep recovery fast would freeze the database constantly; one rare enough to
+avoid the freezes would leave recovery scanning a long tail. The sharp checkpoint trades the wrong thing: it buys short recovery with long stalls during normal
+running, when normal running is the case that matters ten-thousand-to-one. What is needed is a checkpoint that records enough for recovery to start late
+<em>without</em> stopping the database or forcing all its dirty pages — a checkpoint taken while the system runs.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: record what is dirty and active, so recovery can start late</span>
+<p><strong>1. In words.</strong> Periodically, without stopping, write down the transactions still active and the pages still dirty (with, for each dirty page,
+the oldest log record that might not be on it yet). Recovery then begins analysis at the checkpoint and begins redo at the earliest such record, ignoring the
+entire durable prefix before it.</p>
+<p><strong>2. As a picture.</strong> Figure 59.1: a long log line. Far to the left, a vast greyed-out prefix marked &ldquo;already on disk — skip.&rdquo; A
+checkpoint marker sits near the right; a RedoLSN pointer, computed from the dirty-page table, sits a little to its left. Recovery reads only the short segment
+from the RedoLSN to the end.</p>
+<p><strong>3. As numbers.</strong> A running store logs 2,040 update records; a fuzzy checkpoint near the end captures a dirty set of 16 pages and yields a
+RedoLSN of 1,964. Redo without a checkpoint would scan all 2,040 records; with the checkpoint it scans 77 — skipping 96.2% of the log — and the safety guard
+confirms 0 un-flushed changes hide below the RedoLSN (&sect;59.3).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 190" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A checkpoint lets recovery start at the RedoLSN and skip the long, already-durable prefix of the log.</text>
+<rect x="20" y="40" width="470" height="26" fill="#e9e9e9" stroke="#999"/>
+<text x="120" y="57" font-size="9" fill="#777">already on disk (flushed long ago) &#8212; skip</text>
+<rect x="490" y="40" width="120" height="26" fill="#dff0df" stroke="#2f7d32"/>
+<text x="500" y="57" font-size="9" fill="#2f7d32">records to redo</text>
+<line x1="490" y1="34" x2="490" y2="78" stroke="#b58900" stroke-width="2"/>
+<text x="440" y="90" font-size="9" fill="#7a5c00">RedoLSN 1964</text>
+<line x1="560" y1="34" x2="560" y2="78" stroke="#14406b" stroke-width="2"/>
+<text x="540" y="90" font-size="9" fill="#14406b">CKPT 2001</text>
+<text x="596" y="57" font-size="9" fill="#333"></text>
+<line x1="610" y1="34" x2="610" y2="78" stroke="#333"/>
+<text x="588" y="102" font-size="9" fill="#333">end 2041</text>
+<text x="20" y="130" font-size="10" fill="#333">Dirty-page table at checkpoint (16 pages): for each, recLSN = oldest log record maybe not yet on that page.</text>
+<text x="20" y="150" font-size="10" fill="#333">RedoLSN = min recLSN over the table &#8594; redo begins there; everything earlier is provably durable.</text>
+<text x="20" y="170" font-size="10" fill="#2f7d32">Redo scans 77 of 2040 records (96.2% skipped); the durable prefix is never touched.</text>
+</svg>
+<figcaption>Figure 59.1: a fuzzy checkpoint records the dirty-page table (each page's recLSN) and the active transactions. Recovery starts redo at the RedoLSN —
+the smallest recLSN — because every change older than that is on a page already flushed since, hence durable. The long prefix is skipped, bounding recovery to
+the recent tail.</figcaption>
+</figure>
+
+<h2>59.3 The fuzzy checkpoint: record the tables, keep running</h2>
+
+<p>A <strong>fuzzy</strong> checkpoint drops the sharp checkpoint's two expensive demands — quiescing and flushing everything — and keeps only what recovery
+truly needs: a written record of the state of play. It records two tables. The <strong>active-transaction table</strong> lists every transaction currently in
+flight and, for each, the LSN of its most recent log record (so undo can find where to start rolling it back). The <strong>dirty-page table</strong> lists
+every page currently dirty in the buffer pool and, for each, its <strong>recLSN</strong> — the LSN of the <em>oldest</em> log record whose change might not yet
+be on that page, set when the page first became dirty after last being clean. Crucially, the database keeps running the whole time: transactions commit, pages
+are flushed, new pages are dirtied, all while (and after) the checkpoint is written. The checkpoint does not claim the disk is up to date — it is
+&ldquo;fuzzy&rdquo; precisely because dirty pages remain — it claims only <em>these transactions were active and these pages were dirty as of here</em>, which
+is exactly what recovery needs to reconstruct its starting tables without scanning from the beginning. The store models this and measures the payoff:</p>
+
+<pre><code>checkpoints: bounding recovery
+  total update records in log: 2040
+  pages dirty at checkpoint (DPT size): 16 of 200
+  last LSN: 2041   checkpoint LSN: 2001   RedoLSN (min recLSN): 1964
+  redo scans WITHOUT checkpoint (from LSN 1): 2040 records
+  redo scans WITH checkpoint (from RedoLSN): 77 records
+  fraction of the log skipped by the checkpoint: 96.2%
+  changes below RedoLSN that are still in the DPT (must be 0): 0
+</code></pre>
+
+<p>The numbers tell the story. Of 200 pages, only <strong>16</strong> are dirty at the checkpoint — the hot working set — because the background flusher has
+been steadily writing the rest back and they left the dirty-page table when they went clean. The <strong>RedoLSN</strong>, the smallest recLSN over those 16
+pages, is <strong>1,964</strong>: no change logged before record 1,964 can be missing from disk, because every page it touched has since been flushed (or was
+never in the dirty set). So redo can begin at 1,964 and scan just <strong>77</strong> records to the end, instead of all <strong>2,040</strong> from record one
+— it skips <strong>96.2%</strong> of the log. That fraction is the whole value of the checkpoint: recovery's redo work is now proportional to the un-flushed
+tail (77 records), not the total history (2,040), and it would stay near 77 even if the log held a billion records, because the flusher keeps the dirty set —
+and hence the RedoLSN — near the end. The last line is the safety check that this skip is <em>sound</em>: it counts changes below the RedoLSN that are still
+dirty (not yet on disk), and finds <strong>0</strong>. Nothing was skipped that needed redoing — which is a property of how the RedoLSN is chosen, the subject
+of &sect;59.4. This is the answer to the opener: the database periodically records the dirty-page and active-transaction tables, and recovery starts redo at
+the smallest recLSN, safely skipping the durable prefix.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the recLSN set to the wrong moment &mdash; a RedoLSN that starts recovery too late</span>
+<p>The checkpoint's safety rests entirely on the recLSN meaning the right thing, and the classic corruption bug is setting it to the wrong LSN. The recLSN of a
+dirty page must be the LSN of the <em>first</em> change made to it since it was last clean — the oldest change that might not be on disk. Set it there, and the
+RedoLSN (the minimum recLSN) sits at or before every un-flushed change, so redo starting at the RedoLSN reconstructs them all. The tempting mistake is to
+record instead the page's <em>current</em> page LSN — the LSN of its <em>most recent</em> change — reasoning that &ldquo;that's where the page is up to.&rdquo;
+This is silently catastrophic: it moves the recLSN forward past earlier un-flushed changes on the same page, so the RedoLSN jumps ahead of changes that are
+<em>not</em> yet on disk, and redo skips them. The result is lost committed writes with no error at recovery time — the store comes back &ldquo;successfully,&rdquo;
+missing data, the worst possible failure because it is invisible. (The safety line in the run — &ldquo;changes below the RedoLSN still dirty: 0&rdquo; — is
+exactly the assertion that this bug is absent.) The mirror mistake is harmless but wasteful: set the recLSN too <em>early</em> (or never advance it as pages
+flush) and the RedoLSN drifts toward record one, so recovery redoes durable changes — slow, not wrong. The discipline: recLSN is the oldest-dirty LSN, updated
+when a clean page is first dirtied and cleared when the page is flushed; the RedoLSN is their minimum; and a checkpoint that gets this backward trades a fast
+recovery for a silent one.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Recovery is taking longer every month as the log grows. Let's just checkpoint by pausing writes, flushing
+the whole buffer pool, and truncating the log — do it every few minutes and recovery is always fast.&rdquo; Cover the paragraph and answer in four or five
+sentences, drawing on &sect;59.2&ndash;&sect;59.4.</p>
+<p><em>Model answer.</em> &ldquo;You've correctly diagnosed the problem — recovery scales with the log because it starts from the beginning — but that's a
+<strong>sharp</strong> checkpoint, and pausing writes plus flushing the whole pool every few minutes is a stop-the-world stall that punishes the common case,
+normal running, to speed up the rare one. One long transaction can stretch the pause unboundedly, and the full flush is exactly the burst of random writes
+no-force exists to avoid. The right tool is a <strong>fuzzy</strong> checkpoint: without pausing, record the active-transaction table and the dirty-page table
+(each dirty page's oldest-un-flushed LSN, its recLSN); recovery then starts redo at the minimum recLSN and skips the durable prefix — in our model, 96% of the
+log — while the database never stops. And don't truncate the log at the checkpoint: pages are still dirty (that's why it's fuzzy), so records before the
+checkpoint may still be needed; you can only recycle log space behind the RedoLSN. So: keep the frequency, drop the pause and the full flush, and record the
+two tables instead.&rdquo; Naming fuzzy versus sharp, the recLSN, and the RedoLSN is the senior register.</p>
+</aside>
+
+<h2>59.4 recLSN, the RedoLSN, and the frequency trade-off</h2>
+
+<p>The correctness of the whole scheme reduces to one invariant about the recLSN. For every page, the recLSN is the oldest LSN whose change may not have reached
+that page; equivalently, <em>every</em> change with an LSN below a page's recLSN is already on that page. Take the minimum recLSN across all dirty pages — the
+<strong>RedoLSN</strong> — and you have an LSN below which <em>no</em> change on <em>any</em> page can be un-flushed: any earlier change either touched a page
+not currently dirty (so it was flushed and is durable) or touched a dirty page but predates that page's recLSN (so, by the invariant, it too is on the page).
+That is precisely why redo may start at the RedoLSN and lose nothing — the guarantee the run's &ldquo;0 un-flushed changes below RedoLSN&rdquo; check confirms.
+A dirty page's recLSN is set when it transitions clean-to-dirty and is cleared (the page leaves the dirty-page table) when the flusher writes it back; the
+checkpoint simply snapshots this live table, and analysis after a crash rebuilds it by replaying from the checkpoint forward. Notice what the checkpoint did
+<em>not</em> require: it did not flush any page, so the recLSN and RedoLSN reflect ongoing lazy flushing rather than a forced burst — the fuzzy checkpoint's
+whole advantage.</p>
+
+<p>This buys a tunable knob rather than a free lunch. Checkpoint <strong>frequency</strong> trades steady-state overhead against recovery time. Checkpoint
+often and the RedoLSN stays close to the log's end, so recovery is short — but each checkpoint costs a little work and log space, and, more importantly,
+keeping the RedoLSN near the end requires the flusher to keep the dirty set small, which means writing dirty pages back sooner (giving up some of no-force's
+batching). Checkpoint rarely, or let dirty pages linger, and normal-running overhead drops — but the dirty set grows, the RedoLSN drifts back, and recovery
+lengthens. Real systems expose this directly (a target recovery time, or a bound on log-to-replay, or a maximum dirty-page count) and let a background process
+hold the RedoLSN within the target. The essential shift is what recovery time now depends on: not the age of the database or the total length of its log, but
+the distance from the RedoLSN to the log's end — the amount of un-flushed, unresolved work — which the checkpoint and the flusher together keep bounded.
+Recovery that once grew with all of history now grows only with the recent past.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the recLSN invariant, and use it to explain why redo may safely begin at the RedoLSN (the minimum recLSN). What does checkpoint frequency trade off,
+and what does recovery time now depend on instead of the log's total length? (Answer below.)</p>
+</aside>
+
+<h2>59.5 What to carry forward</h2>
+
+<p>Replaying the log from the beginning couples recovery time to the entire history of the database, because analysis and redo both start at record one, even
+though almost every record describes a change long since flushed and a transaction long since resolved (&sect;59.1). A <strong>sharp checkpoint</strong> —
+quiesce, flush every dirty page, record that the disk is clean — makes recovery start late but freezes the database to take it, punishing the common case
+(&sect;59.2). A <strong>fuzzy checkpoint</strong> records only the <strong>active-transaction table</strong> and the <strong>dirty-page table</strong> (each dirty
+page's <strong>recLSN</strong>) without pausing or flushing, letting recovery begin analysis at the checkpoint and redo at the <strong>RedoLSN</strong>, the
+minimum recLSN — in the model, skipping 96.2% of a 2,040-record log while a safety check confirms nothing un-flushed hid below it (&sect;59.3). The recLSN must
+be the <em>oldest</em>-un-flushed LSN per page; setting it to the current page LSN moves the RedoLSN too far forward and silently loses data (&sect;59.4). The
+named trap: a recLSN set to the wrong moment yields a fast recovery that is missing writes and reports success.</p>
+
+<p>Chapters 57 through 59 have assembled every ingredient of a real recovery method, but as separate parts: the write-ahead log and redo (57), the before-image,
+undo, the LSN, and the page LSN (58), and now the checkpoint with its two tables and the RedoLSN (59). What remains is to fuse them into one algorithm with a
+precise, restartable protocol — an <strong>analysis</strong> pass that starts at the checkpoint and rebuilds the transaction and dirty-page tables to find the
+losers and the RedoLSN; a <strong>redo</strong> pass that starts at the RedoLSN and repeats history using the page LSN; and an <strong>undo</strong> pass that
+rolls back the losers while logging <strong>compensation records</strong> so that undo is itself redoable and recovery survives a crash mid-recovery. That
+algorithm is <strong>ARIES</strong> (Mohan et&nbsp;al. 1992), and the checkpoint of this chapter is exactly what anchors its first pass. Chapter 60 puts the
+three passes together and runs them — including a crash <em>during</em> undo — to show the whole method is correct even when recovery itself is interrupted.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Explain why replay-from-the-start couples recovery time to the whole log.</li>
+<li>Describe a sharp checkpoint and the two costs that make it unusable.</li>
+<li>Say what a fuzzy checkpoint records and why it need not flush or pause.</li>
+<li>Define recLSN and the RedoLSN, and state the invariant that makes starting redo there safe.</li>
+<li>Explain the corruption caused by setting recLSN to the current page LSN instead of the oldest-dirty LSN.</li>
+<li>State what recovery time depends on once checkpoints are in place, and the frequency trade-off.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why, without checkpoints, does recovery cost grow with the total log length rather than with un-flushed work? (&sect;59.1)</li>
+<li><strong>R2.</strong> What does a sharp checkpoint do, and why is it unacceptable in a running system? (&sect;59.2)</li>
+<li><strong>R3.</strong> What two tables does a fuzzy checkpoint record, and how does recovery use them to start late? (&sect;59.3)</li>
+<li><strong>R4.</strong> State the recLSN invariant and explain why redo may begin at the RedoLSN. (&sect;59.4)</li>
+<li><strong>R5.</strong> Why does setting recLSN to the current page LSN silently lose data? (&sect;59.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh &amp; Peter Schwarz, &ldquo;ARIES: A Transaction Recovery Method Supporting
+Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging,&rdquo; <em>ACM Transactions on Database Systems</em> 17(1), 1992, pp.
+94&ndash;162, DOI 10.1145/128765.128770.</strong> The source of fuzzy checkpointing with an explicit dirty-page table and recLSN, and the RedoLSN that anchors
+the redo pass — the machinery of &sect;59.3&ndash;&sect;59.4. First author C. Mohan; venue, volume, issue, pages, year, and DOI verified via the ACM Digital
+Library and DBLP, and the DOI resolves.</li>
+<li><strong>Theo H&#228;rder &amp; Andreas Reuter, &ldquo;Principles of Transaction-Oriented Database Recovery,&rdquo; <em>ACM Computing Surveys</em> 15(4),
+1983, pp. 287&ndash;317, DOI 10.1145/289.291.</strong> The taxonomy of checkpoint schemes (transaction-consistent, action-consistent, fuzzy) and where each
+sits in the recovery design space — context for why the fuzzy checkpoint wins. First author Theo H&#228;rder; venue, volume, issue, pages, year, and DOI
+verified via DBLP and the ACM Digital Library, and the DOI resolves.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992, ISBN 978-1-55860-190-1.</strong>
+The definitive development of checkpoints, the dirty-page table, and the interaction between checkpoint frequency and recovery time. Authors, publisher, year,
+and ISBN verified via the publisher listing and the Library of Congress record.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003, ISBN 978-0-07-246563-1.</strong>
+A step-by-step textbook treatment of fuzzy checkpointing within the ARIES framework, for the reader who wants the tables and passes drawn out in full.
+Authors and edition verified via the McGraw-Hill catalog and the Library of Congress record.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex59.1"><span class="ex-label">59.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, why does recovery without checkpoints take longer the longer a database has been running?</div>
+
+<div class="exercise" id="ex59.2"><span class="ex-label">59.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two tables a fuzzy checkpoint records, and say what each is used for during recovery.</div>
+
+<div class="exercise" id="ex59.3"><span class="ex-label">59.3</span> <span class="ex-tag warm">warm-up</span>
+Define a page's recLSN in one sentence.</div>
+
+<div class="exercise" id="ex59.4"><span class="ex-label">59.4</span> <span class="ex-tag core">core</span>
+Sharp versus fuzzy. (a) What does a sharp checkpoint do to the buffer pool and to in-flight transactions? (b) Give the two costs that make it unacceptable in
+a running system. (c) What does a fuzzy checkpoint record instead, and why can it be taken without pausing or flushing?</div>
+
+<div class="exercise" id="ex59.5"><span class="ex-label">59.5</span> <span class="ex-tag core">core</span>
+The run's numbers. Using the output (2,040 records, 16 dirty pages, RedoLSN 1,964, 77 records scanned with the checkpoint): (a) why is the dirty set only 16 of
+200 pages? (b) explain the 96.2% skipped figure in terms of RedoLSN and log length. (c) what would happen to the RedoLSN and to recovery time if the log grew
+to a billion records while the flusher kept pace?</div>
+
+<div class="exercise" id="ex59.6"><span class="ex-label">59.6</span> <span class="ex-tag core">core</span>
+The RedoLSN. (a) State the recLSN invariant for a single page. (b) Explain why the minimum recLSN across dirty pages is a safe place to begin redo. (c) Why is
+a change with an LSN below the RedoLSN guaranteed to be on its data page?</div>
+
+<div class="exercise" id="ex59.7"><span class="ex-label">59.7</span> <span class="ex-tag complexity">cost</span>
+The frequency trade-off. (a) What does checkpointing more frequently cost during normal running? (b) What does checkpointing rarely cost at recovery time? (c)
+Once checkpoints exist, what quantity does recovery time depend on, and how does a background flusher keep it bounded?</div>
+
+<div class="exercise" id="ex59.8"><span class="ex-label">59.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team implements fuzzy checkpoints but sets each dirty page's recLSN to the page's current page LSN (its most
+recent change) rather than to the oldest change since it went dirty.
+<br><strong>Step 1 (given):</strong> page <code>P</code> goes dirty at LSN 100 (change A) and is changed again at LSN 150 (change B), still unflushed.
+<br><strong>Step 2 (given):</strong> a checkpoint records <code>P</code>'s recLSN as 150 (the current page LSN), not 100.
+<br><strong>Step 3 (given):</strong> the RedoLSN is computed as the minimum recLSN, so it is at least 150; a crash occurs and recovery starts redo at the
+RedoLSN.
+<br><strong>Step 4 (you):</strong> Explain what happens to change A during redo, why recovery reports success anyway, and why this is the most dangerous class
+of recovery bug — then give the one-line fix.</div>
+
+<div class="exercise" id="ex59.9"><span class="ex-label">59.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>sharp checkpoint</em>, <em>fuzzy checkpoint</em>, <em>dirty-page table</em>, <em>recLSN</em>, or <em>RedoLSN</em> —
+and why: (a) the LSN where redo begins; (b) quiescing and flushing everything before writing the checkpoint; (c) the per-page oldest-un-flushed LSN; (d)
+recording the active and dirty tables without pausing; (e) the list recovery uses to know which pages might need redoing.</div>
+
+<div class="exercise" id="ex59.10"><span class="ex-label">59.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A fuzzy checkpoint flushes every dirty page.&rdquo; (b) &ldquo;After a fuzzy
+checkpoint the on-disk data is fully up to date.&rdquo; (c) &ldquo;The RedoLSN is the smallest recLSN in the dirty-page table.&rdquo; (d) &ldquo;Once
+checkpoints exist, recovery time depends on the total length of the log.&rdquo; (e) &ldquo;Setting recLSN too early makes recovery slower but not incorrect.&rdquo;</div>
+
+<div class="exercise" id="ex59.11"><span class="ex-label">59.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) After a crash, analysis must rebuild the dirty-page table starting from the one in the checkpoint record; explain why the checkpoint's
+table might be stale by the crash and how replaying the log forward from the checkpoint repairs it. (b) You may recycle log space only behind the RedoLSN, not
+behind the checkpoint; explain why. (c) The checkpoint records active transactions with each one's most recent LSN; explain how the coming undo pass uses that
+LSN, and why it needs it to start rolling a loser back.</div>
+
+<div class="exercise" id="ex59.12"><span class="ex-label">59.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Model a running store: append update records across many pages, run a background flusher that writes back the
+oldest-dirtied page, and maintain a dirty-page table with a correct recLSN per page. (b) Take a fuzzy checkpoint that snapshots the dirty-page table, compute
+the RedoLSN as the minimum recLSN, and count how many log records lie at or after the RedoLSN versus in the whole log. (c) Report the fraction skipped, add an
+assertion that no change below the RedoLSN is still dirty, and explain why that assertion — not a timing — is the evidence the checkpoint is both effective and
+safe.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch60">
+<h1>Chapter 60 — ARIES: Analysis, Redo, and Undo</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch57">Chapter 57</a> (write-ahead logging and redo — the durable foundation),
+<a href="#ch58">Chapter 58</a> (redo, undo, the LSN, and the page LSN — the two operations and the numbering ARIES fuses), <a href="#ch59">Chapter 59</a>
+(the fuzzy checkpoint, the dirty-page table, and the RedoLSN — what anchors the first pass), <a href="#ch48">Chapter 48</a> (the buffer pool and steal — why
+uncommitted changes can be on disk). &nbsp;·&nbsp; Chapters 57&ndash;59 built every ingredient separately. This chapter assembles them into one algorithm —
+<strong>ARIES</strong> (Mohan et&nbsp;al. 1992) — whose three passes, analysis, redo, and undo, recover a steal + no-force database correctly, and remain
+correct even when a crash strikes <em>during recovery itself</em>.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch58">Chapter 58</a> — what does a page LSN let redo do, and what does a loser transaction need? (2) <a href="#ch59">Chapter 59</a>
+— what does the RedoLSN mark, and where does recovery get it? (3) <em>Predict:</em> recovery has rolled back half of a loser's changes when the machine crashes
+<em>again</em>, mid-rollback. When it restarts, how should it avoid re-undoing the half it already reversed — and what would it have had to write to the log, as
+it undid each change, to know where to resume? Write your guess; &sect;60.4 answers it.</p>
+</aside>
+
+<p><strong>ARIES</strong> — Algorithm for Recovery and Isolation Exploiting Semantics — is the recovery method that turned the pieces of the last three
+chapters into a single, provably correct protocol, and it is the design real databases actually run. Its structure is three sequential passes over the log.
+<strong>Analysis</strong> reads forward from the last checkpoint, rebuilding the transaction table and the dirty-page table as of the crash, to determine two
+things: which transactions are <em>losers</em> (in flight at the crash, to be undone) and the <em>RedoLSN</em> (where redo must begin). <strong>Redo</strong>
+reads forward from the RedoLSN and <em>repeats history</em>: it re-applies <em>every</em> logged change — committed or not, winner or loser — whose LSN exceeds
+its page's page LSN, reconstructing the exact page contents that existed at the moment of the crash. <strong>Undo</strong> then reads backward, rolling back
+the losers' changes, and — the detail that makes the whole thing robust — logs a <strong>compensation log record</strong> for each undo it performs, so that
+undo is itself redoable and can resume rather than restart if recovery is interrupted. The governing idea is Mohan's phrase, <em>repeat history</em>: rather
+than trying to selectively redo only the winners, ARIES first faithfully reconstructs the entire pre-crash state, then cleanly undoes the losers on top of it —
+a factoring that makes each pass simple and, crucially, restartable. This chapter walks the three passes (&sect;60.1); details analysis and the tables it
+rebuilds (&sect;60.2); runs redo, repeating history, on a working store (&sect;60.3); and builds undo with compensation records, then crashes <em>during</em>
+undo and re-runs recovery to prove it reaches the identical state (&sect;60.4). By the end you have a recovery method that keeps durability and atomicity across
+a crash — including a crash in recovery.</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) implementing a small
+ARIES-style recovery manager over a page store. Its durable inputs are the write-ahead log and the data pages that happened to reach disk under steal + no-force,
+each stamped with a page LSN. It runs a workload of three transactions — one committing, two losers — with pages stolen to disk carrying uncommitted values and
+a committed change lost from memory, then recovers in three passes: analysis (find losers and the RedoLSN), redo (repeat history via the page LSN), and undo
+(roll back losers, logging a compensation record per undo). It then <em>crashes partway through the undo pass</em> and re-runs recovery on the persisted log —
+now containing the compensation records written so far — and checks that the final state is identical to a clean recovery and equals the committed-only state.
+This is a deterministic, structural demonstration — recovery either reaches the committed-only state (and the restart reaches the same state) or it does not, and
+it does — not a wall-clock timing (<code>perf</code> is not installed on this machine, and the claim is correctness and restartability, not speed).</p>
+
+<h2>60.1 The three passes, and why history is repeated</h2>
+
+<p>ARIES recovers in three passes over the log, in a fixed order, each with one job. <strong>Analysis</strong> comes first and looks backward in effect but scans
+forward: starting from the most recent checkpoint (Chapter 59), it replays the log to the end, maintaining the transaction table (who was active, and their most
+recent LSN) and the dirty-page table (which pages were dirty, and their recLSN). At the end it knows the <strong>losers</strong> — transactions with no commit
+record, whose changes must be undone — and the <strong>RedoLSN</strong>, the smallest recLSN, where redo must begin. <strong>Redo</strong> comes second, scanning
+forward from the RedoLSN, and does something that surprises people first meeting ARIES: it re-applies <em>every</em> change it finds whose LSN exceeds the target
+page's page LSN, <em>regardless of whether the transaction committed</em>. It redoes losers' changes too. <strong>Undo</strong> comes third, scanning backward
+from the end, and rolls back exactly the losers, restoring each change's before-image. Winners are never touched by undo; losers are fully reversed.</p>
+
+<p>Why redo the losers, only to undo them moments later? Because it makes recovery <em>uniform</em> and <em>restartable</em>, and the cost is negligible. This is
+ARIES's defining principle, <strong>repeat history</strong>: redo reconstructs the <em>exact</em> page state that existed at the instant of the crash — every
+change that had been made, committed or not — so that when undo runs, it operates on precisely the pages the running system had, and every page's page LSN is a
+correct, complete high-water mark. The alternative, trying to redo only winners, would require redo to know each transaction's fate before repeating its
+changes, would leave pages in a state that never actually existed, and would break the page-LSN accounting that makes redo idempotent (Chapter 58). By
+repeating <em>all</em> history first and undoing losers second, ARIES keeps each pass a simple, mechanical sweep — analysis counts, redo re-applies by page LSN,
+undo reverses by transaction — and, because both redo and undo are logged and idempotent, the whole sequence can be interrupted and restarted any number of
+times. Repeating history is not wasted work; it is the factoring that buys simplicity and restartability, which for a recovery algorithm are worth far more than
+saving a few redundant redos.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the three ARIES passes in order and the one job of each. Why does redo re-apply losers' changes rather than skip them — what does &ldquo;repeat history&rdquo;
+reconstruct, and what would break if redo tried to skip losers? (Answer in &sect;60.2.)</p>
+</aside>
+
+<h2>60.2 Analysis: rebuilding the tables, finding losers and the RedoLSN</h2>
+
+<p>Analysis turns a log and a checkpoint into the two facts redo and undo need. It begins at the last checkpoint record, seeding its <strong>transaction table</strong>
+and <strong>dirty-page table</strong> from the tables the checkpoint recorded (Chapter 59), then scans forward to the end of the log, updating them as it goes.
+For each <em>update</em> record it sees, it notes the transaction as active (recording that record's LSN as the transaction's most recent) and, if the record's
+page is not already in the dirty-page table, adds it with this record's LSN as the page's recLSN — the oldest change that might not be on that page. For each
+<em>commit</em> (or end) record, it marks the transaction committed (or removes it). When the scan reaches the end of the log — the point of the crash — the
+transaction table holds exactly the transactions that were in flight, and every one still marked active-and-uncommitted is a <strong>loser</strong>. The
+dirty-page table holds the pages that may not be fully on disk, and the minimum recLSN over it is the <strong>RedoLSN</strong>. That is all analysis produces:
+the loser set for undo, and the RedoLSN for redo.</p>
+
+<p>Two subtleties matter. First, the checkpoint's tables are a <em>starting</em> point, not the truth: the database kept running after the checkpoint was
+written, so analysis must replay forward to bring the tables up to the crash — adding transactions that began after the checkpoint, and pages dirtied after it.
+Second, analysis does not touch data pages at all; it only reads the log and builds tables in memory. It is cheap — a single forward scan of the tail from the
+checkpoint — and it commits recovery to nothing, which is why it is safe to redo from scratch if recovery is interrupted before redo begins. With the loser set
+and the RedoLSN in hand, recovery knows precisely what redo must reconstruct and what undo must reverse. In the working store, analysis finds the two
+uncommitted transactions as losers and computes the RedoLSN from the dirty-page table; the next section runs redo from there.</p>
+
+<p><em>(Answer to the &sect;60.1 quick check: the passes are analysis (find losers and the RedoLSN), redo (repeat history — re-apply every change past its page
+LSN), and undo (roll back losers). Redo re-applies losers' changes because &ldquo;repeat history&rdquo; reconstructs the exact page state at the crash, giving
+undo a consistent basis and every page a correct page LSN; skipping losers would demand redo know each transaction's fate, would produce page states that never
+existed, and would break the page-LSN accounting that makes redo idempotent.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: analysis finds the work, redo repeats history, undo reverses losers</span>
+<p><strong>1. In words.</strong> Analysis scans from the checkpoint to rebuild the transaction and dirty-page tables, yielding the losers and the RedoLSN. Redo
+scans from the RedoLSN and re-applies every change past its page LSN, reconstructing the crash-time state. Undo scans backward and rolls the losers back, logging
+a compensation record per undo so undo is redoable and restartable.</p>
+<p><strong>2. As a picture.</strong> Figure 60.1: the log as a horizontal line. An analysis arrow runs left-to-right from the checkpoint to the end; a redo arrow
+runs left-to-right from the (earlier) RedoLSN to the end; an undo arrow runs right-to-left from the end, touching only the losers' records and dropping a small
+&ldquo;CLR&rdquo; box beside each one it reverses.</p>
+<p><strong>3. As numbers.</strong> Three transactions run; one commits, two are losers. On disk after the crash: <code>P1={a:777}</code>, <code>P3={e:30}</code>
+(stolen uncommitted values); the committed-only target is <code>P1.a=10, P2.c=20</code>. Clean recovery: redo re-applies 2, undo writes 3 compensation records,
+final state equals the target — <em>True</em>. Crash after 1 compensation record, then restart: redo re-applies 0, undo writes 2 more, final state equals the
+target and the clean run — <em>True</em> (&sect;60.3&ndash;&sect;60.4).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">ARIES: three passes over the log &#8212; analysis, then redo (repeat history), then undo (losers only).</text>
+<line x1="60" y1="60" x2="600" y2="60" stroke="#333"/>
+<line x1="120" y1="52" x2="120" y2="68" stroke="#b58900" stroke-width="2"/><text x="96" y="46" font-size="9" fill="#7a5c00">RedoLSN</text>
+<line x1="220" y1="52" x2="220" y2="68" stroke="#14406b" stroke-width="2"/><text x="200" y="46" font-size="9" fill="#14406b">CKPT</text>
+<line x1="600" y1="52" x2="600" y2="68" stroke="#b23" stroke-width="2"/><text x="576" y="46" font-size="9" fill="#b23">crash</text>
+<text x="60" y="95" font-size="9" fill="#333">ANALYSIS</text>
+<path d="M 220 100 L 596 100" stroke="#14406b" fill="none" marker-end="url(#a)"/>
+<text x="60" y="125" font-size="9" fill="#7a5c00">REDO</text>
+<path d="M 120 130 L 596 130" stroke="#b58900" fill="none" marker-end="url(#a)"/>
+<text x="60" y="162" font-size="9" fill="#2f7d32">UNDO</text>
+<path d="M 596 165 L 124 165" stroke="#2f7d32" fill="none" marker-end="url(#a)"/>
+<rect x="300" y="158" width="20" height="14" fill="#dff0df" stroke="#2f7d32"/><text x="302" y="169" font-size="7" fill="#2f7d32">CLR</text>
+<rect x="440" y="158" width="20" height="14" fill="#dff0df" stroke="#2f7d32"/><text x="442" y="169" font-size="7" fill="#2f7d32">CLR</text>
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#333"/></marker></defs>
+</svg>
+<figcaption>Figure 60.1: the three passes. Analysis scans from the checkpoint to find losers and the RedoLSN; redo scans from the RedoLSN forward, repeating all
+history; undo scans backward, reversing only losers and logging a compensation record (CLR) for each undo so undo is itself redoable and restartable.</figcaption>
+</figure>
+
+<h2>60.3 Redo: repeating history from the RedoLSN</h2>
+
+<p>Redo reconstructs the crash-time state. Scanning forward from the RedoLSN, for each update (and, later, each compensation) record, it loads the target page
+and compares the record's LSN to the page's page LSN: if the record is newer, it applies the change and advances the page LSN; if not, the change is already on
+the page and it skips (Chapter 58's idempotence). It does this for winners and losers alike — repeating history. In the working store, three transactions ran:
+<code>T1</code> wrote <code>P1.a=10</code> and <code>P2.c=20</code> and committed; loser <code>T2</code> wrote <code>P1.a=777</code>; loser <code>T3</code> wrote
+<code>P3.e=30</code> and <code>P2.d=40</code>; then the machine crashed. Under steal + no-force, pages <code>P1</code> and <code>P3</code> were stolen to disk
+carrying the losers' uncommitted values, while <code>P2</code> was never flushed, losing <code>T1</code>'s committed <code>c=20</code>. Clean recovery runs all
+three passes:</p>
+
+<pre><code>ARIES: analysis, redo, undo
+  durable at crash -- on-disk pages (STEAL): {'P1': {'a': 777}, 'P3': {'e': 30}}
+  committed-only target: {('P1', 'a'): 10, ('P2', 'c'): 20}
+
+Clean recovery (no second crash):
+  ANALYSIS  losers=['T2', 'T3']  RedoLSN=1  DPT={'P1': 1, 'P2': 2, 'P3': 5}
+  REDO      re-applied 2 records from RedoLSN forward
+  UNDO      rolled back losers, wrote 3 CLRs
+  final state: {('P1', 'a'): 10, ('P2', 'c'): 20}
+  final == committed-only: True
+</code></pre>
+
+<p>Analysis names <code>T2</code> and <code>T3</code> losers (neither committed) and computes <code>RedoLSN=1</code> from the dirty-page table. Redo scans from
+record 1 and <em>re-applies 2</em>: <code>T1</code>'s <code>P2.c=20</code> (committed, lost with the unflushed page) and <code>T3</code>'s <code>P2.d=40</code> (a
+loser's change, also lost) — the two changes that page <code>P2</code> was missing. It skips the rest: <code>P1.a</code> and <code>P3.e</code> are already on
+their stolen pages, their page LSNs already covering those records. After redo, the pages hold exactly what they held at the crash — <code>P1={a:777}</code>,
+<code>P2={c:20,d:40}</code>, <code>P3={e:30}</code> — losers' uncommitted values included. That is repeating history: the state is faithfully the pre-crash state,
+not yet the correct final one. Undo then reverses the losers (next section), restoring <code>P1.a</code> to <code>10</code> and deleting <code>P2.d</code> and
+<code>P3.e</code>, landing on <code>P1.a=10, P2.c=20</code> — the committed-only target, <em>True</em>. Redo did not decide anything about correctness; it only
+rebuilt the ground truth on which undo operates. The separation is the point: redo makes the pages match the crash, undo makes the transactions match their
+outcomes.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: undo that isn't logged &mdash; the compensation record you skip is the corruption on the next crash</span>
+<p>The seductive shortcut in undo is to treat it as private cleanup: just write each before-image back to its page and move on, without logging anything, since
+&ldquo;we're only restoring old values.&rdquo; It works perfectly until a crash lands <em>during</em> undo — and then it corrupts. Suppose undo has reversed
+three of a loser's five changes when the machine crashes. Nothing recorded that those three were reversed. On restart, analysis re-derives the same loser (it
+still has no commit record), redo repeats history — which <em>re-applies the very changes undo just removed</em>, because the log still contains the original
+updates and the pages were re-stolen — and undo starts over from the loser's last change, reversing all five, some for the second time. If any change is not
+self-inverse (an increment, a counter, a structural update to a shared page), the double-undo corrupts it, and worse, undo may run past a value that a later,
+already-undone action depended on. The fix is the <strong>compensation log record</strong> (CLR): as undo reverses each change, it <em>logs</em> the reversal —
+a redo-only record carrying the value it wrote and, critically, an <strong>undoNextLSN</strong> pointing to the next change still to be undone for that
+transaction. Now undo's progress is durable. On restart, redo replays the CLRs too (they are ordinary redo records, idempotent via the page LSN), restoring the
+pages to exactly where undo had reached; and undo, following the undoNextLSN chain, resumes at the next un-undone change rather than restarting — so no change is
+ever undone twice, and undo never needs to be undone. A CLR is never itself rolled back; that one-way property is what bounds recovery and guarantees
+termination. Undo that isn't logged is a rollback that passes every test until the one crash that lands inside it.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate reviewing the recovery code asks: &ldquo;Why are we writing <em>more</em> log records during recovery? We're rolling
+transactions back — undoing work — so logging the undos seems backwards. If we crash again we'll just recover again; why not keep undo simple and silent?&rdquo;
+Cover the paragraph and answer in four or five sentences, drawing on &sect;60.1 and &sect;60.4.</p>
+<p><em>Model answer.</em> &ldquo;Because recovery can itself be interrupted, and silent undo isn't restartable. If we crash halfway through rolling a transaction
+back with no record of how far we got, the next recovery repeats history — which re-applies the changes we just undid — and then undoes from the top, reversing
+some changes twice; anything not self-inverse gets corrupted. So we log a <strong>compensation record</strong> for each undo: it's a redo-only record that says
+&lsquo;this reversal happened,&rsquo; and it carries an undoNextLSN pointing to the next change still to undo. On restart, redo replays those compensation records
+too — idempotently, by page LSN — putting the pages exactly where undo had reached, and undo resumes from the undoNextLSN instead of restarting. That's what makes
+recovery survive a crash <em>inside</em> recovery, and it's why compensation records are never themselves undone — that one-way rule guarantees we terminate. The
+extra records aren't backwards; they're the difference between a rollback that's restartable and one that only looks correct until it's interrupted.&rdquo;
+Naming CLRs, undoNextLSN, and restartability is the senior register.</p>
+</aside>
+
+<h2>60.4 Undo, compensation records, and surviving a crash during recovery</h2>
+
+<p>Undo rolls the losers back, and it does so as a logged, restartable operation. Scanning the losers' changes in reverse LSN order — each transaction's records
+chained by a back-pointer so undo can walk them newest-to-oldest — undo restores each change's before-image to its page and immediately logs a
+<strong>compensation log record</strong> (CLR). The CLR is an ordinary redo record for the <em>reversal</em>: it carries the value undo wrote (the before-image)
+so redo can re-apply the reversal after a crash, and it carries an <strong>undoNextLSN</strong> pointing to the next change that still needs undoing for that
+transaction (the current change's predecessor in the chain, or nothing if this was the transaction's first change). When a transaction's undo reaches the end of
+its chain, undo writes an <em>end</em> record and the transaction is done. The two properties that matter: CLRs are <strong>redo-only</strong> — they are never
+themselves undone — and their undoNextLSN records exactly how far undo has progressed. Together these make undo survive its own interruption. The store proves it
+by crashing after a single CLR and re-running recovery on the persisted log:</p>
+
+<pre><code>Restart recovery (crash midway through undo, then re-run):
+  ANALYSIS  losers=['T2', 'T3']  RedoLSN=1  DPT={'P1': 1, 'P2': 2, 'P3': 5}
+  REDO      re-applied 2 records from RedoLSN forward
+  UNDO      *** CRASH after 1 CLRs ***
+  ANALYSIS  losers=['T2', 'T3']  RedoLSN=1  DPT={'P1': 1, 'P2': 2, 'P3': 5}
+  REDO      re-applied 0 records from RedoLSN forward
+  UNDO      rolled back losers, wrote 2 CLRs
+  final state: {('P1', 'a'): 10, ('P2', 'c'): 20}
+  final == committed-only: True
+  restart reached the SAME state as clean recovery: True
+</code></pre>
+
+<p>Follow the restart. The first attempt runs analysis and redo, then in undo reverses one change (<code>T3</code>'s <code>P2.d=40</code>) and logs one CLR — and
+crashes. That CLR is now durable in the log. The second attempt starts over: analysis again finds <code>T2</code> and <code>T3</code> as losers (still no commit),
+but this time redo <em>re-applies 0</em> records — the pages already reflect all history including the one logged compensation, so every record is at or below its
+page LSN and is skipped (idempotence, exactly as designed). Undo then resumes: because the persisted CLR's undoNextLSN points past the already-reversed
+<code>P2.d</code> to the next un-undone change, undo does <em>not</em> reverse <code>P2.d</code> again — it continues with <code>T3</code>'s <code>P3.e</code> and
+<code>T2</code>'s <code>P1.a</code>, writing <em>2 more</em> CLRs — 3 in total across both attempts, one per change, never a repeat. The final state is
+<code>P1.a=10, P2.c=20</code>, identical to the clean recovery and equal to the committed-only target — <em>True</em> on both counts. This is the answer to the
+opener: recovery avoids re-undoing by logging a compensation record with an undoNextLSN as it reverses each change, so a restart replays those records (redo) and
+resumes the rollback from where it left off (undo). A crash during recovery is just another crash; ARIES treats recovery as ordinary, logged, idempotent work,
+which is why it terminates and why it is correct no matter how many times it is interrupted.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What two things does a compensation log record carry, and what does each enable when recovery restarts after a crash during undo? Why are CLRs never themselves
+undone, and what does that one-way property guarantee? (Answer below.)</p>
+</aside>
+
+<h2>60.5 What to carry forward</h2>
+
+<p><strong>ARIES</strong> recovers in three passes. <strong>Analysis</strong> scans forward from the last checkpoint, rebuilding the transaction and dirty-page
+tables to find the <strong>losers</strong> and the <strong>RedoLSN</strong> (&sect;60.2). <strong>Redo</strong> scans forward from the RedoLSN and
+<strong>repeats history</strong> — re-applying every change past its page LSN, winners and losers alike — to reconstruct the exact crash-time page state, which
+gives undo a consistent basis and keeps every page LSN a correct high-water mark (&sect;60.1, &sect;60.3). <strong>Undo</strong> scans backward, rolling back the
+losers, and logs a <strong>compensation log record</strong> per reversal, carrying the restored value (so redo can replay the reversal) and an
+<strong>undoNextLSN</strong> (so undo can resume, not restart) — which is what lets recovery survive a crash <em>during</em> recovery, demonstrated by a restart
+that reached the identical committed-only state, undoing each change exactly once (&sect;60.4). CLRs are redo-only and never undone, a one-way property that
+guarantees termination. The named trap: undo that isn't logged corrupts on the next crash by re-undoing changes it already reversed.</p>
+
+<p>ARIES completes the durability-and-recovery story this part set out to tell: a steal + no-force database, tuned for buffer-pool and commit performance, can
+nonetheless recover exactly — every committed write preserved, every uncommitted one erased — across any crash, including one that interrupts recovery itself.
+The load-bearing ideas were built in sequence: write-ahead logging and the durability contract (Chapter 57), the before-image, undo, the LSN, and the page LSN
+(Chapter 58), the checkpoint and the RedoLSN (Chapter 59), and now the three passes with compensation records that fuse them (Chapter 60). What remains of the
+part sharpens the edges — the failures beyond a clean crash (a lost or corrupted disk, not just lost memory, which brings <strong>media recovery</strong> from
+an archived log and backups), and the choices in <em>what</em> to log (physical byte-images versus logical operations versus the physiological middle ground
+ARIES assumes). But the core is now in place, and it points forward past durability entirely. ARIES's full name — Algorithm for Recovery <em>and Isolation</em>
+— hints at the next part: recovery was only ever half of what a transaction promises. The other half is <strong>isolation</strong> — running many transactions
+<em>concurrently</em> without their letting each other see half-finished work — the A, C, and I of ACID that the coming part on transactions and concurrency
+control takes up. Durability is how a database keeps its word to one writer across a crash; isolation is how it keeps its word to many writers at once.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Name the three ARIES passes in order and the one job of each.</li>
+<li>Explain &ldquo;repeat history&rdquo; — what redo reconstructs and why it redoes losers too.</li>
+<li>Say what analysis produces and where it starts and stops scanning.</li>
+<li>Describe a compensation log record and its two fields.</li>
+<li>Explain how the undoNextLSN lets undo resume rather than restart after a crash mid-undo.</li>
+<li>State why CLRs are never undone and what that guarantees.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> List the three ARIES passes and what each computes or changes. (&sect;60.1)</li>
+<li><strong>R2.</strong> Why does redo repeat all history, including losers' changes? (&sect;60.1, &sect;60.3)</li>
+<li><strong>R3.</strong> What does analysis produce, and from where to where does it scan? (&sect;60.2)</li>
+<li><strong>R4.</strong> Walk through the store's run: what redo re-applied, what undo reversed, why the result is committed-only. (&sect;60.3&ndash;&sect;60.4)</li>
+<li><strong>R5.</strong> How do compensation records and the undoNextLSN let recovery survive a crash during undo? (&sect;60.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh &amp; Peter Schwarz, &ldquo;ARIES: A Transaction Recovery Method Supporting
+Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging,&rdquo; <em>ACM Transactions on Database Systems</em> 17(1), 1992, pp.
+94&ndash;162, DOI 10.1145/128765.128770.</strong> The algorithm itself: the three passes, repeating history, compensation log records with undoNextLSN, and the
+proofs of correctness under a crash during recovery — the primary source for this entire chapter. First author C. Mohan; venue, volume, issue, pages, year, and
+DOI verified via the ACM Digital Library and DBLP, and the DOI resolves.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992, ISBN 978-1-55860-190-1.</strong>
+The definitive treatment of logging and recovery, developing redo, undo, compensation, and the analysis/redo/undo structure with full context. Authors,
+publisher, year, and ISBN verified via the publisher listing and the Library of Congress record.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003, ISBN 978-0-07-246563-1.</strong>
+A step-by-step textbook walkthrough of ARIES — the transaction and dirty-page tables, the RedoLSN, and CLRs — worked on small examples, the ideal companion for
+re-deriving this chapter by hand. Authors and edition verified via the McGraw-Hill catalog and the Library of Congress record.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, pp. 141&ndash;259, DOI 10.1561/1900000002.</strong> Places ARIES within a complete engine — how the log manager, buffer
+manager, and transaction manager cooperate — and why the industry standardized on this design. First author Joseph M. Hellerstein; venue, volume, issue, pages,
+year, and DOI verified via now publishers and the ACM Digital Library, and the DOI resolves.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex60.1"><span class="ex-label">60.1</span> <span class="ex-tag warm">warm-up</span>
+Name the three ARIES passes in order and give the one job of each in a phrase.</div>
+
+<div class="exercise" id="ex60.2"><span class="ex-label">60.2</span> <span class="ex-tag warm">warm-up</span>
+What two things does analysis produce, and which later pass uses each?</div>
+
+<div class="exercise" id="ex60.3"><span class="ex-label">60.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does &ldquo;repeat history&rdquo; mean?</div>
+
+<div class="exercise" id="ex60.4"><span class="ex-label">60.4</span> <span class="ex-tag core">core</span>
+The passes. (a) From where to where does analysis scan, and what does it read and update? (b) From where does redo start, and what comparison decides whether it
+applies each record? (c) In what order does undo process a loser's changes, and what does it do to each?</div>
+
+<div class="exercise" id="ex60.5"><span class="ex-label">60.5</span> <span class="ex-tag core">core</span>
+Repeat history. (a) Why does redo re-apply losers' changes as well as winners'? (b) What state do the pages hold immediately after redo, before undo runs? (c)
+Give two things that would break if redo tried to redo only committed transactions.</div>
+
+<div class="exercise" id="ex60.6"><span class="ex-label">60.6</span> <span class="ex-tag core">core</span>
+The clean run. Using the output (losers <code>T2</code>, <code>T3</code>; redo re-applies 2; undo writes 3 CLRs; on-disk <code>P1={a:777}</code>,
+<code>P3={e:30}</code>): (a) which two changes did redo re-apply and why were they missing? (b) which changes did the two stolen pages already hold, so redo
+skipped them? (c) what did undo restore to reach <code>P1.a=10, P2.c=20</code>?</div>
+
+<div class="exercise" id="ex60.7"><span class="ex-label">60.7</span> <span class="ex-tag core">core</span>
+Compensation records. (a) What two fields does a CLR carry, and what is each for? (b) Why is a CLR a redo-only record, never itself undone? (c) What does that
+one-way property guarantee about recovery?</div>
+
+<div class="exercise" id="ex60.8"><span class="ex-label">60.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A loser <code>T</code> made three changes, LSNs 40, 41, 42. Undo begins and reverses the change at LSN 42, logging a
+CLR whose undoNextLSN points to 41; then the machine crashes.
+<br><strong>Step 1 (given):</strong> on restart, analysis again finds <code>T</code> a loser (it has no commit record).
+<br><strong>Step 2 (given):</strong> redo repeats history from the RedoLSN, replaying the original updates and the one persisted CLR, idempotently by page LSN.
+<br><strong>Step 3 (given):</strong> undo resumes for <code>T</code>, reading the last CLR's undoNextLSN.
+<br><strong>Step 4 (you):</strong> State which change undo reverses next and which it does <em>not</em> re-reverse, how many CLRs <code>T</code> has when fully
+undone, and why no change is undone twice.</div>
+
+<div class="exercise" id="ex60.9"><span class="ex-label">60.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>analysis</em>, <em>redo</em>, <em>undo</em>, <em>repeat history</em>, or <em>compensation log record</em> — and why:
+(a) re-applying every change past its page LSN, committed or not; (b) reversing a loser's changes newest-to-oldest; (c) the record logged as each reversal
+happens; (d) rebuilding the transaction and dirty-page tables from the checkpoint; (e) the principle that recovery first reconstructs the exact crash-time state.</div>
+
+<div class="exercise" id="ex60.10"><span class="ex-label">60.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Redo re-applies only committed transactions' changes.&rdquo; (b) &ldquo;Undo
+runs before redo.&rdquo; (c) &ldquo;A compensation log record can itself be undone if recovery crashes.&rdquo; (d) &ldquo;Analysis reads and repairs data
+pages.&rdquo; (e) &ldquo;The undoNextLSN lets undo resume from where it stopped rather than restart.&rdquo;</div>
+
+<div class="exercise" id="ex60.11"><span class="ex-label">60.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) ARIES recovers from lost <em>memory</em> (a crash); sketch what additionally changes if the <em>disk</em> is lost or corrupted, and why
+that needs an archived log and a backup (media recovery). (b) This chapter's records stored full before- and after-images; explain the trade-off between logging
+physical byte-images and logging logical operations, and why ARIES uses a physiological middle ground (physical-to-a-page, logical-within-it). (c) ARIES's full
+name mentions <em>isolation</em>; explain why recovery alone does not make concurrent transactions correct, and name one anomaly two transactions could cause
+that recovery would not prevent.</div>
+
+<div class="exercise" id="ex60.12"><span class="ex-label">60.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build a small ARIES-style recovery manager over a page store with a WAL carrying before- and after-images and page LSNs;
+run a workload with at least one committing and one non-committing transaction, and steal some pages to disk. (b) Recover in three passes — analysis (losers +
+RedoLSN), redo (repeat history via page LSN), undo (roll back losers, logging a CLR with an undoNextLSN per reversal). (c) Then crash partway through undo, re-run
+recovery on the persisted log, and assert the final state equals both the committed-only state and a clean recovery's result — and explain why undoing each change
+exactly once across the two runs is the evidence that your CLRs make recovery restartable.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XI</div><h1>Transactions & Concurrency Control</h1><p class='part-blurb'>ACID, isolation levels and their anomalies, 2PL, MVCC, and OCC — correctness under concurrency, implemented.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XII</div><h1>Query Processing & Execution</h1><p class='part-blurb'>Parser, planner, physical operators, and execution models (Volcano/vectorized/codegen) — turning SQL into work.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XIII</div><h1>Query Optimization</h1><p class='part-blurb'>Statistics, cardinality estimation, cost models, and join ordering — the optimizer, honestly.</p></div>
@@ -28925,6 +29982,273 @@ asserts the recovered state equals the pre-crash state (this chapter: 163 keys l
 notes this is a deterministic, structural demonstration — the recovered state matches or it does not — not a wall-clock timing, and that moving the
 <code>fsync</code> after the mutation (or removing it) breaks the write-ahead rule and lets a crash lose acknowledged writes. <em>Tempting wrong answer:</em>
 &ldquo;report the recovery time as the result&rdquo; — the result is the correctness of recovery, not its speed. <strong>Feed-forward:</strong> &sect;57.3.</div>
+
+</section>
+
+<section class="solutions" id="sol58">
+<h1>Chapter 58 — Solutions</h1>
+
+<div class="solution" id="sol58.1"><span class="sol-label">58.1</span>
+A <strong>transaction</strong> is a group of changes bracketed by begin and commit/abort that must take effect all-or-nothing (atomicity). A <strong>winner</strong>
+is a transaction that committed before the crash; a <strong>loser</strong> is one that was active at the crash and never committed. <em>Tempting wrong answer:</em>
+&ldquo;a loser is a transaction whose changes were lost&rdquo; — a loser is defined by <em>not committing</em>, not by what reached disk; its changes may well be
+on disk, which is exactly why undo is needed. <strong>Feed-forward:</strong> &sect;58.1.</div>
+
+<div class="solution" id="sol58.2"><span class="sol-label">58.2</span>
+The <strong>after-image</strong> (the new value) is redo information — used to re-apply the change; the <strong>before-image</strong> (the old value) is undo
+information — used to reverse it. <em>Tempting wrong answer:</em> &ldquo;only the new value, since recovery just replays&rdquo; — that suffices only under no-steal;
+under steal you must also store the old value to roll uncommitted changes back. <strong>Feed-forward:</strong> &sect;58.1.</div>
+
+<div class="solution" id="sol58.3"><span class="sol-label">58.3</span>
+<strong>Steal:</strong> the buffer pool may write a page dirtied by an uncommitted transaction back to disk (steal its frame). <strong>No-force:</strong>
+a transaction's data pages need not be forced to disk at commit — commit forces only the log. <em>Tempting wrong answer:</em> &ldquo;no-force means data is never
+written&rdquo; — data pages are written lazily; no-force only removes the force-at-commit requirement. <strong>Feed-forward:</strong> &sect;58.2.</div>
+
+<div class="solution" id="sol58.4"><span class="sol-label">58.4</span>
+(a) A winner needs <strong>redo</strong>: under no-force its committed changes may not have reached disk, so recovery must re-apply them to keep durability. (b)
+A loser needs <strong>undo</strong>: under steal its uncommitted changes may have reached disk, so recovery must remove them to keep atomicity. (c) Redo only
+<em>re-applies</em> a change; when a loser's change is already on disk, re-applying it (or doing nothing) leaves it in place, whereas undo must <em>erase</em> it
+by restoring the before-image — the opposite operation. <em>Tempting wrong answer:</em> &ldquo;recovery can just skip the loser's records&rdquo; — skipping leaves
+the stolen change durable on disk; it must be actively rolled back. <strong>Feed-forward:</strong> &sect;58.1&ndash;&sect;58.2.</div>
+
+<div class="solution" id="sol58.5"><span class="sol-label">58.5</span>
+(a) No-steal + force: neither. No-steal + no-force: redo only. Steal + force: undo only. Steal + no-force: both. (b) No-steal + force needs neither, but it
+forces scattered data on every commit (random-write throughput, ~19&nbsp;MB/s) and pins every dirty page until commit (crippling the buffer pool) — correct but
+slow. (c) Real engines pick <strong>steal + no-force</strong>: it buys free buffer eviction and log-only commit (fast), and the bill is implementing both redo
+and undo. <em>Tempting wrong answer:</em> &ldquo;pick no-steal + force to avoid the complexity&rdquo; — the performance cost is prohibitive; the complexity of
+redo+undo is the accepted price. <strong>Feed-forward:</strong> &sect;58.2.</div>
+
+<div class="solution" id="sol58.6"><span class="sol-label">58.6</span>
+(a) <code>T1</code>'s <code>P2.c=5</code> was redone; it was missing because page <code>P2</code> was never flushed, so under no-force the committed change
+lived only in the lost memory. (b) Redo repeats <em>all</em> history — winners and losers — so <code>T2</code>'s lost <code>P2.z=7</code> was also re-applied;
+undo sorts losers out afterward. (c) Undo restored <code>T2</code>'s before-images (<code>P1.a</code> back to <code>1</code>, deleting <code>P2.z</code>), leaving
+only <code>T1</code>'s committed effects — the committed-only state. <em>Tempting wrong answer:</em> &ldquo;redo skipped the loser's changes because they were
+uncommitted&rdquo; — redo does not distinguish; it repeated them, and undo removed them. <strong>Feed-forward:</strong> &sect;58.3.</div>
+
+<div class="solution" id="sol58.7"><span class="sol-label">58.7</span>
+(a) The page LSN stores the LSN of the most recent log record applied to that page, and is updated (and written to disk with the page) each time a change is
+applied to it. (b) Redo skips a record when its LSN &le; the target page's page LSN (the change is already on the page); it re-applies only records whose LSN is
+greater. (c) After one redo pass every applied record's LSN is &le; its page LSN, so every subsequent pass skips it — applying redo once or many times reaches
+the same state. <em>Tempting wrong answer:</em> &ldquo;compare the LSN to the newest record in the log&rdquo; — the comparison is against the <em>page's</em> LSN,
+which records how far that specific page has been brought up to date. <strong>Feed-forward:</strong> &sect;58.4.</div>
+
+<div class="solution" id="sol58.8"><span class="sol-label">58.8</span>
+<strong>Step 4:</strong> Because <code>T</code> is a loser, atomicity requires that its change to <code>r</code> be erased — <code>r</code> must be restored to the
+value it held before <code>T</code>, namely <code>5</code>. The redo-only log cannot do this: it recorded only <code>r=8</code> (the after-image), and undo needs
+the <em>before</em>-image, <code>5</code>, which was never logged — so there is no durable record of what to roll back to, and the stolen <code>8</code> is stuck
+on disk. The one-line fix: log the before-image as well as the after-image for every update (and, per the write-ahead rule, force it before the page is stolen).
+<em>Tempting wrong answer:</em> &ldquo;re-run the transaction to overwrite <code>r</code>&rdquo; — the transaction aborted; there is no correct value to
+re-derive without the before-image. <strong>Feed-forward:</strong> &sect;58.1&ndash;&sect;58.3.</div>
+
+<div class="solution" id="sol58.9"><span class="sol-label">58.9</span>
+(a) <strong>Redo</strong> — re-apply a committed change lost from disk. (b) <strong>Undo</strong> — roll back an aborted transaction's change. (c)
+<strong>Steal</strong> — evict an uncommitted dirty page. (d) <strong>No-force</strong> — commit forces only the log. (e) <strong>Page LSN</strong> — per-page
+high-water mark that lets redo skip. <em>Tempting wrong answer:</em> swapping (c) and (d) — steal is about eviction of uncommitted pages; no-force is about not
+forcing at commit. <strong>Feed-forward:</strong> &sect;58.2&ndash;&sect;58.4.</div>
+
+<div class="solution" id="sol58.10"><span class="sol-label">58.10</span>
+(a) <strong>True</strong> — under no-steal no uncommitted change ever reaches disk, so there is nothing to undo. (b) <strong>False</strong> — no-force means the
+pages may <em>not</em> be on disk at commit; only the log is forced, so redo is needed. (c) <strong>True</strong> — that is exactly the redo/undo split. (d)
+<strong>False</strong> — the page LSN is stored on the page (and written to disk with it); the log stores the record LSNs. (e) <strong>True</strong> — a crash can
+strike during recovery, so re-applying already-applied changes must be a no-op. <em>Tempting wrong answer:</em> marking (b) true because &ldquo;committed sounds
+durable&rdquo; — durability under no-force comes from the forced log, not from the data pages being on disk. <strong>Feed-forward:</strong> &sect;58.2&ndash;&sect;58.4.</div>
+
+<div class="solution" id="sol58.11"><span class="sol-label">58.11</span>
+(a) Scanning the whole log costs time proportional to all history, which grows without bound; a <strong>checkpoint</strong> periodically records the active
+transactions and the dirty pages (with the oldest not-yet-flushed LSN per page) so recovery can start its scan near the end of the log. (b) If a crash struck
+mid-undo and a re-run started undo from scratch, it could try to reverse changes it already reversed — double-undo — or roll back past a value later work depends
+on, corrupting the store; undo therefore needs a durable record of what it has already reversed so it can resume. (c) Redoing losers' changes first makes every
+page's page LSN reflect the true latest logged change on it, so the page LSN is a correct high-water mark for the whole log — undo can then proceed knowing
+history has been faithfully repeated, and undo's own actions are logged and redone the same way. <em>Tempting wrong answer:</em> &ldquo;redoing losers is wasted
+work&rdquo; — it is what keeps the page LSN and the redo/undo protocol uniform and restartable (Chapter 60). <strong>Feed-forward:</strong> &sect;58.5.</div>
+
+<div class="solution" id="sol58.12"><span class="sol-label">58.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a page store logging a before-image and after-image per change with a monotonic LSN and a
+per-page page LSN; (b) runs a committing and a non-committing transaction, flushes one page carrying the uncommitted change and loses one committed change,
+then redoes (skipping records at or below the page LSN) and undoes (restoring the loser's before-images); (c) asserts the recovered state equals the
+committed-only state (this chapter: recovered <code>P1.a=1, P2.c=5</code>), reruns redo to confirm zero records are applied, and explains that the zero-apply
+second pass is the evidence of idempotence — every change is now covered by its page LSN, so replay is a no-op and recovery is safe to restart.
+<em>Tempting wrong answer:</em> &ldquo;report the recovery time&rdquo; — the result is the correctness and idempotence of recovery, not its speed.
+<strong>Feed-forward:</strong> &sect;58.3&ndash;&sect;58.4.</div>
+
+</section>
+
+<section class="solutions" id="sol59">
+<h1>Chapter 59 — Solutions</h1>
+
+<div class="solution" id="sol59.1"><span class="sol-label">59.1</span>
+Because recovery scans the log from the first record, its cost is proportional to the log's total length, which grows the longer the database runs — so a
+long-lived, reliable system takes longer to recover. <em>Tempting wrong answer:</em> &ldquo;because more data means more to reload&rdquo; — it is the log length
+(number of records scanned), not the data size, that drives the cost; almost all of those records describe already-durable changes. <strong>Feed-forward:</strong>
+&sect;59.1.</div>
+
+<div class="solution" id="sol59.2"><span class="sol-label">59.2</span>
+The <strong>active-transaction table</strong> (transactions in flight, each with its most recent LSN) — used by analysis to identify losers and by undo to know
+where to start rolling each back; and the <strong>dirty-page table</strong> (dirty pages, each with its recLSN) — used to compute the RedoLSN, where redo
+begins. <em>Tempting wrong answer:</em> &ldquo;a list of committed transactions&rdquo; — the checkpoint records the <em>active</em> ones; committed ones are
+settled and need no tracking. <strong>Feed-forward:</strong> &sect;59.3.</div>
+
+<div class="solution" id="sol59.3"><span class="sol-label">59.3</span>
+A page's recLSN is the LSN of the <em>oldest</em> log record whose change might not yet be on that page — set when the page first goes from clean to dirty, and
+cleared when the page is flushed. <em>Tempting wrong answer:</em> &ldquo;the LSN of the page's most recent change&rdquo; — that is the page LSN; the recLSN is the
+oldest un-flushed change, and confusing the two silently loses data. <strong>Feed-forward:</strong> &sect;59.3&ndash;&sect;59.4.</div>
+
+<div class="solution" id="sol59.4"><span class="sol-label">59.4</span>
+(a) A sharp checkpoint quiesces the system (waits for all in-flight transactions to finish, refusing new work) and flushes every dirty page to disk before
+writing the checkpoint record. (b) The two costs: the quiesce is an unbounded stall (one long transaction holds the system hostage), and the full flush is a
+burst of scattered random writes (~19&nbsp;MB/s) — exactly what no-force exists to avoid. (c) A fuzzy checkpoint records only the active-transaction and
+dirty-page tables; it can be taken without pausing or flushing because it merely snapshots the current state of play rather than forcing the disk up to date.
+<em>Tempting wrong answer:</em> &ldquo;a fuzzy checkpoint is just a less frequent sharp one&rdquo; — the difference is <em>what</em> it does (record tables vs
+quiesce-and-flush), not how often. <strong>Feed-forward:</strong> &sect;59.2&ndash;&sect;59.3.</div>
+
+<div class="solution" id="sol59.5"><span class="sol-label">59.5</span>
+(a) The workload is skewed — a small hot set takes most writes — and the background flusher steadily writes back the rest, so only the ~16 hot pages remain
+dirty; clean pages have left the dirty-page table. (b) The RedoLSN (1,964) sits near the log's end (2,041), so redo scans only the 77 records at or after it
+instead of all 2,040 — about 96.2% skipped. (c) The RedoLSN would stay near the end (the flusher keeps the dirty set and thus the minimum recLSN recent), so
+recovery would still scan roughly 77 records — recovery time stays bounded regardless of total log length. <em>Tempting wrong answer:</em> &ldquo;a billion-record
+log means a billion-record recovery&rdquo; — that is exactly what the checkpoint prevents; recovery tracks the un-flushed tail, not the history.
+<strong>Feed-forward:</strong> &sect;59.3.</div>
+
+<div class="solution" id="sol59.6"><span class="sol-label">59.6</span>
+(a) Invariant: every change with an LSN below a page's recLSN is already on that page. (b) The RedoLSN is the minimum recLSN across dirty pages, so below it no
+page can have an un-flushed change — either the change's page is not dirty (already flushed) or it predates that page's recLSN (on the page by the invariant).
+(c) Hence any change with LSN below the RedoLSN is guaranteed durable, and redo may skip it without loss. <em>Tempting wrong answer:</em> &ldquo;start redo at the
+checkpoint LSN&rdquo; — the checkpoint LSN can be later than the RedoLSN; starting there would skip un-flushed changes made before the checkpoint but after their
+page went dirty. <strong>Feed-forward:</strong> &sect;59.4.</div>
+
+<div class="solution" id="sol59.7"><span class="sol-label">59.7</span>
+(a) More frequent checkpoints cost extra work and log space, and — to keep the RedoLSN near the end — push the flusher to write dirty pages back sooner, giving
+up some no-force batching. (b) Rare checkpoints let the dirty set grow and the RedoLSN drift back, lengthening recovery. (c) Recovery time depends on the
+distance from the RedoLSN to the log's end (the un-flushed, unresolved work); a background flusher holds the dirty set — and thus the RedoLSN — within a target,
+bounding it. <em>Tempting wrong answer:</em> &ldquo;checkpoint as often as possible&rdquo; — past a point the steady-state overhead and lost batching outweigh
+the recovery savings; it is a tuned trade-off. <strong>Feed-forward:</strong> &sect;59.4.</div>
+
+<div class="solution" id="sol59.8"><span class="sol-label">59.8</span>
+<strong>Step 4:</strong> With the RedoLSN at 150, redo begins after change A (LSN 100), so if A never reached <code>P</code>'s on-disk copy it is
+<em>never re-applied</em> — the committed change A is silently lost. Recovery reports success because nothing detects the gap: the log replayed cleanly from the
+(wrong) RedoLSN and no invariant was checked. This is the most dangerous class of bug because it is a <em>silent</em> data loss — the database comes back
+&ldquo;healthy&rdquo; and short of committed writes, so it is discovered late, if ever. The one-line fix: set recLSN to the oldest un-flushed change (100), i.e.,
+the LSN at which the page first went dirty, not its current page LSN. <em>Tempting wrong answer:</em> &ldquo;redo will catch A because it scans the whole log&rdquo;
+— redo starts at the RedoLSN precisely to avoid scanning the whole log; the wrong recLSN moves that start past A. <strong>Feed-forward:</strong> &sect;59.4.</div>
+
+<div class="solution" id="sol59.9"><span class="sol-label">59.9</span>
+(a) <strong>RedoLSN</strong> — where redo begins. (b) <strong>Sharp checkpoint</strong> — quiesce and flush everything first. (c) <strong>recLSN</strong> —
+per-page oldest-un-flushed LSN. (d) <strong>Fuzzy checkpoint</strong> — record the tables without pausing. (e) <strong>Dirty-page table</strong> — the pages that
+might need redoing. <em>Tempting wrong answer:</em> confusing (c) recLSN with the page LSN — recLSN is the oldest un-flushed change, the page LSN the newest
+applied. <strong>Feed-forward:</strong> &sect;59.2&ndash;&sect;59.4.</div>
+
+<div class="solution" id="sol59.10"><span class="sol-label">59.10</span>
+(a) <strong>False</strong> — a fuzzy checkpoint flushes nothing; it only records the tables (that is why dirty pages remain and it is &ldquo;fuzzy&rdquo;). (b)
+<strong>False</strong> — dirty pages persist, so the on-disk data is <em>not</em> fully up to date after a fuzzy checkpoint. (c) <strong>True</strong> — the
+RedoLSN is the minimum recLSN. (d) <strong>False</strong> — recovery time depends on the distance from the RedoLSN to the log's end, not the total log length.
+(e) <strong>True</strong> — too-early recLSN redoes durable changes: slower, still correct. <em>Tempting wrong answer:</em> marking (b) true because a checkpoint
+&ldquo;sounds like&rdquo; a consistent snapshot — a <em>sharp</em> checkpoint leaves the disk clean, but a fuzzy one deliberately does not.
+<strong>Feed-forward:</strong> &sect;59.2&ndash;&sect;59.4.</div>
+
+<div class="solution" id="sol59.11"><span class="sol-label">59.11</span>
+(a) The database keeps running after the checkpoint is written — pages are dirtied and flushed — so the recorded table is stale by the crash; analysis replays
+the log forward from the checkpoint, adding pages to the dirty-page table when it sees their first change and (in full ARIES) accounting for flushes, so it
+rebuilds the table as of the crash. (b) Records before the checkpoint may still describe changes on pages that are still dirty (recLSN before the checkpoint),
+so they are needed for redo; only records behind the RedoLSN are provably durable and safe to recycle. (c) Undo starts from a loser's most recent LSN and walks
+its changes backward (via the per-record back-pointer); the checkpoint's recorded last-LSN per active transaction is where that walk begins.
+<em>Tempting wrong answer:</em> &ldquo;the checkpoint's table is authoritative, so analysis can trust it as-is&rdquo; — it is a stale starting point that the forward replay must
+update. <strong>Feed-forward:</strong> &sect;59.5.</div>
+
+<div class="solution" id="sol59.12"><span class="sol-label">59.12</span>
+Open-ended and platform-specific. A correct write-up: (a) models a running store with a background flusher and a correct per-page recLSN (oldest un-flushed
+change); (b) takes a fuzzy checkpoint snapshotting the dirty-page table, computes the RedoLSN as the minimum recLSN, and counts records at or after it versus in
+the whole log; (c) reports the skipped fraction (this chapter: ~96%), asserts that no change below the RedoLSN is still dirty, and explains that this structural
+assertion — not elapsed time — is the evidence that the checkpoint both bounds recovery (few records scanned) and loses nothing (no un-flushed change skipped).
+<em>Tempting wrong answer:</em> &ldquo;time the recovery to prove the checkpoint helps&rdquo; — the guarantee is the record-count reduction and the safety
+assertion, both structural. <strong>Feed-forward:</strong> &sect;59.3&ndash;&sect;59.4.</div>
+
+</section>
+
+<section class="solutions" id="sol60">
+<h1>Chapter 60 — Solutions</h1>
+
+<div class="solution" id="sol60.1"><span class="sol-label">60.1</span>
+<strong>Analysis</strong> — scan from the checkpoint to find the losers and the RedoLSN. <strong>Redo</strong> — scan from the RedoLSN, repeating history by
+re-applying every change past its page LSN. <strong>Undo</strong> — scan backward, rolling back the losers and logging a compensation record per reversal.
+<em>Tempting wrong answer:</em> &ldquo;redo, undo, analysis&rdquo; — analysis must come first; redo and undo depend on the losers and RedoLSN it produces.
+<strong>Feed-forward:</strong> &sect;60.1.</div>
+
+<div class="solution" id="sol60.2"><span class="sol-label">60.2</span>
+The <strong>loser set</strong> (transactions active at the crash with no commit), used by undo; and the <strong>RedoLSN</strong> (the minimum recLSN in the
+dirty-page table), used by redo as its starting point. <em>Tempting wrong answer:</em> &ldquo;analysis redoes the changes&rdquo; — analysis only reads the log and
+builds tables in memory; it touches no data page. <strong>Feed-forward:</strong> &sect;60.2.</div>
+
+<div class="solution" id="sol60.3"><span class="sol-label">60.3</span>
+Repeat history means redo re-applies <em>every</em> logged change past its page LSN — committed or not — so the pages are reconstructed to the exact state they
+held at the instant of the crash, before undo removes the losers. <em>Tempting wrong answer:</em> &ldquo;replay only the winners&rdquo; — that is precisely what
+repeat-history does <em>not</em> do; redoing losers too is what keeps the passes simple and restartable. <strong>Feed-forward:</strong> &sect;60.1.</div>
+
+<div class="solution" id="sol60.4"><span class="sol-label">60.4</span>
+(a) Analysis scans forward from the last checkpoint to the end of the log, reading update/commit/end records and updating the transaction table and dirty-page
+table in memory. (b) Redo starts at the RedoLSN; for each record it applies the change only if the record's LSN exceeds the target page's page LSN (otherwise the
+change is already on the page and it skips). (c) Undo processes a loser's changes newest-to-oldest (following the back-pointer chain), restoring each
+before-image and logging a CLR. <em>Tempting wrong answer:</em> &ldquo;redo starts at the checkpoint&rdquo; — it starts at the RedoLSN, which can be earlier than
+the checkpoint. <strong>Feed-forward:</strong> &sect;60.2&ndash;&sect;60.4.</div>
+
+<div class="solution" id="sol60.5"><span class="sol-label">60.5</span>
+(a) So the pages are reconstructed to the exact crash-time state, giving undo a consistent basis and every page a correct page LSN. (b) Immediately after redo the
+pages hold everything that existed at the crash — including losers' uncommitted values (in the run, <code>P1={a:777}</code>, <code>P2={c:20,d:40}</code>,
+<code>P3={e:30}</code>). (c) Two breakages: redo would need to know each transaction's fate before repeating its change (it does not, until analysis is fully
+digested per change), and the pages would reach a state that never actually existed, corrupting the page-LSN high-water marks that make redo idempotent.
+<em>Tempting wrong answer:</em> &ldquo;redoing losers wastes effort and risks leaving their changes in&rdquo; — undo removes them right after; the reconstruction
+is what makes undo and restart correct. <strong>Feed-forward:</strong> &sect;60.1, &sect;60.3.</div>
+
+<div class="solution" id="sol60.6"><span class="sol-label">60.6</span>
+(a) Redo re-applied <code>T1</code>'s <code>P2.c=20</code> (committed) and <code>T3</code>'s <code>P2.d=40</code> (loser), both missing because page
+<code>P2</code> was never flushed. (b) The stolen pages already held <code>T2</code>'s <code>P1.a=777</code> and <code>T3</code>'s <code>P3.e=30</code>, whose page
+LSNs already covered those records, so redo skipped them. (c) Undo restored <code>P1.a</code> to its before-image <code>10</code> (erasing <code>777</code>) and
+deleted <code>P2.d</code> and <code>P3.e</code>, leaving <code>P1.a=10, P2.c=20</code>. <em>Tempting wrong answer:</em> &ldquo;redo re-applied <code>P1.a=777</code>&rdquo;
+— it skipped it; <code>P1</code> was stolen with that value already on it. <strong>Feed-forward:</strong> &sect;60.3&ndash;&sect;60.4.</div>
+
+<div class="solution" id="sol60.7"><span class="sol-label">60.7</span>
+(a) The value it wrote (the before-image), so redo can replay the reversal after a crash; and the <strong>undoNextLSN</strong>, pointing to the next change still
+to be undone for that transaction, so undo can resume. (b) A CLR is redo-only because it records a reversal that has already been decided and must simply be
+re-applied on restart — undoing it would re-introduce the loser's change. (c) The one-way property guarantees recovery <em>terminates</em>: undo never generates
+new work to undo, so the rollback cannot loop. <em>Tempting wrong answer:</em> &ldquo;a CLR is undone if we roll back further&rdquo; — CLRs are never undone; the
+undoNextLSN chain skips past already-compensated changes. <strong>Feed-forward:</strong> &sect;60.4.</div>
+
+<div class="solution" id="sol60.8"><span class="sol-label">60.8</span>
+<strong>Step 4:</strong> Undo resumes at LSN 41 (the last CLR's undoNextLSN), reverses the change at 41, then 40 — it does <em>not</em> re-reverse 42, because the
+persisted CLR advanced undoNextLSN past it. When <code>T</code> is fully undone it has three CLRs, one per original change (42, 41, 40), each written exactly once
+across the two runs. No change is undone twice because the durable CLR's undoNextLSN records that 42 was already compensated, so restart resumes below it rather
+than restarting the chain. <em>Tempting wrong answer:</em> &ldquo;undo restarts at 42 and writes a fourth CLR&rdquo; — the undoNextLSN exists precisely to prevent
+that re-reversal. <strong>Feed-forward:</strong> &sect;60.4.</div>
+
+<div class="solution" id="sol60.9"><span class="sol-label">60.9</span>
+(a) <strong>Redo</strong> — re-apply every change past its page LSN. (b) <strong>Undo</strong> — reverse a loser's changes newest-to-oldest. (c)
+<strong>Compensation log record</strong> — logged as each reversal happens. (d) <strong>Analysis</strong> — rebuild the tables from the checkpoint. (e)
+<strong>Repeat history</strong> — reconstruct the exact crash-time state first. <em>Tempting wrong answer:</em> calling (a) &ldquo;repeat history&rdquo; — repeat
+history is the <em>principle</em>; (a) names the pass, redo, that implements it. <strong>Feed-forward:</strong> &sect;60.1&ndash;&sect;60.4.</div>
+
+<div class="solution" id="sol60.10"><span class="sol-label">60.10</span>
+(a) <strong>False</strong> — redo re-applies all changes past their page LSN, committed or not (repeat history). (b) <strong>False</strong> — undo runs last,
+after analysis and redo. (c) <strong>False</strong> — a CLR is redo-only and never undone; that is what guarantees termination. (d) <strong>False</strong> —
+analysis only reads the log and builds tables in memory; it does not touch data pages. (e) <strong>True</strong> — the undoNextLSN is exactly what lets undo
+resume rather than restart. <em>Tempting wrong answer:</em> marking (a) true because &ldquo;only committed work should survive&rdquo; — it should, but that is
+undo's job; redo faithfully repeats everything first. <strong>Feed-forward:</strong> &sect;60.1&ndash;&sect;60.4.</div>
+
+<div class="solution" id="sol60.11"><span class="sol-label">60.11</span>
+(a) A crash loses volatile memory but the disk survives; if the <em>disk</em> is lost or corrupted, the on-disk pages and page LSNs are gone, so recovery needs a
+prior <strong>backup</strong> plus an <strong>archived log</strong> spanning from the backup forward, replaying the archived log onto the restored backup (media
+recovery) rather than onto the live disk. (b) Physical byte-image logging is simple and idempotent but bulky and brittle to layout; logical operation logging is
+compact but hard to make idempotent and restartable (an operation's effect depends on current state); ARIES uses the <strong>physiological</strong> middle —
+physical to a page, logical within it — getting compact records that are still idempotent per page via the page LSN. (c) Recovery makes each transaction
+all-or-nothing across a crash, but says nothing about what <em>concurrent</em> transactions may observe of each other mid-flight; e.g., two transactions could
+produce a dirty read or a lost update — an isolation failure recovery does not address. <em>Tempting wrong answer:</em> &ldquo;media recovery is just running
+ARIES again&rdquo; — ARIES assumes the disk survived; a lost disk needs a backup and the archived log, not the live one. <strong>Feed-forward:</strong> &sect;60.5.</div>
+
+<div class="solution" id="sol60.12"><span class="sol-label">60.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a page store with a WAL carrying before/after-images and page LSNs and steals some pages to
+disk; (b) recovers in three passes — analysis (losers + RedoLSN), redo (repeat history, skipping records at or below the page LSN), undo (roll back losers,
+logging a CLR with an undoNextLSN per reversal); (c) crashes mid-undo, re-runs recovery, and asserts the final state equals both the committed-only state and a
+clean recovery (this chapter: <code>P1.a=10, P2.c=20</code>), explaining that each change being undone exactly once across the two runs — never re-reversed — is
+the evidence the CLRs made recovery restartable. <em>Tempting wrong answer:</em> &ldquo;measure recovery time to show it works&rdquo; — the guarantee is the
+state equality and the once-only undo, both structural. <strong>Feed-forward:</strong> &sect;60.4.</div>
 
 </section>
 </body></html>

@@ -1,0 +1,361 @@
+<section class="chapter" id="ch58">
+<h1>Chapter 58 — Redo, Undo, and the Log Sequence Number</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch57">Chapter 57</a> (write-ahead logging, redo recovery, and the write-ahead rule — the
+mechanism this chapter completes), <a href="#ch48">Chapter 48</a> (the buffer pool and page eviction — the moment an uncommitted change can be
+<em>stolen</em> to disk), <a href="#ch41">Chapter 41</a> (<code>fsync</code> and stable storage — what &ldquo;durable&rdquo; actually requires),
+<a href="#ch46">Chapter 46</a> (sequential ~916&nbsp;MB/s versus random ~19&nbsp;MB/s — why the log is one file). &nbsp;·&nbsp; Chapter 57's store logged
+only <em>redo</em> and every logged change had already been acknowledged, so recovery was a clean replay. A real database is messier: transactions abort,
+and a page holding an <em>uncommitted</em> change can reach disk before the transaction that made it commits. This chapter adds the missing half —
+<strong>undo</strong> — and the numbering, the <strong>log sequence number</strong>, that makes both halves correct and idempotent.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch57">Chapter 57</a> — what is the write-ahead rule, and what did the redo log let recovery reconstruct? (2)
+<a href="#ch48">Chapter 48</a> — when the buffer pool needs a free frame and evicts a <em>dirty</em> page, what happens to that page's contents, even if the
+transaction that dirtied it has not committed? (3) <em>Predict:</em> a transaction updates a row, its dirty page is evicted to disk, and then the
+transaction aborts (or the machine crashes) before it commits. The redo log can re-apply committed changes, but this change was never committed and it is
+already <em>on disk</em>. What extra information would recovery need to remove it, and where would that information have to live? Write your guess;
+&sect;58.2&ndash;&sect;58.3 answer it.</p>
+</aside>
+
+<p>Chapter 57 proved that a forced redo log makes acknowledged writes survive a crash. It did so by assuming two things that a real engine cannot: that
+every logged change belonged to a transaction that <em>committed</em>, and that recovery could safely replay from the very beginning into an empty store.
+Drop the first assumption and a new failure appears. Transactions are not single writes; a <strong>transaction</strong> is a group of changes that must take
+effect all-or-nothing (the A of ACID, atomicity), bracketed by a <em>begin</em> and either a <em>commit</em> or an <em>abort</em>. Between those brackets its
+changes are provisional — and yet the buffer pool, which knows nothing of transactions, may evict a dirty page holding one of them to make room, writing a
+provisional change to disk (Chapter 48). If that transaction then aborts, or the machine crashes before it commits, the change is durable but
+<em>wrong</em>: it belongs to a transaction whose effects must vanish entirely. Redo cannot fix this — redo re-applies changes, it does not remove them.
+The database needs the opposite operation, <strong>undo</strong>: the ability to roll a change back, which means the log must record not only the
+<em>new</em> value (redo information) but also the <em>old</em> value it replaced (undo information). This chapter builds that: the transaction and why
+undo is unavoidable (&sect;58.1); the buffer-policy space — <strong>steal</strong> and <strong>no-force</strong> — that decides exactly when redo and undo
+are each required (&sect;58.2); a working store that logs both and rolls back an uncommitted transaction after a crash (&sect;58.3); and the
+<strong>log sequence number</strong> and its on-page twin, the <strong>page LSN</strong>, that make redo idempotent and recovery safe to restart
+(&sect;58.4). By the end, recovery is correct under the messy reality that Chapter 57 assumed away, and the stage is set for ARIES.</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) that builds a
+tiny page store whose write-ahead log carries <em>both</em> redo (the after-image) and undo (the before-image) for each change, every record stamped with a
+monotonic <strong>LSN</strong>; each data page carries a <strong>page LSN</strong>, the LSN of the last change applied to it. It runs a workload of two
+transactions — one that commits, one that does not — arranges for one page to be <em>stolen</em> to disk carrying the uncommitted change while another
+committed change is <em>lost</em> from memory, then recovers: a redo pass that repeats history (skipping changes already on their page, by comparing LSNs)
+and an undo pass that rolls back the uncommitted transaction. It prints how many records redo applied versus skipped, how many updates undo reversed, and
+checks that the recovered state <em>exactly</em> equals the committed-only state. This is a deterministic, structural demonstration — the recovered state
+either matches the committed-only expectation or it does not, and it does — not a wall-clock timing (<code>perf</code> is not installed on this machine, and
+the point is correctness). Performance facts (sequential versus random) are Chapter 46's measured figures, cited, not re-measured.</p>
+
+<h2>58.1 The transaction, and why redo alone is not enough</h2>
+
+<p>Chapter 57's log recorded independent, already-committed operations. Real work comes in <strong>transactions</strong>: a bracketed group of changes —
+<em>begin</em>, some updates, then <em>commit</em> or <em>abort</em> — that the database must make atomic, so that either all of the group's changes take
+effect or none do. Commit is the promise-keeping point of Chapter 57: once a transaction commits, its changes must survive (durability), which is why the
+commit forces the log. But atomicity introduces a symmetric obligation on the other side. A transaction that <em>aborts</em> — because the application asked
+to roll back, or a constraint failed, or the transaction was chosen to break a deadlock (a hazard we meet in the next part) — must leave <em>no</em> trace:
+every change it made must be reversed as if it never happened. And a transaction that is simply <em>in flight</em> when the machine crashes is, for recovery's
+purposes, an abort it never got to request: it never reached commit, so by atomicity its changes must not survive. Call such a transaction a
+<strong>loser</strong> — active at the crash, never committed — and its opposite, a committed transaction, a <strong>winner</strong>.</p>
+
+<p>Now the problem. Redo, from Chapter 57, re-applies logged changes to reconstruct state that was lost from memory — it is exactly what a winner needs, so
+its committed changes survive even if their pages never reached disk. But a loser needs the reverse. Suppose a loser updated a row, its dirty page was
+evicted to disk by the buffer pool (Chapter 48 — the pool has no idea the transaction is uncommitted; it just needs a free frame), and then the machine
+crashed. The change is now durably on disk, attached to a transaction that must have <em>no</em> effect. Redo cannot help: replaying the log re-applies the
+change, and doing nothing leaves it in place — either way the loser's write persists, violating atomicity. The only fix is to <em>remove</em> it, to restore
+the value the page held before the loser touched it. That is <strong>undo</strong>, and it needs information redo never had: the <em>before-image</em>, the
+old value. So a real log records two things per change — the new value (redo) <em>and</em> the old value (undo) — and recovery is two passes, not one: redo
+to restore winners' lost changes, undo to erase losers' surviving ones. This is the answer forming to the opener: the extra information is the before-image,
+and it has to live in the log, forced ahead of the change just like the after-image, so that after a crash the database can always find what to roll back to.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define a <em>loser</em> transaction and a <em>winner</em>, and say which recovery operation each one needs. Why can redo never substitute for undo when a
+loser's change has already reached disk? (Answer in &sect;58.2.)</p>
+</aside>
+
+<h2>58.2 Steal and no-force: the policy space that decides redo and undo</h2>
+
+<p>Whether recovery needs redo, undo, both, or neither is not arbitrary — it is fixed by two independent buffer-pool policy choices, a taxonomy owed to
+H&#228;rder and Reuter (1983). The first choice: may the buffer pool write a page dirtied by a still-uncommitted transaction back to disk? If yes, the policy
+is <strong>steal</strong> (a frame can be &ldquo;stolen&rdquo; from an uncommitted transaction and reused); if no, <strong>no-steal</strong> (dirty pages are
+pinned in memory until their transaction commits). The second choice: must all of a transaction's changes be forced to disk at commit? If yes, the policy is
+<strong>force</strong>; if no — Chapter 57's answer — <strong>no-force</strong> (commit forces only the log, and data pages drift to disk lazily). Each
+choice pins one recovery need. <strong>Steal implies undo</strong>: if an uncommitted change can reach disk, a crash can leave that change durable with its
+transaction unfinished, so recovery must be able to roll it back. <strong>No-force implies redo</strong>: if a committed transaction's data pages need not be
+on disk at commit, a crash can lose a committed change from memory, so recovery must be able to re-apply it. The two mirror the two threats of Chapter 57.1 —
+inconsistency from surviving uncommitted work (undo's job) and lost committed work (redo's job).</p>
+
+<p>Laid out as a matrix (Figure 58.1), the four combinations demand different recovery machinery. <em>No-steal + force</em> needs neither redo nor undo — no
+uncommitted change ever reaches disk (nothing to undo) and every committed change is on disk at commit (nothing to redo) — but it is the policy Chapter 57
+already ruled out: forcing scattered data on every commit caps throughput at the random-write rate (~19&nbsp;MB/s), and pinning every dirty page until commit
+strangles the buffer pool, unable to evict anything a long transaction is holding. Relaxing either constraint buys performance at the price of a recovery
+obligation. The design every serious engine actually chooses — and the one ARIES is built for — is the most permissive corner, <strong>steal + no-force</strong>:
+the buffer pool evicts freely (great memory behavior) and commit forces only the log (great commit throughput), and the bill is that recovery must implement
+<em>both</em> redo and undo. That is why this chapter needs both, and why the before-image and after-image both go in the log. This is the answer to the
+opener and the quick check: because the engine chose steal, an uncommitted change can be on disk, so recovery keeps the before-image in the log to undo it;
+redo can never do that job because redo only re-applies, and re-applying the loser's change is the opposite of removing it.</p>
+
+<p><em>(Answer to the &sect;58.1 quick check: a loser is a transaction active at the crash that never committed; a winner is one that committed. A winner
+needs <strong>redo</strong> — re-apply its changes in case they were lost from memory; a loser needs <strong>undo</strong> — remove its changes in case they
+reached disk. Redo cannot substitute for undo because redo only re-applies a change, and the loser's change must be <strong>erased</strong>, which requires the
+old value the change overwrote.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: log the before-image and the after-image; redo winners, undo losers</span>
+<p><strong>1. In words.</strong> Because the engine steals (uncommitted changes may reach disk) and does not force (committed changes may not), recovery must
+both re-apply committed changes that were lost and roll back uncommitted changes that survived. So every log record carries both the new value (redo) and the
+old value (undo); recovery redoes to restore, then undoes to erase.</p>
+<p><strong>2. As a picture.</strong> Figure 58.1: a 2&times;2 matrix, steal/no-steal against force/no-force. Each cell is labelled with the recovery it
+needs — neither, redo only, undo only, or both. The steal + no-force cell (both) is highlighted: the corner every real engine chooses, the corner this book
+builds.</p>
+<p><strong>3. As numbers.</strong> The store logs 4 update records across two transactions; one commits, one (a loser) does not. After a crash, the redo
+pass re-applies 2 records and skips 2 already on their page (by LSN), and the undo pass reverses the loser's 2 updates; the recovered state equals the
+committed-only state exactly — <em>True</em> (&sect;58.3).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 620 250" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The recovery you owe is fixed by two buffer-pool policies: STEAL demands undo, NO-FORCE demands redo.</text>
+<text x="150" y="52" font-size="10" fill="#333">FORCE data at commit</text>
+<text x="330" y="52" font-size="10" fill="#333">NO-FORCE (log only)</text>
+<text x="20" y="100" font-size="10" fill="#333" transform="rotate(-90 20 100)">NO-STEAL</text>
+<text x="20" y="185" font-size="10" fill="#333" transform="rotate(-90 20 185)">STEAL</text>
+<rect x="140" y="62" width="150" height="70" fill="#eef3f9" stroke="#14406b"/>
+<text x="150" y="90" font-size="10" fill="#14406b">neither redo</text><text x="150" y="106" font-size="10" fill="#14406b">nor undo</text>
+<text x="150" y="124" font-size="8" fill="#8c3a1d">(but forces on commit: slow)</text>
+<rect x="300" y="62" width="200" height="70" fill="#f7f2e6" stroke="#b58900"/>
+<text x="310" y="90" font-size="10" fill="#7a5c00">REDO only</text>
+<text x="310" y="108" font-size="8" fill="#7a5c00">committed change may be lost</text>
+<rect x="140" y="140" width="150" height="70" fill="#f7f2e6" stroke="#b58900"/>
+<text x="150" y="168" font-size="10" fill="#7a5c00">UNDO only</text>
+<text x="150" y="186" font-size="8" fill="#7a5c00">uncommitted change may survive</text>
+<rect x="300" y="140" width="200" height="70" fill="#dff0df" stroke="#2f7d32" stroke-width="2"/>
+<text x="310" y="164" font-size="10" fill="#2f7d32">REDO + UNDO</text>
+<text x="310" y="182" font-size="8" fill="#2f7d32">the corner every real engine picks;</text>
+<text x="310" y="196" font-size="8" fill="#2f7d32">the corner ARIES is built for</text>
+<text x="520" y="180" font-size="14" fill="#2f7d32">&#9733;</text>
+</svg>
+<figcaption>Figure 58.1: the steal/no-force policy matrix (H&#228;rder &amp; Reuter 1983). Steal makes undo mandatory (an uncommitted change can reach disk);
+no-force makes redo mandatory (a committed change can be missing from disk). Real engines choose steal + no-force — best buffer and commit behavior — and
+pay with both redo and undo, the machinery of this chapter and ARIES.</figcaption>
+</figure>
+
+<h2>58.3 A store that logs both: rolling back a loser after a crash</h2>
+
+<p>The working store makes redo and undo concrete under steal + no-force. It keeps data in pages; each change appends a log record carrying the page, key,
+<em>before</em>-image (undo), and <em>after</em>-image (redo), and — following the write-ahead rule — the record is logged before the page is touched. Two
+transactions run: <code>T1</code> writes <code>P1.a=1</code> and <code>P2.c=5</code> and commits; <code>T2</code> writes <code>P1.a=99</code> and
+<code>P2.z=7</code> and then the machine crashes before <code>T2</code> commits. To exercise both recovery passes, the durable state at the crash is chosen
+to mirror what a real buffer pool would leave: page <code>P1</code> was <em>stolen</em> to disk after <code>T2</code>'s write (so on disk <code>P1.a=99</code>,
+an uncommitted value that must be undone), while page <code>P2</code> was never flushed (so <code>T1</code>'s committed <code>P2.c=5</code> is <em>lost</em>
+from memory and must be redone). Recovery runs analysis to find the loser, a redo pass to repeat history, and an undo pass to roll the loser back:</p>
+
+<pre><code>redo + undo, the LSN and the page LSN
+  log records: 4   committed txns: ['T1']
+  on-disk P1 after STEAL (holds uncommitted T2 a=99): {'a': 99}
+  loser transactions (no commit, must be undone): ['T2']
+  redo pass: applied 2, skipped-as-already-present 2
+  undo pass: reversed 2 loser updates
+  recovered live cells: {('P1', 'a'): 1, ('P2', 'c'): 5}
+  expected (committed-only): {('P1', 'a'): 1, ('P2', 'c'): 5}
+  recovery == committed-only state: True
+  second redo pass re-applies: 0 records (idempotent)
+</code></pre>
+
+<p>Read the two passes in order. <strong>Redo</strong> re-applies every logged change whose LSN is greater than its page's page LSN — repeating history so
+that any change missing from disk is restored. Here it <em>applies 2</em>: <code>T1</code>'s <code>P2.c=5</code> (a committed change lost with the unflushed
+page — precisely what no-force forces recovery to redo) and, notably, <code>T2</code>'s <code>P2.z=7</code>, a loser's change that was also lost. Redo repeats
+<em>all</em> history, winners and losers alike, before undo sorts them out — an ARIES idea we return to in Chapter 60. It <em>skips 2</em>: the changes already
+on page <code>P1</code>, whose page LSN already covers them, so re-applying would be wasted work (and, as &sect;58.4 shows, the skip is what makes redo safe to
+repeat). <strong>Undo</strong> then walks the loser <code>T2</code>'s changes in reverse and restores each before-image: <code>P1.a</code> back to
+<code>1</code> (erasing the stolen <code>99</code>) and <code>P2.z</code> back to nothing (deleting the insert) — <em>2 updates reversed</em>. The result is
+exactly the committed-only state, <code>P1.a=1, P2.c=5</code> — <em>True</em>: <code>T1</code>'s work survived in full, <code>T2</code>'s vanished without
+trace, atomicity and durability both kept. And the final line previews &sect;58.4: run redo again on the recovered pages and it re-applies <em>0</em>
+records, because every change is now covered by its page LSN — recovery is idempotent, safe to run twice.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: undo without a before-image, or applying the change before logging it</span>
+<p>The two commonest ways to break undo are to not have the information it needs, or to have it too late. First, <strong>the missing before-image</strong>: a
+tempting &ldquo;optimization&rdquo; is to log only the new value (redo) — it is smaller, and Chapter 57's store did exactly that. But under steal, a loser's
+change can be on disk, and rolling it back requires the value the page held <em>before</em> the change; a redo-only log simply does not contain it, so the
+uncommitted write can never be removed and atomicity is lost the first time a stolen page belongs to an aborted transaction. A steal engine must log the
+before-image. Second, <strong>the undo-logging rule</strong>: the before-image must reach the log <em>before</em> the change reaches the data page on disk —
+the same write-ahead ordering as redo, and for a symmetric reason. If a data page carrying an uncommitted change were flushed before its undo record was
+durable, a crash in between would leave a change on disk with no logged before-image to reverse it to — an unrecoverable, unrollbackable state, the exact
+inconsistency of Chapter 57.1. Third, a subtler one: <strong>undo is not &ldquo;write the old value back and forget it.&rdquo;</strong> If recovery crashes
+<em>during</em> undo and a naive re-run simply re-undoes from scratch, it may try to roll back changes it already rolled back, or roll back past a value
+another action depends on. Real undo logs its own progress so it can resume, not restart — the compensation-log-record idea of Chapter 60. The honest posture:
+under steal you owe a before-image, logged ahead of the change, and an undo that records what it has already reversed — anything less is a rollback that works
+in tests and corrupts under a crash mid-recovery.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Our log records are twice as big as they need to be because we store the old value <em>and</em> the new
+value for every update. Let's drop the old value — recovery just replays the log to rebuild state, so the new value is all we ever need.&rdquo; Cover the
+paragraph and answer in four or five sentences, drawing on &sect;58.1&ndash;&sect;58.3.</p>
+<p><em>Model answer.</em> &ldquo;The old value isn't redundant — it's the <strong>undo</strong> information, and we need it precisely because we <strong>steal</strong>.
+Our buffer pool evicts dirty pages without knowing whether their transaction has committed, so an <em>uncommitted</em> change can land on disk; if that
+transaction then aborts or we crash before it commits, atomicity says its change must disappear, and removing it means restoring the value the page held
+before — the old value we'd be dropping. Redo can't do that job: replaying the log re-applies the change, the opposite of erasing it. So a redo-only log is
+fine only under no-steal, where uncommitted changes never reach disk; the moment we steal — and we do, for buffer-pool performance — we owe both images. If
+log size is the worry, the answer is compression or physiological logging, not throwing away the before-image.&rdquo; Naming steal, undo, and the
+atomicity obligation is the senior register.</p>
+</aside>
+
+<h2>58.4 The log sequence number: making redo idempotent and recovery restartable</h2>
+
+<p>One number underpins the whole scheme: the <strong>log sequence number</strong> (LSN), a monotonically increasing identifier assigned to every log record
+as it is appended. Because it only ever grows, an LSN doubles as a position in the log and a timestamp of relative order — record 500 happened before record
+501 — and that lets recovery answer the question that makes redo safe: <em>is this logged change already reflected on its data page?</em> The trick is to store,
+on each data page, the LSN of the most recent log record applied to it — the <strong>page LSN</strong> — and to write it to disk <em>with</em> the page. Now
+recovery has a per-page high-water mark. During redo it compares each log record's LSN against the page LSN of the page it targets: if the record's LSN is
+less than or equal to the page LSN, the change is already on the page (the page was flushed after that change), so recovery <em>skips</em> it; only records
+newer than the page LSN are re-applied. This is exactly the &ldquo;skipped 2&rdquo; and the &ldquo;second redo re-applies 0&rdquo; of &sect;58.3. The
+consequence is <strong>idempotence</strong>: applying the redo pass once or ten times reaches the same state, because after the first application every record
+is at or below its page LSN and every subsequent pass skips it.</p>
+
+<p>Idempotence is not a nicety; it is what makes recovery correct at all, because recovery can itself be interrupted. A crash can strike <em>during</em>
+recovery — the power is no more reliable while the database is recovering than while it is running — and the only way a second recovery attempt can be safe is
+if re-applying already-applied changes is a no-op. Without the page LSN, redo would have no way to tell an already-applied change from a missing one; it would
+blindly re-apply, and a change that is not idempotent on its own (an increment, an append, a structural pointer update) would be corrupted by the second
+application. The page LSN turns &ldquo;replay the log&rdquo; from a fragile one-shot into a repeatable operation, which is the property Chapter 60 leans on
+completely: ARIES redoes <em>all</em> history on every recovery, however many times recovery restarts, and the page LSN is what keeps that safe. Two rules,
+then, carry forward: the LSN orders the log and stamps each page so redo knows what to skip; and recovery, being interruptible, must be idempotent — which the
+page LSN delivers for redo and which, for undo, will require the compensation records of Chapter 60. Correct because ordered and skippable; safe because
+repeatable.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What is a page LSN, and how does comparing it to a log record's LSN let redo skip a change that is already on disk? Why does that skipping make recovery
+safe to run more than once, and why does an interruptible recovery need that property? (Answer below.)</p>
+</aside>
+
+<h2>58.5 What to carry forward</h2>
+
+<p>Work comes in <strong>transactions</strong> — atomic, bracketed by begin and commit/abort — which splits recovery's job in two: committed <strong>winners</strong>
+need <strong>redo</strong> (re-apply changes lost from memory), and uncommitted <strong>losers</strong> need <strong>undo</strong> (erase changes that reached
+disk), so the log must carry both a before-image and an after-image per change (&sect;58.1). Which of redo and undo you owe is fixed by two buffer policies
+(H&#228;rder &amp; Reuter 1983): <strong>steal</strong> (evict uncommitted dirty pages) forces undo, <strong>no-force</strong> (commit forces only the log)
+forces redo, and every real engine picks <strong>steal + no-force</strong> — best buffer and commit behavior — so it owes both (&sect;58.2). A store logging
+both images lost a committed change and gained a stolen uncommitted one; recovery redid 2 changes (repeating all history), skipped 2 already on their page,
+and undid the loser's 2, landing exactly on the committed-only state (&sect;58.3). The <strong>log sequence number</strong> orders the log, and its on-page
+copy, the <strong>page LSN</strong>, lets redo skip changes already durable — making redo <strong>idempotent</strong> and recovery safe to restart, which
+matters because a crash can strike during recovery (&sect;58.4). The named trap: a redo-only log under steal cannot roll back, and an undo that restarts rather
+than resumes corrupts on a mid-recovery crash.</p>
+
+<p>Two loose ends drive the rest of the part. First, &sect;58.3's recovery still scanned the log from the very beginning to find winners, losers, and lost
+changes — fine for four records, impossible for a log that has grown for months. The fix is the <strong>checkpoint</strong>: a periodic record of which
+transactions are active and which pages are dirty, letting recovery start its scan near the end of the log instead of at record one — Chapter 59. Second, this
+chapter's undo simply overwrote before-images and, as the trap warned, a crash <em>during</em> undo would leave it unable to resume cleanly; and analysis, redo,
+and undo were sketched as three separate loops rather than one disciplined protocol. The algorithm that unifies all of it — a checkpoint-anchored analysis pass,
+a redo pass that repeats history using the page LSN, and an undo pass that logs <strong>compensation records</strong> so undo is itself redoable and restartable
+— is <strong>ARIES</strong> (Mohan et&nbsp;al. 1992), the subject of Chapter 60. Redo, undo, and the LSN are its three ingredients; the next two chapters
+assemble them into a recovery method that is correct even when the crash lands in the middle of recovery.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Define a transaction, a winner, and a loser, and say which recovery operation each needs.</li>
+<li>Explain why a steal policy makes undo mandatory, and give the failure it prevents.</li>
+<li>Explain why a no-force policy makes redo mandatory.</li>
+<li>State which corner of the steal/force matrix real engines pick and what it costs them.</li>
+<li>Say what a page LSN is and how it lets redo skip an already-applied change.</li>
+<li>Explain why recovery must be idempotent, tying it to a crash during recovery.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why is a redo-only log insufficient once a transaction can abort or crash mid-flight? (&sect;58.1)</li>
+<li><strong>R2.</strong> State the steal/no-force taxonomy and which recovery operation each policy makes mandatory. (&sect;58.2)</li>
+<li><strong>R3.</strong> Walk through the store's run: what was redone, what was skipped, what was undone, and why the result is committed-only. (&sect;58.3)</li>
+<li><strong>R4.</strong> What is a page LSN and how does it make redo idempotent? (&sect;58.4)</li>
+<li><strong>R5.</strong> Why must recovery be safe to restart, and what property of redo delivers that? (&sect;58.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Theo H&#228;rder &amp; Andreas Reuter, &ldquo;Principles of Transaction-Oriented Database Recovery,&rdquo; <em>ACM Computing Surveys</em> 15(4),
+1983, pp. 287&ndash;317, DOI 10.1145/289.291.</strong> The paper that named the steal/no-steal and force/no-force policy space of &sect;58.2 (and coined the
+ACID acronym); the source for why steal implies undo and no-force implies redo. First author Theo H&#228;rder; venue, volume, issue, pages, year, and DOI
+verified via DBLP and the ACM Digital Library, and the DOI resolves.</li>
+<li><strong>C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh &amp; Peter Schwarz, &ldquo;ARIES: A Transaction Recovery Method Supporting
+Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging,&rdquo; <em>ACM Transactions on Database Systems</em> 17(1), 1992, pp.
+94&ndash;162, DOI 10.1145/128765.128770.</strong> The algorithm that assembles redo, undo, the LSN, and the page LSN into a complete recovery method
+(Chapter 60); the origin of the page-LSN comparison that makes redo idempotent. First author C. Mohan; venue, volume, issue, pages, year, and DOI verified
+via the ACM Digital Library and DBLP, and the DOI resolves.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992, ISBN 978-1-55860-190-1.</strong>
+The definitive treatment of transactions, logging, and the redo/undo obligations of each policy — the full development behind &sect;58.1&ndash;&sect;58.2.
+Authors, publisher, year, and ISBN verified via the publisher listing and the Library of Congress record.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, pp. 141&ndash;259, DOI 10.1561/1900000002.</strong> A concise modern account of where logging and the LSN sit in a full
+engine, and how the buffer pool and log manager cooperate under steal + no-force. First author Joseph M. Hellerstein; venue, volume, issue, pages, year, and
+DOI verified via now publishers and the ACM Digital Library, and the DOI resolves.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex58.1"><span class="ex-label">58.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define a transaction, a winner, and a loser.</div>
+
+<div class="exercise" id="ex58.2"><span class="ex-label">58.2</span> <span class="ex-tag warm">warm-up</span>
+What two pieces of information must a log record carry to support both redo and undo, and which is which?</div>
+
+<div class="exercise" id="ex58.3"><span class="ex-label">58.3</span> <span class="ex-tag warm">warm-up</span>
+Define the steal and no-force policies in one sentence each.</div>
+
+<div class="exercise" id="ex58.4"><span class="ex-label">58.4</span> <span class="ex-tag core">core</span>
+Redo versus undo. (a) Which recovery operation does a winner need, and why? (b) Which does a loser need, and why? (c) Explain concretely why redo cannot do
+undo's job when a loser's change has already reached disk.</div>
+
+<div class="exercise" id="ex58.5"><span class="ex-label">58.5</span> <span class="ex-tag core">core</span>
+The policy matrix. (a) For each of the four steal/no-steal &times; force/no-force cells, state which of redo and undo it requires. (b) Which cell needs
+neither, and why is it nonetheless a poor choice? (c) Which cell do real engines pick, what does it buy, and what recovery bill does it pay?</div>
+
+<div class="exercise" id="ex58.6"><span class="ex-label">58.6</span> <span class="ex-tag core">core</span>
+The store's run. Using the output (4 records, one committing transaction, redo applies 2 and skips 2, undo reverses 2): (a) which committed change was redone
+and why was it missing from disk? (b) why did redo also re-apply a loser's change? (c) what did undo restore, and why is the final state committed-only?</div>
+
+<div class="exercise" id="ex58.7"><span class="ex-label">58.7</span> <span class="ex-tag core">core</span>
+The page LSN. (a) What is stored in a page LSN and when is it updated? (b) Give the exact comparison redo uses to decide whether to skip a log record. (c)
+Explain why this makes the redo pass idempotent.</div>
+
+<div class="exercise" id="ex58.8"><span class="ex-label">58.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team runs a steal + no-force engine but, to shrink the log, records only the after-image (redo) for each
+update.
+<br><strong>Step 1 (given):</strong> transaction <code>T</code> updates row <code>r</code> from <code>5</code> to <code>8</code>; the log records only
+<code>r=8</code>.
+<br><strong>Step 2 (given):</strong> the buffer pool steals <code>r</code>'s dirty page to disk before <code>T</code> commits.
+<br><strong>Step 3 (given):</strong> <code>T</code> aborts (or the machine crashes before <code>T</code> commits), so <code>T</code> is a loser.
+<br><strong>Step 4 (you):</strong> Explain what recovery must now do to <code>r</code>, why the redo-only log makes it impossible, exactly what information
+was missing, and the one-line fix.</div>
+
+<div class="exercise" id="ex58.9"><span class="ex-label">58.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>steal</em>, <em>no-force</em>, <em>redo</em>, <em>undo</em>, or <em>page LSN</em> — and why: (a) re-applying a
+committed change that never reached disk; (b) rolling back an aborted transaction's change; (c) the policy that lets the buffer pool evict an uncommitted
+dirty page; (d) the policy under which commit forces only the log; (e) the per-page value that lets redo skip an already-applied change.</div>
+
+<div class="exercise" id="ex58.10"><span class="ex-label">58.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A no-steal policy makes undo unnecessary.&rdquo; (b) &ldquo;Under no-force,
+a committed transaction's data pages are guaranteed on disk at commit.&rdquo; (c) &ldquo;Redo re-applies changes; undo removes them.&rdquo; (d) &ldquo;The page
+LSN is stored only in the log, not on the page.&rdquo; (e) &ldquo;Because recovery can itself crash, redo must be idempotent.&rdquo;</div>
+
+<div class="exercise" id="ex58.11"><span class="ex-label">58.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) The store scanned the whole log to find losers and lost changes; explain why that does not scale and what a <em>checkpoint</em> would
+record to bound it. (b) The undo pass here simply overwrote before-images; explain what could go wrong if a crash struck midway through undo and a re-run
+started undo from scratch, and why a record of undo's own progress is needed. (c) Redo repeated <em>all</em> history, including losers' changes, before undo
+ran; give one reason a recovery algorithm might deliberately redo losers' changes rather than skip them (hint: consider what the page LSN needs to be correct).</div>
+
+<div class="exercise" id="ex58.12"><span class="ex-label">58.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build a page store whose log records carry both a before-image and an after-image, each stamped with a monotonic LSN,
+and stamp each page with a page LSN. (b) Run two transactions — one committing, one not — arrange for one page to be flushed carrying the uncommitted change
+and another committed change to be lost, then recover with a redo pass (skipping records at or below the page LSN) and an undo pass (restoring the loser's
+before-images). (c) Assert the recovered state equals the committed-only state, run redo a second time and confirm it applies zero records, and explain why
+that second-pass result is the evidence that recovery is idempotent.</div>
+
+</section>
+</section>

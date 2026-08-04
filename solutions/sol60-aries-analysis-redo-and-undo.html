@@ -1,0 +1,87 @@
+<section class="solutions" id="sol60">
+<h1>Chapter 60 — Solutions</h1>
+
+<div class="solution" id="sol60.1"><span class="sol-label">60.1</span>
+<strong>Analysis</strong> — scan from the checkpoint to find the losers and the RedoLSN. <strong>Redo</strong> — scan from the RedoLSN, repeating history by
+re-applying every change past its page LSN. <strong>Undo</strong> — scan backward, rolling back the losers and logging a compensation record per reversal.
+<em>Tempting wrong answer:</em> &ldquo;redo, undo, analysis&rdquo; — analysis must come first; redo and undo depend on the losers and RedoLSN it produces.
+<strong>Feed-forward:</strong> &sect;60.1.</div>
+
+<div class="solution" id="sol60.2"><span class="sol-label">60.2</span>
+The <strong>loser set</strong> (transactions active at the crash with no commit), used by undo; and the <strong>RedoLSN</strong> (the minimum recLSN in the
+dirty-page table), used by redo as its starting point. <em>Tempting wrong answer:</em> &ldquo;analysis redoes the changes&rdquo; — analysis only reads the log and
+builds tables in memory; it touches no data page. <strong>Feed-forward:</strong> &sect;60.2.</div>
+
+<div class="solution" id="sol60.3"><span class="sol-label">60.3</span>
+Repeat history means redo re-applies <em>every</em> logged change past its page LSN — committed or not — so the pages are reconstructed to the exact state they
+held at the instant of the crash, before undo removes the losers. <em>Tempting wrong answer:</em> &ldquo;replay only the winners&rdquo; — that is precisely what
+repeat-history does <em>not</em> do; redoing losers too is what keeps the passes simple and restartable. <strong>Feed-forward:</strong> &sect;60.1.</div>
+
+<div class="solution" id="sol60.4"><span class="sol-label">60.4</span>
+(a) Analysis scans forward from the last checkpoint to the end of the log, reading update/commit/end records and updating the transaction table and dirty-page
+table in memory. (b) Redo starts at the RedoLSN; for each record it applies the change only if the record's LSN exceeds the target page's page LSN (otherwise the
+change is already on the page and it skips). (c) Undo processes a loser's changes newest-to-oldest (following the back-pointer chain), restoring each
+before-image and logging a CLR. <em>Tempting wrong answer:</em> &ldquo;redo starts at the checkpoint&rdquo; — it starts at the RedoLSN, which can be earlier than
+the checkpoint. <strong>Feed-forward:</strong> &sect;60.2&ndash;&sect;60.4.</div>
+
+<div class="solution" id="sol60.5"><span class="sol-label">60.5</span>
+(a) So the pages are reconstructed to the exact crash-time state, giving undo a consistent basis and every page a correct page LSN. (b) Immediately after redo the
+pages hold everything that existed at the crash — including losers' uncommitted values (in the run, <code>P1={a:777}</code>, <code>P2={c:20,d:40}</code>,
+<code>P3={e:30}</code>). (c) Two breakages: redo would need to know each transaction's fate before repeating its change (it does not, until analysis is fully
+digested per change), and the pages would reach a state that never actually existed, corrupting the page-LSN high-water marks that make redo idempotent.
+<em>Tempting wrong answer:</em> &ldquo;redoing losers wastes effort and risks leaving their changes in&rdquo; — undo removes them right after; the reconstruction
+is what makes undo and restart correct. <strong>Feed-forward:</strong> &sect;60.1, &sect;60.3.</div>
+
+<div class="solution" id="sol60.6"><span class="sol-label">60.6</span>
+(a) Redo re-applied <code>T1</code>'s <code>P2.c=20</code> (committed) and <code>T3</code>'s <code>P2.d=40</code> (loser), both missing because page
+<code>P2</code> was never flushed. (b) The stolen pages already held <code>T2</code>'s <code>P1.a=777</code> and <code>T3</code>'s <code>P3.e=30</code>, whose page
+LSNs already covered those records, so redo skipped them. (c) Undo restored <code>P1.a</code> to its before-image <code>10</code> (erasing <code>777</code>) and
+deleted <code>P2.d</code> and <code>P3.e</code>, leaving <code>P1.a=10, P2.c=20</code>. <em>Tempting wrong answer:</em> &ldquo;redo re-applied <code>P1.a=777</code>&rdquo;
+— it skipped it; <code>P1</code> was stolen with that value already on it. <strong>Feed-forward:</strong> &sect;60.3&ndash;&sect;60.4.</div>
+
+<div class="solution" id="sol60.7"><span class="sol-label">60.7</span>
+(a) The value it wrote (the before-image), so redo can replay the reversal after a crash; and the <strong>undoNextLSN</strong>, pointing to the next change still
+to be undone for that transaction, so undo can resume. (b) A CLR is redo-only because it records a reversal that has already been decided and must simply be
+re-applied on restart — undoing it would re-introduce the loser's change. (c) The one-way property guarantees recovery <em>terminates</em>: undo never generates
+new work to undo, so the rollback cannot loop. <em>Tempting wrong answer:</em> &ldquo;a CLR is undone if we roll back further&rdquo; — CLRs are never undone; the
+undoNextLSN chain skips past already-compensated changes. <strong>Feed-forward:</strong> &sect;60.4.</div>
+
+<div class="solution" id="sol60.8"><span class="sol-label">60.8</span>
+<strong>Step 4:</strong> Undo resumes at LSN 41 (the last CLR's undoNextLSN), reverses the change at 41, then 40 — it does <em>not</em> re-reverse 42, because the
+persisted CLR advanced undoNextLSN past it. When <code>T</code> is fully undone it has three CLRs, one per original change (42, 41, 40), each written exactly once
+across the two runs. No change is undone twice because the durable CLR's undoNextLSN records that 42 was already compensated, so restart resumes below it rather
+than restarting the chain. <em>Tempting wrong answer:</em> &ldquo;undo restarts at 42 and writes a fourth CLR&rdquo; — the undoNextLSN exists precisely to prevent
+that re-reversal. <strong>Feed-forward:</strong> &sect;60.4.</div>
+
+<div class="solution" id="sol60.9"><span class="sol-label">60.9</span>
+(a) <strong>Redo</strong> — re-apply every change past its page LSN. (b) <strong>Undo</strong> — reverse a loser's changes newest-to-oldest. (c)
+<strong>Compensation log record</strong> — logged as each reversal happens. (d) <strong>Analysis</strong> — rebuild the tables from the checkpoint. (e)
+<strong>Repeat history</strong> — reconstruct the exact crash-time state first. <em>Tempting wrong answer:</em> calling (a) &ldquo;repeat history&rdquo; — repeat
+history is the <em>principle</em>; (a) names the pass, redo, that implements it. <strong>Feed-forward:</strong> &sect;60.1&ndash;&sect;60.4.</div>
+
+<div class="solution" id="sol60.10"><span class="sol-label">60.10</span>
+(a) <strong>False</strong> — redo re-applies all changes past their page LSN, committed or not (repeat history). (b) <strong>False</strong> — undo runs last,
+after analysis and redo. (c) <strong>False</strong> — a CLR is redo-only and never undone; that is what guarantees termination. (d) <strong>False</strong> —
+analysis only reads the log and builds tables in memory; it does not touch data pages. (e) <strong>True</strong> — the undoNextLSN is exactly what lets undo
+resume rather than restart. <em>Tempting wrong answer:</em> marking (a) true because &ldquo;only committed work should survive&rdquo; — it should, but that is
+undo's job; redo faithfully repeats everything first. <strong>Feed-forward:</strong> &sect;60.1&ndash;&sect;60.4.</div>
+
+<div class="solution" id="sol60.11"><span class="sol-label">60.11</span>
+(a) A crash loses volatile memory but the disk survives; if the <em>disk</em> is lost or corrupted, the on-disk pages and page LSNs are gone, so recovery needs a
+prior <strong>backup</strong> plus an <strong>archived log</strong> spanning from the backup forward, replaying the archived log onto the restored backup (media
+recovery) rather than onto the live disk. (b) Physical byte-image logging is simple and idempotent but bulky and brittle to layout; logical operation logging is
+compact but hard to make idempotent and restartable (an operation's effect depends on current state); ARIES uses the <strong>physiological</strong> middle —
+physical to a page, logical within it — getting compact records that are still idempotent per page via the page LSN. (c) Recovery makes each transaction
+all-or-nothing across a crash, but says nothing about what <em>concurrent</em> transactions may observe of each other mid-flight; e.g., two transactions could
+produce a dirty read or a lost update — an isolation failure recovery does not address. <em>Tempting wrong answer:</em> &ldquo;media recovery is just running
+ARIES again&rdquo; — ARIES assumes the disk survived; a lost disk needs a backup and the archived log, not the live one. <strong>Feed-forward:</strong> &sect;60.5.</div>
+
+<div class="solution" id="sol60.12"><span class="sol-label">60.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a page store with a WAL carrying before/after-images and page LSNs and steals some pages to
+disk; (b) recovers in three passes — analysis (losers + RedoLSN), redo (repeat history, skipping records at or below the page LSN), undo (roll back losers,
+logging a CLR with an undoNextLSN per reversal); (c) crashes mid-undo, re-runs recovery, and asserts the final state equals both the committed-only state and a
+clean recovery (this chapter: <code>P1.a=10, P2.c=20</code>), explaining that each change being undone exactly once across the two runs — never re-reversed — is
+the evidence the CLRs made recovery restartable. <em>Tempting wrong answer:</em> &ldquo;measure recovery time to show it works&rdquo; — the guarantee is the
+state equality and the once-only undo, both structural. <strong>Feed-forward:</strong> &sect;60.4.</div>
+
+</section>

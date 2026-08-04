@@ -1,0 +1,87 @@
+<section class="solutions" id="sol58">
+<h1>Chapter 58 — Solutions</h1>
+
+<div class="solution" id="sol58.1"><span class="sol-label">58.1</span>
+A <strong>transaction</strong> is a group of changes bracketed by begin and commit/abort that must take effect all-or-nothing (atomicity). A <strong>winner</strong>
+is a transaction that committed before the crash; a <strong>loser</strong> is one that was active at the crash and never committed. <em>Tempting wrong answer:</em>
+&ldquo;a loser is a transaction whose changes were lost&rdquo; — a loser is defined by <em>not committing</em>, not by what reached disk; its changes may well be
+on disk, which is exactly why undo is needed. <strong>Feed-forward:</strong> &sect;58.1.</div>
+
+<div class="solution" id="sol58.2"><span class="sol-label">58.2</span>
+The <strong>after-image</strong> (the new value) is redo information — used to re-apply the change; the <strong>before-image</strong> (the old value) is undo
+information — used to reverse it. <em>Tempting wrong answer:</em> &ldquo;only the new value, since recovery just replays&rdquo; — that suffices only under no-steal;
+under steal you must also store the old value to roll uncommitted changes back. <strong>Feed-forward:</strong> &sect;58.1.</div>
+
+<div class="solution" id="sol58.3"><span class="sol-label">58.3</span>
+<strong>Steal:</strong> the buffer pool may write a page dirtied by an uncommitted transaction back to disk (steal its frame). <strong>No-force:</strong>
+a transaction's data pages need not be forced to disk at commit — commit forces only the log. <em>Tempting wrong answer:</em> &ldquo;no-force means data is never
+written&rdquo; — data pages are written lazily; no-force only removes the force-at-commit requirement. <strong>Feed-forward:</strong> &sect;58.2.</div>
+
+<div class="solution" id="sol58.4"><span class="sol-label">58.4</span>
+(a) A winner needs <strong>redo</strong>: under no-force its committed changes may not have reached disk, so recovery must re-apply them to keep durability. (b)
+A loser needs <strong>undo</strong>: under steal its uncommitted changes may have reached disk, so recovery must remove them to keep atomicity. (c) Redo only
+<em>re-applies</em> a change; when a loser's change is already on disk, re-applying it (or doing nothing) leaves it in place, whereas undo must <em>erase</em> it
+by restoring the before-image — the opposite operation. <em>Tempting wrong answer:</em> &ldquo;recovery can just skip the loser's records&rdquo; — skipping leaves
+the stolen change durable on disk; it must be actively rolled back. <strong>Feed-forward:</strong> &sect;58.1&ndash;&sect;58.2.</div>
+
+<div class="solution" id="sol58.5"><span class="sol-label">58.5</span>
+(a) No-steal + force: neither. No-steal + no-force: redo only. Steal + force: undo only. Steal + no-force: both. (b) No-steal + force needs neither, but it
+forces scattered data on every commit (random-write throughput, ~19&nbsp;MB/s) and pins every dirty page until commit (crippling the buffer pool) — correct but
+slow. (c) Real engines pick <strong>steal + no-force</strong>: it buys free buffer eviction and log-only commit (fast), and the bill is implementing both redo
+and undo. <em>Tempting wrong answer:</em> &ldquo;pick no-steal + force to avoid the complexity&rdquo; — the performance cost is prohibitive; the complexity of
+redo+undo is the accepted price. <strong>Feed-forward:</strong> &sect;58.2.</div>
+
+<div class="solution" id="sol58.6"><span class="sol-label">58.6</span>
+(a) <code>T1</code>'s <code>P2.c=5</code> was redone; it was missing because page <code>P2</code> was never flushed, so under no-force the committed change
+lived only in the lost memory. (b) Redo repeats <em>all</em> history — winners and losers — so <code>T2</code>'s lost <code>P2.z=7</code> was also re-applied;
+undo sorts losers out afterward. (c) Undo restored <code>T2</code>'s before-images (<code>P1.a</code> back to <code>1</code>, deleting <code>P2.z</code>), leaving
+only <code>T1</code>'s committed effects — the committed-only state. <em>Tempting wrong answer:</em> &ldquo;redo skipped the loser's changes because they were
+uncommitted&rdquo; — redo does not distinguish; it repeated them, and undo removed them. <strong>Feed-forward:</strong> &sect;58.3.</div>
+
+<div class="solution" id="sol58.7"><span class="sol-label">58.7</span>
+(a) The page LSN stores the LSN of the most recent log record applied to that page, and is updated (and written to disk with the page) each time a change is
+applied to it. (b) Redo skips a record when its LSN &le; the target page's page LSN (the change is already on the page); it re-applies only records whose LSN is
+greater. (c) After one redo pass every applied record's LSN is &le; its page LSN, so every subsequent pass skips it — applying redo once or many times reaches
+the same state. <em>Tempting wrong answer:</em> &ldquo;compare the LSN to the newest record in the log&rdquo; — the comparison is against the <em>page's</em> LSN,
+which records how far that specific page has been brought up to date. <strong>Feed-forward:</strong> &sect;58.4.</div>
+
+<div class="solution" id="sol58.8"><span class="sol-label">58.8</span>
+<strong>Step 4:</strong> Because <code>T</code> is a loser, atomicity requires that its change to <code>r</code> be erased — <code>r</code> must be restored to the
+value it held before <code>T</code>, namely <code>5</code>. The redo-only log cannot do this: it recorded only <code>r=8</code> (the after-image), and undo needs
+the <em>before</em>-image, <code>5</code>, which was never logged — so there is no durable record of what to roll back to, and the stolen <code>8</code> is stuck
+on disk. The one-line fix: log the before-image as well as the after-image for every update (and, per the write-ahead rule, force it before the page is stolen).
+<em>Tempting wrong answer:</em> &ldquo;re-run the transaction to overwrite <code>r</code>&rdquo; — the transaction aborted; there is no correct value to
+re-derive without the before-image. <strong>Feed-forward:</strong> &sect;58.1&ndash;&sect;58.3.</div>
+
+<div class="solution" id="sol58.9"><span class="sol-label">58.9</span>
+(a) <strong>Redo</strong> — re-apply a committed change lost from disk. (b) <strong>Undo</strong> — roll back an aborted transaction's change. (c)
+<strong>Steal</strong> — evict an uncommitted dirty page. (d) <strong>No-force</strong> — commit forces only the log. (e) <strong>Page LSN</strong> — per-page
+high-water mark that lets redo skip. <em>Tempting wrong answer:</em> swapping (c) and (d) — steal is about eviction of uncommitted pages; no-force is about not
+forcing at commit. <strong>Feed-forward:</strong> &sect;58.2&ndash;&sect;58.4.</div>
+
+<div class="solution" id="sol58.10"><span class="sol-label">58.10</span>
+(a) <strong>True</strong> — under no-steal no uncommitted change ever reaches disk, so there is nothing to undo. (b) <strong>False</strong> — no-force means the
+pages may <em>not</em> be on disk at commit; only the log is forced, so redo is needed. (c) <strong>True</strong> — that is exactly the redo/undo split. (d)
+<strong>False</strong> — the page LSN is stored on the page (and written to disk with it); the log stores the record LSNs. (e) <strong>True</strong> — a crash can
+strike during recovery, so re-applying already-applied changes must be a no-op. <em>Tempting wrong answer:</em> marking (b) true because &ldquo;committed sounds
+durable&rdquo; — durability under no-force comes from the forced log, not from the data pages being on disk. <strong>Feed-forward:</strong> &sect;58.2&ndash;&sect;58.4.</div>
+
+<div class="solution" id="sol58.11"><span class="sol-label">58.11</span>
+(a) Scanning the whole log costs time proportional to all history, which grows without bound; a <strong>checkpoint</strong> periodically records the active
+transactions and the dirty pages (with the oldest not-yet-flushed LSN per page) so recovery can start its scan near the end of the log. (b) If a crash struck
+mid-undo and a re-run started undo from scratch, it could try to reverse changes it already reversed — double-undo — or roll back past a value later work depends
+on, corrupting the store; undo therefore needs a durable record of what it has already reversed so it can resume. (c) Redoing losers' changes first makes every
+page's page LSN reflect the true latest logged change on it, so the page LSN is a correct high-water mark for the whole log — undo can then proceed knowing
+history has been faithfully repeated, and undo's own actions are logged and redone the same way. <em>Tempting wrong answer:</em> &ldquo;redoing losers is wasted
+work&rdquo; — it is what keeps the page LSN and the redo/undo protocol uniform and restartable (Chapter 60). <strong>Feed-forward:</strong> &sect;58.5.</div>
+
+<div class="solution" id="sol58.12"><span class="sol-label">58.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a page store logging a before-image and after-image per change with a monotonic LSN and a
+per-page page LSN; (b) runs a committing and a non-committing transaction, flushes one page carrying the uncommitted change and loses one committed change,
+then redoes (skipping records at or below the page LSN) and undoes (restoring the loser's before-images); (c) asserts the recovered state equals the
+committed-only state (this chapter: recovered <code>P1.a=1, P2.c=5</code>), reruns redo to confirm zero records are applied, and explains that the zero-apply
+second pass is the evidence of idempotence — every change is now covered by its page LSN, so replay is a no-op and recovery is safe to restart.
+<em>Tempting wrong answer:</em> &ldquo;report the recovery time&rdquo; — the result is the correctness and idempotence of recovery, not its speed.
+<strong>Feed-forward:</strong> &sect;58.3&ndash;&sect;58.4.</div>
+
+</section>

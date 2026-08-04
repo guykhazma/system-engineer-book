@@ -1,0 +1,121 @@
+<section class="solutions" id="sol10">
+<h1>Chapter 10 — Solutions</h1>
+
+<div class="solution" id="sol10.1"><span class="sol-label">10.1</span>
+<strong>Undefined behavior:</strong> the standard imposes <em>no requirements</em> (C §3.4.3) — the program
+has no meaning on the triggering input. <strong>Unspecified behavior:</strong> the standard offers two or
+more valid possibilities and does not say which you get (e.g. argument evaluation order). <strong>Implementation-
+defined:</strong> unspecified but the implementation must <em>document</em> its choice (e.g. <code>sizeof(int)</code>).
+Only <strong>undefined</strong> behavior grants the optimizer license to assume the situation never happens.
+<strong>Feed-forward:</strong> §10.1.</div>
+
+<div class="solution" id="sol10.2"><span class="sol-label">10.2</span>
+<strong>Unsigned</strong> integer overflow is <em>not</em> UB — it is defined to wrap modulo 2<sup>n</sup>.
+<strong>Signed</strong> integer overflow <em>is</em> undefined behavior. The defined case (unsigned) yields
+the mathematically correct value reduced modulo 2<sup>n</sup> (i.e. the low <em>n</em> bits).
+<em>Tempting wrong answer:</em> "both wrap, it's two's complement" — the hardware may wrap, but the
+<em>language</em> leaves signed overflow undefined, which is what the optimizer exploits. <strong>Feed-forward:</strong>
+§10.3.</div>
+
+<div class="solution" id="sol10.3"><span class="sol-label">10.3</span>
+Most likely explanation: the program contains <strong>undefined behavior</strong> that was harmless-looking
+at <code>-O0</code> but that the optimizer exploited at <code>-O2</code> (it assumed the UB never happens and
+transformed the code). The two flags to hunt it: <code>-fsanitize=undefined</code> (UBSan) and
+<code>-fsanitize=address</code> (ASan), ideally with <code>-Wall -Wextra</code>. <em>Tempting wrong answer:</em>
+"the optimizer has a bug" — far more often the UB was already there. <strong>Feed-forward:</strong> §10.2, §10.4.</div>
+
+<div class="solution" id="sol10.4"><span class="sol-label">10.4</span>
+Signed overflow is UB, so the compiler may assume <code>x + 1</code> never overflows; if it never overflows,
+<code>x + 1 &gt; x</code> is always true, so the function folds to <code>return 1</code> (on this machine,
+<code>movl $1, %eax; ret</code>). What breaks: a programmer using <code>if (x + 1 &lt; x)</code> to detect
+overflow relies on the overflow <em>happening</em> and wrapping — but that is UB, so the compiler assumes it
+cannot happen and deletes the check. Correct detection: compile with <code>-fwrapv</code> (defines signed
+overflow as wraparound), or do the arithmetic in an unsigned type, or use <code>__builtin_add_overflow</code>,
+which reports overflow without invoking UB. <em>Tempting wrong answer:</em> "test after the add" — testing
+<em>after</em> signed overflow is testing after UB. <strong>Feed-forward:</strong> §10.3–10.4.</div>
+
+<div class="solution" id="sol10.5"><span class="sol-label">10.5</span>
+(a) The UB is a <strong>null-pointer dereference</strong>: <code>t-&gt;sk</code> dereferences <code>t</code>
+before it is checked. (b) Because dereferencing null is UB, the compiler may assume <code>t</code> was non-null
+at the dereference, so <code>if (!t)</code> is provably false and is deleted as dead code. (c) Fix: move the
+check before the dereference — <code>if (!t) return -1; int *sk = t-&gt;sk; return *sk;</code>. (d) The flag
+that preserves the check without moving code: <code>-fno-delete-null-pointer-checks</code>. The pattern is the
+real Linux kernel bug <strong>CVE-2009-1897</strong> (<code>tun_chr_poll</code>). <em>Tempting wrong answer:</em>
+"the check is there, so it's fine" — it is there in the source, not in the binary. <strong>Feed-forward:</strong>
+§10.3.</div>
+
+<div class="solution" id="sol10.6"><span class="sol-label">10.6</span>
+The compiler is behaving correctly under the <strong>as-if rule</strong>: it must preserve the observable
+behavior of a <em>well-defined</em> program, but a program that dereferences a possibly-null pointer has
+undefined behavior on the null input, so there is no observable behavior it must preserve there. Given the
+dereference <code>t-&gt;sk</code>, the compiler infers <code>t != NULL</code> and legally removes the redundant
+<code>if (!t)</code>. The code, not the compiler, is wrong: the check comes after the dereference it is meant
+to guard. <em>Tempting wrong answer:</em> "the source clearly has the check, so the compiler dropped correct
+code" — to the optimizer, a check after a dereference is a statement the pointer was already non-null.
+<strong>Feed-forward:</strong> §10.2.</div>
+
+<div class="solution" id="sol10.7"><span class="sol-label">10.7</span>
+(a) Mandating checks would insert a bounds check on every array access, an overflow check on every signed
+add, and a null check on every dereference — runtime cost on the hot path of essentially every program. (b)
+One optimization signed-overflow UB enables: treating a loop counter as unable to wrap, so the compiler can
+prove loop termination, promote the counter to a wider type, or strength-reduce — none guaranteed if overflow
+were defined to wrap. (c) The bargain: the programmer gives up "defined behavior in the bad case" (and takes
+on the duty never to trigger UB); the compiler gains the freedom to generate fast code across all hardware
+without pervasive safety checks. <em>Tempting wrong answer:</em> "UB is just a mistake in the standard" — it
+is a deliberate performance/portability choice. <strong>Feed-forward:</strong> §10.4.</div>
+
+<div class="solution" id="sol10.8"><span class="sol-label">10.8</span>
+<strong>Step 4:</strong> Fix: the bounds check must come <em>before</em> the access — check
+<code>if (i &lt; 0 || i &gt;= n) return; </code> (or handle the error) <em>then</em> touch <code>a[i]</code>,
+including for logging. A sanitizer that would have flagged the original out-of-bounds access at runtime:
+<strong>AddressSanitizer</strong> (<code>-fsanitize=address</code>) for a heap/stack array, or UBSan's bounds
+check for a known-size array. Moving the log line is not "just reordering output": once <code>a[i]</code>
+executes, the compiler may <em>prove</em> <code>0 &lt;= i &lt; n</code> (else UB) and delete the later check —
+so the position of the access changes what the compiler is allowed to assume about <code>i</code>, not merely
+when a byte is printed. <em>Tempting wrong answer:</em> "it's just a logging line, order doesn't matter" — the
+access is what licenses the deletion. <strong>Feed-forward:</strong> §10.2–10.3.</div>
+
+<div class="solution" id="sol10.9"><span class="sol-label">10.9</span>
+(a) <strong>Implementation-defined</strong> — <code>sizeof(int)</code> varies but must be documented. (b)
+<strong>Unspecified</strong> — the order of evaluating <code>a()</code> and <code>b()</code> is one of two
+valid, undocumented choices. (c) <strong>Undefined</strong> — <code>INT_MAX + 1</code> is signed overflow. (d)
+<strong>Implementation-defined</strong> — right-shift of a negative signed integer is implementation-defined
+(the standard lets the implementation choose arithmetic vs. logical shift and document it). (e) <strong>Undefined
+behavior</strong> (in general) — reading a <code>malloc</code>'d block before writing it uses an indeterminate
+value (the §9.3 memory bug). <em>Method-selection cue:</em> "varies but documented" &rarr; impl-defined; "two
+valid orders" &rarr; unspecified; "no meaning at all" &rarr; undefined. <strong>Feed-forward:</strong> §10.1, §9.3.</div>
+
+<div class="solution" id="sol10.10"><span class="sol-label">10.10</span>
+Least to most effective: (a) <code>-O0</code> — <em>hides</em> the bug (the UB remains; a future build or a
+different path re-exposes it); (b) <code>volatile</code> — also <em>hides</em> it (it defeats some optimizer
+assumptions but does not remove the UB, and is fragile and slow); (c) <code>-fsanitize=undefined,address</code>
+plus fixing what it reports — <em>removes</em> the bug by finding and eliminating the actual UB. So the order
+is (a) &lt; (b) &lt; (c), and only (c) removes rather than hides. <em>Tempting wrong answer:</em> "compile at
+<code>-O0</code> in production to be safe" — you keep the bug and lose performance. <strong>Feed-forward:</strong>
+§10.4.</div>
+
+<div class="solution" id="sol10.11"><span class="sol-label">10.11</span>
+(a) The standard says a program that executes UB has undefined behavior for that <em>execution</em> — not just
+from the buggy line onward — so the compiler need not preserve observable effects that occur before the UB
+either; it may hoist, sink, or delete surrounding work ("UB can time-travel," in Regehr's phrasing). (b)
+Concrete scenario: an upstream <code>t-&gt;sk</code> lets the compiler delete a downstream <code>if (!t)
+return ERR;</code>; a caller that would have safely returned an error on a null <code>t</code> now falls
+through into code that trusts <code>t</code>, and an attacker who maps memory at address 0 reaches it — a
+would-be crash becomes a silent privilege escalation (the CVE-2009-1897 shape). (c) A static guarantee is
+stronger because a runtime sanitizer only catches UB on the <em>inputs and paths you actually execute</em>
+during testing, whereas "the safe subset has no UB" holds for <em>all</em> executions — a proof, not a spot
+check. <em>Tempting wrong answer:</em> "sanitizers make UB safe" — they detect it on exercised paths only.
+<strong>Feed-forward:</strong> §10.2, §10.5, Part 5.</div>
+
+<div class="solution" id="sol10.12"><span class="sol-label">10.12</span>
+Machine-specific by design. A correct write-up reports: at <code>-O2</code>, <code>x + 1 &gt; x</code> folds
+to <code>return 1</code> (on the book's machine, <code>movl $1, %eax; ret</code>), and adding
+<code>-fwrapv</code> makes the addition and comparison reappear; for <code>poll</code>, the default
+<code>-O2</code> omits the <code>testq %rdi,%rdi</code> null check while
+<code>-fno-delete-null-pointer-checks</code> restores it. The signed-overflow program should be flagged by
+<code>-fsanitize=undefined</code> as a runtime error (<code>signed integer overflow</code>). Essential
+discipline: report only observed assembly/output and label the compiler/version (gcc 11.4.0, x86-64 here),
+since exact instructions and wording vary. <em>Tempting wrong answer:</em> "the assembly will be the same as
+mine" — it depends on compiler and version. <strong>Feed-forward:</strong> §10.3–10.4.</div>
+
+</section>

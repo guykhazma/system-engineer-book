@@ -1,0 +1,431 @@
+<section class="chapter" id="ch12">
+<h1>Chapter 12 — Custom Allocators: Arenas, Pools &amp; Free Lists</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch09">Chapter 9</a> (what the allocator
+does — free lists, size classes, fragmentation, cost), <a href="#ch10">Chapter 10</a> (a use-after-free is
+undefined behavior, whoever owns the memory), <a href="#ch05">Chapter 5</a> (mechanical sympathy: cost
+follows layout and access pattern). &nbsp;·&nbsp; <strong>Closes Part 2.</strong> Chapter 9 treated the
+general-purpose allocator as a fact of the machine and cataloged the ways manual memory goes wrong. This
+chapter turns allocation from a hazard you survive into a tool you wield: when your allocation <em>pattern</em>
+is known, a custom allocator — an arena, a pool, a free list — can be dramatically faster than
+<code>malloc</code>, and we will build and measure one on this machine. It also completes the arc of the
+part: even your own allocator does not relax a single rule from Chapters 9–11.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch09">Chapter 9</a> — why is a heap <code>malloc</code> far more
+expensive than the stack's pointer-bump, and what two things (a search structure and a per-block record) does
+the allocator maintain? (2) <a href="#ch09">Chapter 9</a> — what is <em>external fragmentation</em>, and why
+can it make a large allocation fail even when total free memory is ample? (3) <em>Predict:</em> suppose you
+allocate a million small objects that all die at the same moment. If you could replace a million individual
+<code>free</code> calls with a <em>single</em> operation that reclaims them all at once, roughly how much
+faster do you think freeing would be? We will measure exactly this.</p>
+</aside>
+
+<p>Chapter 9's allocator is a marvel of generality: it satisfies any size, in any order, at any time, and it
+is the right default for the overwhelming majority of code. But generality has a price — every allocation may
+search a free list, split a block, and update bookkeeping; every free may coalesce; and interleaved requests
+fragment the pool. When you know something specific about <em>how</em> your program allocates — that many
+objects share a lifetime, or that they are all the same size — you can trade the general allocator's
+flexibility for speed and simplicity by writing an allocator specialized to that pattern. This chapter builds
+the two most useful specializations: the <strong>arena</strong> (also called a region or bump allocator),
+which makes allocation a pointer increment and frees everything at once (§12.2), and the <strong>pool</strong>
+or free-list allocator for fixed-size objects (§12.3). We start by asking precisely when the general
+allocator loses (§12.1), build and measure an arena on this machine, then close with an honest accounting of
+when a custom allocator is worth it — and the crucial fact that it does not lift the burden of Chapters 9–11
+(§12.4–12.5). This is the capstone of "manual memory": having felt its hazards, you now use it deliberately.</p>
+
+<h2>12.1 Why not just <code>malloc</code>? — allocation patterns</h2>
+
+<p>The general-purpose allocator is optimized for the case where it knows <em>nothing</em> about your
+requests. That ignorance is what costs you. Three patterns where a specialized allocator can do far better,
+precisely because it exploits knowledge the general allocator lacks:</p>
+
+<ul>
+<li><strong>Many objects, one lifetime.</strong> A request handler, a compiler pass, a frame of a game — all
+allocate a burst of objects that become garbage together at a known moment. The general allocator makes you
+<code>free</code> each one individually (and track every pointer to do so); an allocator that knows they
+share a lifetime can free the whole batch in one operation.</li>
+<li><strong>Many objects, one size.</strong> A pool of network connections, tree nodes, fixed-size buffers.
+The general allocator's size-class machinery and per-block headers are overhead you do not need if every
+object is identical; a fixed-size allocator can hand out and reclaim blocks in O(1) with almost no
+bookkeeping and no fragmentation <em>within</em> that size.</li>
+<li><strong>Hot allocation loops.</strong> Per-iteration <code>malloc</code>/<code>free</code> in a tight
+loop pays the general allocator's cost every iteration. Amortizing that — allocating a big block once and
+sub-dividing it cheaply — can dominate.</li>
+</ul>
+
+<p>The mechanism behind all three is the same idea as Chapter 5's mechanical sympathy: when you know the
+access or lifetime pattern, you can lay memory out and manage it to match, and the machine rewards you. But
+there is a discipline here that this chapter insists on and §12.4 returns to: custom allocators are a
+<em>measured</em> optimization, not a default. Berger, Zorn, and McKinley's study of eight real programs
+using custom allocators (OOPSLA 2002) found that for most of them a good general-purpose allocator matched or
+beat the custom one — the big wins came specifically from the region/arena pattern (the "one lifetime" case),
+where they measured improvements up to 44%. The lesson is not "always write your own"; it is "when the
+pattern is right, the win is real and large — and when it is not, you have added complexity for nothing."</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the allocation pattern an <em>arena</em> exploits and the one a <em>fixed-size pool</em> exploits.
+Which single piece of knowledge does each have that the general-purpose allocator does not? (Answer after the
+next section.)</p>
+</aside>
+
+<h2>12.2 The arena (region / bump) allocator — build and measure it</h2>
+
+<p>An <strong>arena</strong> (or region, or bump allocator) exploits the "many objects, one lifetime"
+pattern. The idea is minimal: reserve one large block up front, keep a single <em>offset</em> into it, and
+satisfy each allocation by returning the current offset and bumping it forward by the requested size (rounded
+up for alignment). There is no free list, no size class, no per-block header, and — most importantly — no
+per-object free: individual objects are <em>never</em> freed. Instead the entire arena is reclaimed at once,
+either by resetting the offset to zero (reuse the memory) or by freeing the backing block. Allocation is a
+pointer increment; bulk-free is a single assignment or one <code>free</code>. Here is the whole allocator:</p>
+
+<pre><code>typedef struct { unsigned char *base; size_t cap, off; } Arena;
+
+Arena arena_new(size_t cap){ Arena a; a.base = malloc(cap); a.cap = cap; a.off = 0; return a; }
+
+void *arena_alloc(Arena *a, size_t n){
+    size_t p = (a-&gt;off + 15) &amp; ~(size_t)15;   /* round up to 16-byte alignment */
+    if (p + n &gt; a-&gt;cap) return NULL;           /* arena exhausted */
+    a-&gt;off = p + n;                             /* bump the offset */
+    return a-&gt;base + p;
+}
+
+void arena_reset(Arena *a){ a-&gt;off = 0; }       /* frees EVERYTHING in O(1) */</code></pre>
+
+<p>That is a complete, working allocator. Compiled and run on this machine, it hands out correctly aligned,
+independent blocks (<code>x=42</code>, <code>s="hello"</code>, <code>y=7</code>, each 16-byte aligned), and
+<code>arena_reset</code> returns the offset to 0, reclaiming all of them in one operation. The payoff is
+speed, and it is worth measuring honestly. The arena wins when many objects are live <em>simultaneously</em>
+and die together — so the fair comparison is: allocate <em>N</em> objects that all stay live, then free them.
+With the arena that is <em>N</em> pointer-bumps and one bulk free; with <code>malloc</code> it is <em>N</em>
+allocations and <em>N</em> individual frees. For <em>N</em> = 5,000,000 small objects on this machine (gcc
+11.4.0, <code>-O2</code>, x86-64):</p>
+
+<pre><code>arena  (N live, 1 bulk free) :  ~50-90 ms
+malloc (N live, N frees)     : ~240-370 ms
+speedup                      :  ~4-5x</code></pre>
+
+<p>Roughly a <strong>four-to-five-fold</strong> speedup, which lines up with the region wins Berger et al.
+reported. <strong>These figures are illustrative and from this specific machine/run — they vary run-to-run
+(the ranges above are across repeated runs) and with size, allocator, and hardware; measure your own.</strong>
+The win has a clear source: the arena replaced a million bookkeeping-heavy <code>free</code> calls with a
+single offset reset, and made each allocation a pointer add instead of a free-list search.</p>
+
+<figure>
+<svg viewBox="0 0 640 180" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">Arena: one block, one offset. Each alloc bumps the offset; reset frees everything at once.</text>
+<rect x="20" y="26" width="600" height="30" fill="#f5f8fb" stroke="#14406b"/>
+<rect x="20" y="26" width="90" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="30" y="45" font-size="8">obj A</text>
+<rect x="110" y="26" width="60" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="120" y="45" font-size="8">obj B</text>
+<rect x="170" y="26" width="120" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="180" y="45" font-size="8">obj C</text>
+<line x1="290" y1="20" x2="290" y2="62" stroke="#8c3a1d" stroke-width="2"/>
+<text x="296" y="50" font-size="9" fill="#8c3a1d">off (next alloc lands here &rarr;)</text>
+<text x="20" y="82" font-size="9" fill="#333">alloc(n): p = round_up(off); off = p + n; return base + p;   &mdash;   O(1), a pointer add. No header, no search.</text>
+<text x="20" y="100" font-size="9" fill="#2e6b34">reset(): off = 0;   &mdash;   frees A, B, C (and all others) in ONE step. No per-object free.</text>
+<text x="20" y="128" font-size="9" fill="#8c3a1d">Trade-off: you CANNOT free obj B alone. If B outlives A and C, its memory is stuck until the whole arena resets.</text>
+<text x="20" y="146" font-size="9" fill="#555">Right pattern: objects that share a lifetime (a request, a frame, a compiler pass). Wrong pattern: mixed, long lifetimes.</text>
+<text x="20" y="168" font-size="9" fill="#555">Berger/Zorn/McKinley (OOPSLA 2002): regions win big for the right pattern, but can inflate memory use when objects outlive the batch.</text>
+</svg>
+<figcaption>Figure 12.1: An arena allocates by bumping a single offset and frees everything at once by
+resetting it — O(1) allocation, O(1) bulk free, no fragmentation, no per-object free. The cost is
+inflexibility: you cannot free one object early, so memory is held until the whole region is reset.</figcaption>
+</figure>
+
+<p>The trade-off is exactly that inflexibility, and it is not free. Because you cannot free an individual
+object, any object that outlives the batch pins the <em>entire</em> arena's memory until reset — so an arena
+used with the wrong lifetime pattern can inflate memory consumption badly (Berger et al. note precisely this
+downside of regions). And — the theme of §12.5 — resetting an arena while a pointer into it is still in use
+is a use-after-free by another name: undefined behavior, exactly as in Chapter 10, now with <em>you</em> as
+the allocator.</p>
+
+<p><em>(Answer to the §12.1 quick check: an <strong>arena</strong> exploits "many objects share one
+lifetime" — it knows the batch dies together, so it can skip per-object frees and reclaim all at once. A
+<strong>fixed-size pool</strong> exploits "many objects, one size" — it knows every block is identical, so it
+needs no size classes, no split/coalesce, and no per-block size header.)</em></p>
+
+<h2>12.3 The pool / free-list allocator — fixed-size, O(1) both ways</h2>
+
+<p>When objects share a <em>size</em> rather than a lifetime — a pool of tree nodes, connection structs,
+fixed buffers — a <strong>pool allocator</strong> (a fixed-size free-list allocator) is the specialization
+that fits. Carve one large block into an array of equal-size slots and thread the free slots onto a singly
+linked <strong>free list</strong>: because every slot is the same size and currently unused, you can store
+the "next free slot" pointer <em>inside the slot itself</em>, costing no extra memory. Allocation pops the
+head of the free list; freeing pushes the slot back onto the head. Both are O(1), a couple of pointer
+operations, with no search, no splitting, no coalescing, and — because all slots are identical — no external
+fragmentation within the pool at all. The sketch:</p>
+
+<pre><code>/* free_list points at the first free slot; each free slot's first bytes hold the next pointer */
+void *pool_alloc(Pool *p){
+    if (!p-&gt;free_list) return NULL;            /* pool exhausted */
+    void *slot = p-&gt;free_list;
+    p-&gt;free_list = *(void **)slot;             /* pop: next free = this slot's stored next */
+    return slot;
+}
+void pool_free(Pool *p, void *slot){
+    *(void **)slot = p-&gt;free_list;             /* push: this slot's next = old head */
+    p-&gt;free_list = slot;                        /* new head = this slot */
+}</code></pre>
+
+<p>Unlike the arena, a pool <em>does</em> support freeing individual objects — that is its point — so it fits
+the "allocate and free repeatedly, but always the same size" pattern the arena cannot. What it gives up is
+generality: it serves exactly one size. This is not a toy idea. The Linux kernel's <strong>slab
+allocator</strong> — introduced in Jeff Bonwick's 1994 paper (USENIX) for SunOS and adopted widely since — is
+a production-grade elaboration: it maintains per-size caches of pre-initialized objects ("slabs") so that
+allocating a kernel object is a free-list pop and freeing it a push, retaining the object's initialized state
+between uses and adding a cache-coloring scheme to spread objects across cache lines (Ch 3). Production
+general allocators (glibc's <code>malloc</code>, jemalloc, tcmalloc) likewise use size-classed free lists
+internally — the pool is the general allocator's own core trick, exposed for you to specialize.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: specialize the allocator to the pattern</span>
+<p><strong>1. In words.</strong> The general allocator is fast <em>because it knows nothing</em> is a
+contradiction — its generality costs search, headers, and fragmentation. If you know the pattern (shared
+lifetime → arena; shared size → pool), you drop the machinery you do not need and get O(1) with almost no
+bookkeeping.</p>
+<p><strong>2. As two pictures.</strong> Arena (Fig 12.1): one offset, bump to allocate, reset to free all.
+Pool: an array of equal slots with a free list threaded through the unused ones; pop to allocate, push to
+free — both O(1), no fragmentation within the size.</p>
+<p><strong>3. As numbers.</strong> Arena on this machine: ~4–5&times; faster than <code>malloc</code> for the
+one-lifetime batch (§12.2). Pool: allocation and free are each a couple of pointer writes versus the general
+allocator's free-list search and coalesce. The win is real <em>only</em> when the pattern holds (§12.4).</p>
+</aside>
+
+<h2>12.4 Choosing an allocator — an honest accounting</h2>
+
+<p>With three allocators in hand — general-purpose, arena, pool — the engineering question is when to reach
+for each. The honest answer starts with a warning that the research backs up: <strong>the general-purpose
+allocator is the right default, and custom allocation is a measured optimization, not a reflex.</strong>
+Berger, Zorn, and McKinley found that for six of eight real programs a state-of-the-art general allocator
+matched or beat the hand-written custom one — the programmers' custom allocators were often <em>slower</em>
+as well as buggier and harder to maintain. Custom allocation earned its keep in exactly the region/arena case.
+So the decision procedure is: profile first (Chapter 9's cost model, and the performance-engineering
+discipline Part 6 develops — measure before you optimize); confirm allocation is actually a bottleneck; then
+match the allocator to the pattern:</p>
+
+<ul>
+<li><strong>General-purpose <code>malloc</code></strong> — the default. Any size, any order, any lifetime,
+individual frees. Use it unless you have measured a reason not to.</li>
+<li><strong>Arena</strong> — when a burst of objects shares a lifetime and dies together (a request, a frame,
+a parse). O(1) alloc, O(1) bulk free, no per-object free. Watch the memory downside: anything that outlives
+the batch pins the whole region.</li>
+<li><strong>Pool</strong> — when objects share a fixed size and are allocated/freed repeatedly. O(1) both
+ways, no fragmentation within the size, individual frees supported. Serves exactly one size.</li>
+</ul>
+
+<p>Each choice is a trade, not a free win. The arena trades the ability to free individually for speed and
+simplicity — and can waste memory if the lifetime assumption is wrong. The pool trades generality (one size
+only) for O(1) operations and zero fragmentation. And every custom allocator trades the maturity, debugging
+support, and hardening of the system allocator for code you now own and must get right. That last cost is the
+bridge to §12.5.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: "a custom allocator makes the memory bugs go away"</span>
+<p>It is tempting to think that once <em>you</em> control allocation, the hazards of Chapters 9–11 are behind
+you. The opposite is true: <strong>writing your own allocator makes you responsible for the very invariants
+the language and the system allocator's tooling used to help enforce</strong> — and it introduces new ways to
+violate them. Reset an arena while a pointer into it is still live, and the next allocation reuses that memory
+under the old pointer: a <em>use-after-reset</em>, which is a use-after-free (Ch 9), undefined behavior (Ch
+10), with you as the allocator. <code>pool_free</code> the same slot twice and you corrupt the free list —
+a double-free in your own code. Hand out a slot without checking the pool is non-empty and you return a null
+you may dereference. Worse, sanitizers (Ch 9) understand <code>malloc</code>/<code>free</code> but do
+<em>not</em>, by default, understand <em>your</em> arena's reset or <em>your</em> pool's recycling, so they
+may not catch a use-after-reset at all — you have moved the bug below the tool's visibility. (ASan offers
+manual "poisoning" hooks precisely so custom allocators can be made visible to it, but you must add them.) A
+custom allocator does not repeal lifetimes, bounds, and free-exactly-once; it makes you their implementer.
+Every rule from Chapters 9–11 still holds — you have just taken over enforcing them.</p>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>You reset an arena to reclaim a request's memory, but one object from that request was stored in a cache
+that outlives the request. What bug have you just created, and what is its Chapter-9 name? (Answer below the
+communicate box.)</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: "Our service is slow — let's replace <code>malloc</code> with
+an arena allocator everywhere for a quick speed win." Cover the paragraph and respond in three or four
+sentences, drawing on §12.1 and §12.4.</p>
+<p><em>Model answer.</em> "An arena is a big win for a specific pattern — a burst of objects that share a
+lifetime and die together, like everything allocated while handling one request — but it's the wrong tool
+'everywhere,' because it can't free individual objects, so any object that outlives its batch pins the whole
+region and can inflate our memory badly. The evidence backs the caution: Berger, Zorn, and McKinley found a
+good general allocator matched or beat hand-written custom allocators for most programs, with the arena/region
+case being the real exception. Let's profile first to confirm allocation is actually the bottleneck, then
+apply an arena precisely where the lifetime pattern fits — per-request scratch memory — and keep
+<code>malloc</code> for the mixed-lifetime long-lived state. And whatever we pick, we still own every
+lifetime and bound: resetting an arena with a live pointer into it is a use-after-free that our sanitizers
+won't see by default." Naming the pattern, citing the measured result, and insisting on profiling — rather
+than a blanket swap — is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §12.4 quick check: you have created a <strong>use-after-free</strong> — specifically a
+use-after-reset. Resetting the arena ended the lifetime of that object's storage; the cached pointer now
+dangles, and the next allocation from the arena will reuse those bytes under it. It is undefined behavior, and
+by default the sanitizers will not flag it, because they do not know your arena reset ended a lifetime.)</em></p>
+
+<h2>12.5 What to carry forward — and out of Part 2</h2>
+
+<p>The general-purpose allocator is optimized for knowing nothing about your requests, and that ignorance is
+its cost — search, headers, coalescing, fragmentation (Ch 9). When you <em>do</em> know the pattern, a custom
+allocator trades generality for speed. An <strong>arena</strong> exploits shared lifetime: allocate by
+bumping an offset, free everything at once by resetting it — O(1) both ways, no per-object free, measured at
+roughly four-to-five times faster than <code>malloc</code> for the batch pattern on this machine, at the cost
+of being unable to free one object early. A <strong>pool</strong> exploits shared size: an array of equal
+slots with a free list threaded through the unused ones, O(1) allocation and free with no fragmentation within
+the size — the same trick the kernel's slab allocator and production <code>malloc</code>s use internally. But
+custom allocation is a <em>measured</em> optimization, not a default: the research (Berger et al.) shows a
+good general allocator usually matches hand-rolled ones, with the arena/region pattern the clear exception —
+so profile, confirm the bottleneck, and match the allocator to the pattern. And, decisively, writing your own
+allocator does not lift one obligation from Chapters 9–11: you become the implementer of lifetimes, bounds,
+and free-exactly-once, with new ways to violate them (use-after-reset, pool double-free) that your tools may
+not see.</p>
+
+<p>That last point closes Part 2. Across six chapters you went from "a pointer is an address into regioned
+memory" (Ch 7), through lifetimes and the stack/heap (Ch 8), manual allocation and its bug catalogue (Ch 9),
+undefined behavior and the optimizer that trusts it (Ch 10), the buffer overflow that hijacks control flow
+(Ch 11), to writing the allocator itself (Ch 12) — and the through-line never changed: <strong>in C you hold,
+by hand, a proof that no pointer is used outside its lifetime, no access outside its bounds, every block freed
+exactly once, and no undefined behavior ever triggered.</strong> That proof is real, it is heavy, and every
+bug in this part is what happens when it fails. You now understand the machine to the metal and the net that
+is absent. Two paths lead out. The operating system (Part 3) is what sits beneath all of this — the processes,
+threads, and virtual memory that gave you the address space and the heap in the first place; you will see the
+system-call boundary from the other side. And Rust (Part 5) is the language that makes the compiler
+<em>check</em> the proof you have been carrying — ownership, borrowing, and lifetimes turning the invariants of
+this entire part into type rules verified before the program runs. You have felt the weight; the rest of the
+book is about the machine underneath it and the tools that lift it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the three allocation patterns where a custom allocator beats general-purpose <code>malloc</code>,
+and the knowledge each exploits.</li>
+<li>Write an <strong>arena</strong> allocator from memory (base, capacity, offset; bump to allocate, reset to
+free all) and state its one big trade-off.</li>
+<li>Write a <strong>pool</strong>/free-list allocator's alloc and free (pop/push a free list threaded through
+the slots) and say why both are O(1) with no fragmentation within the size.</li>
+<li>Give the honest decision rule (general by default; profile; arena for shared lifetime; pool for shared
+size) and cite what the Berger et al. study found.</li>
+<li>Explain why a custom allocator does <em>not</em> remove the Chapter 9–11 obligations — and name a bug
+(use-after-reset) your sanitizers may miss.</li>
+<li>Summarize Part 2's through-line and how it sets up the OS (Part 3) and Rust (Part 5).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Name three allocation patterns where a custom allocator wins, and what each
+exploits. (§12.1)</li>
+<li><strong>R2.</strong> Describe an arena's allocate and free, its complexity, and its trade-off. (§12.2)</li>
+<li><strong>R3.</strong> Describe a pool/free-list allocator and why it has no fragmentation within its
+size. (§12.3)</li>
+<li><strong>R4.</strong> What did Berger et al. find about custom vs. general allocators, and what is the
+decision rule? (§12.1, §12.4)</li>
+<li><strong>R5.</strong> Why does a custom allocator not remove the Chapter 9–11 obligations? Name a bug it
+introduces. (§12.4–12.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter
+9.</strong> Dynamic memory allocation: allocator design, free lists, coalescing, and the mechanics an arena
+and pool specialize. The reference for §12.1's cost model.</li>
+<li><strong>Berger, Zorn &amp; McKinley, "Reconsidering Custom Memory Allocation," OOPSLA 2002.</strong> The
+empirical study behind §12.4: a good general allocator matches most hand-written custom allocators, with
+regions (arenas) the clear exception (improvements up to 44%, but a memory-consumption downside). Free from
+the authors.</li>
+<li><strong>Bonwick, "The Slab Allocator: An Object-Caching Kernel Memory Allocator," USENIX 1994.</strong>
+The production pool/slab allocator behind §12.3, still used in the Linux kernel. Free.</li>
+<li><strong>The jemalloc / tcmalloc documentation.</strong> Real, widely deployed general allocators whose
+internals (size-classed free lists, thread caches) are the pool idea at scale. Documented behavior only;
+verify against the version you use.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex12.1"><span class="ex-label">12.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: (a) what does an arena exploit? (b) what does a pool exploit? (c) which of the two can
+free an individual object?</div>
+
+<div class="exercise" id="ex12.2"><span class="ex-label">12.2</span> <span class="ex-tag warm">warm-up</span>
+What is the time complexity of an arena's <code>alloc</code> and its bulk <code>reset</code>? What is the one
+thing an arena cannot do that <code>malloc</code> can?</div>
+
+<div class="exercise" id="ex12.3"><span class="ex-label">12.3</span> <span class="ex-tag warm">warm-up</span>
+In a fixed-size pool, where is the "next free slot" pointer stored, and why does that cost no extra memory?</div>
+
+<div class="exercise" id="ex12.4"><span class="ex-label">12.4</span> <span class="ex-tag core">core</span>
+Write, from memory, an arena allocator (a struct with base/capacity/offset, plus <code>arena_alloc</code> with
+16-byte alignment and <code>arena_reset</code>). Explain why <code>arena_alloc</code> is O(1) and why
+<code>arena_reset</code> frees everything without touching individual objects.</div>
+
+<div class="exercise" id="ex12.5"><span class="ex-label">12.5</span> <span class="ex-tag core">core</span>
+Write a pool allocator's <code>pool_alloc</code> and <code>pool_free</code> using a free list threaded through
+the slots. Explain why both are O(1) and why the pool has no external fragmentation within its size class.</div>
+
+<div class="exercise" id="ex12.6"><span class="ex-label">12.6</span> <span class="ex-tag core">core</span>
+A teammate wants to replace <code>malloc</code> with an arena "everywhere for speed." Give two concrete
+reasons this is a bad blanket policy — one about the arena's inability to free individually, one citing the
+Berger et al. finding — and state the correct decision procedure.</div>
+
+<div class="exercise" id="ex12.7"><span class="ex-label">12.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is an arena's per-allocation cost lower than <code>malloc</code>'s — name two things the general
+allocator does that the arena skips (tie to Ch 9). (b) The chapter measured ~4–5&times; on this machine for
+the "N live, then free" pattern; why does that comparison favor the arena, and what different pattern would
+narrow or erase the gap? (c) What memory-consumption risk does an arena carry, and when does it bite?</div>
+
+<div class="exercise" id="ex12.8"><span class="ex-label">12.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A per-request arena is reset at the end of each request. A
+developer adds a cache that stores, across requests, a pointer to a string that was allocated <em>in</em> the
+arena. Diagnose the bug.
+<br><strong>Step 1 (given):</strong> <code>arena_reset</code> ends the lifetime of everything in the arena by
+returning the offset to 0.
+<br><strong>Step 2 (given):</strong> The cached pointer still holds the string's old address, but that
+storage is now considered free.
+<br><strong>Step 3 (given):</strong> The next request's allocations will reuse those bytes, so a later read
+through the cached pointer sees another request's data or garbage.
+<br><strong>Step 4 (you):</strong> Name the bug using Chapter 9's vocabulary, state whether it is undefined
+behavior, explain why the ASan/Valgrind of §9.4 will likely <em>not</em> catch it by default, and give a fix
+(what must be copied where, so the cache does not point into the arena).</div>
+
+<div class="exercise" id="ex12.9"><span class="ex-label">12.9</span> <span class="ex-tag mixed">mixed</span>
+For each workload, choose <em>general <code>malloc</code></em>, <em>arena</em>, or <em>pool</em>, and justify
+in a line: (a) a web handler that allocates many small objects while serving one request, all discardable when
+the response is sent; (b) a graph engine that constantly creates and destroys same-size nodes throughout its
+run; (c) a general-purpose library that cannot predict its callers' allocation patterns; (d) a compiler pass
+that allocates a burst of AST nodes freed together when the pass ends.</div>
+
+<div class="exercise" id="ex12.10"><span class="ex-label">12.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>undefined behavior</em>, <em>a defined-but-real defect</em>, or <em>well-defined and
+fine</em>, drawing on Chapters 9–12: (a) reading through a pointer into an arena after
+<code>arena_reset</code>; (b) an arena holding a long-lived object that pins the whole region, growing memory
+use; (c) <code>pool_free</code>-ing the same slot twice; (d) resetting an arena when no live pointers into it
+remain.</div>
+
+<div class="exercise" id="ex12.11"><span class="ex-label">12.11</span> <span class="ex-tag stretch">stretch</span>
+Part 2 has argued that in C the programmer carries, by hand, a proof about lifetimes, bounds, and freeing. (a)
+State that proof obligation in one sentence. (b) Explain how a custom allocator <em>relocates</em> rather than
+<em>removes</em> that obligation — who now enforces "free exactly once" for arena and pool memory? (c) In one
+or two sentences, describe what it would mean for a language (Rust, Part 5) to tie an allocation's lifetime to
+a scope so that "use after reset" becomes a compile-time error — and why that is stronger than a runtime
+sanitizer that does not understand your allocator.</div>
+
+<div class="exercise" id="ex12.12"><span class="ex-label">12.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, implement the arena of §12.2. (a) Verify correctness: allocate three objects of different
+sizes, confirm they are independent and 16-byte aligned, and that <code>arena_reset</code> returns the offset
+to 0. (b) Time allocating <em>N</em> objects that stay live then freeing them, arena (one bulk free) vs.
+<code>malloc</code> (N frees), for a large <em>N</em>, and report the ratio. (c) Repeat with a pattern where
+each object is freed immediately after allocation and explain why the arena's advantage shrinks. Report only
+what you measured and label your compiler/hardware, since numbers vary.</div>
+
+</section>
+</section>

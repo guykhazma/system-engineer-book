@@ -248,6 +248,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch07">Chapter 7 — Pointers &amp; Memory Layout</a></li>
 <li class="toc-ch"><a href="#ch08">Chapter 8 — The Stack &amp; the Heap</a></li>
 <li class="toc-ch"><a href="#ch09">Chapter 9 — Manual Allocation: malloc/free and What Goes Wrong</a></li>
+<li class="toc-ch"><a href="#ch10">Chapter 10 — Undefined Behavior &amp; the Optimizing Compiler</a></li>
+<li class="toc-ch"><a href="#ch11">Chapter 11 — Arrays, Strings &amp; Buffer Safety</a></li>
+<li class="toc-ch"><a href="#ch12">Chapter 12 — Custom Allocators: Arenas, Pools &amp; Free Lists</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part III &mdash; The Operating System</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part IV &mdash; Concurrency & Parallelism</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part V &mdash; Rust for Systems</li>
@@ -4057,7 +4060,7 @@ double-free, and (via LeakSanitizer) memory leaks. The odd one out is the <stron
 <h2>9.5 What to carry forward — and the bridge to Rust</h2>
 
 <p>Manual allocation is a contract you uphold by hand. <code>malloc</code> gives uninitialized bytes (check
-for <code>NULL</code>), <code>calloc</code> gives zeroed bytes (and checks its multiply), <code>realloc</code>
+for <code>NULL</code>), <code>calloc</code> gives zeroed bytes (and, on mainstream implementations, checks its <em>n</em>&times;<em>size</em> multiply for overflow), <code>realloc</code>
 resizes and may move (assign to a temporary), and <code>free</code> returns a block exactly once
 (<code>free(NULL)</code> is a safe no-op). Underneath, the allocator manages a pool with free lists and size
 classes, splitting and coalescing blocks, at real cost, and can leave the pool fragmented. And the ways it
@@ -4211,6 +4214,1308 @@ a use-after-free, a heap buffer overflow, a double-free, and a leak. Compile eac
 for each. (b) Write a fifth program with an uninitialized read and confirm whether ASan flags it; if not,
 note what tool would. Report only what you actually observed, and label your compiler/tool versions, since
 the exact output varies.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch10">
+<h1>Chapter 10 — Undefined Behavior &amp; the Optimizing Compiler</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch09">Chapter 9</a> (the memory bugs, most
+of them undefined behavior; the §3.4.3 definition), <a href="#ch07">Chapter 7</a> (pointers, bounds, and
+one-past-the-end), <a href="#ch05">Chapter 5</a> (what the compiler is allowed to reorder). &nbsp;·&nbsp;
+<strong>Continues Part 2.</strong> Chapter 9 named undefined behavior and told you it was "stronger than a
+crash." This chapter shows you <em>why</em> — how the optimizing compiler actively reasons from the
+assumption that your program contains no UB, so a latent bug does not merely misbehave where it sits: it lets
+the compiler transform code elsewhere in surprising, sometimes dangerous ways. We will compile real examples
+on this machine and read the assembly.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch09">Chapter 9</a> — in the C standard's terms, what does
+<strong>undefined behavior</strong> mean, and how is it different from <em>unspecified</em> and
+<em>implementation-defined</em> behavior? (2) <a href="#ch07">Chapter 7</a> — indexing a pointer is defined
+only within an array (plus one-past-the-end for the address, not the dereference); what is stepping outside
+that? (3) <em>Predict:</em> you write <code>int f(int x){ return x + 1 &gt; x; }</code>. For <em>signed</em>
+<code>int</code>, is <code>x + 1 &gt; x</code> always true? What do you think an optimizing compiler emits for
+this function — a comparison, or the constant <code>1</code>? By the end you will be able to read the
+assembly and say exactly why.</p>
+</aside>
+
+<p>Here is the mental shift this chapter demands. It is tempting to think of C as a "portable assembler":
+you write operations, the compiler emits the corresponding instructions, and undefined behavior is what
+happens when those instructions hit a bad state at runtime. That model is wrong, and believing it is the
+source of a whole category of baffling bugs. The correct model is that <strong>undefined behavior is a
+promise you make to the compiler</strong> — a precondition it is entitled to assume you never violate — and
+the optimizer reasons <em>from</em> that promise. When you write code that can execute UB, you have not
+described "what the machine does in the bad case"; you have told the compiler the bad case cannot happen, and
+it will rewrite your program on that basis. We will make this concrete: the standard's definition and its
+two milder cousins (§10.1); the single assumption the optimizer runs on (§10.2); a gallery of UB that
+actually changes the compiled code on this machine, read as assembly (§10.3); and why the language is built
+this way, plus the tools and flags that defend you (§10.4). This is the intellectual core of why manual
+memory management (Ch 9) is so heavy, and — again — the exact weight Rust will lift in Part 5.</p>
+
+<h2>10.1 Undefined behavior, precisely — and its two milder cousins</h2>
+
+<p>Chapter 9 gave the definition; we now lean on it fully. The C standard (C11 §3.4.3) defines
+<strong>undefined behavior</strong> as behavior "for which this International Standard imposes <em>no
+requirements</em>," and notes that permissible responses range from "ignoring the situation completely with
+unpredictable results" to "behaving during translation or program execution in a documented manner
+characteristic of the environment" to "terminating a translation or execution." Read that carefully: "no
+requirements" and "during translation" together mean the license extends to <em>compile time</em> — the
+compiler, not just the running program, may do anything when UB is possible. Three standard categories,
+sharpened from §9.3, are worth keeping straight because only the first grants the compiler this license:</p>
+
+<ul>
+<li><strong>Undefined behavior</strong> (§3.4.3): no requirements at all. The program has no meaning on the
+inputs that trigger it. Examples: signed integer overflow, dereferencing a null or dangling pointer, an
+out-of-bounds access, a data race, reading an object through a pointer of an incompatible type (a strict-
+aliasing violation).</li>
+<li><strong>Unspecified behavior</strong> (§3.4.4): the standard gives two or more valid possibilities and
+does not say which you get — e.g. the order in which a function's arguments are evaluated. Each possibility
+is a normal, non-catastrophic outcome; the compiler need not document its choice.</li>
+<li><strong>Implementation-defined behavior</strong> (§3.4.1): unspecified behavior that the implementation
+must <em>document</em> — e.g. the width of <code>int</code>, or the byte order (Ch 7). Portable code avoids
+depending on it; it is not dangerous, merely non-portable.</li>
+</ul>
+
+<p>The distinction that matters for this chapter: unspecified and implementation-defined behavior still
+produce a <em>valid program</em> with <em>some</em> defined outcome — you just may not know which. Undefined
+behavior produces <strong>no valid program at all</strong> on the triggering input. There is no "the value
+you happen to get"; the standard has stopped describing your program entirely. Everything in §10.2 follows
+from that single fact.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Which of these is undefined, which unspecified, which implementation-defined: (a) <code>sizeof(long)</code>;
+(b) the evaluation order of <code>f() + g()</code>; (c) signed integer overflow? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>10.2 The optimizer's one assumption: UB never happens</h2>
+
+<p>An optimizing compiler transforms your code under the <strong>as-if rule</strong>: it may emit any
+instructions it likes as long as the observable behavior of a <em>well-defined</em> program is preserved.
+The crucial word is <em>well-defined</em>. For an input that triggers undefined behavior, the program has no
+observable behavior the compiler is required to preserve — so the optimizer is free to assume that input
+never occurs. It does not check; it does not warn (usually); it simply reasons: "this operation would be UB
+if condition <em>C</em> held, and the programmer has promised never to invoke UB, therefore <em>C</em> is
+false — and I may use that fact to simplify everything downstream (and, under the as-if rule, upstream too)."</p>
+
+<p>Two consequences of that reasoning surprise people. First, <strong>the optimizer propagates the
+assumption</strong>: one operation that is only UB when <code>p</code> is null lets the compiler conclude
+<code>p</code> is non-null <em>everywhere</em> that value is used, deleting your later null check as
+provably-dead code. Second, <strong>the effects can appear to "travel" in time</strong>: because a program
+that executes UB has undefined behavior for the <em>whole</em> execution, an optimizer may hoist, sink, or
+delete work around the UB in ways that make observable effects <em>before</em> the buggy line also vanish or
+change. This is why "it printed the right thing up to the crash" is not something you can rely on. Neither of
+these is a compiler bug — each is the as-if rule applied to a program whose meaning you forfeited by writing
+the UB. Lattner's LLVM series and Regehr's guide (Further Reading) walk through the same reasoning at
+length; the sections below reproduce it on this machine.</p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">How the optimizer reasons about a possibly-UB operation:</text>
+<rect x="20" y="28" width="180" height="46" fill="#f5f8fb" stroke="#14406b"/>
+<text x="30" y="47" font-size="10">Your source contains an</text>
+<text x="30" y="62" font-size="10">operation UB when C holds</text>
+<text x="212" y="45" font-size="16">&rarr;</text>
+<rect x="236" y="28" width="180" height="46" fill="#fdf6ec" stroke="#8c5a1d"/>
+<text x="246" y="47" font-size="10">"Programmer promised no</text>
+<text x="246" y="62" font-size="10">UB, so C must be false"</text>
+<text x="428" y="45" font-size="16">&rarr;</text>
+<rect x="452" y="28" width="168" height="46" fill="#fdecec" stroke="#8c3a1d"/>
+<text x="462" y="47" font-size="10">Delete/rewrite code that</text>
+<text x="462" y="62" font-size="10">assumed C could be true</text>
+<text x="20" y="104" font-size="10" fill="#333">Example (this chapter, §10.3):</text>
+<rect x="20" y="112" width="290" height="80" fill="#fff" stroke="#8a8f98"/>
+<text x="28" y="130" font-size="9" font-family="monospace">int *sk = t-&gt;sk;   // deref t (UB if t==NULL)</text>
+<text x="28" y="146" font-size="9" font-family="monospace">if (!t) return -1; // null check AFTER deref</text>
+<text x="28" y="162" font-size="9" font-family="monospace">return *sk;</text>
+<text x="28" y="184" font-size="9" fill="#8c3a1d">compiler: "t was dereferenced &rArr; t != NULL"</text>
+<text x="330" y="150" font-size="16">&rarr;</text>
+<rect x="356" y="112" width="264" height="80" fill="#fdecec" stroke="#8c3a1d"/>
+<text x="364" y="130" font-size="9" fill="#8c3a1d">the `if (!t)` check is DELETED as dead code</text>
+<text x="364" y="150" font-size="9" font-family="monospace">int *sk = t-&gt;sk;</text>
+<text x="364" y="166" font-size="9" font-family="monospace">return *sk;   // check gone</text>
+<text x="364" y="186" font-size="9" fill="#555">real bug: Linux CVE-2009-1897 (§10.3)</text>
+</svg>
+<figcaption>Figure 10.1: The optimizer treats a possibly-UB operation as a promise that the triggering
+condition never holds, then simplifies on that basis — here deleting a null check because the pointer was
+already dereferenced. The pattern is the real Linux kernel bug reproduced in §10.3.</figcaption>
+</figure>
+
+<p><em>(Answer to the §10.1 quick check: (a) <code>sizeof(long)</code> is <strong>implementation-defined</strong>
+— it varies but must be documented; (b) the evaluation order of <code>f() + g()</code> is
+<strong>unspecified</strong> — one of two valid orders, undocumented; (c) signed integer overflow is
+<strong>undefined behavior</strong> — no requirements at all, the case the optimizer exploits.)</em></p>
+
+<h2>10.3 A gallery of UB that changes the compiled code — read on this machine</h2>
+
+<p>Abstract claims about "the optimizer may assume" become believable only when you watch it happen. Each
+example below was compiled with <code>gcc 11.4.0</code> at <code>-O2</code> on this x86-64 machine and the
+relevant assembly read directly. <strong>Exact output varies by compiler and version; these are from this
+specific toolchain.</strong></p>
+
+<p><strong>Signed integer overflow (the opener).</strong> In C, signed integer overflow is undefined
+(unsigned overflow is defined and wraps modulo 2<sup>n</sup>). So in <code>int f(int x){ return x + 1 &gt;
+x; }</code> the compiler may assume <code>x + 1</code> never overflows — and if it never overflows,
+<code>x + 1 &gt; x</code> is <em>always</em> true. It compiles the whole function to a constant:</p>
+
+<pre><code>/* gcc -O2 -S : int f(int x){ return x + 1 &gt; x; } */
+f:
+        movl    $1, %eax      ; return 1, unconditionally
+        ret</code></pre>
+
+<p>No addition, no comparison — just <code>return 1</code>. This is correct per the standard and often
+useful (it lets loops with an <code>int</code> counter be optimized as if they cannot wrap). But if you were
+<em>relying</em> on wraparound to detect overflow — the classic <code>if (x + 1 &lt; x) /* overflowed */</code>
+— the check is deleted and your overflow goes undetected. (Compile the same with <code>-fwrapv</code>, which
+<em>defines</em> signed overflow as two's-complement wraparound, and the comparison reappears.)</p>
+
+<p><strong>Null check deleted after a dereference (a real CVE).</strong> Dereferencing a null pointer is UB,
+so once a pointer has been dereferenced the compiler may assume it is non-null from then on. Consider the
+pattern below — a simplified form of the actual Linux kernel function <code>tun_chr_poll</code>:</p>
+
+<pre><code>struct T { int *sk; };
+int poll(struct T *t) {
+    int *sk = t-&gt;sk;      /* dereference t */
+    if (!t) return -1;    /* null check AFTER the dereference */
+    return *sk;
+}</code></pre>
+
+<p>At <code>-O2</code>, gcc on this machine emits (the <code>if (!t)</code> is <em>gone</em> — no test of the
+pointer against zero):</p>
+
+<pre><code>poll:
+        endbr64
+        movq    (%rdi), %rax   ; sk = t-&gt;sk   (dereference t)
+        movl    (%rax), %eax   ; return *sk
+        ret                    ; no `testq %rdi,%rdi; je ...` -- check deleted</code></pre>
+
+<p>Compiled with <code>-fno-delete-null-pointer-checks</code>, the guard survives (<code>testq %rdi,%rdi; je
+.L3</code> reappears). This is not a contrived teaching example: it is the shape of <strong>CVE-2009-1897</strong>
+in the Linux kernel's <code>drivers/net/tun.c</code> (kernel 2.6.30). The pointer was dereferenced before the
+null check; gcc, entitled to assume the dereference could not have been of a null pointer, deleted the check;
+an attacker able to map memory at address zero could then reach the code that should have been guarded — a
+privilege-escalation hole. The kernel's fix moved the check before the dereference and, as belt-and-braces,
+the build adopted <code>-fno-delete-null-pointer-checks</code>. The lesson is exact: <strong>a null check
+that comes after the dereference it is meant to guard is not a weak check — to the optimizer it is a
+statement that the pointer was already known non-null, and it may be deleted.</strong></p>
+
+<p><strong>The others you already met (Ch 9), now as UB the optimizer trusts.</strong> Out-of-bounds access,
+use-after-free, and uninitialized reads are all UB; the optimizer is likewise permitted to assume they never
+happen and to transform code accordingly (for instance, assuming an index stays in range, or that two
+pointers of incompatible types never alias — the <strong>strict-aliasing</strong> rule, §6.5, which lets the
+compiler keep a value in a register across a write through an <code>int*</code> when it "knows" a
+<code>float*</code> cannot touch the same object; <code>-fno-strict-aliasing</code> disables it). The through-
+line: every UB in Chapter 9's catalogue is not just a runtime hazard but a compile-time license.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: UB is a promise, not a behavior</span>
+<p><strong>1. In words.</strong> Undefined behavior is a precondition you promise the compiler you will never
+violate. The compiler does not define "what happens in the bad case"; it assumes the bad case is impossible
+and optimizes on that assumption. So UB has no outcome to reason about — only consequences the optimizer
+derives from "this can't happen."</p>
+<p><strong>2. As a decision.</strong> For an operation that is UB exactly when condition <em>C</em> holds, the
+compiler branches: "either <em>C</em> is false (fine, proceed) or <em>C</em> is true (UB, undefined — I owe
+nothing)." Both branches let it act as if <em>C</em> is false. So it deletes anything that only mattered when
+<em>C</em> was true — like a null check after a dereference.</p>
+<p><strong>3. As compiled code.</strong> <code>x + 1 &gt; x</code> becomes <code>return 1</code>;
+<code>if (!t)</code> after <code>t-&gt;sk</code> vanishes. The transform is visible in the assembly (§10.3) and
+correct per the standard — the "surprise" is entirely in the reader's wrong mental model of C as a portable
+assembler.</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: "it worked at -O0, so the optimizer broke my code"</span>
+<p>When a program behaves at <code>-O0</code> and misbehaves at <code>-O2</code>, the instinct is "the
+optimizer introduced a bug." Almost always the truth is the reverse: <strong>the undefined behavior was
+already in your program, and the optimizer merely exercised the license that UB granted it.</strong> At
+<code>-O0</code> the compiler emits naive code that happens to do what you expected; at <code>-O2</code> it
+reasons from "no UB" and the latent bug surfaces. The tells: "only fails in release builds," "only with
+optimizations on," "adding a <code>printf</code> makes it go away" (the print perturbs what the optimizer can
+prove). The wrong fix is to compile at <code>-O0</code> or sprinkle <code>volatile</code> until it "works" —
+that hides UB, it does not remove it, and the next compiler version may re-expose it. The right response is
+to find and eliminate the undefined behavior: build with <code>-fsanitize=undefined</code> (UBSan) and
+<code>-Wall -Wextra</code>, and reason about which operation had no defined meaning. "Works at <code>-O0</code>"
+is not evidence of correctness, exactly as "didn't crash" was not in Chapter 9.</p>
+</aside>
+
+<h2>10.4 Why the language is built this way — and how to defend</h2>
+
+<p>It is fair to ask why the standard grants this license at all. The answer is a deliberate bargain.
+Leaving these situations undefined — rather than mandating a checked outcome — is what lets a C compiler
+generate fast code across wildly different hardware without inserting a bounds check on every array access, an
+overflow check on every addition, or a null check on every dereference. Signed-overflow UB, for example, lets
+the compiler promote loop counters, strength-reduce, and assume loops terminate; defined wraparound would
+forbid some of those. The cost of the bargain is precisely this chapter: the responsibility for never
+triggering UB shifts entirely to you, and the compiler will not (in general) tell you when you have.
+Different languages strike the bargain differently — Java defines integer overflow and mandates bounds
+checks (paying runtime cost for safety); Rust checks bounds and, in debug builds, overflow, and confines the
+UB-bearing operations to explicitly <code>unsafe</code> blocks (Part 5). C chose maximum latitude for the
+compiler, and hands you the bill.</p>
+
+<p>Given that, your defenses are concrete and layered:</p>
+<ul>
+<li><strong>Sanitizers.</strong> <code>-fsanitize=undefined</code> (UndefinedBehaviorSanitizer, in gcc and
+clang) instruments the program to detect many UB categories at runtime — signed overflow, out-of-bounds on
+known-size arrays, null dereference, misaligned access, and more — reporting the file and line. Combined with
+AddressSanitizer (Ch 9) for memory errors, it turns much silent UB into loud, located failures. Run your
+tests under both.</li>
+<li><strong>Warnings.</strong> <code>-Wall -Wextra</code> catch a meaningful fraction statically (uninitialized
+reads, some overflows, format-string mismatches). Free; turn them on and treat them as errors
+(<code>-Werror</code>) where you can.</li>
+<li><strong>Defining-the-undefined flags.</strong> When you deliberately depend on a behavior the standard
+leaves undefined, tell the compiler to define it: <code>-fwrapv</code> (signed overflow wraps),
+<code>-fno-strict-aliasing</code> (allow type-punning through pointers), <code>-fno-delete-null-pointer-checks</code>
+(keep null checks even after a dereference). These trade some optimization for predictability and are how the
+Linux kernel, among others, tames the sharpest edges.</li>
+<li><strong>Write UB-free code.</strong> The durable fix. Check pointers before dereferencing, indices before
+indexing, and sizes before copying (Ch 11); use unsigned types or explicit overflow-checked arithmetic when
+you need wraparound or overflow detection; never read before initializing. Every rule from §9.1 is really a
+rule for staying inside the defined language.</li>
+</ul>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Your code does <code>if (x + 1 &lt; x)</code> to detect signed overflow and the check keeps getting
+optimized away. Name two ways to make the detection actually work — one that changes the flag you compile
+with, one that changes the type or arithmetic you use. (Answer below the communicate box.)</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate files a compiler bug: "gcc deleted my null check! Look — I clearly write
+<code>if (!t) return -1;</code> and it's not in the assembly. This is a miscompilation." The code
+dereferences <code>t</code> one line above the check. Cover the paragraph and respond in three or four
+sentences, using <em>undefined behavior</em> and the as-if rule.</p>
+<p><em>Model answer.</em> "It's not a miscompilation — it's the as-if rule doing exactly what the standard
+permits. You dereference <code>t</code> with <code>t-&gt;sk</code> <em>before</em> the check, and
+dereferencing a null pointer is undefined behavior, so the compiler is entitled to assume <code>t</code> was
+non-null at that point — which makes the later <code>if (!t)</code> provably dead code it can delete. This is
+literally the shape of the Linux kernel bug CVE-2009-1897. The fix isn't to report gcc; it's to move the null
+check <em>before</em> the dereference (and, if we want a belt-and-braces guard, build with
+<code>-fno-delete-null-pointer-checks</code>). A check that comes after the dereference it guards isn't a
+weak check — to the optimizer it's a promise the pointer was already non-null." Naming the as-if rule and
+the CVE, rather than blaming the compiler, is the senior register — and it turns a "compiler bug" into a
+one-line code fix.</p>
+</aside>
+
+<p><em>(Answer to the §10.4 quick check: (1) compile with <code>-fwrapv</code>, which defines signed
+overflow as two's-complement wraparound so the comparison is no longer optimized away; or (2) do the
+arithmetic in an <strong>unsigned</strong> type (defined to wrap) or use a checked-arithmetic builtin such as
+<code>__builtin_add_overflow</code>, which reports overflow without relying on UB. Detecting signed overflow
+by <strong>letting it happen</strong> and testing afterward is itself UB — that is why the naive check disappears.)</em></p>
+
+<h2>10.5 What to carry forward</h2>
+
+<p>Undefined behavior is not "what the machine does in the bad case." It is a precondition you promise the
+compiler you will never violate, and the optimizer reasons from that promise: under the as-if rule it may
+assume every UB-triggering condition is false and rewrite your program accordingly — deleting a null check
+after a dereference, folding <code>x + 1 &gt; x</code> to the constant <code>1</code>, keeping a value in a
+register across a write it "knows" cannot alias. We watched each of these happen in the assembly on this
+machine. The categories to keep separate are undefined (no requirements — the compiler's license),
+unspecified (a valid but unstated choice), and implementation-defined (unspecified but documented); only the
+first grants the license. The language makes this bargain on purpose — it is what lets C compile to fast code
+across every architecture without safety checks on every operation — and it hands you the whole cost. Your
+defenses are UBSan and ASan for detection, <code>-Wall -Wextra</code> for the static fraction, the
+define-the-undefined flags (<code>-fwrapv</code>, <code>-fno-strict-aliasing</code>,
+<code>-fno-delete-null-pointer-checks</code>) when you must depend on an edge, and — above all — writing code
+that never triggers UB.</p>
+
+<p>This chapter closes the loop opened in Chapter 9. There we cataloged the manual-memory bugs and called
+most of them UB; here you saw why that word carries so much weight — UB is what makes those bugs
+unpredictable, build-dependent, and, as CVE-2009-1897 shows, exploitable. It also sets up the next chapter:
+the buffer overflow of Chapter 9 is UB, and Chapter 11 follows exactly what an out-of-bounds write can do to
+a program's control flow — the single most consequential UB in the history of security. And it is the
+sharpest possible motivation for Rust (Part 5): a language whose safe subset has <em>no</em> undefined
+behavior, confining every UB-bearing operation to code you must mark <code>unsafe</code>, so the promises this
+chapter made you keep by hand are enforced by the type system before the program ever runs.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the C standard's definition of <strong>undefined behavior</strong> and distinguish it from
+<strong>unspecified</strong> and <strong>implementation-defined</strong> behavior.</li>
+<li>Explain the <strong>as-if rule</strong> and why it lets the optimizer assume UB-triggering conditions are
+false — including how an assumption "propagates" and can affect code before the buggy line.</li>
+<li>Walk through why <code>int f(int x){ return x + 1 &gt; x; }</code> can compile to <code>return 1</code>,
+and why a null check <em>after</em> a dereference can be deleted (CVE-2009-1897).</li>
+<li>Explain why "it worked at <code>-O0</code>" and "adding a <code>printf</code> fixed it" are UB
+signatures, not evidence of correctness.</li>
+<li>Name four defenses (UBSan, warnings, define-the-undefined flags, UB-free code) and say what each buys.</li>
+<li>Say, in one sentence, why the language leaves these behaviors undefined at all — the optimization/safety
+bargain — and how Rust strikes it differently.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Define undefined, unspecified, and implementation-defined behavior, and say which
+grants the compiler its license. (§10.1)</li>
+<li><strong>R2.</strong> State the as-if rule and explain how "the optimizer assumes UB never happens" leads
+to deleting code. (§10.2)</li>
+<li><strong>R3.</strong> Why can <code>x + 1 &gt; x</code> become <code>1</code>, and how does
+<code>-fwrapv</code> change that? (§10.3–10.4)</li>
+<li><strong>R4.</strong> Describe CVE-2009-1897: what pattern caused it, why the check was deleted, and the
+two-part fix. (§10.3)</li>
+<li><strong>R5.</strong> Name the bargain the language makes and four defenses against UB. (§10.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Chris Lattner, "What Every C Programmer Should Know About Undefined Behavior" (LLVM Project Blog,
+2011, three parts).</strong> The optimizer-writer's own account of how and why the compiler exploits UB, with
+worked examples (null checks, signed overflow, strict aliasing). Free.</li>
+<li><strong>John Regehr, "A Guide to Undefined Behavior in C and C++" (Embedded in Academia, 2010, three
+parts).</strong> A researcher's catalogue of UB and its interaction with aggressive compilers, including the
+"UB can time-travel" framing. Free (<code>blog.regehr.org</code>).</li>
+<li><strong>The C standard</strong> — §3.4.1/3.4.3/3.4.4 (the three behavior categories), §6.5 (aliasing),
+and the integer-overflow rules. The authority for what is undefined; <strong>cppreference.com</strong>
+summarizes it accessibly.</li>
+<li><strong>UndefinedBehaviorSanitizer (UBSan) documentation</strong> (Clang/GCC). The runtime detector for
+many UB categories; verify the exact checks and flags against your compiler version.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex10.1"><span class="ex-label">10.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define <em>undefined</em>, <em>unspecified</em>, and <em>implementation-defined</em>
+behavior, and state which one grants the optimizer license to assume the situation never happens.</div>
+
+<div class="exercise" id="ex10.2"><span class="ex-label">10.2</span> <span class="ex-tag warm">warm-up</span>
+Is <em>unsigned</em> integer overflow undefined behavior in C? Is <em>signed</em> integer overflow? Answer
+each and, for the defined one, say what value results.</div>
+
+<div class="exercise" id="ex10.3"><span class="ex-label">10.3</span> <span class="ex-tag warm">warm-up</span>
+A program prints correct output at <code>-O0</code> but wrong output at <code>-O2</code>. State the single
+most likely explanation, and name the two build flags you would add to hunt for it.</div>
+
+<div class="exercise" id="ex10.4"><span class="ex-label">10.4</span> <span class="ex-tag core">core</span>
+Explain, step by step, why <code>int f(int x){ return x + 1 &gt; x; }</code> can be compiled to
+<code>return 1</code>. Then explain what breaks if a programmer used <code>if (x + 1 &lt; x)</code> to detect
+overflow, and give a correct way to detect it.</div>
+
+<div class="exercise" id="ex10.5"><span class="ex-label">10.5</span> <span class="ex-tag core">core</span>
+Given <code>int *sk = t-&gt;sk; if (!t) return -1; return *sk;</code>: (a) name the UB, (b) explain why an
+optimizer may delete the <code>if (!t)</code> check, (c) give the one-line code fix, and (d) name the flag
+that would preserve the check without changing the code. This is a real CVE — name the pattern.</div>
+
+<div class="exercise" id="ex10.6"><span class="ex-label">10.6</span> <span class="ex-tag core">core</span>
+"The compiler has a bug — my code is fine, it just miscompiled." A teammate says this about the §10.5 null-
+check example. Explain, using the as-if rule, why the compiler is behaving correctly and the code is not.</div>
+
+<div class="exercise" id="ex10.7"><span class="ex-label">10.7</span> <span class="ex-tag complexity">cost</span>
+The standard <em>could</em> have defined all of these behaviors (mandating bounds checks, overflow checks,
+null checks). (a) What runtime cost would that impose? (b) Name one specific optimization that signed-overflow
+UB enables. (c) State the bargain in one sentence: what the programmer gives up and what the compiler gains.</div>
+
+<div class="exercise" id="ex10.8"><span class="ex-label">10.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A teammate reports: "My bounds check <code>if (i &lt; 0 || i
+&gt;= n)</code> works, but after I access <code>a[i]</code> <em>first</em> for logging and check
+<code>i</code> afterward, the check stopped firing." Diagnose and fix.
+<br><strong>Step 1 (given):</strong> Accessing <code>a[i]</code> with <code>i</code> out of range is an out-
+of-bounds access — undefined behavior.
+<br><strong>Step 2 (given):</strong> Once <code>a[i]</code> has executed, the compiler may assume
+<code>i</code> was in range (else UB), i.e. <code>0 &lt;= i &lt; n</code>.
+<br><strong>Step 3 (given):</strong> Therefore the later <code>if (i &lt; 0 || i &gt;= n)</code> is provably
+false and can be deleted — same shape as the null-check CVE.
+<br><strong>Step 4 (you):</strong> State the fix (what must come before what), name one sanitizer that would
+have flagged the original out-of-bounds access at runtime, and say why moving the log line does not merely
+"reorder output" but changes what the compiler is allowed to prove.</div>
+
+<div class="exercise" id="ex10.9"><span class="ex-label">10.9</span> <span class="ex-tag mixed">mixed</span>
+For each, decide whether it is <em>undefined</em>, <em>unspecified</em>, or <em>implementation-defined</em>,
+and justify in a line: (a) the value of <code>sizeof(int)</code>; (b) the order <code>a()</code> and
+<code>b()</code> are called in <code>a() + b()</code>; (c) <code>INT_MAX + 1</code>; (d) right-shifting a
+negative signed integer; (e) reading a <code>malloc</code>'d block before writing it. (One of these is a §9.3
+memory bug; recognizing that is the point.)</div>
+
+<div class="exercise" id="ex10.10"><span class="ex-label">10.10</span> <span class="ex-tag mixed">mixed</span>
+A colleague proposes three "fixes" for an intermittent bug that only appears in release builds: (a) always
+compile at <code>-O0</code>; (b) mark the variables <code>volatile</code> until it stops; (c) build the tests
+with <code>-fsanitize=undefined,address</code> and fix whatever it reports. Rank them from least to most
+effective and say, for each, whether it removes the bug or merely hides it.</div>
+
+<div class="exercise" id="ex10.11"><span class="ex-label">10.11</span> <span class="ex-tag stretch">stretch</span>
+The chapter says a UB assumption can "propagate" and even affect code <em>before</em> the buggy line. (a)
+Explain why, using the definition of UB as applying to the whole program execution. (b) Give a concrete
+scenario where deleting a downstream null check (because of an upstream dereference) turns a would-be crash
+into a silent security hole. (c) Argue why a <em>static</em> guarantee (Rust's safe subset having no UB) is
+qualitatively stronger than a runtime sanitizer here.</div>
+
+<div class="exercise" id="ex10.12"><span class="ex-label">10.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, compile <code>int f(int x){ return x + 1 &gt; x; }</code> with <code>gcc -O2 -S</code>
+and read the assembly; then recompile with <code>-fwrapv</code> and compare. Do the same for the §10.5
+<code>poll</code> function with and without <code>-fno-delete-null-pointer-checks</code>. (a) Record what
+changed in each case. (b) Write a tiny program with a signed-overflow bug and confirm whether
+<code>-fsanitize=undefined</code> reports it. Report only what you observed and label your compiler/version,
+since output varies.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch11">
+<h1>Chapter 11 — Arrays, Strings &amp; Buffer Safety</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch10">Chapter 10</a> (a buffer overflow
+is undefined behavior — and the optimizer trusts it never happens), <a href="#ch09">Chapter 9</a> (the
+buffer-overflow bug, stated precisely), <a href="#ch08">Chapter 8</a> (the stack, frames, and the return
+address that sits on it), <a href="#ch07">Chapter 7</a> (arrays, pointers, and array-to-pointer decay).
+&nbsp;·&nbsp; <strong>Continues Part 2.</strong> This chapter takes the buffer overflow — Chapter 9's most
+consequential bug — and follows it all the way to its worst outcome: overwriting a return address and
+seizing a program's control flow. Then it covers the C string model that makes overflows so easy, the
+string-function minefield, and the layered defenses real systems deploy — measuring each on this machine.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch08">Chapter 8</a> — a function's local array and its return
+address both live in the same stack frame; which direction does the stack grow, and which of those two is at
+a <em>higher</em> address on a typical downward-growing stack? (2) <a href="#ch09">Chapter 9</a> — an out-of-
+bounds <em>write</em> was called "especially dangerous." Why more dangerous than an out-of-bounds read? (3)
+<em>Predict:</em> you replace an unsafe <code>strcpy(dst, src)</code> with <code>strncpy(dst, src, n)</code>
+where <code>n</code> is exactly the size of <code>dst</code>, and <code>src</code> is <code>n</code>
+characters long. Do you think the result is a valid, null-terminated C string? We will compile exactly this
+and read the bytes.</p>
+</aside>
+
+<p>Almost every catastrophic memory-corruption vulnerability in the history of software traces to the same
+root: a program wrote past the end of a buffer. Chapter 9 named it and called it undefined behavior; Chapter
+10 showed why UB is dangerous in the abstract. This chapter makes it visceral, because the buffer overflow is
+not merely "corrupt some adjacent bytes" — on the stack, the bytes adjacent to a local array include the
+saved return address, and overwriting <em>that</em> hands an attacker control of what the CPU executes next.
+We will build up to it deliberately: why the C string is a fragile convention rather than a real type
+(§11.1); the anatomy of a stack buffer overflow and why it is exploitable (§11.2); the string-function
+minefield and the sized functions that replace it — including the trap that <code>strncpy</code> is
+<em>not</em> the safe <code>strcpy</code> (§11.3); the layered defenses (stack canaries, <code>_FORTIFY_SOURCE</code>,
+ASLR, NX/DEP) and precisely what each does and does not guarantee, run on this machine (§11.4); and the
+disciplines that actually prevent the bug (§11.5). Throughout, the refrain from Chapters 9 and 10 holds: the
+bug is UB, so a program that "runs fine in testing" may be one crafted input away from disaster.</p>
+
+<h2>11.1 The C string is a convention, not a type</h2>
+
+<p>C has no string type. What C calls a string is a <strong>convention</strong>: a contiguous array of
+<code>char</code> terminated by a null byte <code>'\0'</code> (a zero byte, value 0). The length is not stored
+anywhere — it is <em>implied</em> by the position of the terminator, which is why <code>strlen</code> is an
+O(n) scan that walks bytes until it finds the zero. This one design decision is the source of a startling
+share of C's danger. Because the length is not carried with the data, every function that touches a string
+must either be told the buffer's capacity or trust that a terminator exists within bounds — and when that
+trust is misplaced, the read or write runs off the end. Recall from <a href="#ch07">Chapter 7</a> that an
+array decays to a pointer to its first element the moment you pass it to a function: the callee receives an
+address with <em>no length information at all</em>. A <code>char *</code> tells you where a string starts; it
+tells you nothing about how much room there is. Bounds safety in C is therefore never automatic — it is
+something the programmer must reconstruct by hand, by tracking capacities alongside pointers.</p>
+
+<p>Two consequences follow immediately. First, <strong>a missing terminator is a bug waiting to happen</strong>:
+a "string" with no <code>'\0'</code> in bounds makes <code>strlen</code>, <code>printf("%s")</code>, and every
+other string function read past the end — an out-of-bounds read (UB), which can leak adjacent memory (the
+Heartbleed class, Ch 9). Second, <strong>a copy into an undersized buffer overflows it</strong>: writing an
+<em>n</em>-plus-one-byte string (n characters plus the terminator) into an <em>n</em>-byte buffer writes one
+byte past the end — an out-of-bounds write (UB), the subject of the rest of this chapter. The C string's
+elegance (a string is just bytes) and its danger (a string is <em>just</em> bytes, with no length and no
+bounds) are the same fact.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is <code>strlen</code> an O(n) operation rather than O(1)? And when you pass a <code>char buf[64]</code>
+to a function, how much does the function know about <code>buf</code>'s capacity? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>11.2 The stack buffer overflow — anatomy and why it is exploitable</h2>
+
+<p>Recall the stack frame from <a href="#ch08">Chapter 8</a>. When a function runs, its local variables — a
+<code>char buf[8]</code>, say — live in its stack frame, and (on the common downward-growing stack of x86-64
+and most architectures) the frame also holds the <strong>saved return address</strong>: the address the CPU
+will jump to when this function returns. Critically, the return address sits at a <em>higher</em> address
+than the local buffer, while a copy into the buffer writes toward <em>higher</em> addresses. So a write that
+overruns <code>buf</code> marches straight toward the saved return address. Overflow it by enough bytes and
+you overwrite the return address itself. Now the picture is stark: when the function returns, the CPU loads
+that overwritten value into the instruction pointer and jumps <em>wherever the overflowing bytes told it
+to</em>. An attacker who controls the input controls where the program goes next.</p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">One stack frame (stack grows down; a copy into buf writes UP toward the return address):</text>
+<text x="500" y="40" font-size="9" fill="#555">higher addresses</text>
+<rect x="120" y="34" width="300" height="26" fill="#fdecec" stroke="#8c3a1d"/>
+<text x="130" y="51" font-size="10">saved return address  &larr; overwrite this = hijack control</text>
+<rect x="120" y="60" width="300" height="24" fill="#f3eefc" stroke="#5b3a8c"/>
+<text x="130" y="76" font-size="10">saved frame pointer</text>
+<rect x="120" y="84" width="300" height="26" fill="#eef4fb" stroke="#14406b"/>
+<text x="130" y="101" font-size="10">char buf[8]   &larr; the copy starts here, writes upward</text>
+<text x="500" y="126" font-size="9" fill="#555">lower addresses</text>
+<line x1="270" y1="108" x2="270" y2="40" stroke="#8c3a1d" stroke-width="2" marker-end="url(#ar)"/>
+<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#8c3a1d"/></marker></defs>
+<text x="285" y="128" font-size="9" fill="#8c3a1d">overflow direction</text>
+<text x="20" y="156" font-size="9" fill="#333">strcpy(buf, "AAAAAAAA....\xef\xbe\xad\xde"): 8 bytes fill buf, more climb over the saved FP,</text>
+<text x="20" y="170" font-size="9" fill="#333">and the final bytes land on the return address. On `ret`, execution jumps to the attacker's value.</text>
+<text x="20" y="192" font-size="9" fill="#2e6b34">A stack canary (§11.4) sits between buf and the return address; the overflow trips it before `ret`.</text>
+</svg>
+<figcaption>Figure 11.1: A stack buffer overflow. Because the saved return address sits above the local
+buffer and a copy writes upward, overrunning the buffer can overwrite the return address, redirecting
+control flow when the function returns. A stack canary is placed in the gap to detect exactly this.</figcaption>
+</figure>
+
+<p>This is not a hypothetical; it is the mechanism behind decades of exploits, laid out for the first time in
+a widely read form by <strong>Aleph One's "Smashing the Stack for Fun and Profit"</strong> (Phrack 49, 1996)
+and developed rigorously in CS:APP (§3.10). The classic exploit places the attacker's own machine code
+("shellcode") in the buffer and overwrites the return address to point at it; modern mitigations (§11.4) have
+made that specific technique much harder, but the fundamental hazard — an out-of-bounds write reaching
+control data — remains, and newer techniques (return-oriented programming) route around the defenses. To
+make it concrete, this program overflows an 8-byte buffer:</p>
+
+<pre><code>#include &lt;string.h&gt;
+int main(void){
+    char buf[8];
+    strcpy(buf, "this string is much too long for the buffer");  /* 44 bytes into 8 */
+    return buf[0];
+}</code></pre>
+
+<p>Compiled with stack protection on this machine (<code>gcc -O0 -fstack-protector-all</code>) and run, it
+does <em>not</em> silently corrupt and continue — the canary catches it (§11.4). gcc even warns at compile
+time before you run it:</p>
+
+<pre><code>warning: '__builtin_memcpy' writing 44 bytes into a region of size 8 overflows the destination
+         [-Wstringop-overflow=]
+$ ./a.out
+*** stack smashing detected ***: terminated
+Aborted (core dumped)          # exit status 134 (SIGABRT)</code></pre>
+
+<p>Without those defenses — an older toolchain, or a copy whose length the compiler cannot see — the same
+overflow would have corrupted the return address silently. <strong>Outputs are from this machine (gcc 11.4.0,
+x86-64); wording and status vary by toolchain.</strong></p>
+
+<aside class="warning">
+<span class="box-title">Trap: "<code>strncpy</code> is the safe <code>strcpy</code>"</span>
+<p>The most common half-fix in C is to reach for <code>strncpy(dst, src, n)</code> believing the <code>n</code>
+makes it safe. It bounds the write, which prevents the overflow — but <strong><code>strncpy</code> does not
+guarantee a null terminator</strong>. Its actual contract (cppreference; the C standard): it copies at most
+<code>n</code> bytes; if <code>src</code> is shorter than <code>n</code> it pads the rest with zeros, but if
+<code>src</code> is <em>n</em> or more bytes long it writes exactly <code>n</code> bytes and stops — leaving
+<code>dst</code> <strong>unterminated</strong>. The next <code>strlen</code> or <code>printf("%s")</code> then
+runs off the end: you traded a bounded overflow for an unbounded over-read. On this machine,
+<code>char dst[4]; strncpy(dst, "abcd", 4);</code> leaves the four bytes <code>97 98 99 100</code>
+(<code>'a' 'b' 'c' 'd'</code>) with <em>no</em> terminating zero — a "string" that is not a string.
+<code>strncpy</code> was designed in the 1970s for fixed-width records (like early UNIX directory entries),
+<em>not</em> as a safe string copy, and using it as one is a classic trap. If you use it, you must terminate
+by hand (<code>dst[n-1] = '\0';</code>) — or, better, use <code>snprintf</code> (§11.3), which always
+terminates.</p>
+</aside>
+
+<p><em>(Answer to the §11.1 quick check: <code>strlen</code> is O(n) because a C string stores no length — it
+must scan byte by byte until it finds the terminating <code>'\0'</code>. And a function receiving
+<code>char buf[64]</code> knows <strong>nothing</strong> about the capacity: the array decayed to a bare
+<code>char *</code>, an address with no length attached — you must pass the size separately.)</em></p>
+
+<h2>11.3 The string-function minefield — and the sized alternatives</h2>
+
+<p>The classic C string functions are unsafe by construction because they take no destination size: they
+write until they hit a terminator in the <em>source</em>, with no regard for the <em>destination's</em>
+capacity. The worst offenders and their safer replacements:</p>
+
+<ul>
+<li><strong><code>gets(char *s)</code></strong> — reads a line into <code>s</code> with <em>no</em> bound
+whatsoever. It was so irredeemably unsafe that it was deprecated in C99 and <strong>removed from the language
+in C11</strong>. Never use it; use <code>fgets(s, size, stdin)</code>, which takes the buffer size.</li>
+<li><strong><code>strcpy(dst, src)</code> / <code>strcat(dst, src)</code></strong> — copy/append with no
+destination bound; overflow <code>dst</code> whenever <code>src</code> is too long. Prefer
+<code>snprintf</code> (below), or bounded copies where you control termination.</li>
+<li><strong><code>sprintf(dst, fmt, ...)</code></strong> — formats into <code>dst</code> with no bound; a
+long formatted result overflows. Replace with <strong><code>snprintf(dst, size, fmt, ...)</code></strong>,
+which writes at most <code>size</code> bytes <em>including</em> the terminator, always null-terminates (when
+<code>size &gt; 0</code>), and returns the length it <em>would</em> have written — so you can even detect
+truncation.</li>
+<li><strong><code>strncpy</code> / <code>strncat</code></strong> — bounded but treacherous:
+<code>strncpy</code> may not terminate (the §11.2 trap), and <code>strncat</code>'s size argument is the
+number of bytes to append, not the buffer size, which readers routinely get wrong. Usable, but only with
+care and a manual terminator.</li>
+</ul>
+
+<p>The reliable pattern for building a string safely is <code>snprintf</code>: it is bounded, always
+terminates, and reports truncation. When you truly need a raw copy, carry the capacity and check it —
+<code>if (srclen + 1 &lt;= dstcap) memcpy(dst, src, srclen + 1);</code> — the same "reconstruct the length by
+hand" discipline §11.1 demanded. (Some platforms offer <code>strlcpy</code>/<code>strlcat</code>, which always
+terminate and return the source length; they are widely available but are <em>not</em> in the C standard, so
+their portability must be checked. The standard's own <code>_s</code> "bounds-checking" functions, Annex K,
+exist but are optional and unevenly implemented — do not assume them.)</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the one standard string function that was <em>removed</em> from C11 for being unsafe, and its safe
+replacement. And what does <code>snprintf</code> guarantee that <code>strncpy</code> does not? (Answer below
+the communicate box.)</p>
+</aside>
+
+<h2>11.4 Defense in depth — canaries, FORTIFY, ASLR, NX — and what each buys</h2>
+
+<p>Because buffer overflows are so consequential, modern toolchains and operating systems layer several
+<em>mitigations</em>. It is essential to understand what each actually guarantees, because none of them
+<em>removes</em> the bug — they raise the cost of exploiting it, and each defeats a specific technique while
+leaving others open. Four you will meet, three demonstrated on this machine:</p>
+
+<ul>
+<li><strong>Compiler bounds warnings.</strong> With optimization and <code>-Wall</code>, gcc's
+<code>-Wstringop-overflow</code> can catch overflows it can see at compile time. On this machine the §11.2
+program drew <code>warning: '__builtin_memcpy' writing 44 bytes into a region of size 8 overflows the
+destination</code> — a static catch, but only when the sizes are visible to the compiler.</li>
+<li><strong><code>_FORTIFY_SOURCE</code>.</strong> Building with <code>-D_FORTIFY_SOURCE=2 -O2</code> makes
+glibc substitute checked variants (<code>__strcpy_chk</code>, <code>__memcpy_chk</code>, …) that know the
+destination size and abort on overflow — catching many cases at compile time <em>or</em> runtime. On this
+machine, fortifying <code>char buf[4]; strcpy(buf, "hello");</code> produced
+<code>warning: '__builtin___strcpy_chk' writing 6 bytes into a region of size 4</code>. It only helps where
+the size is known and requires optimization; it is not universal.</li>
+<li><strong>Stack canaries</strong> (<code>-fstack-protector</code> / <code>-fstack-protector-all</code>).
+The compiler places a random "canary" value between the local buffers and the saved return address (Figure
+11.1) and checks it just before returning; if an overflow overwrote it, the program aborts instead of
+returning to corrupted control data. On this machine, the §11.2 overflow tripped it:
+<code>*** stack smashing detected ***: terminated</code>, exit status 134. Canaries defeat the classic
+"overwrite the return address by linear overflow" attack — but not overwrites that skip the canary, or
+non-control-data corruption, and they act <em>after</em> the corruption (they convert exploitation into a
+crash, i.e. a denial of service, not into "no bug").</li>
+<li><strong>ASLR and NX/DEP</strong> (OS-level). <strong>Address Space Layout Randomization</strong>
+randomizes the base addresses of the stack, heap, and libraries each run, so an attacker cannot easily
+predict where to jump. <strong>NX/DEP</strong> (the no-execute page permission, tied to virtual memory from
+Chapter 4) marks the stack and heap non-executable, so injected shellcode cannot run as code. Together they
+defeat the original "inject shellcode on the stack and jump to it" recipe — which is why real attacks moved
+to <em>return-oriented programming</em>, chaining existing code fragments rather than injecting new ones.
+These are runtime/OS defenses, not compiler ones, and again they raise cost rather than eliminate the bug.</li>
+</ul>
+
+<p>The load-bearing point: <strong>every one of these is a mitigation, not a fix.</strong> They assume the
+overflow exists and try to contain its blast radius — turning a silent hijack into a crash, or a reliable
+exploit into an unreliable one. The bug is still there, still undefined behavior (Ch 10), and a determined
+attacker or an unlucky input may route around any single layer. The only true fix is to not write out of
+bounds in the first place (§11.5) — or to use a language that enforces bounds by construction (Part 5).</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a buffer overflow is a bounds violation with consequences</span>
+<p><strong>1. In words.</strong> Writing past a buffer's end (§9.3's bounds violation) is undefined behavior;
+on the stack the bytes just past a local array include control data — the saved return address — so the
+overflow can redirect execution, not merely corrupt data.</p>
+<p><strong>2. As a picture.</strong> Figure 11.1: <code>buf</code> low, saved frame pointer above it, return
+address above that; a copy writes upward, so an overrun climbs over the frame pointer onto the return
+address. A canary sits in the gap to catch the climb.</p>
+<p><strong>3. As UB the compiler and OS fight in layers.</strong> The write is UB (Ch 10) — no defined
+outcome. Compiler warnings and <code>_FORTIFY_SOURCE</code> catch some cases; canaries turn a hijack into a
+crash; ASLR and NX defeat specific exploit recipes. None removes the UB; only bounds-correct code does.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> In a review, a colleague writes: "I turned on <code>-fstack-protector</code>, so
+our buffer overflows are handled — we don't need to fix the <code>strcpy</code> calls." Cover the paragraph
+and respond in three or four sentences, distinguishing <em>mitigation</em> from <em>fix</em>.</p>
+<p><em>Model answer.</em> "A stack canary is a mitigation, not a fix: it detects a linear stack overflow just
+before the function returns and aborts, so it converts a control-flow hijack into a crash — a denial of
+service, still a real incident, and it does nothing for heap overflows, non-control-data corruption, or
+overwrites that skip the canary. The overflow is still there, still undefined behavior, so the compiler is
+free to do surprising things around it, and a canary that fires in production is an outage. We should keep
+the canary <em>and</em> ASLR <em>and</em> <code>_FORTIFY_SOURCE</code> as defense in depth, but the actual fix
+is to remove the unbounded copies — replace <code>strcpy</code> with <code>snprintf</code> or a capacity-
+checked <code>memcpy</code> — so the out-of-bounds write cannot happen." Naming the distinction — mitigation
+contains blast radius, only bounds-correct code removes the bug — is the senior register, and it keeps the
+defenses without treating them as a license to leave the bug in.</p>
+</aside>
+
+<p><em>(Answer to the §11.3 quick check: <code>gets</code> was removed from C11; its safe replacement is
+<code>fgets</code>, which takes the buffer size. And <code>snprintf</code> always null-terminates its output
+(when the size is nonzero) and reports truncation, whereas <code>strncpy</code> may leave the destination
+with no terminator at all.)</em></p>
+
+<h2>11.5 What to carry forward</h2>
+
+<p>The C string is a convention — a null-terminated byte array with no stored length — and that single fact
+is why bounds safety in C is manual and why buffer overflows are so easy. An out-of-bounds write is
+undefined behavior (Ch 9, Ch 10), and on the stack it is the most consequential UB in security: the saved
+return address lives just past a local buffer, so an overrun can overwrite it and redirect control flow —
+the mechanism Aleph One documented and CS:APP develops. The classic string functions (<code>gets</code>,
+<code>strcpy</code>, <code>strcat</code>, <code>sprintf</code>) take no destination size and are unsafe by
+construction; <code>gets</code> was removed from C11 outright. The sized replacements — <code>fgets</code>,
+<code>snprintf</code>, capacity-checked <code>memcpy</code> — are safe <em>when you carry the capacity and
+check it</em>, and <code>strncpy</code> is a trap because it can leave a string unterminated. Layered
+defenses (compiler warnings, <code>_FORTIFY_SOURCE</code>, stack canaries, ASLR, NX/DEP) each raise the cost
+of exploitation and we watched three of them fire on this machine — but every one is a mitigation that
+contains the blast radius, not a fix that removes the bug.</p>
+
+<p>The discipline that actually prevents the bug is the same one Chapters 7–10 kept circling: a bare pointer
+carries no bounds, so <em>you</em> must carry them — keep the capacity beside every buffer, check every copy
+against it, prefer sized APIs, and never trust that a terminator is present. That is a proof obligation, on
+every string operation, that the programmer discharges by hand and that no amount of mitigation discharges
+for you. It is also the cleanest possible statement of what a safer language buys: in Rust (Part 5) a string
+and a slice <em>carry their length</em>, indexing is bounds-checked, and an out-of-bounds access is a defined
+panic rather than undefined memory corruption — the "carry the length by hand" discipline of this chapter,
+promoted into the type system. Part 2 has now taken you from "a pointer is an address" (Ch 7) to "and you own
+every lifetime, every bound, and every promise to the compiler" (Ch 8–11). The final chapter turns the last
+of those responsibilities — allocation — from a hazard you survive into a tool you wield.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a C string is "a convention, not a type," and why that makes <code>strlen</code> O(n) and
+bounds safety manual.</li>
+<li>Draw a stack frame and explain why a buffer overflow can overwrite the <strong>saved return
+address</strong> and hijack control flow.</li>
+<li>State why <code>strncpy</code> is <em>not</em> the safe <code>strcpy</code> — the exact contract that
+bites — and name a genuinely safe alternative.</li>
+<li>Name the four classic unsafe string functions and their sized replacements, and which one C11 removed.</li>
+<li>Describe stack canaries, <code>_FORTIFY_SOURCE</code>, ASLR, and NX/DEP, and say for each what it buys
+and why it is a mitigation, not a fix.</li>
+<li>State the one discipline that actually prevents overflows, and how Rust promotes it into the type system.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a C string, physically, and why does it store no length? (§11.1)</li>
+<li><strong>R2.</strong> Why can a stack buffer overflow hijack control flow — what sits next to the buffer,
+and in which direction does a copy write? (§11.2)</li>
+<li><strong>R3.</strong> State <code>strncpy</code>'s exact contract and the trap it creates; give a safer
+function. (§11.2–11.3)</li>
+<li><strong>R4.</strong> For canaries, <code>_FORTIFY_SOURCE</code>, ASLR, and NX/DEP, what does each defeat,
+and why is each a mitigation not a fix? (§11.4)</li>
+<li><strong>R5.</strong> What single discipline prevents overflows, and how does Rust encode it? (§11.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Aleph One, "Smashing the Stack for Fun and Profit," Phrack 49 (1996).</strong> The first widely
+read, step-by-step account of stack buffer overflow exploitation; historically pivotal. Free
+(<code>phrack.org</code>). Read it for the mechanism, not as current exploit practice (the mitigations of
+§11.4 postdate it).</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP),
+§3.10.</strong> Buffer overflows, stack smashing, and the mitigations (canaries, ASLR, NX) developed
+rigorously with the stack-frame model of Chapter 8. The reference for this chapter.</li>
+<li><strong>cppreference.com</strong> and the <strong>C standard</strong> — the exact contracts of
+<code>strcpy</code>, <code>strncpy</code>, <code>strcat</code>, <code>snprintf</code>, <code>fgets</code>,
+and the removal of <code>gets</code> in C11. The authority for what each function promises.</li>
+<li><strong>Beej's Guide to C.</strong> Free (<code>beej.us</code>). Practical, readable coverage of C strings
+and the safe idioms.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex11.1"><span class="ex-label">11.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: (a) what physically marks the end of a C string? (b) why is <code>strlen</code> O(n)?
+(c) when you pass an array to a function, what does the function learn about its capacity?</div>
+
+<div class="exercise" id="ex11.2"><span class="ex-label">11.2</span> <span class="ex-tag warm">warm-up</span>
+Which standard string function was <em>removed</em> from the language in C11 for being unsafe, and what
+should you use instead?</div>
+
+<div class="exercise" id="ex11.3"><span class="ex-label">11.3</span> <span class="ex-tag warm">warm-up</span>
+True or false, with a one-line reason each: (a) <code>strncpy(dst, src, n)</code> always produces a null-
+terminated string. (b) A stack canary removes the buffer-overflow bug. (c) <code>snprintf</code> always null-
+terminates when its size argument is nonzero.</div>
+
+<div class="exercise" id="ex11.4"><span class="ex-label">11.4</span> <span class="ex-tag core">core</span>
+Explain, using a stack-frame diagram in words, why an out-of-bounds <em>write</em> into a local array can
+hijack a program's control flow but an out-of-bounds <em>read</em> (usually) cannot. What lies just past the
+buffer, and in which direction does a copy write?</div>
+
+<div class="exercise" id="ex11.5"><span class="ex-label">11.5</span> <span class="ex-tag core">core</span>
+For each, state whether it can overflow the destination and why, and give a safe rewrite: (a)
+<code>strcpy(buf, user_input);</code> (b) <code>sprintf(buf, "%s-%s", a, b);</code> (c)
+<code>char d[4]; strncpy(d, "abcd", 4); printf("%s", d);</code></div>
+
+<div class="exercise" id="ex11.6"><span class="ex-label">11.6</span> <span class="ex-tag core">core</span>
+A colleague argues: "We enabled stack canaries and ASLR, so buffer overflows are handled." Give three
+distinct reasons this is wrong — each naming something a canary or ASLR does <em>not</em> prevent — and state
+what the actual fix is.</div>
+
+<div class="exercise" id="ex11.7"><span class="ex-label">11.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is <code>strlen</code> O(n) while a length-carrying string type (as in Rust or C++
+<code>std::string</code>) makes "get the length" O(1)? (b) What runtime cost do stack canaries and
+<code>_FORTIFY_SOURCE</code> add, and what do you get for it? (c) Is a canary check on the hot path free?
+Classify the trade-off (safety vs. speed).</div>
+
+<div class="exercise" id="ex11.8"><span class="ex-label">11.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Diagnose and fix:
+<code>void greet(const char *name){ char msg[16]; strcpy(msg, "Hello, "); strcat(msg, name); puts(msg); }</code>.
+<br><strong>Step 1 (given):</strong> <code>"Hello, "</code> is 7 characters plus a terminator, using 8 of the
+16 bytes.
+<br><strong>Step 2 (given):</strong> <code>strcat</code> appends <code>name</code> with no bound; if
+<code>name</code> is longer than 7 characters the total exceeds 16 bytes.
+<br><strong>Step 3 (given):</strong> So a long <code>name</code> overflows <code>msg</code> — an out-of-
+bounds write, undefined behavior, and (on the stack) a potential control-flow hijack.
+<br><strong>Step 4 (you):</strong> Rewrite the function using <code>snprintf</code> so it can never overflow
+regardless of <code>name</code>'s length; state what <code>snprintf</code> guarantees that <code>strcat</code>
+does not; and name one §11.4 defense that would turn the original overflow into a crash rather than a silent
+hijack.</div>
+
+<div class="exercise" id="ex11.9"><span class="ex-label">11.9</span> <span class="ex-tag mixed">mixed</span>
+For each symptom, name the most likely cause — <em>unterminated string (over-read)</em>, <em>buffer overflow
+(over-write)</em>, <em>use-after-free</em> (Ch 9), or <em>a mitigation firing</em> — and justify in a line:
+(a) a program prints a corrupted string with garbage bytes appended after the expected text; (b) a service
+aborts with <code>*** stack smashing detected ***</code> on a long request; (c) reading a freed heap block
+returns another request's data; (d) <code>printf("%s", s)</code> reads far past where the data should end and
+leaks adjacent memory.</div>
+
+<div class="exercise" id="ex11.10"><span class="ex-label">11.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>undefined behavior</em>, <em>a defined-but-real defect</em>, or <em>well-defined and
+fine</em>, drawing on Chapters 9–11: (a) <code>strncpy(d, s, sizeof d)</code> then reading <code>d</code> as
+a string, where <code>strlen(s) &gt;= sizeof d</code>; (b) <code>snprintf(d, sizeof d, "%s", s)</code> then
+reading <code>d</code>; (c) writing one byte past a heap block; (d) a canary aborting the process on a
+detected overflow.</div>
+
+<div class="exercise" id="ex11.11"><span class="ex-label">11.11</span> <span class="ex-tag stretch">stretch</span>
+The chapter calls the mitigations "defense in depth." (a) Explain what each of stack canaries, NX/DEP, and
+ASLR defeats, and name the exploit technique (return-oriented programming) that was developed to route around
+NX. (b) Argue why layering mitigations is still worthwhile even though none is a fix. (c) Explain what it
+means for Rust to make the bug "not happen" rather than "not exploit" — and why a bounds-checked panic is
+categorically different from undefined memory corruption.</div>
+
+<div class="exercise" id="ex11.12"><span class="ex-label">11.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, write the §11.2 8-byte-buffer overflow. (a) Compile with
+<code>-fstack-protector-all</code>, run it, and record the exact message and exit status. (b) Compile the
+same with <code>-D_FORTIFY_SOURCE=2 -O2</code> and record any compile-time diagnostic. (c) Write
+<code>char d[4]; strncpy(d, "abcd", 4);</code> and print the four bytes as integers to confirm whether a
+terminator is present. Report only what you observed and label your compiler/version, since output varies.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch12">
+<h1>Chapter 12 — Custom Allocators: Arenas, Pools &amp; Free Lists</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch09">Chapter 9</a> (what the allocator
+does — free lists, size classes, fragmentation, cost), <a href="#ch10">Chapter 10</a> (a use-after-free is
+undefined behavior, whoever owns the memory), <a href="#ch05">Chapter 5</a> (mechanical sympathy: cost
+follows layout and access pattern). &nbsp;·&nbsp; <strong>Closes Part 2.</strong> Chapter 9 treated the
+general-purpose allocator as a fact of the machine and cataloged the ways manual memory goes wrong. This
+chapter turns allocation from a hazard you survive into a tool you wield: when your allocation <em>pattern</em>
+is known, a custom allocator — an arena, a pool, a free list — can be dramatically faster than
+<code>malloc</code>, and we will build and measure one on this machine. It also completes the arc of the
+part: even your own allocator does not relax a single rule from Chapters 9–11.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch09">Chapter 9</a> — why is a heap <code>malloc</code> far more
+expensive than the stack's pointer-bump, and what two things (a search structure and a per-block record) does
+the allocator maintain? (2) <a href="#ch09">Chapter 9</a> — what is <em>external fragmentation</em>, and why
+can it make a large allocation fail even when total free memory is ample? (3) <em>Predict:</em> suppose you
+allocate a million small objects that all die at the same moment. If you could replace a million individual
+<code>free</code> calls with a <em>single</em> operation that reclaims them all at once, roughly how much
+faster do you think freeing would be? We will measure exactly this.</p>
+</aside>
+
+<p>Chapter 9's allocator is a marvel of generality: it satisfies any size, in any order, at any time, and it
+is the right default for the overwhelming majority of code. But generality has a price — every allocation may
+search a free list, split a block, and update bookkeeping; every free may coalesce; and interleaved requests
+fragment the pool. When you know something specific about <em>how</em> your program allocates — that many
+objects share a lifetime, or that they are all the same size — you can trade the general allocator's
+flexibility for speed and simplicity by writing an allocator specialized to that pattern. This chapter builds
+the two most useful specializations: the <strong>arena</strong> (also called a region or bump allocator),
+which makes allocation a pointer increment and frees everything at once (§12.2), and the <strong>pool</strong>
+or free-list allocator for fixed-size objects (§12.3). We start by asking precisely when the general
+allocator loses (§12.1), build and measure an arena on this machine, then close with an honest accounting of
+when a custom allocator is worth it — and the crucial fact that it does not lift the burden of Chapters 9–11
+(§12.4–12.5). This is the capstone of "manual memory": having felt its hazards, you now use it deliberately.</p>
+
+<h2>12.1 Why not just <code>malloc</code>? — allocation patterns</h2>
+
+<p>The general-purpose allocator is optimized for the case where it knows <em>nothing</em> about your
+requests. That ignorance is what costs you. Three patterns where a specialized allocator can do far better,
+precisely because it exploits knowledge the general allocator lacks:</p>
+
+<ul>
+<li><strong>Many objects, one lifetime.</strong> A request handler, a compiler pass, a frame of a game — all
+allocate a burst of objects that become garbage together at a known moment. The general allocator makes you
+<code>free</code> each one individually (and track every pointer to do so); an allocator that knows they
+share a lifetime can free the whole batch in one operation.</li>
+<li><strong>Many objects, one size.</strong> A pool of network connections, tree nodes, fixed-size buffers.
+The general allocator's size-class machinery and per-block headers are overhead you do not need if every
+object is identical; a fixed-size allocator can hand out and reclaim blocks in O(1) with almost no
+bookkeeping and no fragmentation <em>within</em> that size.</li>
+<li><strong>Hot allocation loops.</strong> Per-iteration <code>malloc</code>/<code>free</code> in a tight
+loop pays the general allocator's cost every iteration. Amortizing that — allocating a big block once and
+sub-dividing it cheaply — can dominate.</li>
+</ul>
+
+<p>The mechanism behind all three is the same idea as Chapter 5's mechanical sympathy: when you know the
+access or lifetime pattern, you can lay memory out and manage it to match, and the machine rewards you. But
+there is a discipline here that this chapter insists on and §12.4 returns to: custom allocators are a
+<em>measured</em> optimization, not a default. Berger, Zorn, and McKinley's study of eight real programs
+using custom allocators (OOPSLA 2002) found that for most of them a good general-purpose allocator matched or
+beat the custom one — the big wins came specifically from the region/arena pattern (the "one lifetime" case),
+where they measured improvements up to 44%. The lesson is not "always write your own"; it is "when the
+pattern is right, the win is real and large — and when it is not, you have added complexity for nothing."</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the allocation pattern an <em>arena</em> exploits and the one a <em>fixed-size pool</em> exploits.
+Which single piece of knowledge does each have that the general-purpose allocator does not? (Answer after the
+next section.)</p>
+</aside>
+
+<h2>12.2 The arena (region / bump) allocator — build and measure it</h2>
+
+<p>An <strong>arena</strong> (or region, or bump allocator) exploits the "many objects, one lifetime"
+pattern. The idea is minimal: reserve one large block up front, keep a single <em>offset</em> into it, and
+satisfy each allocation by returning the current offset and bumping it forward by the requested size (rounded
+up for alignment). There is no free list, no size class, no per-block header, and — most importantly — no
+per-object free: individual objects are <em>never</em> freed. Instead the entire arena is reclaimed at once,
+either by resetting the offset to zero (reuse the memory) or by freeing the backing block. Allocation is a
+pointer increment; bulk-free is a single assignment or one <code>free</code>. Here is the whole allocator:</p>
+
+<pre><code>typedef struct { unsigned char *base; size_t cap, off; } Arena;
+
+Arena arena_new(size_t cap){ Arena a; a.base = malloc(cap); a.cap = cap; a.off = 0; return a; }
+
+void *arena_alloc(Arena *a, size_t n){
+    size_t p = (a-&gt;off + 15) &amp; ~(size_t)15;   /* round up to 16-byte alignment */
+    if (p + n &gt; a-&gt;cap) return NULL;           /* arena exhausted */
+    a-&gt;off = p + n;                             /* bump the offset */
+    return a-&gt;base + p;
+}
+
+void arena_reset(Arena *a){ a-&gt;off = 0; }       /* frees EVERYTHING in O(1) */</code></pre>
+
+<p>That is a complete, working allocator. Compiled and run on this machine, it hands out correctly aligned,
+independent blocks (<code>x=42</code>, <code>s="hello"</code>, <code>y=7</code>, each 16-byte aligned), and
+<code>arena_reset</code> returns the offset to 0, reclaiming all of them in one operation. The payoff is
+speed, and it is worth measuring honestly. The arena wins when many objects are live <em>simultaneously</em>
+and die together — so the fair comparison is: allocate <em>N</em> objects that all stay live, then free them.
+With the arena that is <em>N</em> pointer-bumps and one bulk free; with <code>malloc</code> it is <em>N</em>
+allocations and <em>N</em> individual frees. For <em>N</em> = 5,000,000 small objects on this machine (gcc
+11.4.0, <code>-O2</code>, x86-64):</p>
+
+<pre><code>arena  (N live, 1 bulk free) :  ~50-90 ms
+malloc (N live, N frees)     : ~240-370 ms
+speedup                      :  ~4-5x</code></pre>
+
+<p>Roughly a <strong>four-to-five-fold</strong> speedup, which lines up with the region wins Berger et al.
+reported. <strong>These figures are illustrative and from this specific machine/run — they vary run-to-run
+(the ranges above are across repeated runs) and with size, allocator, and hardware; measure your own.</strong>
+The win has a clear source: the arena replaced a million bookkeeping-heavy <code>free</code> calls with a
+single offset reset, and made each allocation a pointer add instead of a free-list search.</p>
+
+<figure>
+<svg viewBox="0 0 640 180" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">Arena: one block, one offset. Each alloc bumps the offset; reset frees everything at once.</text>
+<rect x="20" y="26" width="600" height="30" fill="#f5f8fb" stroke="#14406b"/>
+<rect x="20" y="26" width="90" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="30" y="45" font-size="8">obj A</text>
+<rect x="110" y="26" width="60" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="120" y="45" font-size="8">obj B</text>
+<rect x="170" y="26" width="120" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="180" y="45" font-size="8">obj C</text>
+<line x1="290" y1="20" x2="290" y2="62" stroke="#8c3a1d" stroke-width="2"/>
+<text x="296" y="50" font-size="9" fill="#8c3a1d">off (next alloc lands here &rarr;)</text>
+<text x="20" y="82" font-size="9" fill="#333">alloc(n): p = round_up(off); off = p + n; return base + p;   &mdash;   O(1), a pointer add. No header, no search.</text>
+<text x="20" y="100" font-size="9" fill="#2e6b34">reset(): off = 0;   &mdash;   frees A, B, C (and all others) in ONE step. No per-object free.</text>
+<text x="20" y="128" font-size="9" fill="#8c3a1d">Trade-off: you CANNOT free obj B alone. If B outlives A and C, its memory is stuck until the whole arena resets.</text>
+<text x="20" y="146" font-size="9" fill="#555">Right pattern: objects that share a lifetime (a request, a frame, a compiler pass). Wrong pattern: mixed, long lifetimes.</text>
+<text x="20" y="168" font-size="9" fill="#555">Berger/Zorn/McKinley (OOPSLA 2002): regions win big for the right pattern, but can inflate memory use when objects outlive the batch.</text>
+</svg>
+<figcaption>Figure 12.1: An arena allocates by bumping a single offset and frees everything at once by
+resetting it — O(1) allocation, O(1) bulk free, no fragmentation, no per-object free. The cost is
+inflexibility: you cannot free one object early, so memory is held until the whole region is reset.</figcaption>
+</figure>
+
+<p>The trade-off is exactly that inflexibility, and it is not free. Because you cannot free an individual
+object, any object that outlives the batch pins the <em>entire</em> arena's memory until reset — so an arena
+used with the wrong lifetime pattern can inflate memory consumption badly (Berger et al. note precisely this
+downside of regions). And — the theme of §12.5 — resetting an arena while a pointer into it is still in use
+is a use-after-free by another name: undefined behavior, exactly as in Chapter 10, now with <em>you</em> as
+the allocator.</p>
+
+<p><em>(Answer to the §12.1 quick check: an <strong>arena</strong> exploits "many objects share one
+lifetime" — it knows the batch dies together, so it can skip per-object frees and reclaim all at once. A
+<strong>fixed-size pool</strong> exploits "many objects, one size" — it knows every block is identical, so it
+needs no size classes, no split/coalesce, and no per-block size header.)</em></p>
+
+<h2>12.3 The pool / free-list allocator — fixed-size, O(1) both ways</h2>
+
+<p>When objects share a <em>size</em> rather than a lifetime — a pool of tree nodes, connection structs,
+fixed buffers — a <strong>pool allocator</strong> (a fixed-size free-list allocator) is the specialization
+that fits. Carve one large block into an array of equal-size slots and thread the free slots onto a singly
+linked <strong>free list</strong>: because every slot is the same size and currently unused, you can store
+the "next free slot" pointer <em>inside the slot itself</em>, costing no extra memory. Allocation pops the
+head of the free list; freeing pushes the slot back onto the head. Both are O(1), a couple of pointer
+operations, with no search, no splitting, no coalescing, and — because all slots are identical — no external
+fragmentation within the pool at all. The sketch:</p>
+
+<pre><code>/* free_list points at the first free slot; each free slot's first bytes hold the next pointer */
+void *pool_alloc(Pool *p){
+    if (!p-&gt;free_list) return NULL;            /* pool exhausted */
+    void *slot = p-&gt;free_list;
+    p-&gt;free_list = *(void **)slot;             /* pop: next free = this slot's stored next */
+    return slot;
+}
+void pool_free(Pool *p, void *slot){
+    *(void **)slot = p-&gt;free_list;             /* push: this slot's next = old head */
+    p-&gt;free_list = slot;                        /* new head = this slot */
+}</code></pre>
+
+<p>Unlike the arena, a pool <em>does</em> support freeing individual objects — that is its point — so it fits
+the "allocate and free repeatedly, but always the same size" pattern the arena cannot. What it gives up is
+generality: it serves exactly one size. This is not a toy idea. The Linux kernel's <strong>slab
+allocator</strong> — introduced in Jeff Bonwick's 1994 paper (USENIX) for SunOS and adopted widely since — is
+a production-grade elaboration: it maintains per-size caches of pre-initialized objects ("slabs") so that
+allocating a kernel object is a free-list pop and freeing it a push, retaining the object's initialized state
+between uses and adding a cache-coloring scheme to spread objects across cache lines (Ch 3). Production
+general allocators (glibc's <code>malloc</code>, jemalloc, tcmalloc) likewise use size-classed free lists
+internally — the pool is the general allocator's own core trick, exposed for you to specialize.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: specialize the allocator to the pattern</span>
+<p><strong>1. In words.</strong> The general allocator is fast <em>because it knows nothing</em> is a
+contradiction — its generality costs search, headers, and fragmentation. If you know the pattern (shared
+lifetime → arena; shared size → pool), you drop the machinery you do not need and get O(1) with almost no
+bookkeeping.</p>
+<p><strong>2. As two pictures.</strong> Arena (Fig 12.1): one offset, bump to allocate, reset to free all.
+Pool: an array of equal slots with a free list threaded through the unused ones; pop to allocate, push to
+free — both O(1), no fragmentation within the size.</p>
+<p><strong>3. As numbers.</strong> Arena on this machine: ~4–5&times; faster than <code>malloc</code> for the
+one-lifetime batch (§12.2). Pool: allocation and free are each a couple of pointer writes versus the general
+allocator's free-list search and coalesce. The win is real <em>only</em> when the pattern holds (§12.4).</p>
+</aside>
+
+<h2>12.4 Choosing an allocator — an honest accounting</h2>
+
+<p>With three allocators in hand — general-purpose, arena, pool — the engineering question is when to reach
+for each. The honest answer starts with a warning that the research backs up: <strong>the general-purpose
+allocator is the right default, and custom allocation is a measured optimization, not a reflex.</strong>
+Berger, Zorn, and McKinley found that for six of eight real programs a state-of-the-art general allocator
+matched or beat the hand-written custom one — the programmers' custom allocators were often <em>slower</em>
+as well as buggier and harder to maintain. Custom allocation earned its keep in exactly the region/arena case.
+So the decision procedure is: profile first (Chapter 9's cost model, and the performance-engineering
+discipline Part 6 develops — measure before you optimize); confirm allocation is actually a bottleneck; then
+match the allocator to the pattern:</p>
+
+<ul>
+<li><strong>General-purpose <code>malloc</code></strong> — the default. Any size, any order, any lifetime,
+individual frees. Use it unless you have measured a reason not to.</li>
+<li><strong>Arena</strong> — when a burst of objects shares a lifetime and dies together (a request, a frame,
+a parse). O(1) alloc, O(1) bulk free, no per-object free. Watch the memory downside: anything that outlives
+the batch pins the whole region.</li>
+<li><strong>Pool</strong> — when objects share a fixed size and are allocated/freed repeatedly. O(1) both
+ways, no fragmentation within the size, individual frees supported. Serves exactly one size.</li>
+</ul>
+
+<p>Each choice is a trade, not a free win. The arena trades the ability to free individually for speed and
+simplicity — and can waste memory if the lifetime assumption is wrong. The pool trades generality (one size
+only) for O(1) operations and zero fragmentation. And every custom allocator trades the maturity, debugging
+support, and hardening of the system allocator for code you now own and must get right. That last cost is the
+bridge to §12.5.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: "a custom allocator makes the memory bugs go away"</span>
+<p>It is tempting to think that once <em>you</em> control allocation, the hazards of Chapters 9–11 are behind
+you. The opposite is true: <strong>writing your own allocator makes you responsible for the very invariants
+the language and the system allocator's tooling used to help enforce</strong> — and it introduces new ways to
+violate them. Reset an arena while a pointer into it is still live, and the next allocation reuses that memory
+under the old pointer: a <em>use-after-reset</em>, which is a use-after-free (Ch 9), undefined behavior (Ch
+10), with you as the allocator. <code>pool_free</code> the same slot twice and you corrupt the free list —
+a double-free in your own code. Hand out a slot without checking the pool is non-empty and you return a null
+you may dereference. Worse, sanitizers (Ch 9) understand <code>malloc</code>/<code>free</code> but do
+<em>not</em>, by default, understand <em>your</em> arena's reset or <em>your</em> pool's recycling, so they
+may not catch a use-after-reset at all — you have moved the bug below the tool's visibility. (ASan offers
+manual "poisoning" hooks precisely so custom allocators can be made visible to it, but you must add them.) A
+custom allocator does not repeal lifetimes, bounds, and free-exactly-once; it makes you their implementer.
+Every rule from Chapters 9–11 still holds — you have just taken over enforcing them.</p>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>You reset an arena to reclaim a request's memory, but one object from that request was stored in a cache
+that outlives the request. What bug have you just created, and what is its Chapter-9 name? (Answer below the
+communicate box.)</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: "Our service is slow — let's replace <code>malloc</code> with
+an arena allocator everywhere for a quick speed win." Cover the paragraph and respond in three or four
+sentences, drawing on §12.1 and §12.4.</p>
+<p><em>Model answer.</em> "An arena is a big win for a specific pattern — a burst of objects that share a
+lifetime and die together, like everything allocated while handling one request — but it's the wrong tool
+'everywhere,' because it can't free individual objects, so any object that outlives its batch pins the whole
+region and can inflate our memory badly. The evidence backs the caution: Berger, Zorn, and McKinley found a
+good general allocator matched or beat hand-written custom allocators for most programs, with the arena/region
+case being the real exception. Let's profile first to confirm allocation is actually the bottleneck, then
+apply an arena precisely where the lifetime pattern fits — per-request scratch memory — and keep
+<code>malloc</code> for the mixed-lifetime long-lived state. And whatever we pick, we still own every
+lifetime and bound: resetting an arena with a live pointer into it is a use-after-free that our sanitizers
+won't see by default." Naming the pattern, citing the measured result, and insisting on profiling — rather
+than a blanket swap — is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §12.4 quick check: you have created a <strong>use-after-free</strong> — specifically a
+use-after-reset. Resetting the arena ended the lifetime of that object's storage; the cached pointer now
+dangles, and the next allocation from the arena will reuse those bytes under it. It is undefined behavior, and
+by default the sanitizers will not flag it, because they do not know your arena reset ended a lifetime.)</em></p>
+
+<h2>12.5 What to carry forward — and out of Part 2</h2>
+
+<p>The general-purpose allocator is optimized for knowing nothing about your requests, and that ignorance is
+its cost — search, headers, coalescing, fragmentation (Ch 9). When you <em>do</em> know the pattern, a custom
+allocator trades generality for speed. An <strong>arena</strong> exploits shared lifetime: allocate by
+bumping an offset, free everything at once by resetting it — O(1) both ways, no per-object free, measured at
+roughly four-to-five times faster than <code>malloc</code> for the batch pattern on this machine, at the cost
+of being unable to free one object early. A <strong>pool</strong> exploits shared size: an array of equal
+slots with a free list threaded through the unused ones, O(1) allocation and free with no fragmentation within
+the size — the same trick the kernel's slab allocator and production <code>malloc</code>s use internally. But
+custom allocation is a <em>measured</em> optimization, not a default: the research (Berger et al.) shows a
+good general allocator usually matches hand-rolled ones, with the arena/region pattern the clear exception —
+so profile, confirm the bottleneck, and match the allocator to the pattern. And, decisively, writing your own
+allocator does not lift one obligation from Chapters 9–11: you become the implementer of lifetimes, bounds,
+and free-exactly-once, with new ways to violate them (use-after-reset, pool double-free) that your tools may
+not see.</p>
+
+<p>That last point closes Part 2. Across six chapters you went from "a pointer is an address into regioned
+memory" (Ch 7), through lifetimes and the stack/heap (Ch 8), manual allocation and its bug catalogue (Ch 9),
+undefined behavior and the optimizer that trusts it (Ch 10), the buffer overflow that hijacks control flow
+(Ch 11), to writing the allocator itself (Ch 12) — and the through-line never changed: <strong>in C you hold,
+by hand, a proof that no pointer is used outside its lifetime, no access outside its bounds, every block freed
+exactly once, and no undefined behavior ever triggered.</strong> That proof is real, it is heavy, and every
+bug in this part is what happens when it fails. You now understand the machine to the metal and the net that
+is absent. Two paths lead out. The operating system (Part 3) is what sits beneath all of this — the processes,
+threads, and virtual memory that gave you the address space and the heap in the first place; you will see the
+system-call boundary from the other side. And Rust (Part 5) is the language that makes the compiler
+<em>check</em> the proof you have been carrying — ownership, borrowing, and lifetimes turning the invariants of
+this entire part into type rules verified before the program runs. You have felt the weight; the rest of the
+book is about the machine underneath it and the tools that lift it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the three allocation patterns where a custom allocator beats general-purpose <code>malloc</code>,
+and the knowledge each exploits.</li>
+<li>Write an <strong>arena</strong> allocator from memory (base, capacity, offset; bump to allocate, reset to
+free all) and state its one big trade-off.</li>
+<li>Write a <strong>pool</strong>/free-list allocator's alloc and free (pop/push a free list threaded through
+the slots) and say why both are O(1) with no fragmentation within the size.</li>
+<li>Give the honest decision rule (general by default; profile; arena for shared lifetime; pool for shared
+size) and cite what the Berger et al. study found.</li>
+<li>Explain why a custom allocator does <em>not</em> remove the Chapter 9–11 obligations — and name a bug
+(use-after-reset) your sanitizers may miss.</li>
+<li>Summarize Part 2's through-line and how it sets up the OS (Part 3) and Rust (Part 5).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Name three allocation patterns where a custom allocator wins, and what each
+exploits. (§12.1)</li>
+<li><strong>R2.</strong> Describe an arena's allocate and free, its complexity, and its trade-off. (§12.2)</li>
+<li><strong>R3.</strong> Describe a pool/free-list allocator and why it has no fragmentation within its
+size. (§12.3)</li>
+<li><strong>R4.</strong> What did Berger et al. find about custom vs. general allocators, and what is the
+decision rule? (§12.1, §12.4)</li>
+<li><strong>R5.</strong> Why does a custom allocator not remove the Chapter 9–11 obligations? Name a bug it
+introduces. (§12.4–12.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter
+9.</strong> Dynamic memory allocation: allocator design, free lists, coalescing, and the mechanics an arena
+and pool specialize. The reference for §12.1's cost model.</li>
+<li><strong>Berger, Zorn &amp; McKinley, "Reconsidering Custom Memory Allocation," OOPSLA 2002.</strong> The
+empirical study behind §12.4: a good general allocator matches most hand-written custom allocators, with
+regions (arenas) the clear exception (improvements up to 44%, but a memory-consumption downside). Free from
+the authors.</li>
+<li><strong>Bonwick, "The Slab Allocator: An Object-Caching Kernel Memory Allocator," USENIX 1994.</strong>
+The production pool/slab allocator behind §12.3, still used in the Linux kernel. Free.</li>
+<li><strong>The jemalloc / tcmalloc documentation.</strong> Real, widely deployed general allocators whose
+internals (size-classed free lists, thread caches) are the pool idea at scale. Documented behavior only;
+verify against the version you use.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex12.1"><span class="ex-label">12.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: (a) what does an arena exploit? (b) what does a pool exploit? (c) which of the two can
+free an individual object?</div>
+
+<div class="exercise" id="ex12.2"><span class="ex-label">12.2</span> <span class="ex-tag warm">warm-up</span>
+What is the time complexity of an arena's <code>alloc</code> and its bulk <code>reset</code>? What is the one
+thing an arena cannot do that <code>malloc</code> can?</div>
+
+<div class="exercise" id="ex12.3"><span class="ex-label">12.3</span> <span class="ex-tag warm">warm-up</span>
+In a fixed-size pool, where is the "next free slot" pointer stored, and why does that cost no extra memory?</div>
+
+<div class="exercise" id="ex12.4"><span class="ex-label">12.4</span> <span class="ex-tag core">core</span>
+Write, from memory, an arena allocator (a struct with base/capacity/offset, plus <code>arena_alloc</code> with
+16-byte alignment and <code>arena_reset</code>). Explain why <code>arena_alloc</code> is O(1) and why
+<code>arena_reset</code> frees everything without touching individual objects.</div>
+
+<div class="exercise" id="ex12.5"><span class="ex-label">12.5</span> <span class="ex-tag core">core</span>
+Write a pool allocator's <code>pool_alloc</code> and <code>pool_free</code> using a free list threaded through
+the slots. Explain why both are O(1) and why the pool has no external fragmentation within its size class.</div>
+
+<div class="exercise" id="ex12.6"><span class="ex-label">12.6</span> <span class="ex-tag core">core</span>
+A teammate wants to replace <code>malloc</code> with an arena "everywhere for speed." Give two concrete
+reasons this is a bad blanket policy — one about the arena's inability to free individually, one citing the
+Berger et al. finding — and state the correct decision procedure.</div>
+
+<div class="exercise" id="ex12.7"><span class="ex-label">12.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is an arena's per-allocation cost lower than <code>malloc</code>'s — name two things the general
+allocator does that the arena skips (tie to Ch 9). (b) The chapter measured ~4–5&times; on this machine for
+the "N live, then free" pattern; why does that comparison favor the arena, and what different pattern would
+narrow or erase the gap? (c) What memory-consumption risk does an arena carry, and when does it bite?</div>
+
+<div class="exercise" id="ex12.8"><span class="ex-label">12.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A per-request arena is reset at the end of each request. A
+developer adds a cache that stores, across requests, a pointer to a string that was allocated <em>in</em> the
+arena. Diagnose the bug.
+<br><strong>Step 1 (given):</strong> <code>arena_reset</code> ends the lifetime of everything in the arena by
+returning the offset to 0.
+<br><strong>Step 2 (given):</strong> The cached pointer still holds the string's old address, but that
+storage is now considered free.
+<br><strong>Step 3 (given):</strong> The next request's allocations will reuse those bytes, so a later read
+through the cached pointer sees another request's data or garbage.
+<br><strong>Step 4 (you):</strong> Name the bug using Chapter 9's vocabulary, state whether it is undefined
+behavior, explain why the ASan/Valgrind of §9.4 will likely <em>not</em> catch it by default, and give a fix
+(what must be copied where, so the cache does not point into the arena).</div>
+
+<div class="exercise" id="ex12.9"><span class="ex-label">12.9</span> <span class="ex-tag mixed">mixed</span>
+For each workload, choose <em>general <code>malloc</code></em>, <em>arena</em>, or <em>pool</em>, and justify
+in a line: (a) a web handler that allocates many small objects while serving one request, all discardable when
+the response is sent; (b) a graph engine that constantly creates and destroys same-size nodes throughout its
+run; (c) a general-purpose library that cannot predict its callers' allocation patterns; (d) a compiler pass
+that allocates a burst of AST nodes freed together when the pass ends.</div>
+
+<div class="exercise" id="ex12.10"><span class="ex-label">12.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>undefined behavior</em>, <em>a defined-but-real defect</em>, or <em>well-defined and
+fine</em>, drawing on Chapters 9–12: (a) reading through a pointer into an arena after
+<code>arena_reset</code>; (b) an arena holding a long-lived object that pins the whole region, growing memory
+use; (c) <code>pool_free</code>-ing the same slot twice; (d) resetting an arena when no live pointers into it
+remain.</div>
+
+<div class="exercise" id="ex12.11"><span class="ex-label">12.11</span> <span class="ex-tag stretch">stretch</span>
+Part 2 has argued that in C the programmer carries, by hand, a proof about lifetimes, bounds, and freeing. (a)
+State that proof obligation in one sentence. (b) Explain how a custom allocator <em>relocates</em> rather than
+<em>removes</em> that obligation — who now enforces "free exactly once" for arena and pool memory? (c) In one
+or two sentences, describe what it would mean for a language (Rust, Part 5) to tie an allocation's lifetime to
+a scope so that "use after reset" becomes a compile-time error — and why that is stronger than a runtime
+sanitizer that does not understand your allocator.</div>
+
+<div class="exercise" id="ex12.12"><span class="ex-label">12.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, implement the arena of §12.2. (a) Verify correctness: allocate three objects of different
+sizes, confirm they are independent and 16-byte aligned, and that <code>arena_reset</code> returns the offset
+to 0. (b) Time allocating <em>N</em> objects that stay live then freeing them, arena (one bulk free) vs.
+<code>malloc</code> (N frees), for a large <em>N</em>, and report the ratio. (c) Repeat with a pattern where
+each object is freed immediately after allocation and explain why the arena's advantage shrinks. Report only
+what you measured and label your compiler/hardware, since numbers vary.</div>
 
 </section>
 </section>
@@ -5281,8 +6586,10 @@ frees" &rarr; double-free; "huge pages help" &rarr; TLB, not a bug. <strong>Feed
 defined-but-real defect</strong> — a memory leak; wasteful but not UB. (c) <strong>Undefined behavior</strong>
 — <code>a[n]</code> on an <code>n</code>-element array is one past the last valid index (valid indices 0..n-1);
 dereferencing it is out of bounds. (d) <strong>Well-defined and fine</strong> — a <code>calloc</code>'d block
-is zeroed, so reading it yields 0, a defined value. (e) <strong>Undefined behavior (indeterminate value)</strong>
-— a <code>malloc</code>'d block is uninitialized, so reading before writing uses an indeterminate value.
+is zeroed, so reading it yields 0, a defined value. (e) <strong>Reads an indeterminate value (at best unspecified, in general undefined behavior)</strong>
+— a <code>malloc</code>'d block is uninitialized, so reading before writing uses an <em>indeterminate value</em>: on this
+ABI an <code>int</code> has no trap representation, so you get an unspecified (garbage) value rather than a crash, but
+the standard permits it to be full UB in general (matching &sect;9.3), so never rely on it.
 <em>Tempting wrong answer:</em> conflating (d) and (e) — <code>calloc</code> zeroes, <code>malloc</code> does
 not. <strong>Feed-forward:</strong> §9.1, §9.3.</div>
 
@@ -5311,6 +6618,374 @@ does <strong>not</strong> flag it — reach for Valgrind or MemorySanitizer, or 
 report only observed output (addresses and wording vary), and note that ASan detects addressability bugs, not
 uninitialized-value bugs. <em>Tempting wrong answer:</em> "ASan catches everything" — it misses uninitialized
 reads. <strong>Feed-forward:</strong> §9.4.</div>
+
+</section>
+
+<section class="solutions" id="sol10">
+<h1>Chapter 10 — Solutions</h1>
+
+<div class="solution" id="sol10.1"><span class="sol-label">10.1</span>
+<strong>Undefined behavior:</strong> the standard imposes <em>no requirements</em> (C §3.4.3) — the program
+has no meaning on the triggering input. <strong>Unspecified behavior:</strong> the standard offers two or
+more valid possibilities and does not say which you get (e.g. argument evaluation order). <strong>Implementation-
+defined:</strong> unspecified but the implementation must <em>document</em> its choice (e.g. <code>sizeof(int)</code>).
+Only <strong>undefined</strong> behavior grants the optimizer license to assume the situation never happens.
+<strong>Feed-forward:</strong> §10.1.</div>
+
+<div class="solution" id="sol10.2"><span class="sol-label">10.2</span>
+<strong>Unsigned</strong> integer overflow is <em>not</em> UB — it is defined to wrap modulo 2<sup>n</sup>.
+<strong>Signed</strong> integer overflow <em>is</em> undefined behavior. The defined case (unsigned) yields
+the mathematically correct value reduced modulo 2<sup>n</sup> (i.e. the low <em>n</em> bits).
+<em>Tempting wrong answer:</em> "both wrap, it's two's complement" — the hardware may wrap, but the
+<em>language</em> leaves signed overflow undefined, which is what the optimizer exploits. <strong>Feed-forward:</strong>
+§10.3.</div>
+
+<div class="solution" id="sol10.3"><span class="sol-label">10.3</span>
+Most likely explanation: the program contains <strong>undefined behavior</strong> that was harmless-looking
+at <code>-O0</code> but that the optimizer exploited at <code>-O2</code> (it assumed the UB never happens and
+transformed the code). The two flags to hunt it: <code>-fsanitize=undefined</code> (UBSan) and
+<code>-fsanitize=address</code> (ASan), ideally with <code>-Wall -Wextra</code>. <em>Tempting wrong answer:</em>
+"the optimizer has a bug" — far more often the UB was already there. <strong>Feed-forward:</strong> §10.2, §10.4.</div>
+
+<div class="solution" id="sol10.4"><span class="sol-label">10.4</span>
+Signed overflow is UB, so the compiler may assume <code>x + 1</code> never overflows; if it never overflows,
+<code>x + 1 &gt; x</code> is always true, so the function folds to <code>return 1</code> (on this machine,
+<code>movl $1, %eax; ret</code>). What breaks: a programmer using <code>if (x + 1 &lt; x)</code> to detect
+overflow relies on the overflow <em>happening</em> and wrapping — but that is UB, so the compiler assumes it
+cannot happen and deletes the check. Correct detection: compile with <code>-fwrapv</code> (defines signed
+overflow as wraparound), or do the arithmetic in an unsigned type, or use <code>__builtin_add_overflow</code>,
+which reports overflow without invoking UB. <em>Tempting wrong answer:</em> "test after the add" — testing
+<em>after</em> signed overflow is testing after UB. <strong>Feed-forward:</strong> §10.3–10.4.</div>
+
+<div class="solution" id="sol10.5"><span class="sol-label">10.5</span>
+(a) The UB is a <strong>null-pointer dereference</strong>: <code>t-&gt;sk</code> dereferences <code>t</code>
+before it is checked. (b) Because dereferencing null is UB, the compiler may assume <code>t</code> was non-null
+at the dereference, so <code>if (!t)</code> is provably false and is deleted as dead code. (c) Fix: move the
+check before the dereference — <code>if (!t) return -1; int *sk = t-&gt;sk; return *sk;</code>. (d) The flag
+that preserves the check without moving code: <code>-fno-delete-null-pointer-checks</code>. The pattern is the
+real Linux kernel bug <strong>CVE-2009-1897</strong> (<code>tun_chr_poll</code>). <em>Tempting wrong answer:</em>
+"the check is there, so it's fine" — it is there in the source, not in the binary. <strong>Feed-forward:</strong>
+§10.3.</div>
+
+<div class="solution" id="sol10.6"><span class="sol-label">10.6</span>
+The compiler is behaving correctly under the <strong>as-if rule</strong>: it must preserve the observable
+behavior of a <em>well-defined</em> program, but a program that dereferences a possibly-null pointer has
+undefined behavior on the null input, so there is no observable behavior it must preserve there. Given the
+dereference <code>t-&gt;sk</code>, the compiler infers <code>t != NULL</code> and legally removes the redundant
+<code>if (!t)</code>. The code, not the compiler, is wrong: the check comes after the dereference it is meant
+to guard. <em>Tempting wrong answer:</em> "the source clearly has the check, so the compiler dropped correct
+code" — to the optimizer, a check after a dereference is a statement the pointer was already non-null.
+<strong>Feed-forward:</strong> §10.2.</div>
+
+<div class="solution" id="sol10.7"><span class="sol-label">10.7</span>
+(a) Mandating checks would insert a bounds check on every array access, an overflow check on every signed
+add, and a null check on every dereference — runtime cost on the hot path of essentially every program. (b)
+One optimization signed-overflow UB enables: treating a loop counter as unable to wrap, so the compiler can
+prove loop termination, promote the counter to a wider type, or strength-reduce — none guaranteed if overflow
+were defined to wrap. (c) The bargain: the programmer gives up "defined behavior in the bad case" (and takes
+on the duty never to trigger UB); the compiler gains the freedom to generate fast code across all hardware
+without pervasive safety checks. <em>Tempting wrong answer:</em> "UB is just a mistake in the standard" — it
+is a deliberate performance/portability choice. <strong>Feed-forward:</strong> §10.4.</div>
+
+<div class="solution" id="sol10.8"><span class="sol-label">10.8</span>
+<strong>Step 4:</strong> Fix: the bounds check must come <em>before</em> the access — check
+<code>if (i &lt; 0 || i &gt;= n) return; </code> (or handle the error) <em>then</em> touch <code>a[i]</code>,
+including for logging. A sanitizer that would have flagged the original out-of-bounds access at runtime:
+<strong>AddressSanitizer</strong> (<code>-fsanitize=address</code>) for a heap/stack array, or UBSan's bounds
+check for a known-size array. Moving the log line is not "just reordering output": once <code>a[i]</code>
+executes, the compiler may <em>prove</em> <code>0 &lt;= i &lt; n</code> (else UB) and delete the later check —
+so the position of the access changes what the compiler is allowed to assume about <code>i</code>, not merely
+when a byte is printed. <em>Tempting wrong answer:</em> "it's just a logging line, order doesn't matter" — the
+access is what licenses the deletion. <strong>Feed-forward:</strong> §10.2–10.3.</div>
+
+<div class="solution" id="sol10.9"><span class="sol-label">10.9</span>
+(a) <strong>Implementation-defined</strong> — <code>sizeof(int)</code> varies but must be documented. (b)
+<strong>Unspecified</strong> — the order of evaluating <code>a()</code> and <code>b()</code> is one of two
+valid, undocumented choices. (c) <strong>Undefined</strong> — <code>INT_MAX + 1</code> is signed overflow. (d)
+<strong>Implementation-defined</strong> — right-shift of a negative signed integer is implementation-defined
+(the standard lets the implementation choose arithmetic vs. logical shift and document it). (e) <strong>Undefined
+behavior</strong> (in general) — reading a <code>malloc</code>'d block before writing it uses an indeterminate
+value (the §9.3 memory bug). <em>Method-selection cue:</em> "varies but documented" &rarr; impl-defined; "two
+valid orders" &rarr; unspecified; "no meaning at all" &rarr; undefined. <strong>Feed-forward:</strong> §10.1, §9.3.</div>
+
+<div class="solution" id="sol10.10"><span class="sol-label">10.10</span>
+Least to most effective: (a) <code>-O0</code> — <em>hides</em> the bug (the UB remains; a future build or a
+different path re-exposes it); (b) <code>volatile</code> — also <em>hides</em> it (it defeats some optimizer
+assumptions but does not remove the UB, and is fragile and slow); (c) <code>-fsanitize=undefined,address</code>
+plus fixing what it reports — <em>removes</em> the bug by finding and eliminating the actual UB. So the order
+is (a) &lt; (b) &lt; (c), and only (c) removes rather than hides. <em>Tempting wrong answer:</em> "compile at
+<code>-O0</code> in production to be safe" — you keep the bug and lose performance. <strong>Feed-forward:</strong>
+§10.4.</div>
+
+<div class="solution" id="sol10.11"><span class="sol-label">10.11</span>
+(a) The standard says a program that executes UB has undefined behavior for that <em>execution</em> — not just
+from the buggy line onward — so the compiler need not preserve observable effects that occur before the UB
+either; it may hoist, sink, or delete surrounding work ("UB can time-travel," in Regehr's phrasing). (b)
+Concrete scenario: an upstream <code>t-&gt;sk</code> lets the compiler delete a downstream <code>if (!t)
+return ERR;</code>; a caller that would have safely returned an error on a null <code>t</code> now falls
+through into code that trusts <code>t</code>, and an attacker who maps memory at address 0 reaches it — a
+would-be crash becomes a silent privilege escalation (the CVE-2009-1897 shape). (c) A static guarantee is
+stronger because a runtime sanitizer only catches UB on the <em>inputs and paths you actually execute</em>
+during testing, whereas "the safe subset has no UB" holds for <em>all</em> executions — a proof, not a spot
+check. <em>Tempting wrong answer:</em> "sanitizers make UB safe" — they detect it on exercised paths only.
+<strong>Feed-forward:</strong> §10.2, §10.5, Part 5.</div>
+
+<div class="solution" id="sol10.12"><span class="sol-label">10.12</span>
+Machine-specific by design. A correct write-up reports: at <code>-O2</code>, <code>x + 1 &gt; x</code> folds
+to <code>return 1</code> (on the book's machine, <code>movl $1, %eax; ret</code>), and adding
+<code>-fwrapv</code> makes the addition and comparison reappear; for <code>poll</code>, the default
+<code>-O2</code> omits the <code>testq %rdi,%rdi</code> null check while
+<code>-fno-delete-null-pointer-checks</code> restores it. The signed-overflow program should be flagged by
+<code>-fsanitize=undefined</code> as a runtime error (<code>signed integer overflow</code>). Essential
+discipline: report only observed assembly/output and label the compiler/version (gcc 11.4.0, x86-64 here),
+since exact instructions and wording vary. <em>Tempting wrong answer:</em> "the assembly will be the same as
+mine" — it depends on compiler and version. <strong>Feed-forward:</strong> §10.3–10.4.</div>
+
+</section>
+
+<section class="solutions" id="sol11">
+<h1>Chapter 11 — Solutions</h1>
+
+<div class="solution" id="sol11.1"><span class="sol-label">11.1</span>
+(a) A single <strong>null byte</strong> <code>'\0'</code> (value 0) marks the end. (b) <code>strlen</code> is
+O(n) because the length is <em>not</em> stored — it must scan byte by byte until it finds the terminator. (c)
+The function learns <strong>nothing</strong> about capacity: the array decays to a bare <code>char *</code>,
+an address with no length attached. <strong>Feed-forward:</strong> §11.1.</div>
+
+<div class="solution" id="sol11.2"><span class="sol-label">11.2</span>
+<code>gets</code> — it read a line with no bound at all and was <strong>removed from the language in C11</strong>
+(deprecated in C99). Use <code>fgets(s, size, stdin)</code>, which takes the buffer size. <em>Tempting wrong
+answer:</em> "<code>scanf("%s")</code> is fine" — unbounded <code>%s</code> has the same overflow problem; use
+a width, e.g. <code>%63s</code>. <strong>Feed-forward:</strong> §11.3.</div>
+
+<div class="solution" id="sol11.3"><span class="sol-label">11.3</span>
+(a) <strong>False</strong> — <code>strncpy</code> does not terminate when the source is at least <code>n</code>
+bytes long; it leaves the destination unterminated. (b) <strong>False</strong> — a canary <em>detects</em> a
+linear stack overflow and aborts; the bug (the out-of-bounds write) is still there. (c) <strong>True</strong>
+— <code>snprintf</code> always null-terminates when its size argument is nonzero. <strong>Feed-forward:</strong>
+§11.2–11.4.</div>
+
+<div class="solution" id="sol11.4"><span class="sol-label">11.4</span>
+On a downward-growing stack, a local array sits <em>below</em> the saved frame pointer and saved
+<strong>return address</strong>, while a copy into the array writes toward <em>higher</em> addresses — so an
+overrun climbs over the frame pointer onto the return address. Overwriting it means that when the function
+executes <code>ret</code>, the CPU jumps to the attacker-supplied value: control-flow hijack. An out-of-bounds
+<em>read</em> (usually) cannot redirect execution — it leaks adjacent bytes but does not write control data.
+<em>Tempting wrong answer:</em> "reads are as dangerous as writes" — reads leak (serious, e.g. Heartbleed) but
+do not seize control. <strong>Feed-forward:</strong> §11.2.</div>
+
+<div class="solution" id="sol11.5"><span class="sol-label">11.5</span>
+(a) <strong>Overflows</strong> whenever <code>user_input</code> is longer than <code>buf</code> — no
+destination bound; rewrite <code>snprintf(buf, sizeof buf, "%s", user_input);</code>. (b) <strong>Overflows</strong>
+if the formatted result exceeds <code>buf</code> — <code>sprintf</code> is unbounded; rewrite
+<code>snprintf(buf, sizeof buf, "%s-%s", a, b);</code>. (c) <strong>Over-reads</strong> — <code>strncpy(d, "abcd",
+4)</code> fills all 4 bytes with no terminator, so <code>printf("%s", d)</code> runs off the end; fix by
+terminating (<code>d[3] = '\0';</code>, losing a char) or, better, <code>snprintf(d, sizeof d, "%s", "abcd")</code>.
+<em>Method-selection cue:</em> "no size argument" &rarr; can overflow; "size argument but no guaranteed
+terminator" &rarr; can over-read. <strong>Feed-forward:</strong> §11.2–11.3.</div>
+
+<div class="solution" id="sol11.6"><span class="sol-label">11.6</span>
+Three reasons a canary + ASLR do not "handle" overflows: (1) a <strong>canary only catches a linear stack
+overflow and only at return</strong> — it does nothing for heap overflows or overwrites of non-control data,
+and it acts after the corruption (turning a hijack into a crash/DoS); (2) <strong>ASLR only randomizes
+addresses</strong> — it raises the difficulty of a working exploit but is defeated by info-leaks or techniques
+that do not need fixed addresses; (3) both are <strong>mitigations, not fixes</strong> — the out-of-bounds
+write is still undefined behavior, still present. The actual fix: remove the unbounded writes (use
+<code>snprintf</code>/bounded copies) so the overflow cannot occur. <em>Tempting wrong answer:</em>
+"mitigations on = bug fixed" — they contain blast radius, they do not remove the bug. <strong>Feed-forward:</strong>
+§11.4.</div>
+
+<div class="solution" id="sol11.7"><span class="sol-label">11.7</span>
+(a) <code>strlen</code> is O(n) because a C string stores no length — it scans to the terminator — whereas a
+length-carrying string stores the count, so reading the length is O(1). (b) Stack canaries add a random-value
+write on entry and a compare on return per protected frame; <code>_FORTIFY_SOURCE</code> adds size-checked
+variants of the string/memory calls — small overhead in exchange for turning many overflows into detected
+aborts or compile errors. (c) Not free: the canary compare is on the return path of every protected function,
+a real (if usually small) cost. Trade-off: <strong>safety vs. speed</strong> — you pay a little runtime to
+detect a class of memory corruption. <em>Tempting wrong answer:</em> "canaries are free" — they add work on
+every protected return. <strong>Feed-forward:</strong> §11.1, §11.4.</div>
+
+<div class="solution" id="sol11.8"><span class="sol-label">11.8</span>
+<strong>Step 4:</strong> Rewrite with a single bounded format:
+<code>void greet(const char *name){ char msg[16]; snprintf(msg, sizeof msg, "Hello, %s", name); puts(msg); }</code>.
+<code>snprintf</code> writes at most <code>sizeof msg</code> bytes <em>including</em> the terminator and always
+null-terminates (when the size is nonzero), so no <code>name</code>, however long, can overflow <code>msg</code>
+— it truncates instead; <code>strcat</code> guarantees neither a bound nor (relative to the destination
+capacity) safety. A §11.4 defense that turns the original overflow into a crash rather than a silent hijack:
+a <strong>stack canary</strong> (<code>-fstack-protector</code>), which aborts with "stack smashing detected"
+instead of returning through a corrupted return address (<code>_FORTIFY_SOURCE</code> would also catch it, at
+compile or run time). <em>Tempting wrong answer:</em> "use <code>strncat</code> with <code>sizeof msg</code>"
+— <code>strncat</code>'s bound is the bytes to <em>append</em>, not the buffer size, and it is easy to
+miscompute. <strong>Feed-forward:</strong> §11.3–11.4.</div>
+
+<div class="solution" id="sol11.9"><span class="sol-label">11.9</span>
+(a) <strong>Buffer overflow (over-write)</strong> is possible, but "garbage appended <em>after</em> the
+expected text" most cleanly matches an <strong>unterminated string (over-read)</strong> — the print continues
+past the intended end until it hits a stray zero. (b) <strong>A mitigation firing</strong> — <code>*** stack
+smashing detected ***</code> is the stack canary aborting on a detected overflow. (c) <strong>Use-after-free</strong>
+— reading a freed block that was reallocated to another request (Ch 9). (d) <strong>Unterminated string (over-
+read)</strong> — <code>printf("%s")</code> reading far past the data and leaking adjacent memory (Heartbleed
+class). <em>Method-selection cue:</em> "garbage after expected text / reads too far" &rarr; missing terminator;
+"stack smashing detected" &rarr; canary; "freed block reused" &rarr; UAF. <strong>Feed-forward:</strong> §11.1–11.4,
+§9.3.</div>
+
+<div class="solution" id="sol11.10"><span class="sol-label">11.10</span>
+(a) <strong>Undefined behavior</strong> — <code>strncpy</code> with <code>strlen(s) &gt;= sizeof d</code>
+leaves <code>d</code> unterminated, so reading it as a string over-reads out of bounds. (b) <strong>Well-defined
+and fine</strong> — <code>snprintf</code> always terminates, so reading <code>d</code> is safe (possibly
+truncated, but valid). (c) <strong>Undefined behavior</strong> — a one-byte heap overflow is an out-of-bounds
+write. (d) <strong>Well-defined</strong> (a defined defensive action) — a canary deliberately aborting the
+process on a detected overflow is defined behavior, not UB (it is the mitigation working). <em>Tempting wrong
+answer:</em> conflating (a) and (b) — the difference is the guaranteed terminator. <strong>Feed-forward:</strong>
+§11.2–11.4.</div>
+
+<div class="solution" id="sol11.11"><span class="sol-label">11.11</span>
+(a) A <strong>stack canary</strong> defeats a linear overflow that reaches the return address (detected at
+return); <strong>NX/DEP</strong> marks the stack/heap non-executable, defeating "inject shellcode and jump to
+it"; <strong>ASLR</strong> randomizes segment base addresses, defeating attacks that need to predict them.
+<strong>Return-oriented programming (ROP)</strong> was developed to route around NX by chaining fragments of
+existing executable code ("gadgets") instead of injecting new code. (b) Layering is worthwhile because each
+mitigation raises the cost and reliability barrier for a different technique; an attacker must defeat all of
+them, and many real exploits fail against the stack. (c) Rust makes the bug "not happen" by carrying the
+length with every slice/string and bounds-checking indexing: an out-of-bounds access is a defined
+<strong>panic</strong>, not undefined memory corruption — categorically different because a panic has a
+defined, contained outcome (the program stops safely) whereas UB has no defined outcome and can corrupt
+control flow. <em>Tempting wrong answer:</em> "a panic is just a crash, same as UB" — a panic is defined and
+cannot be leveraged into memory corruption. <strong>Feed-forward:</strong> §11.4–11.5, Part 5.</div>
+
+<div class="solution" id="sol11.12"><span class="sol-label">11.12</span>
+Machine-specific by design. A correct write-up reports: (a) with <code>-fstack-protector-all</code> the 8-byte
+overflow aborts with <code>*** stack smashing detected ***</code> (on the book's machine, exit status 134,
+SIGABRT); (b) with <code>-D_FORTIFY_SOURCE=2 -O2</code> a compile-time diagnostic like
+<code>__builtin___strcpy_chk / __memcpy_chk writing N bytes into a region of size M</code> (and gcc's
+<code>-Wstringop-overflow</code> may also fire); (c) <code>strncpy(d, "abcd", 4)</code> leaves the four bytes
+<code>97 98 99 100</code> with <em>no</em> terminating zero. Essential discipline: report only observed output
+and label compiler/version (gcc 11.4.0, x86-64 here), since exact messages and status vary. <em>Tempting wrong
+answer:</em> "the canary means the overflow was harmless" — it converted a hijack into a crash; the bug is the
+same. <strong>Feed-forward:</strong> §11.2–11.4.</div>
+
+</section>
+
+<section class="solutions" id="sol12">
+<h1>Chapter 12 — Solutions</h1>
+
+<div class="solution" id="sol12.1"><span class="sol-label">12.1</span>
+(a) An arena exploits <strong>shared lifetime</strong> — many objects that die together. (b) A pool exploits
+<strong>shared size</strong> — many objects of one fixed size. (c) The <strong>pool</strong> can free an
+individual object (push its slot back on the free list); the arena cannot. <strong>Feed-forward:</strong> §12.1–12.3.</div>
+
+<div class="solution" id="sol12.2"><span class="sol-label">12.2</span>
+<code>arena_alloc</code> is <strong>O(1)</strong> (round up the offset, bump it, return the address);
+<code>arena_reset</code> is <strong>O(1)</strong> (set the offset to 0). The one thing an arena cannot do that
+<code>malloc</code> can: <strong>free an individual object</strong> — it frees only the whole region at once.
+<em>Tempting wrong answer:</em> "reset is O(n) because it frees n objects" — it frees them all with a single
+offset assignment, touching none of them. <strong>Feed-forward:</strong> §12.2.</div>
+
+<div class="solution" id="sol12.3"><span class="sol-label">12.3</span>
+The "next free slot" pointer is stored <strong>inside the free slot itself</strong> (its first bytes). It
+costs no extra memory because a free slot holds no live object — its space is unused — so the free list is
+threaded through the slots rather than kept in a separate structure. <em>Tempting wrong answer:</em> "you need
+a separate array of next-pointers" — unnecessary; the free slots' own bytes hold them. <strong>Feed-forward:</strong>
+§12.3.</div>
+
+<div class="solution" id="sol12.4"><span class="sol-label">12.4</span>
+<code>typedef struct { unsigned char *base; size_t cap, off; } Arena;</code> with
+<code>void *arena_alloc(Arena *a, size_t n){ size_t p = (a-&gt;off + 15) &amp; ~(size_t)15; if (p + n &gt; a-&gt;cap)
+return NULL; a-&gt;off = p + n; return a-&gt;base + p; }</code> and
+<code>void arena_reset(Arena *a){ a-&gt;off = 0; }</code>. <code>arena_alloc</code> is O(1) because it does a
+fixed amount of work — align, bounds-check, bump — with no search or coalescing. <code>arena_reset</code>
+frees everything without touching individual objects because "free" here just means "the offset no longer
+points past them," so resetting the offset makes all of that space available again in one step. <em>Tempting
+wrong answer:</em> forgetting the alignment round-up — unaligned returns are UB for some types (Ch 7).
+<strong>Feed-forward:</strong> §12.2.</div>
+
+<div class="solution" id="sol12.5"><span class="sol-label">12.5</span>
+<code>void *pool_alloc(Pool *p){ if (!p-&gt;free_list) return NULL; void *slot = p-&gt;free_list; p-&gt;free_list =
+*(void **)slot; return slot; }</code> and
+<code>void pool_free(Pool *p, void *slot){ *(void **)slot = p-&gt;free_list; p-&gt;free_list = slot; }</code>.
+Both are O(1): allocation pops the free-list head and freeing pushes onto it — a couple of pointer writes, no
+search. There is no external fragmentation within the size class because every slot is identical and
+interchangeable, so any free slot satisfies any request — free space is never "too scattered to fit." <em>Tempting
+wrong answer:</em> "you still need to coalesce" — with one fixed size there is nothing to coalesce.
+<strong>Feed-forward:</strong> §12.3.</div>
+
+<div class="solution" id="sol12.6"><span class="sol-label">12.6</span>
+Reason 1 (inflexibility): an arena cannot free individual objects, so any object that outlives its batch pins
+the <em>whole</em> region until reset — used "everywhere," including for long-lived mixed-lifetime state, it
+can inflate memory badly. Reason 2 (evidence): Berger, Zorn &amp; McKinley (OOPSLA 2002) found a good general-
+purpose allocator matched or beat hand-written custom allocators for most programs; the arena/region case was
+the exception, not the rule. Correct procedure: <strong>profile first</strong> to confirm allocation is the
+bottleneck, then apply an arena only where the shared-lifetime pattern fits (e.g. per-request scratch), keeping
+<code>malloc</code> elsewhere. <em>Tempting wrong answer:</em> "arenas are always faster, so use them
+everywhere" — faster only for the right pattern, and costly in memory otherwise. <strong>Feed-forward:</strong>
+§12.1, §12.4.</div>
+
+<div class="solution" id="sol12.7"><span class="sol-label">12.7</span>
+(a) The arena skips, per allocation: the <strong>free-list search</strong> (it just bumps an offset) and the
+<strong>per-block header / coalescing bookkeeping</strong> (it keeps none) — both of which the general
+allocator does (Ch 9). (b) The ~4–5&times; measurement used "N objects live at once, then freed": the arena
+frees all N with one reset while <code>malloc</code> pays N individual <code>free</code> calls, so the
+comparison rewards the arena's bulk free. A pattern that narrows or erases the gap: freeing each object
+immediately after allocating it, where glibc's <code>malloc</code> reuses one hot block and the per-object
+cost nearly vanishes (as the chapter's first, discarded measurement showed). (c) Memory risk: because it never
+frees individual objects, an arena holding a long-lived object pins the entire region — it bites when object
+lifetimes are mixed rather than shared. <em>Tempting wrong answer:</em> "the arena is always ~5&times; faster"
+— only for its pattern. <strong>Feed-forward:</strong> §12.2, §12.4.</div>
+
+<div class="solution" id="sol12.8"><span class="sol-label">12.8</span>
+<strong>Step 4:</strong> The bug is a <strong>use-after-free</strong> (a use-after-reset): the cached pointer
+dangles into arena storage whose lifetime <code>arena_reset</code> ended, and the next request reuses those
+bytes under it. It <strong>is undefined behavior</strong> (Ch 10). ASan/Valgrind will likely <em>not</em>
+catch it by default because they instrument <code>malloc</code>/<code>free</code>, not <em>your</em> arena's
+reset — to them the arena's backing block is still one big live allocation, so a read into it looks legal
+(you would have to add ASan's manual poisoning hooks for the tool to see the reset). Fix: do not let the cache
+point into the arena — <strong>copy</strong> the string into memory with a lifetime that matches the cache
+(e.g. <code>strdup</code>/<code>malloc</code> owned by the cache), so nothing the cache holds lives in
+per-request arena storage. <em>Tempting wrong answer:</em> "the sanitizer would have caught it" — not for a
+custom allocator's reset, by default. <strong>Feed-forward:</strong> §12.4–12.5, §9.3–9.4.</div>
+
+<div class="solution" id="sol12.9"><span class="sol-label">12.9</span>
+(a) <strong>Arena</strong> — many small objects sharing one lifetime (the request), freed together at
+response time. (b) <strong>Pool</strong> — constant create/destroy of same-size nodes throughout the run; O(1)
+both ways, no fragmentation, individual frees. (c) <strong>General <code>malloc</code></strong> — a library
+cannot predict its callers' patterns, so the general allocator is the safe default. (d) <strong>Arena</strong>
+— a burst of AST nodes freed together when the pass ends (the classic region/compiler-pass case Berger et al.
+highlighted). <em>Method-selection cue:</em> "share a lifetime, die together" &rarr; arena; "same size,
+repeated alloc/free" &rarr; pool; "unknown pattern" &rarr; general. <strong>Feed-forward:</strong> §12.1, §12.4.</div>
+
+<div class="solution" id="sol12.10"><span class="sol-label">12.10</span>
+(a) <strong>Undefined behavior</strong> — reading through a pointer into an arena after
+<code>arena_reset</code> is a use-after-reset (a use-after-free). (b) <strong>A defined-but-real defect</strong>
+— a long-lived object pinning the whole region wastes memory but is not a language-rule violation (analogous
+to a leak: defined, undesirable). (c) <strong>Undefined behavior</strong> — <code>pool_free</code>-ing the
+same slot twice corrupts the free list (a double-free in your allocator). (d) <strong>Well-defined and
+fine</strong> — resetting an arena with no live pointers into it is exactly how it is meant to be used.
+<em>Tempting wrong answer:</em> calling (b) UB — over-retaining memory is a defect, not undefined behavior.
+<strong>Feed-forward:</strong> §12.2–12.5, §9.3.</div>
+
+<div class="solution" id="sol12.11"><span class="sol-label">12.11</span>
+(a) In C the programmer must guarantee, by hand, that no pointer is used outside its target's lifetime, no
+access falls outside its bounds, and every block is freed exactly once — with no undefined behavior triggered.
+(b) A custom allocator <em>relocates</em> the obligation: it does not free individual objects for you (arena)
+or it recycles slots you must not double-free (pool), so <em>you</em> — the allocator's author and its caller
+— now enforce "free exactly once" and "no use after the lifetime ends" for arena/pool memory, and the system
+allocator's tooling no longer helps. (c) A language that ties an allocation's lifetime to a scope (Rust's
+ownership/borrowing) can make "use after reset" a <strong>compile-time error</strong> — the borrow checker
+refuses to let a reference outlive the region it points into — which is stronger than a runtime sanitizer
+because it holds for all executions and needs no test input to trigger, and because the sanitizer does not even
+understand your custom allocator's reset. <em>Tempting wrong answer:</em> "custom allocators remove the
+obligation" — they move it onto you. <strong>Feed-forward:</strong> §12.5, Part 5.</div>
+
+<div class="solution" id="sol12.12"><span class="sol-label">12.12</span>
+Machine-specific by design. A correct write-up reports: (a) three allocations return independent, 16-byte-
+aligned pointers with the expected values, and <code>arena_reset</code> sets the offset back to 0; (b) for
+large <em>N</em> with all objects live then freed, the arena (one bulk free) beats <code>malloc</code> (N
+frees) by a several-fold ratio — on the book's machine roughly 4–5&times;, varying run-to-run; (c) when each
+object is freed immediately after allocation, the arena's advantage shrinks or disappears, because the general
+allocator reuses one hot block and per-object cost nearly vanishes — showing the win depends entirely on the
+lifetime pattern. Essential discipline: report only measured numbers and label compiler/hardware (gcc 11.4.0,
+x86-64 here), since figures vary. <em>Tempting wrong answer:</em> "the arena is faster in every test" — not
+for the free-immediately pattern. <strong>Feed-forward:</strong> §12.2, §12.4.</div>
 
 </section>
 </body></html>

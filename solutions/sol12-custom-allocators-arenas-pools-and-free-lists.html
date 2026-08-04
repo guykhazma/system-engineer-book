@@ -1,0 +1,122 @@
+<section class="solutions" id="sol12">
+<h1>Chapter 12 — Solutions</h1>
+
+<div class="solution" id="sol12.1"><span class="sol-label">12.1</span>
+(a) An arena exploits <strong>shared lifetime</strong> — many objects that die together. (b) A pool exploits
+<strong>shared size</strong> — many objects of one fixed size. (c) The <strong>pool</strong> can free an
+individual object (push its slot back on the free list); the arena cannot. <strong>Feed-forward:</strong> §12.1–12.3.</div>
+
+<div class="solution" id="sol12.2"><span class="sol-label">12.2</span>
+<code>arena_alloc</code> is <strong>O(1)</strong> (round up the offset, bump it, return the address);
+<code>arena_reset</code> is <strong>O(1)</strong> (set the offset to 0). The one thing an arena cannot do that
+<code>malloc</code> can: <strong>free an individual object</strong> — it frees only the whole region at once.
+<em>Tempting wrong answer:</em> "reset is O(n) because it frees n objects" — it frees them all with a single
+offset assignment, touching none of them. <strong>Feed-forward:</strong> §12.2.</div>
+
+<div class="solution" id="sol12.3"><span class="sol-label">12.3</span>
+The "next free slot" pointer is stored <strong>inside the free slot itself</strong> (its first bytes). It
+costs no extra memory because a free slot holds no live object — its space is unused — so the free list is
+threaded through the slots rather than kept in a separate structure. <em>Tempting wrong answer:</em> "you need
+a separate array of next-pointers" — unnecessary; the free slots' own bytes hold them. <strong>Feed-forward:</strong>
+§12.3.</div>
+
+<div class="solution" id="sol12.4"><span class="sol-label">12.4</span>
+<code>typedef struct { unsigned char *base; size_t cap, off; } Arena;</code> with
+<code>void *arena_alloc(Arena *a, size_t n){ size_t p = (a-&gt;off + 15) &amp; ~(size_t)15; if (p + n &gt; a-&gt;cap)
+return NULL; a-&gt;off = p + n; return a-&gt;base + p; }</code> and
+<code>void arena_reset(Arena *a){ a-&gt;off = 0; }</code>. <code>arena_alloc</code> is O(1) because it does a
+fixed amount of work — align, bounds-check, bump — with no search or coalescing. <code>arena_reset</code>
+frees everything without touching individual objects because "free" here just means "the offset no longer
+points past them," so resetting the offset makes all of that space available again in one step. <em>Tempting
+wrong answer:</em> forgetting the alignment round-up — unaligned returns are UB for some types (Ch 7).
+<strong>Feed-forward:</strong> §12.2.</div>
+
+<div class="solution" id="sol12.5"><span class="sol-label">12.5</span>
+<code>void *pool_alloc(Pool *p){ if (!p-&gt;free_list) return NULL; void *slot = p-&gt;free_list; p-&gt;free_list =
+*(void **)slot; return slot; }</code> and
+<code>void pool_free(Pool *p, void *slot){ *(void **)slot = p-&gt;free_list; p-&gt;free_list = slot; }</code>.
+Both are O(1): allocation pops the free-list head and freeing pushes onto it — a couple of pointer writes, no
+search. There is no external fragmentation within the size class because every slot is identical and
+interchangeable, so any free slot satisfies any request — free space is never "too scattered to fit." <em>Tempting
+wrong answer:</em> "you still need to coalesce" — with one fixed size there is nothing to coalesce.
+<strong>Feed-forward:</strong> §12.3.</div>
+
+<div class="solution" id="sol12.6"><span class="sol-label">12.6</span>
+Reason 1 (inflexibility): an arena cannot free individual objects, so any object that outlives its batch pins
+the <em>whole</em> region until reset — used "everywhere," including for long-lived mixed-lifetime state, it
+can inflate memory badly. Reason 2 (evidence): Berger, Zorn &amp; McKinley (OOPSLA 2002) found a good general-
+purpose allocator matched or beat hand-written custom allocators for most programs; the arena/region case was
+the exception, not the rule. Correct procedure: <strong>profile first</strong> to confirm allocation is the
+bottleneck, then apply an arena only where the shared-lifetime pattern fits (e.g. per-request scratch), keeping
+<code>malloc</code> elsewhere. <em>Tempting wrong answer:</em> "arenas are always faster, so use them
+everywhere" — faster only for the right pattern, and costly in memory otherwise. <strong>Feed-forward:</strong>
+§12.1, §12.4.</div>
+
+<div class="solution" id="sol12.7"><span class="sol-label">12.7</span>
+(a) The arena skips, per allocation: the <strong>free-list search</strong> (it just bumps an offset) and the
+<strong>per-block header / coalescing bookkeeping</strong> (it keeps none) — both of which the general
+allocator does (Ch 9). (b) The ~4–5&times; measurement used "N objects live at once, then freed": the arena
+frees all N with one reset while <code>malloc</code> pays N individual <code>free</code> calls, so the
+comparison rewards the arena's bulk free. A pattern that narrows or erases the gap: freeing each object
+immediately after allocating it, where glibc's <code>malloc</code> reuses one hot block and the per-object
+cost nearly vanishes (as the chapter's first, discarded measurement showed). (c) Memory risk: because it never
+frees individual objects, an arena holding a long-lived object pins the entire region — it bites when object
+lifetimes are mixed rather than shared. <em>Tempting wrong answer:</em> "the arena is always ~5&times; faster"
+— only for its pattern. <strong>Feed-forward:</strong> §12.2, §12.4.</div>
+
+<div class="solution" id="sol12.8"><span class="sol-label">12.8</span>
+<strong>Step 4:</strong> The bug is a <strong>use-after-free</strong> (a use-after-reset): the cached pointer
+dangles into arena storage whose lifetime <code>arena_reset</code> ended, and the next request reuses those
+bytes under it. It <strong>is undefined behavior</strong> (Ch 10). ASan/Valgrind will likely <em>not</em>
+catch it by default because they instrument <code>malloc</code>/<code>free</code>, not <em>your</em> arena's
+reset — to them the arena's backing block is still one big live allocation, so a read into it looks legal
+(you would have to add ASan's manual poisoning hooks for the tool to see the reset). Fix: do not let the cache
+point into the arena — <strong>copy</strong> the string into memory with a lifetime that matches the cache
+(e.g. <code>strdup</code>/<code>malloc</code> owned by the cache), so nothing the cache holds lives in
+per-request arena storage. <em>Tempting wrong answer:</em> "the sanitizer would have caught it" — not for a
+custom allocator's reset, by default. <strong>Feed-forward:</strong> §12.4–12.5, §9.3–9.4.</div>
+
+<div class="solution" id="sol12.9"><span class="sol-label">12.9</span>
+(a) <strong>Arena</strong> — many small objects sharing one lifetime (the request), freed together at
+response time. (b) <strong>Pool</strong> — constant create/destroy of same-size nodes throughout the run; O(1)
+both ways, no fragmentation, individual frees. (c) <strong>General <code>malloc</code></strong> — a library
+cannot predict its callers' patterns, so the general allocator is the safe default. (d) <strong>Arena</strong>
+— a burst of AST nodes freed together when the pass ends (the classic region/compiler-pass case Berger et al.
+highlighted). <em>Method-selection cue:</em> "share a lifetime, die together" &rarr; arena; "same size,
+repeated alloc/free" &rarr; pool; "unknown pattern" &rarr; general. <strong>Feed-forward:</strong> §12.1, §12.4.</div>
+
+<div class="solution" id="sol12.10"><span class="sol-label">12.10</span>
+(a) <strong>Undefined behavior</strong> — reading through a pointer into an arena after
+<code>arena_reset</code> is a use-after-reset (a use-after-free). (b) <strong>A defined-but-real defect</strong>
+— a long-lived object pinning the whole region wastes memory but is not a language-rule violation (analogous
+to a leak: defined, undesirable). (c) <strong>Undefined behavior</strong> — <code>pool_free</code>-ing the
+same slot twice corrupts the free list (a double-free in your allocator). (d) <strong>Well-defined and
+fine</strong> — resetting an arena with no live pointers into it is exactly how it is meant to be used.
+<em>Tempting wrong answer:</em> calling (b) UB — over-retaining memory is a defect, not undefined behavior.
+<strong>Feed-forward:</strong> §12.2–12.5, §9.3.</div>
+
+<div class="solution" id="sol12.11"><span class="sol-label">12.11</span>
+(a) In C the programmer must guarantee, by hand, that no pointer is used outside its target's lifetime, no
+access falls outside its bounds, and every block is freed exactly once — with no undefined behavior triggered.
+(b) A custom allocator <em>relocates</em> the obligation: it does not free individual objects for you (arena)
+or it recycles slots you must not double-free (pool), so <em>you</em> — the allocator's author and its caller
+— now enforce "free exactly once" and "no use after the lifetime ends" for arena/pool memory, and the system
+allocator's tooling no longer helps. (c) A language that ties an allocation's lifetime to a scope (Rust's
+ownership/borrowing) can make "use after reset" a <strong>compile-time error</strong> — the borrow checker
+refuses to let a reference outlive the region it points into — which is stronger than a runtime sanitizer
+because it holds for all executions and needs no test input to trigger, and because the sanitizer does not even
+understand your custom allocator's reset. <em>Tempting wrong answer:</em> "custom allocators remove the
+obligation" — they move it onto you. <strong>Feed-forward:</strong> §12.5, Part 5.</div>
+
+<div class="solution" id="sol12.12"><span class="sol-label">12.12</span>
+Machine-specific by design. A correct write-up reports: (a) three allocations return independent, 16-byte-
+aligned pointers with the expected values, and <code>arena_reset</code> sets the offset back to 0; (b) for
+large <em>N</em> with all objects live then freed, the arena (one bulk free) beats <code>malloc</code> (N
+frees) by a several-fold ratio — on the book's machine roughly 4–5&times;, varying run-to-run; (c) when each
+object is freed immediately after allocation, the arena's advantage shrinks or disappears, because the general
+allocator reuses one hot block and per-object cost nearly vanishes — showing the win depends entirely on the
+lifetime pattern. Essential discipline: report only measured numbers and label compiler/hardware (gcc 11.4.0,
+x86-64 here), since figures vary. <em>Tempting wrong answer:</em> "the arena is faster in every test" — not
+for the free-immediately pattern. <strong>Feed-forward:</strong> §12.2, §12.4.</div>
+
+</section>

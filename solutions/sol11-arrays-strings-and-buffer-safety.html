@@ -1,0 +1,122 @@
+<section class="solutions" id="sol11">
+<h1>Chapter 11 — Solutions</h1>
+
+<div class="solution" id="sol11.1"><span class="sol-label">11.1</span>
+(a) A single <strong>null byte</strong> <code>'\0'</code> (value 0) marks the end. (b) <code>strlen</code> is
+O(n) because the length is <em>not</em> stored — it must scan byte by byte until it finds the terminator. (c)
+The function learns <strong>nothing</strong> about capacity: the array decays to a bare <code>char *</code>,
+an address with no length attached. <strong>Feed-forward:</strong> §11.1.</div>
+
+<div class="solution" id="sol11.2"><span class="sol-label">11.2</span>
+<code>gets</code> — it read a line with no bound at all and was <strong>removed from the language in C11</strong>
+(deprecated in C99). Use <code>fgets(s, size, stdin)</code>, which takes the buffer size. <em>Tempting wrong
+answer:</em> "<code>scanf("%s")</code> is fine" — unbounded <code>%s</code> has the same overflow problem; use
+a width, e.g. <code>%63s</code>. <strong>Feed-forward:</strong> §11.3.</div>
+
+<div class="solution" id="sol11.3"><span class="sol-label">11.3</span>
+(a) <strong>False</strong> — <code>strncpy</code> does not terminate when the source is at least <code>n</code>
+bytes long; it leaves the destination unterminated. (b) <strong>False</strong> — a canary <em>detects</em> a
+linear stack overflow and aborts; the bug (the out-of-bounds write) is still there. (c) <strong>True</strong>
+— <code>snprintf</code> always null-terminates when its size argument is nonzero. <strong>Feed-forward:</strong>
+§11.2–11.4.</div>
+
+<div class="solution" id="sol11.4"><span class="sol-label">11.4</span>
+On a downward-growing stack, a local array sits <em>below</em> the saved frame pointer and saved
+<strong>return address</strong>, while a copy into the array writes toward <em>higher</em> addresses — so an
+overrun climbs over the frame pointer onto the return address. Overwriting it means that when the function
+executes <code>ret</code>, the CPU jumps to the attacker-supplied value: control-flow hijack. An out-of-bounds
+<em>read</em> (usually) cannot redirect execution — it leaks adjacent bytes but does not write control data.
+<em>Tempting wrong answer:</em> "reads are as dangerous as writes" — reads leak (serious, e.g. Heartbleed) but
+do not seize control. <strong>Feed-forward:</strong> §11.2.</div>
+
+<div class="solution" id="sol11.5"><span class="sol-label">11.5</span>
+(a) <strong>Overflows</strong> whenever <code>user_input</code> is longer than <code>buf</code> — no
+destination bound; rewrite <code>snprintf(buf, sizeof buf, "%s", user_input);</code>. (b) <strong>Overflows</strong>
+if the formatted result exceeds <code>buf</code> — <code>sprintf</code> is unbounded; rewrite
+<code>snprintf(buf, sizeof buf, "%s-%s", a, b);</code>. (c) <strong>Over-reads</strong> — <code>strncpy(d, "abcd",
+4)</code> fills all 4 bytes with no terminator, so <code>printf("%s", d)</code> runs off the end; fix by
+terminating (<code>d[3] = '\0';</code>, losing a char) or, better, <code>snprintf(d, sizeof d, "%s", "abcd")</code>.
+<em>Method-selection cue:</em> "no size argument" &rarr; can overflow; "size argument but no guaranteed
+terminator" &rarr; can over-read. <strong>Feed-forward:</strong> §11.2–11.3.</div>
+
+<div class="solution" id="sol11.6"><span class="sol-label">11.6</span>
+Three reasons a canary + ASLR do not "handle" overflows: (1) a <strong>canary only catches a linear stack
+overflow and only at return</strong> — it does nothing for heap overflows or overwrites of non-control data,
+and it acts after the corruption (turning a hijack into a crash/DoS); (2) <strong>ASLR only randomizes
+addresses</strong> — it raises the difficulty of a working exploit but is defeated by info-leaks or techniques
+that do not need fixed addresses; (3) both are <strong>mitigations, not fixes</strong> — the out-of-bounds
+write is still undefined behavior, still present. The actual fix: remove the unbounded writes (use
+<code>snprintf</code>/bounded copies) so the overflow cannot occur. <em>Tempting wrong answer:</em>
+"mitigations on = bug fixed" — they contain blast radius, they do not remove the bug. <strong>Feed-forward:</strong>
+§11.4.</div>
+
+<div class="solution" id="sol11.7"><span class="sol-label">11.7</span>
+(a) <code>strlen</code> is O(n) because a C string stores no length — it scans to the terminator — whereas a
+length-carrying string stores the count, so reading the length is O(1). (b) Stack canaries add a random-value
+write on entry and a compare on return per protected frame; <code>_FORTIFY_SOURCE</code> adds size-checked
+variants of the string/memory calls — small overhead in exchange for turning many overflows into detected
+aborts or compile errors. (c) Not free: the canary compare is on the return path of every protected function,
+a real (if usually small) cost. Trade-off: <strong>safety vs. speed</strong> — you pay a little runtime to
+detect a class of memory corruption. <em>Tempting wrong answer:</em> "canaries are free" — they add work on
+every protected return. <strong>Feed-forward:</strong> §11.1, §11.4.</div>
+
+<div class="solution" id="sol11.8"><span class="sol-label">11.8</span>
+<strong>Step 4:</strong> Rewrite with a single bounded format:
+<code>void greet(const char *name){ char msg[16]; snprintf(msg, sizeof msg, "Hello, %s", name); puts(msg); }</code>.
+<code>snprintf</code> writes at most <code>sizeof msg</code> bytes <em>including</em> the terminator and always
+null-terminates (when the size is nonzero), so no <code>name</code>, however long, can overflow <code>msg</code>
+— it truncates instead; <code>strcat</code> guarantees neither a bound nor (relative to the destination
+capacity) safety. A §11.4 defense that turns the original overflow into a crash rather than a silent hijack:
+a <strong>stack canary</strong> (<code>-fstack-protector</code>), which aborts with "stack smashing detected"
+instead of returning through a corrupted return address (<code>_FORTIFY_SOURCE</code> would also catch it, at
+compile or run time). <em>Tempting wrong answer:</em> "use <code>strncat</code> with <code>sizeof msg</code>"
+— <code>strncat</code>'s bound is the bytes to <em>append</em>, not the buffer size, and it is easy to
+miscompute. <strong>Feed-forward:</strong> §11.3–11.4.</div>
+
+<div class="solution" id="sol11.9"><span class="sol-label">11.9</span>
+(a) <strong>Buffer overflow (over-write)</strong> is possible, but "garbage appended <em>after</em> the
+expected text" most cleanly matches an <strong>unterminated string (over-read)</strong> — the print continues
+past the intended end until it hits a stray zero. (b) <strong>A mitigation firing</strong> — <code>*** stack
+smashing detected ***</code> is the stack canary aborting on a detected overflow. (c) <strong>Use-after-free</strong>
+— reading a freed block that was reallocated to another request (Ch 9). (d) <strong>Unterminated string (over-
+read)</strong> — <code>printf("%s")</code> reading far past the data and leaking adjacent memory (Heartbleed
+class). <em>Method-selection cue:</em> "garbage after expected text / reads too far" &rarr; missing terminator;
+"stack smashing detected" &rarr; canary; "freed block reused" &rarr; UAF. <strong>Feed-forward:</strong> §11.1–11.4,
+§9.3.</div>
+
+<div class="solution" id="sol11.10"><span class="sol-label">11.10</span>
+(a) <strong>Undefined behavior</strong> — <code>strncpy</code> with <code>strlen(s) &gt;= sizeof d</code>
+leaves <code>d</code> unterminated, so reading it as a string over-reads out of bounds. (b) <strong>Well-defined
+and fine</strong> — <code>snprintf</code> always terminates, so reading <code>d</code> is safe (possibly
+truncated, but valid). (c) <strong>Undefined behavior</strong> — a one-byte heap overflow is an out-of-bounds
+write. (d) <strong>Well-defined</strong> (a defined defensive action) — a canary deliberately aborting the
+process on a detected overflow is defined behavior, not UB (it is the mitigation working). <em>Tempting wrong
+answer:</em> conflating (a) and (b) — the difference is the guaranteed terminator. <strong>Feed-forward:</strong>
+§11.2–11.4.</div>
+
+<div class="solution" id="sol11.11"><span class="sol-label">11.11</span>
+(a) A <strong>stack canary</strong> defeats a linear overflow that reaches the return address (detected at
+return); <strong>NX/DEP</strong> marks the stack/heap non-executable, defeating "inject shellcode and jump to
+it"; <strong>ASLR</strong> randomizes segment base addresses, defeating attacks that need to predict them.
+<strong>Return-oriented programming (ROP)</strong> was developed to route around NX by chaining fragments of
+existing executable code ("gadgets") instead of injecting new code. (b) Layering is worthwhile because each
+mitigation raises the cost and reliability barrier for a different technique; an attacker must defeat all of
+them, and many real exploits fail against the stack. (c) Rust makes the bug "not happen" by carrying the
+length with every slice/string and bounds-checking indexing: an out-of-bounds access is a defined
+<strong>panic</strong>, not undefined memory corruption — categorically different because a panic has a
+defined, contained outcome (the program stops safely) whereas UB has no defined outcome and can corrupt
+control flow. <em>Tempting wrong answer:</em> "a panic is just a crash, same as UB" — a panic is defined and
+cannot be leveraged into memory corruption. <strong>Feed-forward:</strong> §11.4–11.5, Part 5.</div>
+
+<div class="solution" id="sol11.12"><span class="sol-label">11.12</span>
+Machine-specific by design. A correct write-up reports: (a) with <code>-fstack-protector-all</code> the 8-byte
+overflow aborts with <code>*** stack smashing detected ***</code> (on the book's machine, exit status 134,
+SIGABRT); (b) with <code>-D_FORTIFY_SOURCE=2 -O2</code> a compile-time diagnostic like
+<code>__builtin___strcpy_chk / __memcpy_chk writing N bytes into a region of size M</code> (and gcc's
+<code>-Wstringop-overflow</code> may also fire); (c) <code>strncpy(d, "abcd", 4)</code> leaves the four bytes
+<code>97 98 99 100</code> with <em>no</em> terminating zero. Essential discipline: report only observed output
+and label compiler/version (gcc 11.4.0, x86-64 here), since exact messages and status vary. <em>Tempting wrong
+answer:</em> "the canary means the overflow was harmless" — it converted a hijack into a crash; the bug is the
+same. <strong>Feed-forward:</strong> §11.2–11.4.</div>
+
+</section>

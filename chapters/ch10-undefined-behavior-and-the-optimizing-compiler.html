@@ -1,0 +1,443 @@
+<section class="chapter" id="ch10">
+<h1>Chapter 10 — Undefined Behavior &amp; the Optimizing Compiler</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch09">Chapter 9</a> (the memory bugs, most
+of them undefined behavior; the §3.4.3 definition), <a href="#ch07">Chapter 7</a> (pointers, bounds, and
+one-past-the-end), <a href="#ch05">Chapter 5</a> (what the compiler is allowed to reorder). &nbsp;·&nbsp;
+<strong>Continues Part 2.</strong> Chapter 9 named undefined behavior and told you it was "stronger than a
+crash." This chapter shows you <em>why</em> — how the optimizing compiler actively reasons from the
+assumption that your program contains no UB, so a latent bug does not merely misbehave where it sits: it lets
+the compiler transform code elsewhere in surprising, sometimes dangerous ways. We will compile real examples
+on this machine and read the assembly.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch09">Chapter 9</a> — in the C standard's terms, what does
+<strong>undefined behavior</strong> mean, and how is it different from <em>unspecified</em> and
+<em>implementation-defined</em> behavior? (2) <a href="#ch07">Chapter 7</a> — indexing a pointer is defined
+only within an array (plus one-past-the-end for the address, not the dereference); what is stepping outside
+that? (3) <em>Predict:</em> you write <code>int f(int x){ return x + 1 &gt; x; }</code>. For <em>signed</em>
+<code>int</code>, is <code>x + 1 &gt; x</code> always true? What do you think an optimizing compiler emits for
+this function — a comparison, or the constant <code>1</code>? By the end you will be able to read the
+assembly and say exactly why.</p>
+</aside>
+
+<p>Here is the mental shift this chapter demands. It is tempting to think of C as a "portable assembler":
+you write operations, the compiler emits the corresponding instructions, and undefined behavior is what
+happens when those instructions hit a bad state at runtime. That model is wrong, and believing it is the
+source of a whole category of baffling bugs. The correct model is that <strong>undefined behavior is a
+promise you make to the compiler</strong> — a precondition it is entitled to assume you never violate — and
+the optimizer reasons <em>from</em> that promise. When you write code that can execute UB, you have not
+described "what the machine does in the bad case"; you have told the compiler the bad case cannot happen, and
+it will rewrite your program on that basis. We will make this concrete: the standard's definition and its
+two milder cousins (§10.1); the single assumption the optimizer runs on (§10.2); a gallery of UB that
+actually changes the compiled code on this machine, read as assembly (§10.3); and why the language is built
+this way, plus the tools and flags that defend you (§10.4). This is the intellectual core of why manual
+memory management (Ch 9) is so heavy, and — again — the exact weight Rust will lift in Part 5.</p>
+
+<h2>10.1 Undefined behavior, precisely — and its two milder cousins</h2>
+
+<p>Chapter 9 gave the definition; we now lean on it fully. The C standard (C11 §3.4.3) defines
+<strong>undefined behavior</strong> as behavior "for which this International Standard imposes <em>no
+requirements</em>," and notes that permissible responses range from "ignoring the situation completely with
+unpredictable results" to "behaving during translation or program execution in a documented manner
+characteristic of the environment" to "terminating a translation or execution." Read that carefully: "no
+requirements" and "during translation" together mean the license extends to <em>compile time</em> — the
+compiler, not just the running program, may do anything when UB is possible. Three standard categories,
+sharpened from §9.3, are worth keeping straight because only the first grants the compiler this license:</p>
+
+<ul>
+<li><strong>Undefined behavior</strong> (§3.4.3): no requirements at all. The program has no meaning on the
+inputs that trigger it. Examples: signed integer overflow, dereferencing a null or dangling pointer, an
+out-of-bounds access, a data race, reading an object through a pointer of an incompatible type (a strict-
+aliasing violation).</li>
+<li><strong>Unspecified behavior</strong> (§3.4.4): the standard gives two or more valid possibilities and
+does not say which you get — e.g. the order in which a function's arguments are evaluated. Each possibility
+is a normal, non-catastrophic outcome; the compiler need not document its choice.</li>
+<li><strong>Implementation-defined behavior</strong> (§3.4.1): unspecified behavior that the implementation
+must <em>document</em> — e.g. the width of <code>int</code>, or the byte order (Ch 7). Portable code avoids
+depending on it; it is not dangerous, merely non-portable.</li>
+</ul>
+
+<p>The distinction that matters for this chapter: unspecified and implementation-defined behavior still
+produce a <em>valid program</em> with <em>some</em> defined outcome — you just may not know which. Undefined
+behavior produces <strong>no valid program at all</strong> on the triggering input. There is no "the value
+you happen to get"; the standard has stopped describing your program entirely. Everything in §10.2 follows
+from that single fact.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Which of these is undefined, which unspecified, which implementation-defined: (a) <code>sizeof(long)</code>;
+(b) the evaluation order of <code>f() + g()</code>; (c) signed integer overflow? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>10.2 The optimizer's one assumption: UB never happens</h2>
+
+<p>An optimizing compiler transforms your code under the <strong>as-if rule</strong>: it may emit any
+instructions it likes as long as the observable behavior of a <em>well-defined</em> program is preserved.
+The crucial word is <em>well-defined</em>. For an input that triggers undefined behavior, the program has no
+observable behavior the compiler is required to preserve — so the optimizer is free to assume that input
+never occurs. It does not check; it does not warn (usually); it simply reasons: "this operation would be UB
+if condition <em>C</em> held, and the programmer has promised never to invoke UB, therefore <em>C</em> is
+false — and I may use that fact to simplify everything downstream (and, under the as-if rule, upstream too)."</p>
+
+<p>Two consequences of that reasoning surprise people. First, <strong>the optimizer propagates the
+assumption</strong>: one operation that is only UB when <code>p</code> is null lets the compiler conclude
+<code>p</code> is non-null <em>everywhere</em> that value is used, deleting your later null check as
+provably-dead code. Second, <strong>the effects can appear to "travel" in time</strong>: because a program
+that executes UB has undefined behavior for the <em>whole</em> execution, an optimizer may hoist, sink, or
+delete work around the UB in ways that make observable effects <em>before</em> the buggy line also vanish or
+change. This is why "it printed the right thing up to the crash" is not something you can rely on. Neither of
+these is a compiler bug — each is the as-if rule applied to a program whose meaning you forfeited by writing
+the UB. Lattner's LLVM series and Regehr's guide (Further Reading) walk through the same reasoning at
+length; the sections below reproduce it on this machine.</p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">How the optimizer reasons about a possibly-UB operation:</text>
+<rect x="20" y="28" width="180" height="46" fill="#f5f8fb" stroke="#14406b"/>
+<text x="30" y="47" font-size="10">Your source contains an</text>
+<text x="30" y="62" font-size="10">operation UB when C holds</text>
+<text x="212" y="45" font-size="16">&rarr;</text>
+<rect x="236" y="28" width="180" height="46" fill="#fdf6ec" stroke="#8c5a1d"/>
+<text x="246" y="47" font-size="10">"Programmer promised no</text>
+<text x="246" y="62" font-size="10">UB, so C must be false"</text>
+<text x="428" y="45" font-size="16">&rarr;</text>
+<rect x="452" y="28" width="168" height="46" fill="#fdecec" stroke="#8c3a1d"/>
+<text x="462" y="47" font-size="10">Delete/rewrite code that</text>
+<text x="462" y="62" font-size="10">assumed C could be true</text>
+<text x="20" y="104" font-size="10" fill="#333">Example (this chapter, §10.3):</text>
+<rect x="20" y="112" width="290" height="80" fill="#fff" stroke="#8a8f98"/>
+<text x="28" y="130" font-size="9" font-family="monospace">int *sk = t-&gt;sk;   // deref t (UB if t==NULL)</text>
+<text x="28" y="146" font-size="9" font-family="monospace">if (!t) return -1; // null check AFTER deref</text>
+<text x="28" y="162" font-size="9" font-family="monospace">return *sk;</text>
+<text x="28" y="184" font-size="9" fill="#8c3a1d">compiler: "t was dereferenced &rArr; t != NULL"</text>
+<text x="330" y="150" font-size="16">&rarr;</text>
+<rect x="356" y="112" width="264" height="80" fill="#fdecec" stroke="#8c3a1d"/>
+<text x="364" y="130" font-size="9" fill="#8c3a1d">the `if (!t)` check is DELETED as dead code</text>
+<text x="364" y="150" font-size="9" font-family="monospace">int *sk = t-&gt;sk;</text>
+<text x="364" y="166" font-size="9" font-family="monospace">return *sk;   // check gone</text>
+<text x="364" y="186" font-size="9" fill="#555">real bug: Linux CVE-2009-1897 (§10.3)</text>
+</svg>
+<figcaption>Figure 10.1: The optimizer treats a possibly-UB operation as a promise that the triggering
+condition never holds, then simplifies on that basis — here deleting a null check because the pointer was
+already dereferenced. The pattern is the real Linux kernel bug reproduced in §10.3.</figcaption>
+</figure>
+
+<p><em>(Answer to the §10.1 quick check: (a) <code>sizeof(long)</code> is <strong>implementation-defined</strong>
+— it varies but must be documented; (b) the evaluation order of <code>f() + g()</code> is
+<strong>unspecified</strong> — one of two valid orders, undocumented; (c) signed integer overflow is
+<strong>undefined behavior</strong> — no requirements at all, the case the optimizer exploits.)</em></p>
+
+<h2>10.3 A gallery of UB that changes the compiled code — read on this machine</h2>
+
+<p>Abstract claims about "the optimizer may assume" become believable only when you watch it happen. Each
+example below was compiled with <code>gcc 11.4.0</code> at <code>-O2</code> on this x86-64 machine and the
+relevant assembly read directly. <strong>Exact output varies by compiler and version; these are from this
+specific toolchain.</strong></p>
+
+<p><strong>Signed integer overflow (the opener).</strong> In C, signed integer overflow is undefined
+(unsigned overflow is defined and wraps modulo 2<sup>n</sup>). So in <code>int f(int x){ return x + 1 &gt;
+x; }</code> the compiler may assume <code>x + 1</code> never overflows — and if it never overflows,
+<code>x + 1 &gt; x</code> is <em>always</em> true. It compiles the whole function to a constant:</p>
+
+<pre><code>/* gcc -O2 -S : int f(int x){ return x + 1 &gt; x; } */
+f:
+        movl    $1, %eax      ; return 1, unconditionally
+        ret</code></pre>
+
+<p>No addition, no comparison — just <code>return 1</code>. This is correct per the standard and often
+useful (it lets loops with an <code>int</code> counter be optimized as if they cannot wrap). But if you were
+<em>relying</em> on wraparound to detect overflow — the classic <code>if (x + 1 &lt; x) /* overflowed */</code>
+— the check is deleted and your overflow goes undetected. (Compile the same with <code>-fwrapv</code>, which
+<em>defines</em> signed overflow as two's-complement wraparound, and the comparison reappears.)</p>
+
+<p><strong>Null check deleted after a dereference (a real CVE).</strong> Dereferencing a null pointer is UB,
+so once a pointer has been dereferenced the compiler may assume it is non-null from then on. Consider the
+pattern below — a simplified form of the actual Linux kernel function <code>tun_chr_poll</code>:</p>
+
+<pre><code>struct T { int *sk; };
+int poll(struct T *t) {
+    int *sk = t-&gt;sk;      /* dereference t */
+    if (!t) return -1;    /* null check AFTER the dereference */
+    return *sk;
+}</code></pre>
+
+<p>At <code>-O2</code>, gcc on this machine emits (the <code>if (!t)</code> is <em>gone</em> — no test of the
+pointer against zero):</p>
+
+<pre><code>poll:
+        endbr64
+        movq    (%rdi), %rax   ; sk = t-&gt;sk   (dereference t)
+        movl    (%rax), %eax   ; return *sk
+        ret                    ; no `testq %rdi,%rdi; je ...` -- check deleted</code></pre>
+
+<p>Compiled with <code>-fno-delete-null-pointer-checks</code>, the guard survives (<code>testq %rdi,%rdi; je
+.L3</code> reappears). This is not a contrived teaching example: it is the shape of <strong>CVE-2009-1897</strong>
+in the Linux kernel's <code>drivers/net/tun.c</code> (kernel 2.6.30). The pointer was dereferenced before the
+null check; gcc, entitled to assume the dereference could not have been of a null pointer, deleted the check;
+an attacker able to map memory at address zero could then reach the code that should have been guarded — a
+privilege-escalation hole. The kernel's fix moved the check before the dereference and, as belt-and-braces,
+the build adopted <code>-fno-delete-null-pointer-checks</code>. The lesson is exact: <strong>a null check
+that comes after the dereference it is meant to guard is not a weak check — to the optimizer it is a
+statement that the pointer was already known non-null, and it may be deleted.</strong></p>
+
+<p><strong>The others you already met (Ch 9), now as UB the optimizer trusts.</strong> Out-of-bounds access,
+use-after-free, and uninitialized reads are all UB; the optimizer is likewise permitted to assume they never
+happen and to transform code accordingly (for instance, assuming an index stays in range, or that two
+pointers of incompatible types never alias — the <strong>strict-aliasing</strong> rule, §6.5, which lets the
+compiler keep a value in a register across a write through an <code>int*</code> when it "knows" a
+<code>float*</code> cannot touch the same object; <code>-fno-strict-aliasing</code> disables it). The through-
+line: every UB in Chapter 9's catalogue is not just a runtime hazard but a compile-time license.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: UB is a promise, not a behavior</span>
+<p><strong>1. In words.</strong> Undefined behavior is a precondition you promise the compiler you will never
+violate. The compiler does not define "what happens in the bad case"; it assumes the bad case is impossible
+and optimizes on that assumption. So UB has no outcome to reason about — only consequences the optimizer
+derives from "this can't happen."</p>
+<p><strong>2. As a decision.</strong> For an operation that is UB exactly when condition <em>C</em> holds, the
+compiler branches: "either <em>C</em> is false (fine, proceed) or <em>C</em> is true (UB, undefined — I owe
+nothing)." Both branches let it act as if <em>C</em> is false. So it deletes anything that only mattered when
+<em>C</em> was true — like a null check after a dereference.</p>
+<p><strong>3. As compiled code.</strong> <code>x + 1 &gt; x</code> becomes <code>return 1</code>;
+<code>if (!t)</code> after <code>t-&gt;sk</code> vanishes. The transform is visible in the assembly (§10.3) and
+correct per the standard — the "surprise" is entirely in the reader's wrong mental model of C as a portable
+assembler.</p>
+</aside>
+
+<aside class="warning">
+<span class="box-title">Trap: "it worked at -O0, so the optimizer broke my code"</span>
+<p>When a program behaves at <code>-O0</code> and misbehaves at <code>-O2</code>, the instinct is "the
+optimizer introduced a bug." Almost always the truth is the reverse: <strong>the undefined behavior was
+already in your program, and the optimizer merely exercised the license that UB granted it.</strong> At
+<code>-O0</code> the compiler emits naive code that happens to do what you expected; at <code>-O2</code> it
+reasons from "no UB" and the latent bug surfaces. The tells: "only fails in release builds," "only with
+optimizations on," "adding a <code>printf</code> makes it go away" (the print perturbs what the optimizer can
+prove). The wrong fix is to compile at <code>-O0</code> or sprinkle <code>volatile</code> until it "works" —
+that hides UB, it does not remove it, and the next compiler version may re-expose it. The right response is
+to find and eliminate the undefined behavior: build with <code>-fsanitize=undefined</code> (UBSan) and
+<code>-Wall -Wextra</code>, and reason about which operation had no defined meaning. "Works at <code>-O0</code>"
+is not evidence of correctness, exactly as "didn't crash" was not in Chapter 9.</p>
+</aside>
+
+<h2>10.4 Why the language is built this way — and how to defend</h2>
+
+<p>It is fair to ask why the standard grants this license at all. The answer is a deliberate bargain.
+Leaving these situations undefined — rather than mandating a checked outcome — is what lets a C compiler
+generate fast code across wildly different hardware without inserting a bounds check on every array access, an
+overflow check on every addition, or a null check on every dereference. Signed-overflow UB, for example, lets
+the compiler promote loop counters, strength-reduce, and assume loops terminate; defined wraparound would
+forbid some of those. The cost of the bargain is precisely this chapter: the responsibility for never
+triggering UB shifts entirely to you, and the compiler will not (in general) tell you when you have.
+Different languages strike the bargain differently — Java defines integer overflow and mandates bounds
+checks (paying runtime cost for safety); Rust checks bounds and, in debug builds, overflow, and confines the
+UB-bearing operations to explicitly <code>unsafe</code> blocks (Part 5). C chose maximum latitude for the
+compiler, and hands you the bill.</p>
+
+<p>Given that, your defenses are concrete and layered:</p>
+<ul>
+<li><strong>Sanitizers.</strong> <code>-fsanitize=undefined</code> (UndefinedBehaviorSanitizer, in gcc and
+clang) instruments the program to detect many UB categories at runtime — signed overflow, out-of-bounds on
+known-size arrays, null dereference, misaligned access, and more — reporting the file and line. Combined with
+AddressSanitizer (Ch 9) for memory errors, it turns much silent UB into loud, located failures. Run your
+tests under both.</li>
+<li><strong>Warnings.</strong> <code>-Wall -Wextra</code> catch a meaningful fraction statically (uninitialized
+reads, some overflows, format-string mismatches). Free; turn them on and treat them as errors
+(<code>-Werror</code>) where you can.</li>
+<li><strong>Defining-the-undefined flags.</strong> When you deliberately depend on a behavior the standard
+leaves undefined, tell the compiler to define it: <code>-fwrapv</code> (signed overflow wraps),
+<code>-fno-strict-aliasing</code> (allow type-punning through pointers), <code>-fno-delete-null-pointer-checks</code>
+(keep null checks even after a dereference). These trade some optimization for predictability and are how the
+Linux kernel, among others, tames the sharpest edges.</li>
+<li><strong>Write UB-free code.</strong> The durable fix. Check pointers before dereferencing, indices before
+indexing, and sizes before copying (Ch 11); use unsigned types or explicit overflow-checked arithmetic when
+you need wraparound or overflow detection; never read before initializing. Every rule from §9.1 is really a
+rule for staying inside the defined language.</li>
+</ul>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Your code does <code>if (x + 1 &lt; x)</code> to detect signed overflow and the check keeps getting
+optimized away. Name two ways to make the detection actually work — one that changes the flag you compile
+with, one that changes the type or arithmetic you use. (Answer below the communicate box.)</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate files a compiler bug: "gcc deleted my null check! Look — I clearly write
+<code>if (!t) return -1;</code> and it's not in the assembly. This is a miscompilation." The code
+dereferences <code>t</code> one line above the check. Cover the paragraph and respond in three or four
+sentences, using <em>undefined behavior</em> and the as-if rule.</p>
+<p><em>Model answer.</em> "It's not a miscompilation — it's the as-if rule doing exactly what the standard
+permits. You dereference <code>t</code> with <code>t-&gt;sk</code> <em>before</em> the check, and
+dereferencing a null pointer is undefined behavior, so the compiler is entitled to assume <code>t</code> was
+non-null at that point — which makes the later <code>if (!t)</code> provably dead code it can delete. This is
+literally the shape of the Linux kernel bug CVE-2009-1897. The fix isn't to report gcc; it's to move the null
+check <em>before</em> the dereference (and, if we want a belt-and-braces guard, build with
+<code>-fno-delete-null-pointer-checks</code>). A check that comes after the dereference it guards isn't a
+weak check — to the optimizer it's a promise the pointer was already non-null." Naming the as-if rule and
+the CVE, rather than blaming the compiler, is the senior register — and it turns a "compiler bug" into a
+one-line code fix.</p>
+</aside>
+
+<p><em>(Answer to the §10.4 quick check: (1) compile with <code>-fwrapv</code>, which defines signed
+overflow as two's-complement wraparound so the comparison is no longer optimized away; or (2) do the
+arithmetic in an <strong>unsigned</strong> type (defined to wrap) or use a checked-arithmetic builtin such as
+<code>__builtin_add_overflow</code>, which reports overflow without relying on UB. Detecting signed overflow
+by <strong>letting it happen</strong> and testing afterward is itself UB — that is why the naive check disappears.)</em></p>
+
+<h2>10.5 What to carry forward</h2>
+
+<p>Undefined behavior is not "what the machine does in the bad case." It is a precondition you promise the
+compiler you will never violate, and the optimizer reasons from that promise: under the as-if rule it may
+assume every UB-triggering condition is false and rewrite your program accordingly — deleting a null check
+after a dereference, folding <code>x + 1 &gt; x</code> to the constant <code>1</code>, keeping a value in a
+register across a write it "knows" cannot alias. We watched each of these happen in the assembly on this
+machine. The categories to keep separate are undefined (no requirements — the compiler's license),
+unspecified (a valid but unstated choice), and implementation-defined (unspecified but documented); only the
+first grants the license. The language makes this bargain on purpose — it is what lets C compile to fast code
+across every architecture without safety checks on every operation — and it hands you the whole cost. Your
+defenses are UBSan and ASan for detection, <code>-Wall -Wextra</code> for the static fraction, the
+define-the-undefined flags (<code>-fwrapv</code>, <code>-fno-strict-aliasing</code>,
+<code>-fno-delete-null-pointer-checks</code>) when you must depend on an edge, and — above all — writing code
+that never triggers UB.</p>
+
+<p>This chapter closes the loop opened in Chapter 9. There we cataloged the manual-memory bugs and called
+most of them UB; here you saw why that word carries so much weight — UB is what makes those bugs
+unpredictable, build-dependent, and, as CVE-2009-1897 shows, exploitable. It also sets up the next chapter:
+the buffer overflow of Chapter 9 is UB, and Chapter 11 follows exactly what an out-of-bounds write can do to
+a program's control flow — the single most consequential UB in the history of security. And it is the
+sharpest possible motivation for Rust (Part 5): a language whose safe subset has <em>no</em> undefined
+behavior, confining every UB-bearing operation to code you must mark <code>unsafe</code>, so the promises this
+chapter made you keep by hand are enforced by the type system before the program ever runs.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the C standard's definition of <strong>undefined behavior</strong> and distinguish it from
+<strong>unspecified</strong> and <strong>implementation-defined</strong> behavior.</li>
+<li>Explain the <strong>as-if rule</strong> and why it lets the optimizer assume UB-triggering conditions are
+false — including how an assumption "propagates" and can affect code before the buggy line.</li>
+<li>Walk through why <code>int f(int x){ return x + 1 &gt; x; }</code> can compile to <code>return 1</code>,
+and why a null check <em>after</em> a dereference can be deleted (CVE-2009-1897).</li>
+<li>Explain why "it worked at <code>-O0</code>" and "adding a <code>printf</code> fixed it" are UB
+signatures, not evidence of correctness.</li>
+<li>Name four defenses (UBSan, warnings, define-the-undefined flags, UB-free code) and say what each buys.</li>
+<li>Say, in one sentence, why the language leaves these behaviors undefined at all — the optimization/safety
+bargain — and how Rust strikes it differently.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Define undefined, unspecified, and implementation-defined behavior, and say which
+grants the compiler its license. (§10.1)</li>
+<li><strong>R2.</strong> State the as-if rule and explain how "the optimizer assumes UB never happens" leads
+to deleting code. (§10.2)</li>
+<li><strong>R3.</strong> Why can <code>x + 1 &gt; x</code> become <code>1</code>, and how does
+<code>-fwrapv</code> change that? (§10.3–10.4)</li>
+<li><strong>R4.</strong> Describe CVE-2009-1897: what pattern caused it, why the check was deleted, and the
+two-part fix. (§10.3)</li>
+<li><strong>R5.</strong> Name the bargain the language makes and four defenses against UB. (§10.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Chris Lattner, "What Every C Programmer Should Know About Undefined Behavior" (LLVM Project Blog,
+2011, three parts).</strong> The optimizer-writer's own account of how and why the compiler exploits UB, with
+worked examples (null checks, signed overflow, strict aliasing). Free.</li>
+<li><strong>John Regehr, "A Guide to Undefined Behavior in C and C++" (Embedded in Academia, 2010, three
+parts).</strong> A researcher's catalogue of UB and its interaction with aggressive compilers, including the
+"UB can time-travel" framing. Free (<code>blog.regehr.org</code>).</li>
+<li><strong>The C standard</strong> — §3.4.1/3.4.3/3.4.4 (the three behavior categories), §6.5 (aliasing),
+and the integer-overflow rules. The authority for what is undefined; <strong>cppreference.com</strong>
+summarizes it accessibly.</li>
+<li><strong>UndefinedBehaviorSanitizer (UBSan) documentation</strong> (Clang/GCC). The runtime detector for
+many UB categories; verify the exact checks and flags against your compiler version.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex10.1"><span class="ex-label">10.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define <em>undefined</em>, <em>unspecified</em>, and <em>implementation-defined</em>
+behavior, and state which one grants the optimizer license to assume the situation never happens.</div>
+
+<div class="exercise" id="ex10.2"><span class="ex-label">10.2</span> <span class="ex-tag warm">warm-up</span>
+Is <em>unsigned</em> integer overflow undefined behavior in C? Is <em>signed</em> integer overflow? Answer
+each and, for the defined one, say what value results.</div>
+
+<div class="exercise" id="ex10.3"><span class="ex-label">10.3</span> <span class="ex-tag warm">warm-up</span>
+A program prints correct output at <code>-O0</code> but wrong output at <code>-O2</code>. State the single
+most likely explanation, and name the two build flags you would add to hunt for it.</div>
+
+<div class="exercise" id="ex10.4"><span class="ex-label">10.4</span> <span class="ex-tag core">core</span>
+Explain, step by step, why <code>int f(int x){ return x + 1 &gt; x; }</code> can be compiled to
+<code>return 1</code>. Then explain what breaks if a programmer used <code>if (x + 1 &lt; x)</code> to detect
+overflow, and give a correct way to detect it.</div>
+
+<div class="exercise" id="ex10.5"><span class="ex-label">10.5</span> <span class="ex-tag core">core</span>
+Given <code>int *sk = t-&gt;sk; if (!t) return -1; return *sk;</code>: (a) name the UB, (b) explain why an
+optimizer may delete the <code>if (!t)</code> check, (c) give the one-line code fix, and (d) name the flag
+that would preserve the check without changing the code. This is a real CVE — name the pattern.</div>
+
+<div class="exercise" id="ex10.6"><span class="ex-label">10.6</span> <span class="ex-tag core">core</span>
+"The compiler has a bug — my code is fine, it just miscompiled." A teammate says this about the §10.5 null-
+check example. Explain, using the as-if rule, why the compiler is behaving correctly and the code is not.</div>
+
+<div class="exercise" id="ex10.7"><span class="ex-label">10.7</span> <span class="ex-tag complexity">cost</span>
+The standard <em>could</em> have defined all of these behaviors (mandating bounds checks, overflow checks,
+null checks). (a) What runtime cost would that impose? (b) Name one specific optimization that signed-overflow
+UB enables. (c) State the bargain in one sentence: what the programmer gives up and what the compiler gains.</div>
+
+<div class="exercise" id="ex10.8"><span class="ex-label">10.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A teammate reports: "My bounds check <code>if (i &lt; 0 || i
+&gt;= n)</code> works, but after I access <code>a[i]</code> <em>first</em> for logging and check
+<code>i</code> afterward, the check stopped firing." Diagnose and fix.
+<br><strong>Step 1 (given):</strong> Accessing <code>a[i]</code> with <code>i</code> out of range is an out-
+of-bounds access — undefined behavior.
+<br><strong>Step 2 (given):</strong> Once <code>a[i]</code> has executed, the compiler may assume
+<code>i</code> was in range (else UB), i.e. <code>0 &lt;= i &lt; n</code>.
+<br><strong>Step 3 (given):</strong> Therefore the later <code>if (i &lt; 0 || i &gt;= n)</code> is provably
+false and can be deleted — same shape as the null-check CVE.
+<br><strong>Step 4 (you):</strong> State the fix (what must come before what), name one sanitizer that would
+have flagged the original out-of-bounds access at runtime, and say why moving the log line does not merely
+"reorder output" but changes what the compiler is allowed to prove.</div>
+
+<div class="exercise" id="ex10.9"><span class="ex-label">10.9</span> <span class="ex-tag mixed">mixed</span>
+For each, decide whether it is <em>undefined</em>, <em>unspecified</em>, or <em>implementation-defined</em>,
+and justify in a line: (a) the value of <code>sizeof(int)</code>; (b) the order <code>a()</code> and
+<code>b()</code> are called in <code>a() + b()</code>; (c) <code>INT_MAX + 1</code>; (d) right-shifting a
+negative signed integer; (e) reading a <code>malloc</code>'d block before writing it. (One of these is a §9.3
+memory bug; recognizing that is the point.)</div>
+
+<div class="exercise" id="ex10.10"><span class="ex-label">10.10</span> <span class="ex-tag mixed">mixed</span>
+A colleague proposes three "fixes" for an intermittent bug that only appears in release builds: (a) always
+compile at <code>-O0</code>; (b) mark the variables <code>volatile</code> until it stops; (c) build the tests
+with <code>-fsanitize=undefined,address</code> and fix whatever it reports. Rank them from least to most
+effective and say, for each, whether it removes the bug or merely hides it.</div>
+
+<div class="exercise" id="ex10.11"><span class="ex-label">10.11</span> <span class="ex-tag stretch">stretch</span>
+The chapter says a UB assumption can "propagate" and even affect code <em>before</em> the buggy line. (a)
+Explain why, using the definition of UB as applying to the whole program execution. (b) Give a concrete
+scenario where deleting a downstream null check (because of an upstream dereference) turns a would-be crash
+into a silent security hole. (c) Argue why a <em>static</em> guarantee (Rust's safe subset having no UB) is
+qualitatively stronger than a runtime sanitizer here.</div>
+
+<div class="exercise" id="ex10.12"><span class="ex-label">10.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, compile <code>int f(int x){ return x + 1 &gt; x; }</code> with <code>gcc -O2 -S</code>
+and read the assembly; then recompile with <code>-fwrapv</code> and compare. Do the same for the §10.5
+<code>poll</code> function with and without <code>-fno-delete-null-pointer-checks</code>. (a) Record what
+changed in each case. (b) Write a tiny program with a signed-overflow bug and confirm whether
+<code>-fsanitize=undefined</code> reports it. Report only what you observed and label your compiler/version,
+since output varies.</div>
+
+</section>
+</section>

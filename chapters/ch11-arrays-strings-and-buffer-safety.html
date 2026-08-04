@@ -1,0 +1,425 @@
+<section class="chapter" id="ch11">
+<h1>Chapter 11 — Arrays, Strings &amp; Buffer Safety</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch10">Chapter 10</a> (a buffer overflow
+is undefined behavior — and the optimizer trusts it never happens), <a href="#ch09">Chapter 9</a> (the
+buffer-overflow bug, stated precisely), <a href="#ch08">Chapter 8</a> (the stack, frames, and the return
+address that sits on it), <a href="#ch07">Chapter 7</a> (arrays, pointers, and array-to-pointer decay).
+&nbsp;·&nbsp; <strong>Continues Part 2.</strong> This chapter takes the buffer overflow — Chapter 9's most
+consequential bug — and follows it all the way to its worst outcome: overwriting a return address and
+seizing a program's control flow. Then it covers the C string model that makes overflows so easy, the
+string-function minefield, and the layered defenses real systems deploy — measuring each on this machine.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch08">Chapter 8</a> — a function's local array and its return
+address both live in the same stack frame; which direction does the stack grow, and which of those two is at
+a <em>higher</em> address on a typical downward-growing stack? (2) <a href="#ch09">Chapter 9</a> — an out-of-
+bounds <em>write</em> was called "especially dangerous." Why more dangerous than an out-of-bounds read? (3)
+<em>Predict:</em> you replace an unsafe <code>strcpy(dst, src)</code> with <code>strncpy(dst, src, n)</code>
+where <code>n</code> is exactly the size of <code>dst</code>, and <code>src</code> is <code>n</code>
+characters long. Do you think the result is a valid, null-terminated C string? We will compile exactly this
+and read the bytes.</p>
+</aside>
+
+<p>Almost every catastrophic memory-corruption vulnerability in the history of software traces to the same
+root: a program wrote past the end of a buffer. Chapter 9 named it and called it undefined behavior; Chapter
+10 showed why UB is dangerous in the abstract. This chapter makes it visceral, because the buffer overflow is
+not merely "corrupt some adjacent bytes" — on the stack, the bytes adjacent to a local array include the
+saved return address, and overwriting <em>that</em> hands an attacker control of what the CPU executes next.
+We will build up to it deliberately: why the C string is a fragile convention rather than a real type
+(§11.1); the anatomy of a stack buffer overflow and why it is exploitable (§11.2); the string-function
+minefield and the sized functions that replace it — including the trap that <code>strncpy</code> is
+<em>not</em> the safe <code>strcpy</code> (§11.3); the layered defenses (stack canaries, <code>_FORTIFY_SOURCE</code>,
+ASLR, NX/DEP) and precisely what each does and does not guarantee, run on this machine (§11.4); and the
+disciplines that actually prevent the bug (§11.5). Throughout, the refrain from Chapters 9 and 10 holds: the
+bug is UB, so a program that "runs fine in testing" may be one crafted input away from disaster.</p>
+
+<h2>11.1 The C string is a convention, not a type</h2>
+
+<p>C has no string type. What C calls a string is a <strong>convention</strong>: a contiguous array of
+<code>char</code> terminated by a null byte <code>'\0'</code> (a zero byte, value 0). The length is not stored
+anywhere — it is <em>implied</em> by the position of the terminator, which is why <code>strlen</code> is an
+O(n) scan that walks bytes until it finds the zero. This one design decision is the source of a startling
+share of C's danger. Because the length is not carried with the data, every function that touches a string
+must either be told the buffer's capacity or trust that a terminator exists within bounds — and when that
+trust is misplaced, the read or write runs off the end. Recall from <a href="#ch07">Chapter 7</a> that an
+array decays to a pointer to its first element the moment you pass it to a function: the callee receives an
+address with <em>no length information at all</em>. A <code>char *</code> tells you where a string starts; it
+tells you nothing about how much room there is. Bounds safety in C is therefore never automatic — it is
+something the programmer must reconstruct by hand, by tracking capacities alongside pointers.</p>
+
+<p>Two consequences follow immediately. First, <strong>a missing terminator is a bug waiting to happen</strong>:
+a "string" with no <code>'\0'</code> in bounds makes <code>strlen</code>, <code>printf("%s")</code>, and every
+other string function read past the end — an out-of-bounds read (UB), which can leak adjacent memory (the
+Heartbleed class, Ch 9). Second, <strong>a copy into an undersized buffer overflows it</strong>: writing an
+<em>n</em>-plus-one-byte string (n characters plus the terminator) into an <em>n</em>-byte buffer writes one
+byte past the end — an out-of-bounds write (UB), the subject of the rest of this chapter. The C string's
+elegance (a string is just bytes) and its danger (a string is <em>just</em> bytes, with no length and no
+bounds) are the same fact.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is <code>strlen</code> an O(n) operation rather than O(1)? And when you pass a <code>char buf[64]</code>
+to a function, how much does the function know about <code>buf</code>'s capacity? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>11.2 The stack buffer overflow — anatomy and why it is exploitable</h2>
+
+<p>Recall the stack frame from <a href="#ch08">Chapter 8</a>. When a function runs, its local variables — a
+<code>char buf[8]</code>, say — live in its stack frame, and (on the common downward-growing stack of x86-64
+and most architectures) the frame also holds the <strong>saved return address</strong>: the address the CPU
+will jump to when this function returns. Critically, the return address sits at a <em>higher</em> address
+than the local buffer, while a copy into the buffer writes toward <em>higher</em> addresses. So a write that
+overruns <code>buf</code> marches straight toward the saved return address. Overflow it by enough bytes and
+you overwrite the return address itself. Now the picture is stark: when the function returns, the CPU loads
+that overwritten value into the instruction pointer and jumps <em>wherever the overflowing bytes told it
+to</em>. An attacker who controls the input controls where the program goes next.</p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">One stack frame (stack grows down; a copy into buf writes UP toward the return address):</text>
+<text x="500" y="40" font-size="9" fill="#555">higher addresses</text>
+<rect x="120" y="34" width="300" height="26" fill="#fdecec" stroke="#8c3a1d"/>
+<text x="130" y="51" font-size="10">saved return address  &larr; overwrite this = hijack control</text>
+<rect x="120" y="60" width="300" height="24" fill="#f3eefc" stroke="#5b3a8c"/>
+<text x="130" y="76" font-size="10">saved frame pointer</text>
+<rect x="120" y="84" width="300" height="26" fill="#eef4fb" stroke="#14406b"/>
+<text x="130" y="101" font-size="10">char buf[8]   &larr; the copy starts here, writes upward</text>
+<text x="500" y="126" font-size="9" fill="#555">lower addresses</text>
+<line x1="270" y1="108" x2="270" y2="40" stroke="#8c3a1d" stroke-width="2" marker-end="url(#ar)"/>
+<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#8c3a1d"/></marker></defs>
+<text x="285" y="128" font-size="9" fill="#8c3a1d">overflow direction</text>
+<text x="20" y="156" font-size="9" fill="#333">strcpy(buf, "AAAAAAAA....\xef\xbe\xad\xde"): 8 bytes fill buf, more climb over the saved FP,</text>
+<text x="20" y="170" font-size="9" fill="#333">and the final bytes land on the return address. On `ret`, execution jumps to the attacker's value.</text>
+<text x="20" y="192" font-size="9" fill="#2e6b34">A stack canary (§11.4) sits between buf and the return address; the overflow trips it before `ret`.</text>
+</svg>
+<figcaption>Figure 11.1: A stack buffer overflow. Because the saved return address sits above the local
+buffer and a copy writes upward, overrunning the buffer can overwrite the return address, redirecting
+control flow when the function returns. A stack canary is placed in the gap to detect exactly this.</figcaption>
+</figure>
+
+<p>This is not a hypothetical; it is the mechanism behind decades of exploits, laid out for the first time in
+a widely read form by <strong>Aleph One's "Smashing the Stack for Fun and Profit"</strong> (Phrack 49, 1996)
+and developed rigorously in CS:APP (§3.10). The classic exploit places the attacker's own machine code
+("shellcode") in the buffer and overwrites the return address to point at it; modern mitigations (§11.4) have
+made that specific technique much harder, but the fundamental hazard — an out-of-bounds write reaching
+control data — remains, and newer techniques (return-oriented programming) route around the defenses. To
+make it concrete, this program overflows an 8-byte buffer:</p>
+
+<pre><code>#include &lt;string.h&gt;
+int main(void){
+    char buf[8];
+    strcpy(buf, "this string is much too long for the buffer");  /* 44 bytes into 8 */
+    return buf[0];
+}</code></pre>
+
+<p>Compiled with stack protection on this machine (<code>gcc -O0 -fstack-protector-all</code>) and run, it
+does <em>not</em> silently corrupt and continue — the canary catches it (§11.4). gcc even warns at compile
+time before you run it:</p>
+
+<pre><code>warning: '__builtin_memcpy' writing 44 bytes into a region of size 8 overflows the destination
+         [-Wstringop-overflow=]
+$ ./a.out
+*** stack smashing detected ***: terminated
+Aborted (core dumped)          # exit status 134 (SIGABRT)</code></pre>
+
+<p>Without those defenses — an older toolchain, or a copy whose length the compiler cannot see — the same
+overflow would have corrupted the return address silently. <strong>Outputs are from this machine (gcc 11.4.0,
+x86-64); wording and status vary by toolchain.</strong></p>
+
+<aside class="warning">
+<span class="box-title">Trap: "<code>strncpy</code> is the safe <code>strcpy</code>"</span>
+<p>The most common half-fix in C is to reach for <code>strncpy(dst, src, n)</code> believing the <code>n</code>
+makes it safe. It bounds the write, which prevents the overflow — but <strong><code>strncpy</code> does not
+guarantee a null terminator</strong>. Its actual contract (cppreference; the C standard): it copies at most
+<code>n</code> bytes; if <code>src</code> is shorter than <code>n</code> it pads the rest with zeros, but if
+<code>src</code> is <em>n</em> or more bytes long it writes exactly <code>n</code> bytes and stops — leaving
+<code>dst</code> <strong>unterminated</strong>. The next <code>strlen</code> or <code>printf("%s")</code> then
+runs off the end: you traded a bounded overflow for an unbounded over-read. On this machine,
+<code>char dst[4]; strncpy(dst, "abcd", 4);</code> leaves the four bytes <code>97 98 99 100</code>
+(<code>'a' 'b' 'c' 'd'</code>) with <em>no</em> terminating zero — a "string" that is not a string.
+<code>strncpy</code> was designed in the 1970s for fixed-width records (like early UNIX directory entries),
+<em>not</em> as a safe string copy, and using it as one is a classic trap. If you use it, you must terminate
+by hand (<code>dst[n-1] = '\0';</code>) — or, better, use <code>snprintf</code> (§11.3), which always
+terminates.</p>
+</aside>
+
+<p><em>(Answer to the §11.1 quick check: <code>strlen</code> is O(n) because a C string stores no length — it
+must scan byte by byte until it finds the terminating <code>'\0'</code>. And a function receiving
+<code>char buf[64]</code> knows <strong>nothing</strong> about the capacity: the array decayed to a bare
+<code>char *</code>, an address with no length attached — you must pass the size separately.)</em></p>
+
+<h2>11.3 The string-function minefield — and the sized alternatives</h2>
+
+<p>The classic C string functions are unsafe by construction because they take no destination size: they
+write until they hit a terminator in the <em>source</em>, with no regard for the <em>destination's</em>
+capacity. The worst offenders and their safer replacements:</p>
+
+<ul>
+<li><strong><code>gets(char *s)</code></strong> — reads a line into <code>s</code> with <em>no</em> bound
+whatsoever. It was so irredeemably unsafe that it was deprecated in C99 and <strong>removed from the language
+in C11</strong>. Never use it; use <code>fgets(s, size, stdin)</code>, which takes the buffer size.</li>
+<li><strong><code>strcpy(dst, src)</code> / <code>strcat(dst, src)</code></strong> — copy/append with no
+destination bound; overflow <code>dst</code> whenever <code>src</code> is too long. Prefer
+<code>snprintf</code> (below), or bounded copies where you control termination.</li>
+<li><strong><code>sprintf(dst, fmt, ...)</code></strong> — formats into <code>dst</code> with no bound; a
+long formatted result overflows. Replace with <strong><code>snprintf(dst, size, fmt, ...)</code></strong>,
+which writes at most <code>size</code> bytes <em>including</em> the terminator, always null-terminates (when
+<code>size &gt; 0</code>), and returns the length it <em>would</em> have written — so you can even detect
+truncation.</li>
+<li><strong><code>strncpy</code> / <code>strncat</code></strong> — bounded but treacherous:
+<code>strncpy</code> may not terminate (the §11.2 trap), and <code>strncat</code>'s size argument is the
+number of bytes to append, not the buffer size, which readers routinely get wrong. Usable, but only with
+care and a manual terminator.</li>
+</ul>
+
+<p>The reliable pattern for building a string safely is <code>snprintf</code>: it is bounded, always
+terminates, and reports truncation. When you truly need a raw copy, carry the capacity and check it —
+<code>if (srclen + 1 &lt;= dstcap) memcpy(dst, src, srclen + 1);</code> — the same "reconstruct the length by
+hand" discipline §11.1 demanded. (Some platforms offer <code>strlcpy</code>/<code>strlcat</code>, which always
+terminate and return the source length; they are widely available but are <em>not</em> in the C standard, so
+their portability must be checked. The standard's own <code>_s</code> "bounds-checking" functions, Annex K,
+exist but are optional and unevenly implemented — do not assume them.)</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the one standard string function that was <em>removed</em> from C11 for being unsafe, and its safe
+replacement. And what does <code>snprintf</code> guarantee that <code>strncpy</code> does not? (Answer below
+the communicate box.)</p>
+</aside>
+
+<h2>11.4 Defense in depth — canaries, FORTIFY, ASLR, NX — and what each buys</h2>
+
+<p>Because buffer overflows are so consequential, modern toolchains and operating systems layer several
+<em>mitigations</em>. It is essential to understand what each actually guarantees, because none of them
+<em>removes</em> the bug — they raise the cost of exploiting it, and each defeats a specific technique while
+leaving others open. Four you will meet, three demonstrated on this machine:</p>
+
+<ul>
+<li><strong>Compiler bounds warnings.</strong> With optimization and <code>-Wall</code>, gcc's
+<code>-Wstringop-overflow</code> can catch overflows it can see at compile time. On this machine the §11.2
+program drew <code>warning: '__builtin_memcpy' writing 44 bytes into a region of size 8 overflows the
+destination</code> — a static catch, but only when the sizes are visible to the compiler.</li>
+<li><strong><code>_FORTIFY_SOURCE</code>.</strong> Building with <code>-D_FORTIFY_SOURCE=2 -O2</code> makes
+glibc substitute checked variants (<code>__strcpy_chk</code>, <code>__memcpy_chk</code>, …) that know the
+destination size and abort on overflow — catching many cases at compile time <em>or</em> runtime. On this
+machine, fortifying <code>char buf[4]; strcpy(buf, "hello");</code> produced
+<code>warning: '__builtin___strcpy_chk' writing 6 bytes into a region of size 4</code>. It only helps where
+the size is known and requires optimization; it is not universal.</li>
+<li><strong>Stack canaries</strong> (<code>-fstack-protector</code> / <code>-fstack-protector-all</code>).
+The compiler places a random "canary" value between the local buffers and the saved return address (Figure
+11.1) and checks it just before returning; if an overflow overwrote it, the program aborts instead of
+returning to corrupted control data. On this machine, the §11.2 overflow tripped it:
+<code>*** stack smashing detected ***: terminated</code>, exit status 134. Canaries defeat the classic
+"overwrite the return address by linear overflow" attack — but not overwrites that skip the canary, or
+non-control-data corruption, and they act <em>after</em> the corruption (they convert exploitation into a
+crash, i.e. a denial of service, not into "no bug").</li>
+<li><strong>ASLR and NX/DEP</strong> (OS-level). <strong>Address Space Layout Randomization</strong>
+randomizes the base addresses of the stack, heap, and libraries each run, so an attacker cannot easily
+predict where to jump. <strong>NX/DEP</strong> (the no-execute page permission, tied to virtual memory from
+Chapter 4) marks the stack and heap non-executable, so injected shellcode cannot run as code. Together they
+defeat the original "inject shellcode on the stack and jump to it" recipe — which is why real attacks moved
+to <em>return-oriented programming</em>, chaining existing code fragments rather than injecting new ones.
+These are runtime/OS defenses, not compiler ones, and again they raise cost rather than eliminate the bug.</li>
+</ul>
+
+<p>The load-bearing point: <strong>every one of these is a mitigation, not a fix.</strong> They assume the
+overflow exists and try to contain its blast radius — turning a silent hijack into a crash, or a reliable
+exploit into an unreliable one. The bug is still there, still undefined behavior (Ch 10), and a determined
+attacker or an unlucky input may route around any single layer. The only true fix is to not write out of
+bounds in the first place (§11.5) — or to use a language that enforces bounds by construction (Part 5).</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a buffer overflow is a bounds violation with consequences</span>
+<p><strong>1. In words.</strong> Writing past a buffer's end (§9.3's bounds violation) is undefined behavior;
+on the stack the bytes just past a local array include control data — the saved return address — so the
+overflow can redirect execution, not merely corrupt data.</p>
+<p><strong>2. As a picture.</strong> Figure 11.1: <code>buf</code> low, saved frame pointer above it, return
+address above that; a copy writes upward, so an overrun climbs over the frame pointer onto the return
+address. A canary sits in the gap to catch the climb.</p>
+<p><strong>3. As UB the compiler and OS fight in layers.</strong> The write is UB (Ch 10) — no defined
+outcome. Compiler warnings and <code>_FORTIFY_SOURCE</code> catch some cases; canaries turn a hijack into a
+crash; ASLR and NX defeat specific exploit recipes. None removes the UB; only bounds-correct code does.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> In a review, a colleague writes: "I turned on <code>-fstack-protector</code>, so
+our buffer overflows are handled — we don't need to fix the <code>strcpy</code> calls." Cover the paragraph
+and respond in three or four sentences, distinguishing <em>mitigation</em> from <em>fix</em>.</p>
+<p><em>Model answer.</em> "A stack canary is a mitigation, not a fix: it detects a linear stack overflow just
+before the function returns and aborts, so it converts a control-flow hijack into a crash — a denial of
+service, still a real incident, and it does nothing for heap overflows, non-control-data corruption, or
+overwrites that skip the canary. The overflow is still there, still undefined behavior, so the compiler is
+free to do surprising things around it, and a canary that fires in production is an outage. We should keep
+the canary <em>and</em> ASLR <em>and</em> <code>_FORTIFY_SOURCE</code> as defense in depth, but the actual fix
+is to remove the unbounded copies — replace <code>strcpy</code> with <code>snprintf</code> or a capacity-
+checked <code>memcpy</code> — so the out-of-bounds write cannot happen." Naming the distinction — mitigation
+contains blast radius, only bounds-correct code removes the bug — is the senior register, and it keeps the
+defenses without treating them as a license to leave the bug in.</p>
+</aside>
+
+<p><em>(Answer to the §11.3 quick check: <code>gets</code> was removed from C11; its safe replacement is
+<code>fgets</code>, which takes the buffer size. And <code>snprintf</code> always null-terminates its output
+(when the size is nonzero) and reports truncation, whereas <code>strncpy</code> may leave the destination
+with no terminator at all.)</em></p>
+
+<h2>11.5 What to carry forward</h2>
+
+<p>The C string is a convention — a null-terminated byte array with no stored length — and that single fact
+is why bounds safety in C is manual and why buffer overflows are so easy. An out-of-bounds write is
+undefined behavior (Ch 9, Ch 10), and on the stack it is the most consequential UB in security: the saved
+return address lives just past a local buffer, so an overrun can overwrite it and redirect control flow —
+the mechanism Aleph One documented and CS:APP develops. The classic string functions (<code>gets</code>,
+<code>strcpy</code>, <code>strcat</code>, <code>sprintf</code>) take no destination size and are unsafe by
+construction; <code>gets</code> was removed from C11 outright. The sized replacements — <code>fgets</code>,
+<code>snprintf</code>, capacity-checked <code>memcpy</code> — are safe <em>when you carry the capacity and
+check it</em>, and <code>strncpy</code> is a trap because it can leave a string unterminated. Layered
+defenses (compiler warnings, <code>_FORTIFY_SOURCE</code>, stack canaries, ASLR, NX/DEP) each raise the cost
+of exploitation and we watched three of them fire on this machine — but every one is a mitigation that
+contains the blast radius, not a fix that removes the bug.</p>
+
+<p>The discipline that actually prevents the bug is the same one Chapters 7–10 kept circling: a bare pointer
+carries no bounds, so <em>you</em> must carry them — keep the capacity beside every buffer, check every copy
+against it, prefer sized APIs, and never trust that a terminator is present. That is a proof obligation, on
+every string operation, that the programmer discharges by hand and that no amount of mitigation discharges
+for you. It is also the cleanest possible statement of what a safer language buys: in Rust (Part 5) a string
+and a slice <em>carry their length</em>, indexing is bounds-checked, and an out-of-bounds access is a defined
+panic rather than undefined memory corruption — the "carry the length by hand" discipline of this chapter,
+promoted into the type system. Part 2 has now taken you from "a pointer is an address" (Ch 7) to "and you own
+every lifetime, every bound, and every promise to the compiler" (Ch 8–11). The final chapter turns the last
+of those responsibilities — allocation — from a hazard you survive into a tool you wield.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a C string is "a convention, not a type," and why that makes <code>strlen</code> O(n) and
+bounds safety manual.</li>
+<li>Draw a stack frame and explain why a buffer overflow can overwrite the <strong>saved return
+address</strong> and hijack control flow.</li>
+<li>State why <code>strncpy</code> is <em>not</em> the safe <code>strcpy</code> — the exact contract that
+bites — and name a genuinely safe alternative.</li>
+<li>Name the four classic unsafe string functions and their sized replacements, and which one C11 removed.</li>
+<li>Describe stack canaries, <code>_FORTIFY_SOURCE</code>, ASLR, and NX/DEP, and say for each what it buys
+and why it is a mitigation, not a fix.</li>
+<li>State the one discipline that actually prevents overflows, and how Rust promotes it into the type system.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a C string, physically, and why does it store no length? (§11.1)</li>
+<li><strong>R2.</strong> Why can a stack buffer overflow hijack control flow — what sits next to the buffer,
+and in which direction does a copy write? (§11.2)</li>
+<li><strong>R3.</strong> State <code>strncpy</code>'s exact contract and the trap it creates; give a safer
+function. (§11.2–11.3)</li>
+<li><strong>R4.</strong> For canaries, <code>_FORTIFY_SOURCE</code>, ASLR, and NX/DEP, what does each defeat,
+and why is each a mitigation not a fix? (§11.4)</li>
+<li><strong>R5.</strong> What single discipline prevents overflows, and how does Rust encode it? (§11.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Aleph One, "Smashing the Stack for Fun and Profit," Phrack 49 (1996).</strong> The first widely
+read, step-by-step account of stack buffer overflow exploitation; historically pivotal. Free
+(<code>phrack.org</code>). Read it for the mechanism, not as current exploit practice (the mitigations of
+§11.4 postdate it).</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP),
+§3.10.</strong> Buffer overflows, stack smashing, and the mitigations (canaries, ASLR, NX) developed
+rigorously with the stack-frame model of Chapter 8. The reference for this chapter.</li>
+<li><strong>cppreference.com</strong> and the <strong>C standard</strong> — the exact contracts of
+<code>strcpy</code>, <code>strncpy</code>, <code>strcat</code>, <code>snprintf</code>, <code>fgets</code>,
+and the removal of <code>gets</code> in C11. The authority for what each function promises.</li>
+<li><strong>Beej's Guide to C.</strong> Free (<code>beej.us</code>). Practical, readable coverage of C strings
+and the safe idioms.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex11.1"><span class="ex-label">11.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: (a) what physically marks the end of a C string? (b) why is <code>strlen</code> O(n)?
+(c) when you pass an array to a function, what does the function learn about its capacity?</div>
+
+<div class="exercise" id="ex11.2"><span class="ex-label">11.2</span> <span class="ex-tag warm">warm-up</span>
+Which standard string function was <em>removed</em> from the language in C11 for being unsafe, and what
+should you use instead?</div>
+
+<div class="exercise" id="ex11.3"><span class="ex-label">11.3</span> <span class="ex-tag warm">warm-up</span>
+True or false, with a one-line reason each: (a) <code>strncpy(dst, src, n)</code> always produces a null-
+terminated string. (b) A stack canary removes the buffer-overflow bug. (c) <code>snprintf</code> always null-
+terminates when its size argument is nonzero.</div>
+
+<div class="exercise" id="ex11.4"><span class="ex-label">11.4</span> <span class="ex-tag core">core</span>
+Explain, using a stack-frame diagram in words, why an out-of-bounds <em>write</em> into a local array can
+hijack a program's control flow but an out-of-bounds <em>read</em> (usually) cannot. What lies just past the
+buffer, and in which direction does a copy write?</div>
+
+<div class="exercise" id="ex11.5"><span class="ex-label">11.5</span> <span class="ex-tag core">core</span>
+For each, state whether it can overflow the destination and why, and give a safe rewrite: (a)
+<code>strcpy(buf, user_input);</code> (b) <code>sprintf(buf, "%s-%s", a, b);</code> (c)
+<code>char d[4]; strncpy(d, "abcd", 4); printf("%s", d);</code></div>
+
+<div class="exercise" id="ex11.6"><span class="ex-label">11.6</span> <span class="ex-tag core">core</span>
+A colleague argues: "We enabled stack canaries and ASLR, so buffer overflows are handled." Give three
+distinct reasons this is wrong — each naming something a canary or ASLR does <em>not</em> prevent — and state
+what the actual fix is.</div>
+
+<div class="exercise" id="ex11.7"><span class="ex-label">11.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is <code>strlen</code> O(n) while a length-carrying string type (as in Rust or C++
+<code>std::string</code>) makes "get the length" O(1)? (b) What runtime cost do stack canaries and
+<code>_FORTIFY_SOURCE</code> add, and what do you get for it? (c) Is a canary check on the hot path free?
+Classify the trade-off (safety vs. speed).</div>
+
+<div class="exercise" id="ex11.8"><span class="ex-label">11.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> Diagnose and fix:
+<code>void greet(const char *name){ char msg[16]; strcpy(msg, "Hello, "); strcat(msg, name); puts(msg); }</code>.
+<br><strong>Step 1 (given):</strong> <code>"Hello, "</code> is 7 characters plus a terminator, using 8 of the
+16 bytes.
+<br><strong>Step 2 (given):</strong> <code>strcat</code> appends <code>name</code> with no bound; if
+<code>name</code> is longer than 7 characters the total exceeds 16 bytes.
+<br><strong>Step 3 (given):</strong> So a long <code>name</code> overflows <code>msg</code> — an out-of-
+bounds write, undefined behavior, and (on the stack) a potential control-flow hijack.
+<br><strong>Step 4 (you):</strong> Rewrite the function using <code>snprintf</code> so it can never overflow
+regardless of <code>name</code>'s length; state what <code>snprintf</code> guarantees that <code>strcat</code>
+does not; and name one §11.4 defense that would turn the original overflow into a crash rather than a silent
+hijack.</div>
+
+<div class="exercise" id="ex11.9"><span class="ex-label">11.9</span> <span class="ex-tag mixed">mixed</span>
+For each symptom, name the most likely cause — <em>unterminated string (over-read)</em>, <em>buffer overflow
+(over-write)</em>, <em>use-after-free</em> (Ch 9), or <em>a mitigation firing</em> — and justify in a line:
+(a) a program prints a corrupted string with garbage bytes appended after the expected text; (b) a service
+aborts with <code>*** stack smashing detected ***</code> on a long request; (c) reading a freed heap block
+returns another request's data; (d) <code>printf("%s", s)</code> reads far past where the data should end and
+leaks adjacent memory.</div>
+
+<div class="exercise" id="ex11.10"><span class="ex-label">11.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>undefined behavior</em>, <em>a defined-but-real defect</em>, or <em>well-defined and
+fine</em>, drawing on Chapters 9–11: (a) <code>strncpy(d, s, sizeof d)</code> then reading <code>d</code> as
+a string, where <code>strlen(s) &gt;= sizeof d</code>; (b) <code>snprintf(d, sizeof d, "%s", s)</code> then
+reading <code>d</code>; (c) writing one byte past a heap block; (d) a canary aborting the process on a
+detected overflow.</div>
+
+<div class="exercise" id="ex11.11"><span class="ex-label">11.11</span> <span class="ex-tag stretch">stretch</span>
+The chapter calls the mitigations "defense in depth." (a) Explain what each of stack canaries, NX/DEP, and
+ASLR defeats, and name the exploit technique (return-oriented programming) that was developed to route around
+NX. (b) Argue why layering mitigations is still worthwhile even though none is a fix. (c) Explain what it
+means for Rust to make the bug "not happen" rather than "not exploit" — and why a bounds-checked panic is
+categorically different from undefined memory corruption.</div>
+
+<div class="exercise" id="ex11.12"><span class="ex-label">11.12</span> <span class="ex-tag lab">lab</span>
+On your own machine, write the §11.2 8-byte-buffer overflow. (a) Compile with
+<code>-fstack-protector-all</code>, run it, and record the exact message and exit status. (b) Compile the
+same with <code>-D_FORTIFY_SOURCE=2 -O2</code> and record any compile-time diagnostic. (c) Write
+<code>char d[4]; strncpy(d, "abcd", 4);</code> and print the four bytes as integers to confirm whether a
+terminator is present. Report only what you observed and label your compiler/version, since output varies.</div>
+
+</section>
+</section>

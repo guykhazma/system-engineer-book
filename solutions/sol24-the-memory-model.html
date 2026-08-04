@@ -1,0 +1,110 @@
+<section class="solutions" id="sol24">
+<h1>Chapter 24 — Solutions</h1>
+
+<div class="solution" id="sol24.1"><span class="sol-label">24.1</span>
+Sequential consistency: all cores observe memory operations as if interleaved into a single global order that respects each
+thread's program order. Real machines violate it because of the per-core <strong>store buffer</strong> (a store is buffered
+locally before becoming globally visible). <em>Tempting wrong answer:</em> "caches cause it, and cache coherence would fix
+it" — coherence keeps a single value per location consistent; the reordering here is the store buffer delaying visibility,
+which coherence does not prevent. <strong>Feed-forward:</strong> §24.1.</div>
+
+<div class="solution" id="sol24.2"><span class="sol-label">24.2</span>
+A data race is two accesses to the same location from different threads, at least one a write, not ordered by synchronization
+(happens-before), with at least one non-atomic. The standard says such a program has <strong>undefined behavior</strong> — no
+meaning at all, and the compiler may assume it cannot occur. <em>Tempting wrong answer:</em> "a data race just gives a torn or
+stale value" — it is undefined behavior, strictly worse than an unspecified value. <strong>Feed-forward:</strong> §24.2.</div>
+
+<div class="solution" id="sol24.3"><span class="sol-label">24.3</span>
+It guarantees atomicity (no torn or lost updates) and coherence on the same object; it does <em>not</em> impose any ordering
+on other memory operations and creates no synchronizes-with edge, so it cannot make surrounding writes visible to another
+thread. <em>Tempting wrong answer:</em> "relaxed still orders the writes right before it" — it orders nothing but the atomic's
+own value. <strong>Feed-forward:</strong> §24.3.</div>
+
+<div class="solution" id="sol24.4"><span class="sol-label">24.4</span>
+(a) Under SC the two stores take some global order; say <code>x = 1</code> is first. Then thread 1's later <code>r1 = x</code>
+must read 1 (the store is already globally visible), so <code>r1 == 0</code> is impossible — and symmetrically if
+<code>y = 1</code> is first, <code>r0 == 0</code> is impossible; hence both zero cannot happen. (b) On x86 each store enters a
+private store buffer and is not yet visible to the other core, so each thread's load reads the other variable's old value 0
+before the store drains. (c) Make both stores (and ideally the loads) <code>seq_cst</code>; on x86 the seq_cst store compiles
+to a locked <code>xchg</code> that drains the store buffer, forbidding the store-load reorder. <em>Tempting wrong answer:</em>
+"making the loads acquire fixes it" — acquire/release does not forbid store-load reordering; only seq_cst (or an explicit full
+fence) does. <strong>Feed-forward:</strong> §24.1, §24.2, §24.4.</div>
+
+<div class="solution" id="sol24.5"><span class="sol-label">24.5</span>
+<em>Sequenced-before</em> is program order within a single thread. <em>Synchronizes-with</em> is a cross-thread edge, e.g.
+from a release-store to the acquire-load that reads its value. <em>Happens-before</em> is (roughly) the transitive closure of
+sequenced-before and synchronizes-with. Two conflicting accesses not ordered by happens-before are a data race because nothing
+establishes which is visible to the other — their relative order is undefined, so the standard declares it undefined behavior.
+<em>Tempting wrong answer:</em> "happens-before is just program order" — program order (sequenced-before) is only the
+within-thread part; the cross-thread edges come from synchronizes-with. <strong>Feed-forward:</strong> §24.2, §24.3.</div>
+
+<div class="solution" id="sol24.6"><span class="sol-label">24.6</span>
+<pre><code>producer:  payload = ...;                consumer:  while (load_acquire(&amp;flag) != R) {}
+           store_release(&amp;flag, R);                 use payload;</code></pre>
+(a) The publishing store is <code>release</code>; the observing load is <code>acquire</code>. (b) When the acquire-load reads
+the value the release-store wrote, the store synchronizes-with the load, so everything sequenced-before the release (the
+payload writes) happens-before everything sequenced-after the acquire (the payload reads) — the payload is guaranteed visible.
+(c) With both <code>relaxed</code> there is no synchronizes-with and no happens-before, so the consumer may see the flag set
+but the payload stale (undefined in general); it may still pass on x86 because the hardware does not reorder store-store or
+load-load, so the writes happen to reach memory in order. <em>Method-selection cue:</em> "publish data behind a flag" &#8594;
+release on the publish, acquire on the observe. <strong>Feed-forward:</strong> §24.3, §24.4.</div>
+
+<div class="solution" id="sol24.7"><span class="sol-label">24.7</span>
+(a) x86-TSO never reorders store-store or load-load, so acquire (a load) and release (a store) need no barrier — they compile
+to plain <code>mov</code>, and only the compiler is restrained from reordering across them; seq_cst additionally needs
+store-load ordering, which the hardware <em>does</em> relax, so its store needs a real fence. (b) The <code>xchg</code> is a
+locked read-modify-write that drains the store buffer before proceeding, so the store is globally visible before the following
+load — forbidding the store-buffering outcome that a plain <code>mov</code> allows. (c) ARM/POWER reorder store-store and
+load-load, so acquire and release require explicit barrier instructions there; hence the weakest correct ordering matters for
+portable performance — an unnecessary seq_cst costs a fence on every architecture. <em>Tempting wrong answer:</em> "seq_cst is
+free like acquire/release because x86 is strong" — the seq_cst store still pays for the <code>xchg</code>.
+<strong>Feed-forward:</strong> §24.4.</div>
+
+<div class="solution" id="sol24.8"><span class="sol-label">24.8</span>
+<strong>Step 4:</strong> Make the pointer-publishing store <code>memory_order_release</code> and the reader's pointer load
+<code>memory_order_acquire</code>. Then, when the reader's acquire-load observes the published pointer, the release-store
+synchronizes-with it, so all the node's field writes (sequenced-before the release in the writer) happen-before the reader's
+field reads (sequenced-after the acquire) — the fields are guaranteed visible, no garbage. The bug hid on x86 because x86-TSO
+does not reorder store-store, so the field writes reached memory before the pointer even with relaxed ordering; ARM reorders
+store-store, exposing it. <em>Tempting wrong answer:</em> "add a sleep or a second read to let the writes catch up" — timing
+hacks do not create happens-before; only the release/acquire pairing does. <strong>Feed-forward:</strong> §24.3, §24.4.</div>
+
+<div class="solution" id="sol24.9"><span class="sol-label">24.9</span>
+(a) <strong>relaxed</strong> — a counter whose ordering relative to other data is irrelevant; only the final sum matters. (b)
+<strong>release</strong> on the publish and <strong>acquire</strong> on the consumer's read — it must make the buffer's writes
+visible. (c) <strong>relaxed</strong> — a stop flag whose late observation is harmless needs only atomicity, not ordering. (d)
+<strong>seq_cst</strong> — Dekker needs store-load ordering across the two flags, which only seq_cst (or a full fence)
+provides. <em>Method-selection cue:</em> no cross-variable ordering &#8594; relaxed; publish/observe data &#8594;
+release/acquire; need store-load / global order &#8594; seq_cst. <strong>Feed-forward:</strong> §24.3, §24.4.</div>
+
+<div class="solution" id="sol24.10"><span class="sol-label">24.10</span>
+(a) <strong>False</strong> — a data race is undefined behavior, not merely an unspecified value. (b) <strong>True</strong> — on
+x86 a release-store and a relaxed store both compile to a plain <code>mov</code>. (c) <strong>False</strong> — relaxed orders
+nothing but the atomic's own value; it does not make surrounding writes visible in order. (d) <strong>True</strong> — that is
+the DRF-SC guarantee. (e) <strong>False</strong> — seq_cst's store costs a locked <code>xchg</code> on x86; acquire/release do
+not. <em>Tempting wrong answer:</em> calling (e) true because "x86 is a strong model" — strong enough to make acquire/release
+free, but the seq_cst store still needs a fence. <strong>Feed-forward:</strong> §24.2, §24.4.</div>
+
+<div class="solution" id="sol24.11"><span class="sol-label">24.11</span>
+(a) By promising SC only to race-free programs, the standard lets the compiler and CPU reorder and cache freely wherever no
+synchronization observes it, while a program that synchronizes correctly still sees the simple sequentially consistent model —
+the best of both. (b) "Undefined" (not "unspecified") lets the compiler assume races never occur and optimize on that basis
+(e.g. keeping a shared variable in a register across a supposedly racy read); under a weaker "unspecified value" definition the
+compiler would have to reload shared memory conservatively and could not make those transformations. (c) A data race is
+undefined behavior exactly like a buffer overflow or signed overflow (Chapter 10): the optimizer assumes it cannot happen, so
+a racy program may work in testing and break under a new compiler, optimization level, or CPU — "it worked when I tested it"
+proves nothing about a program with UB. <em>Tempting wrong answer:</em> "undefined is just pedantry; in practice you get a
+stale value" — the compiler is entitled to transformations that make the failure far worse than a stale value.
+<strong>Feed-forward:</strong> §24.2, and Ch 10.</div>
+
+<div class="solution" id="sol24.12"><span class="sol-label">24.12</span>
+Machine-specific by design. A correct write-up reports: (a) with relaxed atomics the store-buffering outcome
+<code>r0 == r1 == 0</code> occurs a nonzero number of times (on the book's machine ~349,000 of two million, about 1 in 5),
+and switching to seq_cst drops it to zero. (b) The disassembly shows relaxed store, release store, and acquire load as plain
+<code>mov</code>, while the seq_cst store is a locked <code>xchg</code> — the one that differs. (c) The release/acquire
+message-passing handoff verifies a large number of payloads (e.g. one million) with zero stale reads. Label compiler/CPU; the
+reordering counts are hardware-dependent. <em>Tempting wrong answer:</em> "zero SC violations means my relaxed publish is
+fine" — on x86 you may see zero even for buggy relaxed publishing; the counts are hardware-dependent, and ARM would differ.
+<strong>Feed-forward:</strong> §24.1, §24.4.</div>
+
+</section>

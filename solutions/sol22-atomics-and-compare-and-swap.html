@@ -1,0 +1,126 @@
+<section class="solutions" id="sol22">
+<h1>Chapter 22 — Solutions</h1>
+
+<div class="solution" id="sol22.1"><span class="sol-label">22.1</span>
+Load <code>count</code> from memory into a register, add one, store the register back to memory. It is non-atomic across
+threads because another thread can read the same old value (or run in parallel) between the load and the store, so two
+increments produce one net change. <em>Tempting wrong answer:</em> "it's one C statement, so it's one operation" — one line
+of C is three machine instructions, and atomicity is a property of the machine operation, not the source. <strong>Feed-forward:</strong>
+§22.1.</div>
+
+<div class="solution" id="sol22.2"><span class="sol-label">22.2</span>
+The <code>LOCK</code> prefix makes the CPU hold the affected cache line exclusively for the entire duration of the
+read-modify-write, so no other core can read or write that line in between — the whole load-add-store is indivisible.
+<code>lock xadd</code> is <strong>one</strong> instruction, where a plain memory increment is three (<code>mov</code>,
+<code>lea</code>/<code>add</code>, <code>mov</code>). <em>Tempting wrong answer:</em> "it locks the whole bus so nothing else
+runs" — modern CPUs lock at the cache line via the coherence protocol, not the whole bus, except in rare unaligned cases.
+<strong>Feed-forward:</strong> §22.2.</div>
+
+<div class="solution" id="sol22.3"><span class="sol-label">22.3</span>
+On success it returns <strong>true</strong> (having written <code>desired</code> because <code>*obj</code> equalled
+<code>expected</code>). On failure it returns false and writes the <em>current</em> value of <code>*obj</code> into
+<code>expected</code>, leaving <code>*obj</code> unchanged. <em>Tempting wrong answer:</em> "on failure it leaves
+<code>expected</code> alone" — it overwrites <code>expected</code> with what it found, which is exactly what makes the retry
+loop reload for free. <strong>Feed-forward:</strong> §22.3.</div>
+
+<div class="solution" id="sol22.4"><span class="sol-label">22.4</span>
+(a) T1 load (0) &#8594; T2 load (0) &#8594; T1 add (1) &#8594; T1 store (1) &#8594; T2 add (1) &#8594; T2 store (1): final
+<code>count == 1</code>, one increment lost. (b) <code>atomic_fetch_add</code> compiles to a single <code>lock xadd</code>
+that holds the cache line exclusively for the whole read-modify-write, so T2's increment cannot begin until T1's has
+completed — the interleaving in (a) cannot occur. (c) At <code>-O2</code> the optimizer can collapse the million-iteration
+loop into a single <code>count += N</code>, shrinking each thread's race window to one load-add-store that rarely collides; a
+data race is undefined behavior, so "passes at <code>-O2</code>" proves nothing. <em>Tempting wrong answer:</em> "the
+<code>-O2</code> version is correct because it gives the right answer" — it is still a data race; it merely hides.
+<strong>Feed-forward:</strong> §22.1, §22.2.</div>
+
+<div class="solution" id="sol22.5"><span class="sol-label">22.5</span>
+<pre><code>void atomic_max(atomic_long *p, long v) {
+    long cur = atomic_load(p);
+    while (v &gt; cur)
+        if (atomic_compare_exchange_weak(p, &amp;cur, v))
+            return;                 /* installed v */
+}</code></pre>
+After a failed CAS, <code>cur</code> holds the value the CAS actually found in <code>*p</code>, so the <code>while</code>
+re-tests against fresh state and no explicit reload is needed. Use <code>_weak</code> in the loop because it is allowed to
+fail spuriously in exchange for cheaper code on load-linked/store-conditional machines, and a spurious failure merely costs
+one extra iteration. <em>Method-selection cue:</em> "update only if the old value satisfies a condition" &#8594; single CAS in
+a retry loop. <strong>Feed-forward:</strong> §22.3.</div>
+
+<div class="solution" id="sol22.6"><span class="sol-label">22.6</span>
+(a) T1 <code>atomic_load(&amp;owner) == 0</code> (true) &#8594; T2 <code>atomic_load(&amp;owner) == 0</code> (true) &#8594; T1
+<code>atomic_store(&amp;owner, 1)</code> &#8594; T2 <code>atomic_store(&amp;owner, 2)</code>: both passed the test, both stored,
+and now T2 "owns" but T1 also believed it did. (b) <code>long expected = 0; if
+(atomic_compare_exchange_strong(&amp;owner, &amp;expected, my_id)) { /* I claimed it */ }</code> — exactly one thread finds
+<code>owner == 0</code> and swaps in its id; the other's CAS fails. (c) Any update that reads a value, decides based on it,
+and writes a value depending on that decision ("if it's still X, make it Y") must be a single CAS, because a separate atomic
+load and store leave a gap. <em>Tempting wrong answer:</em> "put the load and store close together so nothing runs between"
+— proximity in source is irrelevant; only a single indivisible operation closes the gap. <strong>Feed-forward:</strong>
+§22.3, §22.4.</div>
+
+<div class="solution" id="sol22.7"><span class="sol-label">22.7</span>
+(a) The atomic must own the cache line exclusively and acts as a reordering barrier, so it cannot overlap with surrounding
+work the way a plain store can; that serialization is the ~15&#215;. (b) Under eight-core contention the same line ping-pongs
+between cores' caches — each atomic must first pull the line to its own core in exclusive state (coherence traffic, Chapter
+3) — so per-op cost rises well beyond the uncontended 15 ns, sometimes by an order of magnitude. (c) When updates vastly
+outnumber reads, give each thread its own counter (no sharing, no coherence traffic) and sum them only when a total is
+needed; the cost moves to the occasional summation and to cache footprint, not to every increment. <em>Tempting wrong
+answer:</em> "atomics have a fixed cost, so contention doesn't matter" — contention can dominate, which is why sharding a
+counter helps. <strong>Feed-forward:</strong> §22.4, and Ch 3.</div>
+
+<div class="solution" id="sol22.8"><span class="sol-label">22.8</span>
+<strong>Step 4:</strong>
+<pre><code>void record_max(atomic_long *hi, long v) {
+    long cur = atomic_load(hi);
+    while (v &gt; cur)
+        if (atomic_compare_exchange_weak(hi, &amp;cur, v))
+            return;
+}</code></pre>
+It terminates because each failed CAS means another thread installed a value at least as large, which is written back into
+<code>cur</code>; so <code>cur</code> is non-decreasing, and once <code>cur &gt;= v</code> the loop exits without another
+attempt. The invariant it guarantees: at all times <code>hi</code> is greater than or equal to every <code>v</code> that has
+been submitted, and eventually equals the maximum submitted. <em>Tempting wrong answer:</em> "it could loop forever under
+contention" — every retry is caused by a real increase in <code>hi</code>, which is bounded by the largest submitted value,
+so retries are finite. <strong>Feed-forward:</strong> §22.3.</div>
+
+<div class="solution" id="sol22.9"><span class="sol-label">22.9</span>
+(a) <strong>Atomic <code>fetch_add</code></strong> — a fixed arithmetic RMW with a dedicated instruction. (b) <strong>Single
+CAS</strong> (<code>expected = 0</code>, swap in 1) — the success/failure result tells you who won. (c) <strong>CAS retry
+loop</strong> — set the new node's <code>next</code> to the current head, then CAS the head; retry if it moved (the Treiber
+stack of Chapter 23). (d) <strong>Plain access</strong> — a value no thread writes concurrently needs no atomicity.
+<em>Method-selection cue:</em> fixed arithmetic &#8594; <code>fetch_*</code>; one-shot "claim" &#8594; single CAS; update
+depending on current shared state &#8594; CAS loop; no concurrent writer &#8594; plain. <strong>Feed-forward:</strong> §22.2,
+§22.3.</div>
+
+<div class="solution" id="sol22.10"><span class="sol-label">22.10</span>
+(a) <strong>False</strong> — a mutex is a program built <em>from</em> atomics (plus a blocking slow path); the atomic is the
+hardware primitive. (b) <strong>True</strong> — on x86 the atomic and plain forms differ by the one-byte <code>LOCK</code>
+prefix. (c) <strong>False</strong> — the two atomics leave a gap another thread can slip through; only a single CAS composes
+compare-and-set. (d) <strong>True</strong> — that is exactly the consensus hierarchy: CAS has consensus number infinity, plain
+reads/writes number 1. (e) <strong>False</strong> — an uncontended atomic increment is roughly an order of magnitude dearer
+than a plain one (~15 ns vs ~0.9 ns here), and worse under contention. <em>Tempting wrong answer:</em> calling (c) true
+because "each part is atomic" — atomicity of the parts is not atomicity of the whole. <strong>Feed-forward:</strong> §22.2,
+§22.3, §22.4.</div>
+
+<div class="solution" id="sol22.11"><span class="sol-label">22.11</span>
+(a) Consensus number 1 means reads and writes can solve consensus only for a single thread (trivially) — for two, no protocol
+of plain reads and writes lets both irrevocably agree on one value regardless of timing; whichever writes "last" is
+timing-dependent and a reader cannot atomically observe-and-decide, so the two can diverge. (b) CAS at infinity means any
+number of threads can reach consensus, and from CAS you can build a wait-free implementation of <em>any</em> object with a
+sequential specification (a universal construction) — CAS is a universal primitive. (c) Every lock's fast path is a CAS (or
+test-and-set) claiming the lock word, and every lock-free structure is a CAS loop committing an update only if nothing
+changed; the hardware provides CAS specifically because, unlike plain accesses or fixed-arithmetic atomics, it is strong
+enough to build all of them. <em>Tempting wrong answer:</em> "<code>fetch_add</code> is just as universal as CAS" —
+fetch-and-add has a finite consensus number; it cannot express arbitrary conditional commits. <strong>Feed-forward:</strong>
+§22.4.</div>
+
+<div class="solution" id="sol22.12"><span class="sol-label">22.12</span>
+Machine-specific by design. A correct write-up reports: (a) the plain <code>-O0</code> counter falls short of 4,000,000 (on
+the book's machine ~1.36 million, losing ~2.6 million) and varies run to run, while <code>atomic_fetch_add</code> is exactly
+4,000,000 every run; the <code>-O2</code> plain version may "pass" because the optimizer collapses the loop to one add per
+thread, shrinking the race window (still undefined behavior). (b) The disassembly shows the atomic form carries a
+<code>lock</code> prefix (<code>lock xadd</code>) absent from the plain increment. (c) The CAS-loop atomic max agrees with the
+true maximum under many threads. Label compiler/CPU; timing figures are illustrative. <em>Tempting wrong answer:</em> "the
+<code>-O2</code> plain version works, so the bug was the optimizer's fault" — the program was always racy; <code>-O2</code>
+only hid it. <strong>Feed-forward:</strong> §22.1, §22.2, §22.3.</div>
+
+</section>

@@ -1,0 +1,389 @@
+<section class="chapter" id="ch22">
+<h1>Chapter 22 — Atomics and Compare-and-Swap: Building Blocks Below the Lock</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch20">Chapter 20</a> (a lock gives mutual exclusion —
+but what is a lock <em>built from</em>?), <a href="#ch21">Chapter 21</a> (blocking primitives coordinate threads; all of
+them rest on an indivisible hardware operation), <a href="#ch15">Chapter 15</a> (threads share memory, so an unsynchronized
+read-modify-write races), <a href="#ch03">Chapter 3</a> (a core sees memory through its cache; "atomic" is enforced at the
+cache line). &nbsp;·&nbsp; The last two chapters used locks and condition variables as given; this one opens the box and
+shows the hardware primitive — the atomic read-modify-write — that every one of them is built on.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch15">Chapter 15</a> — why is <code>counter++</code> across two threads a
+race, and what are the three machine steps hiding inside that one line of C? (2) <a href="#ch20">Chapter 20</a> — a mutex
+<code>lock()</code> has to test-and-set some word indivisibly; what would go wrong if the test and the set were two separate
+instructions? (3) <em>Predict:</em> four threads each add 1 to a shared counter one million times. With a plain
+<code>count++</code>, what final value do you expect (the ideal is 4,000,000)? With an atomic increment? Write both guesses;
+we measure them in §22.1.</p>
+</aside>
+
+<p>A lock is not a primitive of the machine; it is a <em>program</em>, and like every program it needs some smaller
+indivisible operation to stand on. That operation is the <strong>atomic read-modify-write</strong> (RMW): a single hardware
+instruction that reads a memory location, computes a new value, and writes it back with no other core able to observe or
+interpose a write in the middle. This chapter builds up from the problem that motivates it. First, why an ordinary
+<code>x++</code> on shared memory silently loses updates — it is three steps, not one, and threads interleave inside it
+(§22.1). Then the atomic RMW that fixes it, and how the hardware actually provides indivisibility — the x86 <code>LOCK</code>
+prefix and the cache-line lock beneath it (§22.2). Then the one RMW that is more than a fixed arithmetic operation, the
+<strong>compare-and-swap</strong> (CAS), and the retry loop that turns it into any update you like (§22.3). Finally, why CAS
+in particular is the <em>universal</em> primitive — Herlihy's consensus hierarchy — and what atomics cost, since they are
+far from free (§22.4). We close by carrying CAS toward the lock-free data structures it makes possible (§22.5). Locks were
+the abstraction; atomics are the mechanism underneath.</p>
+
+<h2>22.1 The lost update: <code>x++</code> is three steps, not one</h2>
+
+<p>A single line, <code>count++</code>, compiles to a <strong>read-modify-write</strong>: load <code>count</code> into a
+register, add one, store it back. Those are three separate instructions, and a thread can be preempted — or simply run in
+parallel on another core — between any two of them. When two threads read the same old value before either has stored, both
+compute the same "new" value and both store it: two increments, one net effect. The update is <em>lost</em>. It is not a
+rare corner case; under contention it is the common case. Here are four threads each incrementing a shared <code>long</code>
+one million times, compiled at <code>-O0</code> so each iteration is a genuine load-add-store (gcc 11.4.0, Linux 6.18,
+x86-64):</p>
+
+<pre><code>expected         = 4000000
+plain  x++       = 1355281   (lost 2644719 updates)
+atomic fetch_add = 4000000</code></pre>
+
+<p>The plain counter lost roughly two-thirds of its four million increments — and the exact figure changes every run,
+because it is a function of how the threads happened to interleave, which is precisely the hallmark of a data race. The
+atomic version, using a single indivisible increment, landed on 4,000,000 exactly, every run. (At <code>-O2</code> the plain
+loop can appear to "work": the optimizer collapses the million iterations into one <code>count += 1000000</code>, shrinking
+the race window to a single load-add-store per thread that rarely collides — a reminder that a data race is undefined
+behavior, so a passing test proves nothing.) The lesson is blunt: <strong>a read-modify-write on shared memory must be
+performed as one indivisible operation</strong>, or updates vanish. The tool that makes it one operation is the atomic.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the three machine steps hiding inside <code>count++</code>, and describe the interleaving of two threads that loses
+one increment. Why does the plain counter give a <em>different</em> wrong answer each run? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>22.2 Atomic read-modify-write and how the hardware makes it indivisible</h2>
+
+<p>C11 (and C++11) added <code>&lt;stdatomic.h&gt;</code>: types like <code>atomic_long</code> and operations like
+<code>atomic_fetch_add</code>, <code>atomic_fetch_or</code>, <code>atomic_exchange</code> that the compiler lowers to a
+single atomic machine instruction. Replacing <code>count++</code> with <code>atomic_fetch_add(&amp;count, 1)</code> is the
+whole fix in §22.1. What does "single atomic instruction" mean at the hardware level? On x86, an ordinary increment of a
+memory operand and an atomic one differ by one prefix byte. Compare the compiler's output for a plain post-increment versus
+<code>atomic_fetch_add</code> (gcc 11.4.0, <code>-O2</code>, <code>objdump -d</code>):</p>
+
+<pre><code>plain_add:                       atomic_add:
+  mov    (%rdi),%rax               mov    $0x1,%eax
+  lea    0x1(%rax),%rdx            lock xadd %rax,(%rdi)
+  mov    %rdx,(%rdi)               ret
+  ret                             </code></pre>
+
+<p>The plain version is exactly the three steps of §22.1: <code>mov</code> (load), <code>lea</code> (add one),
+<code>mov</code> (store) — three instructions, interruptible between any pair. The atomic version is <em>one</em>
+instruction, <code>lock xadd</code> ("exchange-and-add"), which loads, adds, and stores as a single indivisible unit. The
+magic is the <code>LOCK</code> prefix. It tells the CPU to hold exclusive ownership of the affected cache line for the
+duration of the read-modify-write, so no other core can read or write that line in between — historically by asserting a bus
+lock, and on modern chips by the cache-coherence protocol (Chapter 3) refusing to yield the line while the locked operation
+completes. The result is that the whole load-add-store is atomic with respect to every other core. Note the cost this
+implies, which §22.4 measures: the core must own the line exclusively, so a <code>lock</code>-prefixed op serializes at the
+cache line and cannot be reordered around freely — it is much dearer than a plain store.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: an atomic RMW is one indivisible read-modify-write</span>
+<p><strong>1. In words.</strong> A plain <code>x++</code> is load, add, store — three instructions another core can
+interleave into, losing updates. An atomic RMW (<code>lock xadd</code>) does the same read-modify-write as a single
+instruction that owns the cache line throughout, so no other core can observe or interpose a write in the middle.</p>
+<p><strong>2. As a picture.</strong> Figure 22.1: two threads each load the same old value 41, each add one, each store 42 —
+one increment lost — versus the atomic path where the second thread cannot touch the line until the first's read-modify-write
+retires, so it reads 42 and stores 43.</p>
+<p><strong>3. As numbers.</strong> Four threads &#215; one million: plain <code>++</code> lost 2,644,719 of 4,000,000 (and a
+different count each run); atomic <code>fetch_add</code> lost none — exactly 4,000,000, every run. In the disassembly, three
+instructions collapse to one <code>lock xadd</code>.</p>
+</aside>
+
+<p><em>(Answer to the §22.1 quick check: the three steps are load <code>count</code> into a register, add one, store it back.
+If thread A loads 41 and, before it stores, thread B also loads 41, both compute 42 and both store 42 — two increments, one
+net change, so one is lost. The wrong answer differs each run because it depends on the exact interleaving of loads and
+stores across cores, which the scheduler and hardware vary run to run — the signature of a data race.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Plain x++: two threads interleave inside the read-modify-write and lose an increment.</text>
+<line x1="70" y1="30" x2="70" y2="120" stroke="#14406b"/><text x="24" y="34" font-size="9" fill="#14406b">T1</text>
+<line x1="320" y1="30" x2="320" y2="120" stroke="#14406b"/><text x="274" y="34" font-size="9" fill="#14406b">T2</text>
+<rect x="55" y="40" width="30" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="92" y="54" font-size="9">load count = 41</text>
+<rect x="305" y="52" width="30" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="342" y="66" font-size="9" fill="#8c3a1d">load count = 41 (still!)</text>
+<rect x="55" y="66" width="30" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="92" y="80" font-size="9">store 42</text>
+<rect x="305" y="86" width="30" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="342" y="100" font-size="9" fill="#8c3a1d">store 42 &#8594; result 42, not 43</text>
+<text x="16" y="150" fill="#2e6b34">lock xadd: T2 cannot touch the line until T1's RMW retires.</text>
+<line x1="70" y1="160" x2="70" y2="205" stroke="#2e6b34"/><line x1="320" y1="160" x2="320" y2="205" stroke="#2e6b34"/>
+<rect x="55" y="166" width="30" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="92" y="180" font-size="9">lock xadd: 41 &#8594; 42</text>
+<rect x="305" y="186" width="30" height="18" fill="#cfe8cf" stroke="#2e6b34"/><text x="342" y="199" font-size="9" fill="#2e6b34">lock xadd: 42 &#8594; 43 (correct)</text>
+</svg>
+<figcaption>Figure 22.1: The lost update. With a plain <code>x++</code>, T2 reads the counter before T1 has stored, so both
+write 42 and one increment is lost. With an atomic <code>lock xadd</code>, T2's read-modify-write cannot begin until T1's
+has completed, because the <code>LOCK</code> prefix holds the cache line exclusively for the whole operation.</figcaption>
+</figure>
+
+<h2>22.3 Compare-and-swap: the conditional RMW and the retry loop</h2>
+
+<p><code>fetch_add</code> and its siblings each hard-wire one operation (add, or, exchange). But most interesting updates are
+not a fixed arithmetic function of the old value — "install this new head only if the head is still what I read," "raise the
+maximum only if my value is larger." The primitive that expresses <em>any</em> such conditional update is
+<strong>compare-and-swap</strong>. In C11 it is <code>atomic_compare_exchange_weak(obj, &amp;expected, desired)</code>: it
+atomically compares the value in <code>obj</code> with <code>expected</code>, and <em>only if they are equal</em> writes
+<code>desired</code> and returns true; otherwise it writes the current value back into <code>expected</code> and returns
+false. In one indivisible step it asks "is it still what I think?" and, if so, updates it. That conditional is what lets you
+build a lock-free update out of a plain read, an arbitrary computation, and a CAS in a <strong>retry loop</strong>: read the
+current value, compute the new one, attempt to CAS it in; if the CAS fails (someone else changed it first), the failure has
+already reloaded the current value, so loop and try again. Here is an atomic <em>maximum</em> — an operation with no
+dedicated instruction — built from a CAS loop, run by eight threads (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>void atomic_max(atomic_long *p, long v) {
+    long cur = atomic_load(p);
+    while (v &gt; cur)                                    /* only if we'd raise it */
+        if (atomic_compare_exchange_weak(p, &amp;cur, v))   /* cur is reloaded on failure */
+            return;                                      /* installed */
+}
+/* 8 threads hammering atomic_max: */
+max seen = 7499  (true max = 7499)</code></pre>
+
+<p>Eight threads racing to raise a shared maximum agreed exactly on the true maximum, 7499, with no lock. The structure is
+the template for essentially every lock-free algorithm in the next chapter: <strong>read a snapshot, compute off it, and
+commit with a CAS that succeeds only if nothing changed underneath you</strong> — retrying if it did. Two details matter.
+The <code>expected</code> argument is updated by a failed CAS to the value it actually found, so the loop always retries
+against fresh state without a separate reload. And the <code>_weak</code> form is allowed to fail <em>spuriously</em> (report
+mismatch even when the values were equal) in exchange for cheaper code on architectures that implement CAS with
+load-linked/store-conditional; because it already lives in a retry loop, a spurious failure just means one more iteration, so
+<code>_weak</code> is the right choice inside a loop and <code>_strong</code> (no spurious failures) for a one-shot check.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State exactly what <code>compare_exchange</code> does on success and on failure, including what happens to the
+<code>expected</code> argument when it fails. Why does the CAS-loop idiom not need a separate reload of the current value on
+retry? When would you pick <code>_weak</code> over <code>_strong</code>? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>22.4 Why CAS is universal — and what atomics cost</h2>
+
+<p>Why single out compare-and-swap rather than, say, atomic add? Because CAS is <em>universal</em> in a precise, proven
+sense. Herlihy's "Wait-Free Synchronization" (1991) ranks synchronization primitives by their <strong>consensus number</strong>:
+the maximum number of threads that can use the primitive (plus plain reads and writes) to solve <em>consensus</em> — all
+agreeing irrevocably on one value despite arbitrary delays. Atomic reads and writes alone have consensus number <strong>1</strong>:
+they cannot solve consensus for even two threads. Atomic <code>fetch_add</code>, <code>test-and-set</code>, and their kin sit
+higher but still at a finite number. Compare-and-swap has consensus number <strong>infinity</strong>: with CAS, any number of
+threads can reach consensus, and from it you can build a wait-free implementation of <em>any</em> object with a sequential
+specification. That is why hardware designers provide CAS (or load-linked/store-conditional, its equivalent) and why every
+lock-free structure in Chapter 23 is a CAS loop: CAS is the primitive from which all the others, and all lock-free objects,
+can be constructed. Plain loads and stores cannot substitute — no arrangement of them solves two-thread consensus.</p>
+
+<p>Universality does not mean free. An atomic RMW must own its cache line exclusively and cannot be reordered around like a
+plain access, so it costs far more than an ordinary operation — and under contention, more still, because the cache line
+ping-pongs between cores (Chapter 3's coherence traffic). Measured uncontended, one operation each, 100 million times (gcc
+11.4.0, <code>-O2</code>):</p>
+
+<pre><code>plain  ++          :  0.9 ns/op
+atomic fetch_add   : 15.3 ns/op        (~15&#215; a plain op)
+mutex lock/unlock  : 11.9 ns/op        (itself two atomic ops)</code></pre>
+
+<p>A plain increment is under a nanosecond; the atomic is an order of magnitude dearer, and a full mutex lock/unlock — which
+is itself built from atomics — is in the same league (a lock is not magically slower than an atomic; it <em>is</em> atomics
+plus a slow path for when it must block). These are illustrative single-machine numbers, but the shape is universal: atomics
+are cheap enough to use freely for a shared counter and expensive enough that a hot, highly contended atomic can dominate a
+profile. The other cost is <em>correctness</em>: atomic loads and stores are individually indivisible, but they do
+<strong>not compose</strong> into an atomic compound. Two separate atomic operations have a gap between them, and the whole
+point of §22.1 was that gaps lose updates — which is exactly the trap that sends you to CAS.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: composing atomic operations (an atomic load then an atomic store is not atomic)</span>
+<p>Because <code>atomic_load</code> and <code>atomic_store</code> are each atomic, it is tempting to write a "conditional
+update" as two of them: <code>if (atomic_load(&amp;p) == expected) atomic_store(&amp;p, desired);</code>. Each call is
+indivisible, but <em>together</em> they are not: between the load and the store, another thread can change <code>p</code>, and
+your store clobbers its update — the lost-update bug of §22.1 wearing atomic clothing. This is a check-then-act race, and it
+is the reason compare-and-swap exists: CAS folds the compare <strong>and</strong> the swap into one indivisible operation, so
+nothing can slip between them. Any time you find yourself reading an atomic, deciding based on the value, and writing back a
+value that depends on that decision, you need a single CAS (usually in a retry loop), not a load followed by a store. The
+tell is a sentence of the form "if it's still X, make it Y" spanning two atomic calls — that gap is the bug.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "I don't need a mutex for this flag. I'll just do <code>if
+(atomic_load(&amp;busy) == 0) atomic_store(&amp;busy, 1);</code> to claim it, and <code>atomic_store(&amp;busy, 0)</code> to
+release. Both are atomic, so it's a lock-free lock — right?" Cover the paragraph and respond in four or five sentences, drawing
+on §22.3 and §22.4.</p>
+<p><em>Model answer.</em> "The two operations are each atomic, but the sequence isn't, and that gap is the whole problem: two
+threads can both load <code>busy == 0</code>, both decide it's free, and both store 1 — you've handed the 'lock' to two
+threads at once, which is the lost-update race from the counter example. To claim the flag indivisibly you need a single
+<em>compare-and-swap</em>: <code>expected = 0; atomic_compare_exchange_strong(&amp;busy, &amp;expected, 1)</code> succeeds for
+exactly one thread and fails for the other, because the compare and the set happen as one operation with no window between
+them. That is, in fact, roughly how a spinlock's fast path is built. But before you build your own, use a real mutex or a
+tested lock-free type: hand-rolled synchronization is where the subtle, load-dependent bugs live, and the atomic
+<code>compare_exchange</code> is the sharp tool you reach for only when you must." Naming the check-then-act gap and reaching
+for CAS — not two atomic accesses — is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §22.3 quick check: on success, <code>compare_exchange</code> finds <code>*obj == expected</code>, writes
+<code>desired</code>, and returns true; on failure, it leaves <code>*obj</code> unchanged, writes the current value of
+<code>*obj</code> into <code>expected</code>, and returns false. The loop needs no separate reload because a failed CAS has
+already refreshed <code>expected</code> with what it found. Prefer <code>_weak</code> inside a retry loop, where a rare
+spurious failure just costs one more iteration and the code is cheaper on load-linked/store-conditional machines; prefer
+<code>_strong</code> for a single, non-looping check.)</em></p>
+
+<h2>22.5 What to carry forward</h2>
+
+<p>Beneath every lock and condition variable is an <strong>atomic read-modify-write</strong>: a single hardware instruction
+that reads, computes, and writes with no other core able to interpose. An ordinary <code>x++</code> is not atomic — it is
+load, add, store, and threads interleave inside it, losing updates (our four-threaded counter lost 2.6 million of 4 million;
+the atomic lost none). The hardware provides indivisibility through a locked operation — on x86 the <code>LOCK</code> prefix,
+which holds the cache line exclusively for the whole read-modify-write (<code>lock xadd</code> is one instruction where the
+plain version is three). The one RMW that expresses <em>arbitrary</em> conditional updates is <strong>compare-and-swap</strong>:
+"write this only if the value is still what I read," folded into one indivisible step, and wrapped in a <strong>retry
+loop</strong> — read, compute, CAS, retry on failure — it implements any update lock-free (our eight-threaded atomic maximum
+agreed on 7499). CAS is not merely convenient but <em>universal</em>: Herlihy's consensus hierarchy places plain
+reads/writes at consensus number 1 and CAS at infinity, so any lock-free object can be built from it. Atomics are far from
+free (roughly fifteen times a plain op, more under contention), and — the trap — they do not compose: an atomic load then an
+atomic store leaves a gap another thread slips through, which is precisely why CAS exists.</p>
+
+<p>With compare-and-swap in hand, a new possibility opens: synchronization <em>without locks at all</em>. If a single CAS can
+commit an update only when nothing changed underneath it, then a data structure can let many threads race, each preparing an
+update and committing it with a CAS, retrying the few that lose — no thread ever blocked, no lock ever held. The next chapter
+builds exactly these <strong>lock-free data structures</strong>: the Treiber stack and the Michael–Scott queue, both nothing
+but a CAS loop over a shared pointer. It also confronts what CAS alone does not solve — the notorious <em>ABA problem</em>,
+where a value returns to what you read while its meaning has changed underneath, defeating the compare — and how real systems
+reclaim memory safely without locks. And underneath all of it sits an assumption we have quietly leaned on and must finally
+make explicit: that these atomic operations become visible to other cores in a sensible order. The chapter after next, on the
+memory model, shows that plain loads and stores carry no such guarantee, and that the ordering a lock or a lock-free
+structure needs is something the atomic must be asked for by name.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why <code>x++</code> on shared memory loses updates, naming the three steps and the racing interleaving.</li>
+<li>Say what the x86 <code>LOCK</code> prefix does, and why <code>lock xadd</code> is atomic where three plain instructions
+are not.</li>
+<li>State precisely what <code>compare_exchange</code> does on success and failure, and write the CAS retry-loop idiom.</li>
+<li>Explain what "CAS is universal" means via consensus numbers (plain reads/writes = 1, CAS = infinity).</li>
+<li>Give the rough cost of an atomic RMW versus a plain op, and why contention makes it worse.</li>
+<li>State why two atomic operations do not compose, and what to use instead for a conditional update.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why is <code>count++</code> across threads a race, and what does an atomic RMW change? (§22.1)</li>
+<li><strong>R2.</strong> What does the <code>LOCK</code> prefix do at the cache-line level, and how many instructions is
+<code>lock xadd</code> versus a plain increment? (§22.2)</li>
+<li><strong>R3.</strong> What does <code>compare_exchange</code> return and write on success and on failure, and what is the
+CAS-loop idiom? (§22.3)</li>
+<li><strong>R4.</strong> What is a consensus number, and what are the consensus numbers of plain reads/writes and of CAS?
+(§22.4)</li>
+<li><strong>R5.</strong> Why do two atomic operations fail to compose into an atomic compound, and what fixes it? (§22.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Herlihy, "Wait-Free Synchronization," <em>ACM Transactions on Programming Languages and Systems</em>
+13(1):124&ndash;149 (1991), DOI 10.1145/114005.102808.</strong> The consensus hierarchy: plain reads/writes have consensus
+number 1, compare-and-swap has infinity, and CAS is universal for wait-free constructions. The source for §22.4; author,
+venue, and year verified via dblp and the ACM Digital Library.</li>
+<li><strong>Herlihy &amp; Shavit, <em>The Art of Multiprocessor Programming</em> (Morgan Kaufmann; 2nd ed. 2020).</strong> The
+standard text on atomics, the consensus hierarchy, and lock-free programming, with the primitives of this chapter developed
+rigorously. <code>[⚠ reference — not free]</code>.</li>
+<li><strong>cppreference, <code>&lt;stdatomic.h&gt;</code> / <code>std::atomic</code> and <code>atomic_compare_exchange</code>
+(<code>en.cppreference.com</code>).</strong> The precise contract for <code>fetch_add</code>, the <code>_weak</code> vs
+<code>_strong</code> compare-exchange, and spurious failure. Primary reference for §22.2&ndash;§22.3; verify per standard
+version.</li>
+<li><strong>Intel 64 and IA-32 Architectures Software Developer's Manual, Vol. 3A, "Locked Atomic Operations" (the
+<code>LOCK</code> prefix and <code>CMPXCHG</code>/<code>XADD</code>).</strong> Primary source for how x86 makes a
+read-modify-write atomic at the cache line. Free from Intel.</li>
+<li><strong>Drepper, "What Every Programmer Should Know About Memory" (Red Hat, 2007).</strong> Free
+(<code>akkadia.org/drepper/cpumemory.pdf</code>). Cache coherence and why a <code>lock</code>-prefixed operation costs what it
+does — background for the numbers in §22.4.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex22.1"><span class="ex-label">22.1</span> <span class="ex-tag warm">warm-up</span>
+Name the three machine steps that <code>count++</code> compiles to, and in one sentence say why that makes it non-atomic
+across threads.</div>
+
+<div class="exercise" id="ex22.2"><span class="ex-label">22.2</span> <span class="ex-tag warm">warm-up</span>
+What does the x86 <code>LOCK</code> prefix guarantee about the cache line during a read-modify-write, and how many
+instructions is <code>lock xadd</code>?</div>
+
+<div class="exercise" id="ex22.3"><span class="ex-label">22.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: what does <code>atomic_compare_exchange</code> return on success, and what does it write into its
+<code>expected</code> argument on failure?</div>
+
+<div class="exercise" id="ex22.4"><span class="ex-label">22.4</span> <span class="ex-tag core">core</span>
+Two threads run <code>count++</code> on a shared counter starting at 0, each once. (a) Enumerate an interleaving of the six
+machine steps (three per thread) that ends with <code>count == 1</code> instead of 2. (b) Explain why replacing the body with
+<code>atomic_fetch_add(&amp;count, 1)</code> makes that interleaving impossible. (c) Why can the same program appear correct
+at <code>-O2</code> yet be lost-update-prone at <code>-O0</code>?</div>
+
+<div class="exercise" id="ex22.5"><span class="ex-label">22.5</span> <span class="ex-tag core">core</span>
+Write the compare-and-swap retry loop for an atomic operation with no dedicated instruction — say, atomically setting a
+counter to the larger of its current value and <code>v</code> (an atomic max). Explain what the <code>expected</code>
+argument holds after a failed CAS and why the loop therefore needs no explicit reload, and state one reason to use
+<code>_weak</code> rather than <code>_strong</code> inside the loop.</div>
+
+<div class="exercise" id="ex22.6"><span class="ex-label">22.6</span> <span class="ex-tag core">core</span>
+A colleague implements "claim a resource" as <code>if (atomic_load(&amp;owner) == 0) atomic_store(&amp;owner, my_id);</code>.
+(a) Show the interleaving that lets two threads both believe they own the resource. (b) Rewrite it with a single
+compare-and-swap so exactly one thread succeeds. (c) Explain the general rule: which shape of update always requires CAS
+rather than a separate atomic load and store?</div>
+
+<div class="exercise" id="ex22.7"><span class="ex-label">22.7</span> <span class="ex-tag complexity">cost</span>
+Using the measured figures (plain <code>++</code> ~0.9 ns, atomic <code>fetch_add</code> ~15 ns, uncontended): (a) explain
+where the ~15&#215; comes from in terms of the cache line and instruction reordering. (b) Predict qualitatively what happens
+to the atomic's cost when eight cores hammer the <em>same</em> counter, and why (invoke Chapter 3's coherence traffic). (c)
+Given that, when is a per-thread counter summed at the end preferable to one shared atomic, and what does that cost
+instead?</div>
+
+<div class="exercise" id="ex22.8"><span class="ex-label">22.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> You must maintain a running maximum latency observed across many worker threads,
+lock-free.
+<br><strong>Step 1 (given):</strong> A plain <code>if (v &gt; hi) hi = v;</code> is a check-then-act race — two threads can
+both pass the test and the smaller write can land last.
+<br><strong>Step 2 (given):</strong> There is no <code>atomic_fetch_max</code> in C11, so you build it from
+<code>compare_exchange</code>.
+<br><strong>Step 3 (given):</strong> The loop reads <code>cur = atomic_load(&amp;hi)</code>, and while <code>v &gt; cur</code>
+tries <code>compare_exchange_weak(&amp;hi, &amp;cur, v)</code>; a failed CAS reloads <code>cur</code>.
+<br><strong>Step 4 (you):</strong> Write the complete function, explain why it terminates (each failed retry means someone
+else raised <code>hi</code>, so <code>cur</code> only grows), and state what invariant it guarantees about <code>hi</code>
+versus every <code>v</code> ever submitted.</div>
+
+<div class="exercise" id="ex22.9"><span class="ex-label">22.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, choose the cheapest correct tool — a plain access, an atomic <code>fetch_*</code>, a single CAS, or a CAS
+retry loop — and justify in a line: (a) increment a shared hit counter; (b) set a flag to 1 exactly once and detect who did
+it first; (c) push onto a shared linked-list stack; (d) read a value no other thread ever writes.</div>
+
+<div class="exercise" id="ex22.10"><span class="ex-label">22.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 20–22, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "A mutex is a
+fundamental hardware primitive, unlike an atomic add." (b) "<code>lock xadd</code> and a plain <code>add</code> to memory
+differ by a one-byte prefix." (c) "Because each is atomic, an <code>atomic_load</code> followed by an
+<code>atomic_store</code> forms an atomic compound operation." (d) "Compare-and-swap can solve consensus for any number of
+threads, but plain reads and writes cannot solve it for two." (e) "An uncontended atomic increment costs about the same as a
+plain increment."</div>
+
+<div class="exercise" id="ex22.11"><span class="ex-label">22.11</span> <span class="ex-tag stretch">stretch</span>
+Herlihy's consensus hierarchy ranks primitives by consensus number. (a) Explain what it means that atomic read/write has
+consensus number 1, and give the intuition for why two threads cannot reach consensus with reads and writes alone. (b)
+Explain what "CAS has consensus number infinity, and is universal" buys you — what class of objects can you build from CAS?
+(c) Connect this to the previous two chapters: in what sense is every lock and every lock-free structure "just" CAS (or an
+equivalent primitive), and why does the hardware bother to provide CAS specifically?</div>
+
+<div class="exercise" id="ex22.12"><span class="ex-label">22.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write four threads each doing one million <code>count++</code> on a shared <code>long</code>, compile
+at <code>-O0</code>, and confirm the total falls short of 4,000,000 and varies run to run; switch to
+<code>atomic_fetch_add</code> and confirm it is exactly 4,000,000 every run; then recompile the plain version at
+<code>-O2</code> and observe it may now "pass" (explain why). (b) Disassemble a plain memory increment and an
+<code>atomic_fetch_add</code> with <code>objdump -d</code> and find the <code>lock</code> prefix. (c) Build an atomic max
+from a <code>compare_exchange_weak</code> loop, run it under many threads, and confirm it agrees with the true maximum. Label
+your compiler and CPU; note the timing figures are illustrative.</div>
+
+</section>
+</section>

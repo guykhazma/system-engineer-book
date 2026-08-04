@@ -1,0 +1,389 @@
+<section class="chapter" id="ch23">
+<h1>Chapter 23 — Lock-Free Data Structures</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch22">Chapter 22</a> (compare-and-swap and the retry loop
+— the one primitive this whole chapter is built from), <a href="#ch20">Chapter 20</a> (a lock serializes access; what if a
+delayed lock-holder must not stall everyone else?), <a href="#ch07">Chapter 7</a> (pointers and nodes — a stack and a queue
+are pointer surgery), <a href="#ch09">Chapter 9</a> (free and use-after-free — reclaiming a node another thread still holds
+is a disaster). &nbsp;·&nbsp; Chapter 22 gave you CAS; this chapter uses nothing but CAS in a loop to build shared stacks and
+queues that no thread ever locks.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch22">Chapter 22</a> — write the compare-and-swap retry-loop idiom in three
+steps (read, compute, commit-or-retry), and say what a failed CAS does to your local copy of the value. (2)
+<a href="#ch20">Chapter 20</a> — name one thing that goes wrong when the thread holding a lock is preempted, delayed, or
+crashes. (3) <em>Predict:</em> eight threads push and pop on a <em>shared</em> stack with no lock — just a CAS on the head
+pointer. Do you expect any pushed item to be lost or duplicated? And if a node can be freed and its address immediately
+reused, what could break? Write your guesses; §23.2 and §23.4 settle them.</p>
+</aside>
+
+<p>A lock makes concurrency correct by making it <em>sequential</em>: one thread at a time inside the critical section. That
+is simple and often right, but it has a structural weakness — the fate of every thread is tied to the one holding the lock.
+If that thread is preempted (Chapter 16), page-faults (Chapter 17), or is simply slow, everyone waiting is stuck, and if it
+dies holding the lock, they are stuck forever. <strong>Lock-free</strong> programming removes that coupling: many threads
+operate on the shared structure at once, each committing its change with a single compare-and-swap that succeeds only if
+nothing moved underneath it, and retrying if it did. No thread ever holds a lock, so no thread's delay can stall the others.
+This chapter builds the idea concretely. First, what "lock-free" actually guarantees — the ladder of progress conditions from
+blocking up to wait-free, and why "lock-free" is a promise about the <em>system</em>, not the absence of locks (§23.1). Then
+the two canonical structures, each a CAS loop over a pointer: the <strong>Treiber stack</strong> (§23.2) and the
+<strong>Michael–Scott queue</strong> (§23.3). Then the hazard that makes lock-free memory management genuinely hard — the
+<strong>ABA problem</strong> and safe reclamation (§23.4). We close by carrying the open question of <em>ordering</em> —
+which lock-free code depends on and which we have not yet justified — into the memory model (§23.5).</p>
+
+<h2>23.1 What "lock-free" means: the ladder of progress</h2>
+
+<p>"Lock-free" is a precise progress guarantee, not a synonym for "uses no mutex." The guarantees form a ladder. A
+<strong>blocking</strong> (lock-based) algorithm offers no non-blocking guarantee at all: a thread delayed inside the critical
+section blocks every other thread indefinitely. <strong>Obstruction-free</strong>, the weakest non-blocking level, promises
+that a thread will finish if it runs <em>in isolation</em> for long enough (no guarantee under contention).
+<strong>Lock-free</strong> promises that the <em>system as a whole</em> always makes progress: out of all contending threads,
+<em>some</em> thread completes its operation in a bounded number of steps, so the structure can never be globally stuck —
+though an unlucky individual thread might retry forever (starve) while others succeed. <strong>Wait-free</strong>, the
+strongest, promises that <em>every</em> thread completes in a bounded number of <em>its own</em> steps, with no starvation.
+These are Herlihy's conditions, and they trade strength for cost: wait-free is ideal but often intricate and slower, so most
+practical "lock-free" structures — including the two in this chapter — give the lock-free guarantee, which is enough to
+eliminate the lock-holder problem.</p>
+
+<p>Why does the guarantee matter in practice? Because a lock-free structure is immune to the pathologies that come from a
+thread being stopped at the wrong moment. There is no lock to hold, so there is no <strong>deadlock</strong> and no
+<strong>priority inversion</strong> (a low-priority thread cannot block a high-priority one by holding a lock, Chapter 16);
+a thread preempted mid-operation delays only itself, never the structure; and a thread that dies leaves the structure usable
+by everyone else. The price is subtlety: every operation must be designed so that its single committing CAS is a
+<strong>linearization point</strong> — the instant the operation appears to take effect atomically, in Herlihy and Wing's
+sense (1990), so that concurrent operations still look like <em>some</em> valid sequential order. Get the linearization point
+right and the structure is correct under any interleaving; get it wrong and you have a race that no test reliably catches.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Put the four progress conditions in order from weakest to strongest, and state the difference between the lock-free and
+wait-free guarantees (whose progress is promised?). Name one pathology that lock-free code cannot suffer, and why. (Answer
+after the next section.)</p>
+</aside>
+
+<h2>23.2 The Treiber stack: a CAS loop on the head pointer</h2>
+
+<p>The simplest lock-free structure is a stack, published by Treiber (IBM, 1986). It is a singly linked list with an atomic
+<code>top</code> pointer, and both operations are the CAS retry loop of Chapter 22 applied to that pointer. To
+<strong>push</strong>: set the new node's <code>next</code> to the current <code>top</code>, then CAS <code>top</code> from
+that old value to the new node; if the CAS fails (someone else pushed or popped first), the failure reloaded
+<code>top</code>, so re-point <code>next</code> and retry. To <strong>pop</strong>: read <code>top</code>, and CAS it to
+<code>top-&gt;next</code>; retry if it moved. That is the whole algorithm — no lock, no blocking. Eight threads pushing
+100,000 items each and then popping every node concurrently agree exactly (gcc 11.4.0, Linux 6.18, x86-64):</p>
+
+<pre><code>void push(long v) {
+    node *n = malloc(sizeof *n); n-&gt;val = v;
+    node *old = atomic_load(&amp;top);
+    do { n-&gt;next = old; }
+    while (!atomic_compare_exchange_weak(&amp;top, &amp;old, n));   /* old reloaded on failure */
+}
+node *pop(void) {
+    node *old = atomic_load(&amp;top);
+    while (old) { if (atomic_compare_exchange_weak(&amp;top, &amp;old, old-&gt;next)) return old; }
+    return NULL;
+}
+/* 8 threads push 100000 each, then 8 threads pop concurrently: */
+pushed total = 800000
+popped count = 800000, popped sum = 800000   (no node lost or duplicated)</code></pre>
+
+<p>Every one of the 800,000 nodes was popped exactly once — none lost, none returned twice — under eight-way contention with
+no lock. The linearization point is the successful CAS: a push "happens" the instant its CAS installs the new top, a pop the
+instant its CAS unlinks the old top, and any two concurrent operations therefore order by which CAS won. Under contention the
+losers simply retry, which is why the guarantee is lock-<em>free</em> (the system always advances — some CAS always wins) and
+not wait-free (a persistently unlucky thread could keep losing). One honest caveat, deferred to §23.4: this code
+<em>leaks</em> — it never frees popped nodes. Freeing them safely while other threads may still be reading them is the hard
+part of lock-free programming, and it is where the ABA problem lives.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: push is a CAS loop that installs a new head</span>
+<p><strong>1. In words.</strong> Point the new node at the current top, then compare-and-swap the top from that old value to
+the new node. If another thread changed the top first, the CAS fails and hands you the new top; re-point and try again.</p>
+<p><strong>2. As a picture.</strong> Figure 23.1: thread A reads <code>top = X</code>, sets <code>new-&gt;next = X</code>; thread
+B pushes first, so <code>top</code> is now Y; A's CAS(<code>top</code>, X, new) fails (top is Y, not X), reloads
+<code>old = Y</code>, re-points <code>new-&gt;next = Y</code>, and its second CAS succeeds.</p>
+<p><strong>3. As numbers.</strong> Eight threads &#215; 100,000 pushes then concurrent pops: 800,000 pushed, 800,000 popped,
+sum 800,000 — no node lost or duplicated. Under an 8-thread push/pop benchmark the lock-free stack ran at ~176 ns/op against
+a mutex-guarded stack's ~359 ns/op (illustrative, contention-dependent).</p>
+</aside>
+
+<p><em>(Answer to the §23.1 quick check: weakest to strongest — blocking, obstruction-free, lock-free, wait-free. Lock-free
+guarantees that the <strong>system</strong> makes progress (some thread always completes), allowing an individual thread to
+starve; wait-free guarantees that <strong>every</strong> thread completes in a bounded number of its own steps. Lock-free code
+cannot deadlock or suffer priority inversion, because there is no lock to hold — a delayed thread stalls only itself, never
+the structure.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Treiber push: CAS the head; retry if another thread moved it first.</text>
+<text x="24" y="42" font-size="9" fill="#14406b">A reads top = X, sets new-&gt;next = X</text>
+<rect x="120" y="30" width="34" height="20" fill="#f5f8fb" stroke="#14406b"/><text x="132" y="44">new</text>
+<rect x="220" y="30" width="26" height="20" fill="#eef" stroke="#14406b"/><text x="228" y="44">X</text>
+<rect x="300" y="30" width="26" height="20" fill="#eef" stroke="#14406b"/><text x="308" y="44">&#8230;</text>
+<line x1="154" y1="40" x2="220" y2="40" stroke="#14406b" marker-end="url(#a)"/>
+<text x="24" y="80" font-size="9" fill="#8c3a1d">Meanwhile B pushes Y: top is now Y, not X</text>
+<rect x="220" y="92" width="26" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="226" y="106">Y</text>
+<rect x="300" y="92" width="26" height="20" fill="#eef" stroke="#14406b"/><text x="308" y="106">X</text>
+<line x1="246" y1="102" x2="300" y2="102" stroke="#8c3a1d" marker-end="url(#a)"/>
+<text x="24" y="140" font-size="9" fill="#8c3a1d">A's CAS(top, X, new) FAILS &#8594; old reloaded to Y</text>
+<text x="24" y="165" font-size="9" fill="#2e6b34">A re-points new-&gt;next = Y, CAS(top, Y, new) SUCCEEDS</text>
+<rect x="300" y="152" width="34" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="312" y="166">new</text>
+<line x1="334" y1="162" x2="380" y2="162" stroke="#2e6b34" marker-end="url(#a)"/>
+<rect x="380" y="152" width="26" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="386" y="166">Y</text>
+<defs><marker id="a" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#555"/></marker></defs>
+</svg>
+<figcaption>Figure 23.1: The Treiber stack's push. Thread A prepares a node pointing at the top it read (X), but thread B
+pushes Y first, so A's compare-and-swap fails — and the failure reloads the current top (Y) into A's local variable. A
+re-points its node at Y and retries; the second CAS succeeds. The successful CAS is the push's linearization point.</figcaption>
+</figure>
+
+<h2>23.3 The Michael–Scott queue: two pointers, and helping</h2>
+
+<p>A FIFO queue is harder than a stack because two ends change independently: enqueue appends at the <code>Tail</code>, dequeue
+removes at the <code>Head</code>. The classic lock-free solution is the <strong>Michael–Scott queue</strong> (PODC 1996),
+the algorithm behind Java's <code>ConcurrentLinkedQueue</code> and countless runtimes. It keeps a permanent
+<strong>dummy node</strong> so the list is never empty (Head and Tail start pointing at it), which removes the awkward special
+cases at the boundaries. Enqueue is a two-step CAS: first CAS the current tail node's <code>next</code> from
+<code>NULL</code> to the new node (this is the linearization point — the item is now in the queue); then CAS <code>Tail</code>
+forward to the new node. Because those two CASes are not one atomic step, another thread can arrive between them and find
+<code>Tail</code> "lagging" — pointing at a node whose <code>next</code> is no longer <code>NULL</code>. The elegant fix is
+<strong>helping</strong>: any thread that observes a lagging tail advances it (CAS <code>Tail</code> to
+<code>tail-&gt;next</code>) before proceeding, so no operation ever waits for the thread that fell behind. Four producers and
+four consumers hammering the queue agree exactly (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>enqueue: link new node after tail (CAS tail-&gt;next: NULL -&gt; n)  // linearization point
+         then swing Tail forward   (CAS Tail: tail -&gt; n)       // may be done by a helper
+dequeue: read value from Head-&gt;next, then CAS Head forward to it
+
+4 producers x 200000, 4 consumers:
+expected  count=800000 sum=1279999600000
+dequeued  count=800000 sum=1279999600000   OK</code></pre>
+
+<p>All 800,000 items came out exactly once and the checksums matched, with no lock anywhere. The two lessons generalize
+beyond the queue. First, when a logical update spans more than one atomic step, you cannot hold a lock across them — so you
+design the structure to be <em>correct in every intermediate state</em> and let any thread <strong>help</strong> complete a
+half-finished operation it stumbles upon; this "help the laggard" pattern recurs throughout lock-free design. Second, the
+linearization point is a single, identifiable CAS (here, linking the new node), which is what lets you reason that the
+concurrent execution is equivalent to some sequential one. As with the stack, this code as written leaks nodes; making
+dequeue free the node it removed — safely, when no other thread is still looking at it — is the reclamation problem of the
+next section.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does the Michael–Scott queue keep a permanent dummy node? Enqueue takes two CAS steps — what can another thread observe
+between them, and what does "helping" do about it? Which single step is the enqueue's linearization point? (Answer below the
+communicate box.)</p>
+</aside>
+
+<h2>23.4 The ABA problem and safe memory reclamation</h2>
+
+<p>Everything so far leaked memory on purpose, because reclaiming it exposes the subtlest bug in lock-free programming. A CAS
+checks whether a pointer <em>still equals</em> the value you read — but "equal" means the same bits, not the same object. If
+between your read and your CAS a value changes from <strong>A</strong> to <strong>B</strong> and back to <strong>A</strong>,
+your CAS sees <code>A</code>, concludes "nothing changed," and succeeds — even though the world moved on underneath it. This
+is the <strong>ABA problem</strong>. It bites the Treiber stack precisely when nodes are freed and reused: a thread reads
+<code>top = A</code> and plans to CAS <code>top</code> to <code>A-&gt;next</code>; meanwhile other threads pop <code>A</code>
+and <code>B</code>, free <code>A</code>, and a fresh <code>malloc</code> hands back <code>A</code>'s address for a new node
+that is pushed, so <code>top</code> is <code>A</code> again — but <code>A-&gt;next</code> now points somewhere entirely
+different (or into freed memory). The stalled thread's CAS succeeds on the recycled address and installs a stale, dangling
+<code>next</code>, corrupting the stack. ABA is intermittent by nature — it needs a specific interleaving plus address reuse —
+which is exactly what makes it dangerous: it survives testing and strikes in production.</p>
+
+<p>There are three standard defenses, and every real lock-free system uses one. A <strong>tagged (versioned) pointer</strong>
+pairs the pointer with a counter that is incremented on every update, and CASes the pair; A-to-B-to-A now differs in the
+counter, so the CAS correctly fails. This needs a double-width CAS — on x86-64 the <code>lock cmpxchg16b</code> instruction
+(compile with <code>-mcx16</code>) — and the versioned Treiber stack passes the same 800,000-node test the plain one did.
+<strong>Hazard pointers</strong> (Michael, 2004) take a different tack: before dereferencing a node, a thread publishes it in
+a per-thread "hazard" slot; a thread that wants to free a node first checks that no hazard pointer references it, deferring
+reclamation until it is unreferenced — so a node in use is never freed, and ABA-via-reuse cannot happen. <strong>Epoch-based
+reclamation</strong> and <strong>RCU</strong> (read-copy-update) generalize this: readers announce they are active, and a
+retired node is freed only after every reader that could have seen it has departed. All three exist for one reason — a
+lock-free structure cannot <code>free</code> a node the moment it is unlinked, because another thread may still be about to
+read it, and freeing it is a use-after-free (Chapter 9) waiting to happen.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the ABA problem (a CAS sees the same value, not the same world)</span>
+<p>A compare-and-swap only checks that a location still holds the <em>bits</em> you read, so a value that goes A &#8594; B
+&#8594; A slips through: your CAS succeeds as if nothing happened, though the object those bits refer to may have been popped,
+freed, and replaced. In the Treiber stack this corrupts the list — the CAS installs a <code>next</code> pointer read from a
+node that has since been recycled, silently losing or duplicating items, or dangling into freed memory. It is intermittent
+(it needs a preemption at the wrong instant plus address reuse), so it passes tests and fails under production load. The tell
+is any lock-free code that frees nodes and reuses their memory while a CAS elsewhere depends on a pointer's identity. The
+fixes are the three of §23.4: a tagged pointer (version the value so A-to-A differs), hazard pointers, or epoch/RCU
+reclamation (never free a node another thread might still hold). If you are writing a lock-free structure that frees nodes and
+you have not chosen one of these, you have an ABA bug you simply have not hit yet.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "I wrote a lock-free stack — push and pop are just a CAS on the head, straight out
+of the textbook. In the unit test it's perfect. But under load it occasionally segfaults or loses an item, and I can't
+reproduce it in the debugger. The CAS is obviously correct — it only swaps the head if it hasn't changed. What's going on?"
+Cover the paragraph and respond in four or five sentences, drawing on §23.2 and §23.4.</p>
+<p><em>Model answer.</em> "The CAS logic is right; the bug is memory reclamation, and the symptom is the ABA problem. If pop
+frees the node it removed, that address can be handed back by <code>malloc</code> and pushed again while another thread is
+mid-pop holding the old head value — its CAS sees the same pointer bits, concludes nothing changed, and succeeds on a node
+whose <code>next</code> now points into recycled or freed memory, which is your segfault-or-lost-item. It's intermittent
+because it needs a preemption at exactly the wrong moment plus address reuse, so it never shows up in a single-stepping
+debugger. The fix isn't the CAS — it's safe reclamation: a tagged/versioned pointer with a double-width CAS so A-to-A differs
+by version, or hazard pointers, or epoch-based reclamation so you never free a node another thread might still be reading.
+Honestly, unless we need this specific structure, I'd use a vetted concurrent queue from the standard library — lock-free
+reclamation is exactly where hand-rolled code goes wrong." Naming ABA, tying it to reclamation rather than the CAS, and
+reaching for a vetted implementation is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §23.3 quick check: the dummy node keeps the list non-empty so Head and Tail always point at a real
+node, eliminating null-boundary special cases. Between enqueue's two CASes another thread can see <code>Tail</code> lagging —
+pointing at a node whose <code>next</code> is no longer <code>NULL</code>; "helping" means that thread advances <code>Tail</code>
+itself (CAS it to <code>tail-&gt;next</code>) rather than waiting. The linearization point is the first CAS, linking the new
+node after the tail — that is the instant the item is in the queue.)</em></p>
+
+<h2>23.5 What to carry forward</h2>
+
+<p>Lock-free programming trades the simplicity of a lock for immunity to the lock-holder's fate: many threads operate at once,
+each committing with a single compare-and-swap that wins only if nothing moved underneath, retrying if it lost, so no thread
+ever blocks another. "Lock-free" is a precise guarantee — the <em>system</em> always makes progress (some thread completes),
+which is weaker than <strong>wait-free</strong> (every thread completes) but strong enough to rule out deadlock and priority
+inversion. The two canonical structures are each a CAS loop over a pointer: the <strong>Treiber stack</strong> (CAS the head;
+our eight-threaded run pushed and popped 800,000 nodes with none lost) and the <strong>Michael–Scott queue</strong> (a dummy
+node, a two-step enqueue, and <em>helping</em> to advance a lagging tail; four producers and four consumers moved 800,000
+items exactly). Each operation has a single CAS as its <strong>linearization point</strong>, which is what makes the
+concurrent execution equivalent to a sequential one. The genuinely hard part is memory: a CAS checks bits, not identity, so a
+value that cycles A&ndash;B&ndash;A defeats it — the <strong>ABA problem</strong> — and you cannot free an unlinked node while
+another thread may still read it. The three defenses are tagged pointers (double-width CAS), hazard pointers, and epoch/RCU
+reclamation.</p>
+
+<p>Every algorithm in this chapter quietly assumed something we have not earned: that when one thread's CAS publishes a node,
+another thread that reads the updated pointer also sees the node's <em>contents</em> — its <code>val</code> and
+<code>next</code> — fully written. On the abstract machine that is obvious; on real multicore hardware it is not. Cores have
+store buffers and caches, and both the compiler and the processor reorder memory operations, so a thread can observe a new
+pointer while the writes that initialized what it points to are still in flight — a reader following a freshly published
+pointer into <em>garbage</em>. What saves the code is that the atomic operations carry <strong>ordering</strong> guarantees,
+and those guarantees are not automatic: they must be requested, by name, through the atomic's memory-ordering argument. The
+final chapter of this part makes that machinery explicit — the <strong>memory model</strong>: why a data race is undefined
+behavior, why plain loads and stores may be reordered across cores, and what <code>memory_order_relaxed</code>,
+<code>acquire</code>/<code>release</code>, and <code>seq_cst</code> actually promise. It is the specification that says
+precisely when the node you just published is safe for another thread to read.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Order the four progress conditions and state what lock-free versus wait-free each guarantee.</li>
+<li>Write the Treiber stack's push and pop as CAS loops, and name each operation's linearization point.</li>
+<li>Explain the Michael–Scott queue's dummy node, two-step enqueue, and the "helping" that advances a lagging tail.</li>
+<li>Explain the ABA problem: why a CAS on the same bits can be wrong, and where it bites the Treiber stack.</li>
+<li>Name the three safe-reclamation techniques (tagged pointers, hazard pointers, epoch/RCU) and what each prevents.</li>
+<li>Say why lock-free code cannot deadlock or suffer priority inversion.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does the lock-free guarantee promise, and how does it differ from wait-free? (§23.1)</li>
+<li><strong>R2.</strong> Write the Treiber stack's push and pop, and name the linearization point of each. (§23.2)</li>
+<li><strong>R3.</strong> Why does the Michael–Scott queue use a dummy node and "helping"? (§23.3)</li>
+<li><strong>R4.</strong> What is the ABA problem, and how does it corrupt the Treiber stack when nodes are freed? (§23.4)</li>
+<li><strong>R5.</strong> Name the three safe-reclamation techniques and what each does. (§23.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Michael &amp; Scott, "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms,"
+<em>Proc. 15th ACM PODC</em> (1996), pp. 267&ndash;275, DOI 10.1145/248052.248106.</strong> The lock-free queue of §23.3,
+with the dummy node and the tail-helping mechanism. Author, venue, and year verified via dblp and the ACM Digital
+Library.</li>
+<li><strong>Treiber, "Systems Programming: Coping with Parallelism," IBM Almaden Research Report RJ 5118 (April 1986).</strong>
+The compare-and-swap stack of §23.2 (the "Treiber stack"). Report number and date verified via the IBM Research report
+archive.</li>
+<li><strong>Herlihy &amp; Wing, "Linearizability: A Correctness Condition for Concurrent Objects," <em>ACM TOPLAS</em>
+12(3):463&ndash;492 (1990), DOI 10.1145/78969.78972.</strong> The definition of the linearization point used throughout this
+chapter. Verified via dblp and the ACM Digital Library.</li>
+<li><strong>Michael, "Hazard Pointers: Safe Memory Reclamation for Lock-Free Objects," <em>IEEE Transactions on Parallel and
+Distributed Systems</em> 15(6):491&ndash;504 (2004), DOI 10.1109/TPDS.2004.8.</strong> The hazard-pointer technique of §23.4
+and its explicit treatment of the ABA problem. Verified via the IEEE/ACM Digital Library.</li>
+<li><strong>Herlihy &amp; Shavit, <em>The Art of Multiprocessor Programming</em> (Morgan Kaufmann; 2nd ed. 2020), chapters on
+concurrent stacks, queues, and memory reclamation.</strong> The textbook development of everything here, with proofs of
+linearizability. <code>[⚠ reference — not free]</code>.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex23.1"><span class="ex-label">23.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does the <em>lock-free</em> progress guarantee promise about the system as a whole?</div>
+
+<div class="exercise" id="ex23.2"><span class="ex-label">23.2</span> <span class="ex-tag warm">warm-up</span>
+In the Treiber stack, what single machine operation is the linearization point of a push? Of a pop?</div>
+
+<div class="exercise" id="ex23.3"><span class="ex-label">23.3</span> <span class="ex-tag warm">warm-up</span>
+State the ABA problem in one sentence: what does a CAS check, and why can "the same value" be misleading?</div>
+
+<div class="exercise" id="ex23.4"><span class="ex-label">23.4</span> <span class="ex-tag core">core</span>
+Implement the Treiber stack's <code>push</code> and <code>pop</code> as CAS loops (pseudocode is fine). For each, explain (a)
+what a failed CAS tells you and how the loop recovers, (b) why the successful CAS is the linearization point, and (c) why the
+structure gives the lock-free guarantee but not the wait-free one.</div>
+
+<div class="exercise" id="ex23.5"><span class="ex-label">23.5</span> <span class="ex-tag core">core</span>
+The Michael–Scott queue enqueues in two CAS steps. (a) Why can it not be done in one? (b) Describe what a second thread can
+observe about <code>Tail</code> after the first CAS but before the second, and how "helping" keeps that from stalling anyone.
+(c) Explain why the dummy node removes the empty-queue special cases at both ends.</div>
+
+<div class="exercise" id="ex23.6"><span class="ex-label">23.6</span> <span class="ex-tag core">core</span>
+Walk through a concrete ABA interleaving on the Treiber stack with nodes freed and reused: thread A reads <code>top = A</code>
+and is about to CAS to <code>A-&gt;next</code>; describe the sequence of pops, frees, and a push that returns address
+<code>A</code>, and show exactly how A's CAS then corrupts the stack. Then say which of the three defenses would prevent it and
+how.</div>
+
+<div class="exercise" id="ex23.7"><span class="ex-label">23.7</span> <span class="ex-tag complexity">cost</span>
+(a) Under low contention, why can a lock-free stack beat a mutex-guarded one (recall the ~176 ns vs ~359 ns/op figure), and
+what is the lock-free structure spending its time on instead of blocking? (b) Under <em>very high</em> contention on a single
+hot pointer, why might the lock-free version's throughput <em>collapse</em> — what does a storm of failing CASes cost
+(Chapter 3's coherence traffic)? (c) Name one structural change (e.g. elimination, or per-thread sub-stacks) that reduces
+contention, and what it trades away.</div>
+
+<div class="exercise" id="ex23.8"><span class="ex-label">23.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> You must make the leaking Treiber stack free popped nodes safely.
+<br><strong>Step 1 (given):</strong> Freeing a node the instant <code>pop</code> unlinks it is unsafe: another thread mid-pop
+may still hold that node as its <code>old</code> and be about to read <code>old-&gt;next</code>.
+<br><strong>Step 2 (given):</strong> Immediate free also enables ABA: the freed address can be reused and pushed, so a stale
+CAS succeeds on recycled memory.
+<br><strong>Step 3 (given):</strong> Hazard pointers have each thread publish the node it is about to dereference; a would-be
+reclaimer frees a retired node only if no hazard pointer references it.
+<br><strong>Step 4 (you):</strong> Describe how a hazard-pointer-protected <code>pop</code> works step by step (publish
+<code>top</code> as hazardous, re-verify it is still <code>top</code>, then read <code>next</code> and CAS), and explain why
+this makes both the use-after-free and the ABA impossible.</div>
+
+<div class="exercise" id="ex23.9"><span class="ex-label">23.9</span> <span class="ex-tag mixed">mixed</span>
+For each requirement, choose between a mutex-guarded structure and a lock-free one, and justify in a line: (a) a shared work
+queue in a soft-real-time audio callback that must never block; (b) a rarely-contended configuration map read at startup; (c)
+a structure accessed from a signal handler (Chapter 18); (d) a structure whose operations are large and complex, with modest
+contention.</div>
+
+<div class="exercise" id="ex23.10"><span class="ex-label">23.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 20–23, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "Lock-free means the
+code uses no atomic instructions." (b) "A lock-free structure can deadlock if two threads retry forever." (c) "The
+Michael–Scott queue's dummy node is a performance optimization that can be omitted." (d) "A CAS that finds the pointer equal
+to what you read proves nothing was popped and freed in between." (e) "Wait-free is a strictly stronger guarantee than
+lock-free."</div>
+
+<div class="exercise" id="ex23.11"><span class="ex-label">23.11</span> <span class="ex-tag stretch">stretch</span>
+"Helping" is a recurring lock-free pattern. (a) Explain what problem helping solves in the Michael–Scott queue and why a
+thread advances <em>another</em> thread's half-finished operation rather than waiting. (b) Argue how helping relates to the
+lock-free guarantee: why does a design where every thread can complete any pending operation avoid a stall when one thread is
+preempted mid-update? (c) Contrast this with a lock, where a preempted holder stalls everyone — and explain the cost helping
+pays for that immunity (extra CASes, more complex invariants).</div>
+
+<div class="exercise" id="ex23.12"><span class="ex-label">23.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) implement the Treiber stack with CAS, run eight threads pushing a known number of items and then
+popping concurrently, and confirm no item is lost or duplicated (leak the nodes for now). (b) Benchmark it against a
+mutex-guarded stack under contention and report ns/op for both (note the result is workload-dependent). (c) Implement the
+tagged-pointer version using a double-width CAS (<code>-mcx16</code> on x86-64, linking <code>-latomic</code>), confirm it
+passes the same correctness test, and find the <code>lock cmpxchg16b</code> in the disassembly. Label your compiler and CPU;
+note the throughput figures are illustrative.</div>
+
+</section>
+</section>

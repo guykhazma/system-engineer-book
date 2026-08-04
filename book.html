@@ -262,6 +262,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part IV &mdash; Concurrency & Parallelism</li>
 <li class="toc-ch"><a href="#ch20">Chapter 20 — Mutual Exclusion: Locks and the Critical Section</a></li>
 <li class="toc-ch"><a href="#ch21">Chapter 21 — Coordinating Threads: Condition Variables and Semaphores</a></li>
+<li class="toc-ch"><a href="#ch22">Chapter 22 — Atomics and Compare-and-Swap: Building Blocks Below the Lock</a></li>
+<li class="toc-ch"><a href="#ch23">Chapter 23 — Lock-Free Data Structures</a></li>
+<li class="toc-ch"><a href="#ch24">Chapter 24 — The Memory Model: memory_order and Happens-Before</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part V &mdash; Rust for Systems</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VI &mdash; Performance Engineering</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VII &mdash; I/O & Networking, Low-Level</li>
@@ -9041,6 +9044,1172 @@ version, and note the CPU numbers are illustrative.</div>
 </section>
 </section>
 
+<section class="chapter" id="ch22">
+<h1>Chapter 22 — Atomics and Compare-and-Swap: Building Blocks Below the Lock</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch20">Chapter 20</a> (a lock gives mutual exclusion —
+but what is a lock <em>built from</em>?), <a href="#ch21">Chapter 21</a> (blocking primitives coordinate threads; all of
+them rest on an indivisible hardware operation), <a href="#ch15">Chapter 15</a> (threads share memory, so an unsynchronized
+read-modify-write races), <a href="#ch03">Chapter 3</a> (a core sees memory through its cache; "atomic" is enforced at the
+cache line). &nbsp;·&nbsp; The last two chapters used locks and condition variables as given; this one opens the box and
+shows the hardware primitive — the atomic read-modify-write — that every one of them is built on.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch15">Chapter 15</a> — why is <code>counter++</code> across two threads a
+race, and what are the three machine steps hiding inside that one line of C? (2) <a href="#ch20">Chapter 20</a> — a mutex
+<code>lock()</code> has to test-and-set some word indivisibly; what would go wrong if the test and the set were two separate
+instructions? (3) <em>Predict:</em> four threads each add 1 to a shared counter one million times. With a plain
+<code>count++</code>, what final value do you expect (the ideal is 4,000,000)? With an atomic increment? Write both guesses;
+we measure them in §22.1.</p>
+</aside>
+
+<p>A lock is not a primitive of the machine; it is a <em>program</em>, and like every program it needs some smaller
+indivisible operation to stand on. That operation is the <strong>atomic read-modify-write</strong> (RMW): a single hardware
+instruction that reads a memory location, computes a new value, and writes it back with no other core able to observe or
+interpose a write in the middle. This chapter builds up from the problem that motivates it. First, why an ordinary
+<code>x++</code> on shared memory silently loses updates — it is three steps, not one, and threads interleave inside it
+(§22.1). Then the atomic RMW that fixes it, and how the hardware actually provides indivisibility — the x86 <code>LOCK</code>
+prefix and the cache-line lock beneath it (§22.2). Then the one RMW that is more than a fixed arithmetic operation, the
+<strong>compare-and-swap</strong> (CAS), and the retry loop that turns it into any update you like (§22.3). Finally, why CAS
+in particular is the <em>universal</em> primitive — Herlihy's consensus hierarchy — and what atomics cost, since they are
+far from free (§22.4). We close by carrying CAS toward the lock-free data structures it makes possible (§22.5). Locks were
+the abstraction; atomics are the mechanism underneath.</p>
+
+<h2>22.1 The lost update: <code>x++</code> is three steps, not one</h2>
+
+<p>A single line, <code>count++</code>, compiles to a <strong>read-modify-write</strong>: load <code>count</code> into a
+register, add one, store it back. Those are three separate instructions, and a thread can be preempted — or simply run in
+parallel on another core — between any two of them. When two threads read the same old value before either has stored, both
+compute the same "new" value and both store it: two increments, one net effect. The update is <em>lost</em>. It is not a
+rare corner case; under contention it is the common case. Here are four threads each incrementing a shared <code>long</code>
+one million times, compiled at <code>-O0</code> so each iteration is a genuine load-add-store (gcc 11.4.0, Linux 6.18,
+x86-64):</p>
+
+<pre><code>expected         = 4000000
+plain  x++       = 1355281   (lost 2644719 updates)
+atomic fetch_add = 4000000</code></pre>
+
+<p>The plain counter lost roughly two-thirds of its four million increments — and the exact figure changes every run,
+because it is a function of how the threads happened to interleave, which is precisely the hallmark of a data race. The
+atomic version, using a single indivisible increment, landed on 4,000,000 exactly, every run. (At <code>-O2</code> the plain
+loop can appear to "work": the optimizer collapses the million iterations into one <code>count += 1000000</code>, shrinking
+the race window to a single load-add-store per thread that rarely collides — a reminder that a data race is undefined
+behavior, so a passing test proves nothing.) The lesson is blunt: <strong>a read-modify-write on shared memory must be
+performed as one indivisible operation</strong>, or updates vanish. The tool that makes it one operation is the atomic.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the three machine steps hiding inside <code>count++</code>, and describe the interleaving of two threads that loses
+one increment. Why does the plain counter give a <em>different</em> wrong answer each run? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>22.2 Atomic read-modify-write and how the hardware makes it indivisible</h2>
+
+<p>C11 (and C++11) added <code>&lt;stdatomic.h&gt;</code>: types like <code>atomic_long</code> and operations like
+<code>atomic_fetch_add</code>, <code>atomic_fetch_or</code>, <code>atomic_exchange</code> that the compiler lowers to a
+single atomic machine instruction. Replacing <code>count++</code> with <code>atomic_fetch_add(&amp;count, 1)</code> is the
+whole fix in §22.1. What does "single atomic instruction" mean at the hardware level? On x86, an ordinary increment of a
+memory operand and an atomic one differ by one prefix byte. Compare the compiler's output for a plain post-increment versus
+<code>atomic_fetch_add</code> (gcc 11.4.0, <code>-O2</code>, <code>objdump -d</code>):</p>
+
+<pre><code>plain_add:                       atomic_add:
+  mov    (%rdi),%rax               mov    $0x1,%eax
+  lea    0x1(%rax),%rdx            lock xadd %rax,(%rdi)
+  mov    %rdx,(%rdi)               ret
+  ret                             </code></pre>
+
+<p>The plain version is exactly the three steps of §22.1: <code>mov</code> (load), <code>lea</code> (add one),
+<code>mov</code> (store) — three instructions, interruptible between any pair. The atomic version is <em>one</em>
+instruction, <code>lock xadd</code> ("exchange-and-add"), which loads, adds, and stores as a single indivisible unit. The
+magic is the <code>LOCK</code> prefix. It tells the CPU to hold exclusive ownership of the affected cache line for the
+duration of the read-modify-write, so no other core can read or write that line in between — historically by asserting a bus
+lock, and on modern chips by the cache-coherence protocol (Chapter 3) refusing to yield the line while the locked operation
+completes. The result is that the whole load-add-store is atomic with respect to every other core. Note the cost this
+implies, which §22.4 measures: the core must own the line exclusively, so a <code>lock</code>-prefixed op serializes at the
+cache line and cannot be reordered around freely — it is much dearer than a plain store.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: an atomic RMW is one indivisible read-modify-write</span>
+<p><strong>1. In words.</strong> A plain <code>x++</code> is load, add, store — three instructions another core can
+interleave into, losing updates. An atomic RMW (<code>lock xadd</code>) does the same read-modify-write as a single
+instruction that owns the cache line throughout, so no other core can observe or interpose a write in the middle.</p>
+<p><strong>2. As a picture.</strong> Figure 22.1: two threads each load the same old value 41, each add one, each store 42 —
+one increment lost — versus the atomic path where the second thread cannot touch the line until the first's read-modify-write
+retires, so it reads 42 and stores 43.</p>
+<p><strong>3. As numbers.</strong> Four threads &#215; one million: plain <code>++</code> lost 2,644,719 of 4,000,000 (and a
+different count each run); atomic <code>fetch_add</code> lost none — exactly 4,000,000, every run. In the disassembly, three
+instructions collapse to one <code>lock xadd</code>.</p>
+</aside>
+
+<p><em>(Answer to the §22.1 quick check: the three steps are load <code>count</code> into a register, add one, store it back.
+If thread A loads 41 and, before it stores, thread B also loads 41, both compute 42 and both store 42 — two increments, one
+net change, so one is lost. The wrong answer differs each run because it depends on the exact interleaving of loads and
+stores across cores, which the scheduler and hardware vary run to run — the signature of a data race.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 220" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Plain x++: two threads interleave inside the read-modify-write and lose an increment.</text>
+<line x1="70" y1="30" x2="70" y2="120" stroke="#14406b"/><text x="24" y="34" font-size="9" fill="#14406b">T1</text>
+<line x1="320" y1="30" x2="320" y2="120" stroke="#14406b"/><text x="274" y="34" font-size="9" fill="#14406b">T2</text>
+<rect x="55" y="40" width="30" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="92" y="54" font-size="9">load count = 41</text>
+<rect x="305" y="52" width="30" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="342" y="66" font-size="9" fill="#8c3a1d">load count = 41 (still!)</text>
+<rect x="55" y="66" width="30" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="92" y="80" font-size="9">store 42</text>
+<rect x="305" y="86" width="30" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="342" y="100" font-size="9" fill="#8c3a1d">store 42 &#8594; result 42, not 43</text>
+<text x="16" y="150" fill="#2e6b34">lock xadd: T2 cannot touch the line until T1's RMW retires.</text>
+<line x1="70" y1="160" x2="70" y2="205" stroke="#2e6b34"/><line x1="320" y1="160" x2="320" y2="205" stroke="#2e6b34"/>
+<rect x="55" y="166" width="30" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="92" y="180" font-size="9">lock xadd: 41 &#8594; 42</text>
+<rect x="305" y="186" width="30" height="18" fill="#cfe8cf" stroke="#2e6b34"/><text x="342" y="199" font-size="9" fill="#2e6b34">lock xadd: 42 &#8594; 43 (correct)</text>
+</svg>
+<figcaption>Figure 22.1: The lost update. With a plain <code>x++</code>, T2 reads the counter before T1 has stored, so both
+write 42 and one increment is lost. With an atomic <code>lock xadd</code>, T2's read-modify-write cannot begin until T1's
+has completed, because the <code>LOCK</code> prefix holds the cache line exclusively for the whole operation.</figcaption>
+</figure>
+
+<h2>22.3 Compare-and-swap: the conditional RMW and the retry loop</h2>
+
+<p><code>fetch_add</code> and its siblings each hard-wire one operation (add, or, exchange). But most interesting updates are
+not a fixed arithmetic function of the old value — "install this new head only if the head is still what I read," "raise the
+maximum only if my value is larger." The primitive that expresses <em>any</em> such conditional update is
+<strong>compare-and-swap</strong>. In C11 it is <code>atomic_compare_exchange_weak(obj, &amp;expected, desired)</code>: it
+atomically compares the value in <code>obj</code> with <code>expected</code>, and <em>only if they are equal</em> writes
+<code>desired</code> and returns true; otherwise it writes the current value back into <code>expected</code> and returns
+false. In one indivisible step it asks "is it still what I think?" and, if so, updates it. That conditional is what lets you
+build a lock-free update out of a plain read, an arbitrary computation, and a CAS in a <strong>retry loop</strong>: read the
+current value, compute the new one, attempt to CAS it in; if the CAS fails (someone else changed it first), the failure has
+already reloaded the current value, so loop and try again. Here is an atomic <em>maximum</em> — an operation with no
+dedicated instruction — built from a CAS loop, run by eight threads (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>void atomic_max(atomic_long *p, long v) {
+    long cur = atomic_load(p);
+    while (v &gt; cur)                                    /* only if we'd raise it */
+        if (atomic_compare_exchange_weak(p, &amp;cur, v))   /* cur is reloaded on failure */
+            return;                                      /* installed */
+}
+/* 8 threads hammering atomic_max: */
+max seen = 7499  (true max = 7499)</code></pre>
+
+<p>Eight threads racing to raise a shared maximum agreed exactly on the true maximum, 7499, with no lock. The structure is
+the template for essentially every lock-free algorithm in the next chapter: <strong>read a snapshot, compute off it, and
+commit with a CAS that succeeds only if nothing changed underneath you</strong> — retrying if it did. Two details matter.
+The <code>expected</code> argument is updated by a failed CAS to the value it actually found, so the loop always retries
+against fresh state without a separate reload. And the <code>_weak</code> form is allowed to fail <em>spuriously</em> (report
+mismatch even when the values were equal) in exchange for cheaper code on architectures that implement CAS with
+load-linked/store-conditional; because it already lives in a retry loop, a spurious failure just means one more iteration, so
+<code>_weak</code> is the right choice inside a loop and <code>_strong</code> (no spurious failures) for a one-shot check.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State exactly what <code>compare_exchange</code> does on success and on failure, including what happens to the
+<code>expected</code> argument when it fails. Why does the CAS-loop idiom not need a separate reload of the current value on
+retry? When would you pick <code>_weak</code> over <code>_strong</code>? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>22.4 Why CAS is universal — and what atomics cost</h2>
+
+<p>Why single out compare-and-swap rather than, say, atomic add? Because CAS is <em>universal</em> in a precise, proven
+sense. Herlihy's "Wait-Free Synchronization" (1991) ranks synchronization primitives by their <strong>consensus number</strong>:
+the maximum number of threads that can use the primitive (plus plain reads and writes) to solve <em>consensus</em> — all
+agreeing irrevocably on one value despite arbitrary delays. Atomic reads and writes alone have consensus number <strong>1</strong>:
+they cannot solve consensus for even two threads. Atomic <code>fetch_add</code>, <code>test-and-set</code>, and their kin sit
+higher but still at a finite number. Compare-and-swap has consensus number <strong>infinity</strong>: with CAS, any number of
+threads can reach consensus, and from it you can build a wait-free implementation of <em>any</em> object with a sequential
+specification. That is why hardware designers provide CAS (or load-linked/store-conditional, its equivalent) and why every
+lock-free structure in Chapter 23 is a CAS loop: CAS is the primitive from which all the others, and all lock-free objects,
+can be constructed. Plain loads and stores cannot substitute — no arrangement of them solves two-thread consensus.</p>
+
+<p>Universality does not mean free. An atomic RMW must own its cache line exclusively and cannot be reordered around like a
+plain access, so it costs far more than an ordinary operation — and under contention, more still, because the cache line
+ping-pongs between cores (Chapter 3's coherence traffic). Measured uncontended, one operation each, 100 million times (gcc
+11.4.0, <code>-O2</code>):</p>
+
+<pre><code>plain  ++          :  0.9 ns/op
+atomic fetch_add   : 15.3 ns/op        (~15&#215; a plain op)
+mutex lock/unlock  : 11.9 ns/op        (itself two atomic ops)</code></pre>
+
+<p>A plain increment is under a nanosecond; the atomic is an order of magnitude dearer, and a full mutex lock/unlock — which
+is itself built from atomics — is in the same league (a lock is not magically slower than an atomic; it <em>is</em> atomics
+plus a slow path for when it must block). These are illustrative single-machine numbers, but the shape is universal: atomics
+are cheap enough to use freely for a shared counter and expensive enough that a hot, highly contended atomic can dominate a
+profile. The other cost is <em>correctness</em>: atomic loads and stores are individually indivisible, but they do
+<strong>not compose</strong> into an atomic compound. Two separate atomic operations have a gap between them, and the whole
+point of §22.1 was that gaps lose updates — which is exactly the trap that sends you to CAS.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: composing atomic operations (an atomic load then an atomic store is not atomic)</span>
+<p>Because <code>atomic_load</code> and <code>atomic_store</code> are each atomic, it is tempting to write a "conditional
+update" as two of them: <code>if (atomic_load(&amp;p) == expected) atomic_store(&amp;p, desired);</code>. Each call is
+indivisible, but <em>together</em> they are not: between the load and the store, another thread can change <code>p</code>, and
+your store clobbers its update — the lost-update bug of §22.1 wearing atomic clothing. This is a check-then-act race, and it
+is the reason compare-and-swap exists: CAS folds the compare <strong>and</strong> the swap into one indivisible operation, so
+nothing can slip between them. Any time you find yourself reading an atomic, deciding based on the value, and writing back a
+value that depends on that decision, you need a single CAS (usually in a retry loop), not a load followed by a store. The
+tell is a sentence of the form "if it's still X, make it Y" spanning two atomic calls — that gap is the bug.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "I don't need a mutex for this flag. I'll just do <code>if
+(atomic_load(&amp;busy) == 0) atomic_store(&amp;busy, 1);</code> to claim it, and <code>atomic_store(&amp;busy, 0)</code> to
+release. Both are atomic, so it's a lock-free lock — right?" Cover the paragraph and respond in four or five sentences, drawing
+on §22.3 and §22.4.</p>
+<p><em>Model answer.</em> "The two operations are each atomic, but the sequence isn't, and that gap is the whole problem: two
+threads can both load <code>busy == 0</code>, both decide it's free, and both store 1 — you've handed the 'lock' to two
+threads at once, which is the lost-update race from the counter example. To claim the flag indivisibly you need a single
+<em>compare-and-swap</em>: <code>expected = 0; atomic_compare_exchange_strong(&amp;busy, &amp;expected, 1)</code> succeeds for
+exactly one thread and fails for the other, because the compare and the set happen as one operation with no window between
+them. That is, in fact, roughly how a spinlock's fast path is built. But before you build your own, use a real mutex or a
+tested lock-free type: hand-rolled synchronization is where the subtle, load-dependent bugs live, and the atomic
+<code>compare_exchange</code> is the sharp tool you reach for only when you must." Naming the check-then-act gap and reaching
+for CAS — not two atomic accesses — is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §22.3 quick check: on success, <code>compare_exchange</code> finds <code>*obj == expected</code>, writes
+<code>desired</code>, and returns true; on failure, it leaves <code>*obj</code> unchanged, writes the current value of
+<code>*obj</code> into <code>expected</code>, and returns false. The loop needs no separate reload because a failed CAS has
+already refreshed <code>expected</code> with what it found. Prefer <code>_weak</code> inside a retry loop, where a rare
+spurious failure just costs one more iteration and the code is cheaper on load-linked/store-conditional machines; prefer
+<code>_strong</code> for a single, non-looping check.)</em></p>
+
+<h2>22.5 What to carry forward</h2>
+
+<p>Beneath every lock and condition variable is an <strong>atomic read-modify-write</strong>: a single hardware instruction
+that reads, computes, and writes with no other core able to interpose. An ordinary <code>x++</code> is not atomic — it is
+load, add, store, and threads interleave inside it, losing updates (our four-threaded counter lost 2.6 million of 4 million;
+the atomic lost none). The hardware provides indivisibility through a locked operation — on x86 the <code>LOCK</code> prefix,
+which holds the cache line exclusively for the whole read-modify-write (<code>lock xadd</code> is one instruction where the
+plain version is three). The one RMW that expresses <em>arbitrary</em> conditional updates is <strong>compare-and-swap</strong>:
+"write this only if the value is still what I read," folded into one indivisible step, and wrapped in a <strong>retry
+loop</strong> — read, compute, CAS, retry on failure — it implements any update lock-free (our eight-threaded atomic maximum
+agreed on 7499). CAS is not merely convenient but <em>universal</em>: Herlihy's consensus hierarchy places plain
+reads/writes at consensus number 1 and CAS at infinity, so any lock-free object can be built from it. Atomics are far from
+free (roughly fifteen times a plain op, more under contention), and — the trap — they do not compose: an atomic load then an
+atomic store leaves a gap another thread slips through, which is precisely why CAS exists.</p>
+
+<p>With compare-and-swap in hand, a new possibility opens: synchronization <em>without locks at all</em>. If a single CAS can
+commit an update only when nothing changed underneath it, then a data structure can let many threads race, each preparing an
+update and committing it with a CAS, retrying the few that lose — no thread ever blocked, no lock ever held. The next chapter
+builds exactly these <strong>lock-free data structures</strong>: the Treiber stack and the Michael–Scott queue, both nothing
+but a CAS loop over a shared pointer. It also confronts what CAS alone does not solve — the notorious <em>ABA problem</em>,
+where a value returns to what you read while its meaning has changed underneath, defeating the compare — and how real systems
+reclaim memory safely without locks. And underneath all of it sits an assumption we have quietly leaned on and must finally
+make explicit: that these atomic operations become visible to other cores in a sensible order. The chapter after next, on the
+memory model, shows that plain loads and stores carry no such guarantee, and that the ordering a lock or a lock-free
+structure needs is something the atomic must be asked for by name.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why <code>x++</code> on shared memory loses updates, naming the three steps and the racing interleaving.</li>
+<li>Say what the x86 <code>LOCK</code> prefix does, and why <code>lock xadd</code> is atomic where three plain instructions
+are not.</li>
+<li>State precisely what <code>compare_exchange</code> does on success and failure, and write the CAS retry-loop idiom.</li>
+<li>Explain what "CAS is universal" means via consensus numbers (plain reads/writes = 1, CAS = infinity).</li>
+<li>Give the rough cost of an atomic RMW versus a plain op, and why contention makes it worse.</li>
+<li>State why two atomic operations do not compose, and what to use instead for a conditional update.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why is <code>count++</code> across threads a race, and what does an atomic RMW change? (§22.1)</li>
+<li><strong>R2.</strong> What does the <code>LOCK</code> prefix do at the cache-line level, and how many instructions is
+<code>lock xadd</code> versus a plain increment? (§22.2)</li>
+<li><strong>R3.</strong> What does <code>compare_exchange</code> return and write on success and on failure, and what is the
+CAS-loop idiom? (§22.3)</li>
+<li><strong>R4.</strong> What is a consensus number, and what are the consensus numbers of plain reads/writes and of CAS?
+(§22.4)</li>
+<li><strong>R5.</strong> Why do two atomic operations fail to compose into an atomic compound, and what fixes it? (§22.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Herlihy, "Wait-Free Synchronization," <em>ACM Transactions on Programming Languages and Systems</em>
+13(1):124&ndash;149 (1991), DOI 10.1145/114005.102808.</strong> The consensus hierarchy: plain reads/writes have consensus
+number 1, compare-and-swap has infinity, and CAS is universal for wait-free constructions. The source for §22.4; author,
+venue, and year verified via dblp and the ACM Digital Library.</li>
+<li><strong>Herlihy &amp; Shavit, <em>The Art of Multiprocessor Programming</em> (Morgan Kaufmann; 2nd ed. 2020).</strong> The
+standard text on atomics, the consensus hierarchy, and lock-free programming, with the primitives of this chapter developed
+rigorously. <code>[⚠ reference — not free]</code>.</li>
+<li><strong>cppreference, <code>&lt;stdatomic.h&gt;</code> / <code>std::atomic</code> and <code>atomic_compare_exchange</code>
+(<code>en.cppreference.com</code>).</strong> The precise contract for <code>fetch_add</code>, the <code>_weak</code> vs
+<code>_strong</code> compare-exchange, and spurious failure. Primary reference for §22.2&ndash;§22.3; verify per standard
+version.</li>
+<li><strong>Intel 64 and IA-32 Architectures Software Developer's Manual, Vol. 3A, "Locked Atomic Operations" (the
+<code>LOCK</code> prefix and <code>CMPXCHG</code>/<code>XADD</code>).</strong> Primary source for how x86 makes a
+read-modify-write atomic at the cache line. Free from Intel.</li>
+<li><strong>Drepper, "What Every Programmer Should Know About Memory" (Red Hat, 2007).</strong> Free
+(<code>akkadia.org/drepper/cpumemory.pdf</code>). Cache coherence and why a <code>lock</code>-prefixed operation costs what it
+does — background for the numbers in §22.4.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex22.1"><span class="ex-label">22.1</span> <span class="ex-tag warm">warm-up</span>
+Name the three machine steps that <code>count++</code> compiles to, and in one sentence say why that makes it non-atomic
+across threads.</div>
+
+<div class="exercise" id="ex22.2"><span class="ex-label">22.2</span> <span class="ex-tag warm">warm-up</span>
+What does the x86 <code>LOCK</code> prefix guarantee about the cache line during a read-modify-write, and how many
+instructions is <code>lock xadd</code>?</div>
+
+<div class="exercise" id="ex22.3"><span class="ex-label">22.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: what does <code>atomic_compare_exchange</code> return on success, and what does it write into its
+<code>expected</code> argument on failure?</div>
+
+<div class="exercise" id="ex22.4"><span class="ex-label">22.4</span> <span class="ex-tag core">core</span>
+Two threads run <code>count++</code> on a shared counter starting at 0, each once. (a) Enumerate an interleaving of the six
+machine steps (three per thread) that ends with <code>count == 1</code> instead of 2. (b) Explain why replacing the body with
+<code>atomic_fetch_add(&amp;count, 1)</code> makes that interleaving impossible. (c) Why can the same program appear correct
+at <code>-O2</code> yet be lost-update-prone at <code>-O0</code>?</div>
+
+<div class="exercise" id="ex22.5"><span class="ex-label">22.5</span> <span class="ex-tag core">core</span>
+Write the compare-and-swap retry loop for an atomic operation with no dedicated instruction — say, atomically setting a
+counter to the larger of its current value and <code>v</code> (an atomic max). Explain what the <code>expected</code>
+argument holds after a failed CAS and why the loop therefore needs no explicit reload, and state one reason to use
+<code>_weak</code> rather than <code>_strong</code> inside the loop.</div>
+
+<div class="exercise" id="ex22.6"><span class="ex-label">22.6</span> <span class="ex-tag core">core</span>
+A colleague implements "claim a resource" as <code>if (atomic_load(&amp;owner) == 0) atomic_store(&amp;owner, my_id);</code>.
+(a) Show the interleaving that lets two threads both believe they own the resource. (b) Rewrite it with a single
+compare-and-swap so exactly one thread succeeds. (c) Explain the general rule: which shape of update always requires CAS
+rather than a separate atomic load and store?</div>
+
+<div class="exercise" id="ex22.7"><span class="ex-label">22.7</span> <span class="ex-tag complexity">cost</span>
+Using the measured figures (plain <code>++</code> ~0.9 ns, atomic <code>fetch_add</code> ~15 ns, uncontended): (a) explain
+where the ~15&#215; comes from in terms of the cache line and instruction reordering. (b) Predict qualitatively what happens
+to the atomic's cost when eight cores hammer the <em>same</em> counter, and why (invoke Chapter 3's coherence traffic). (c)
+Given that, when is a per-thread counter summed at the end preferable to one shared atomic, and what does that cost
+instead?</div>
+
+<div class="exercise" id="ex22.8"><span class="ex-label">22.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> You must maintain a running maximum latency observed across many worker threads,
+lock-free.
+<br><strong>Step 1 (given):</strong> A plain <code>if (v &gt; hi) hi = v;</code> is a check-then-act race — two threads can
+both pass the test and the smaller write can land last.
+<br><strong>Step 2 (given):</strong> There is no <code>atomic_fetch_max</code> in C11, so you build it from
+<code>compare_exchange</code>.
+<br><strong>Step 3 (given):</strong> The loop reads <code>cur = atomic_load(&amp;hi)</code>, and while <code>v &gt; cur</code>
+tries <code>compare_exchange_weak(&amp;hi, &amp;cur, v)</code>; a failed CAS reloads <code>cur</code>.
+<br><strong>Step 4 (you):</strong> Write the complete function, explain why it terminates (each failed retry means someone
+else raised <code>hi</code>, so <code>cur</code> only grows), and state what invariant it guarantees about <code>hi</code>
+versus every <code>v</code> ever submitted.</div>
+
+<div class="exercise" id="ex22.9"><span class="ex-label">22.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, choose the cheapest correct tool — a plain access, an atomic <code>fetch_*</code>, a single CAS, or a CAS
+retry loop — and justify in a line: (a) increment a shared hit counter; (b) set a flag to 1 exactly once and detect who did
+it first; (c) push onto a shared linked-list stack; (d) read a value no other thread ever writes.</div>
+
+<div class="exercise" id="ex22.10"><span class="ex-label">22.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 20–22, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "A mutex is a
+fundamental hardware primitive, unlike an atomic add." (b) "<code>lock xadd</code> and a plain <code>add</code> to memory
+differ by a one-byte prefix." (c) "Because each is atomic, an <code>atomic_load</code> followed by an
+<code>atomic_store</code> forms an atomic compound operation." (d) "Compare-and-swap can solve consensus for any number of
+threads, but plain reads and writes cannot solve it for two." (e) "An uncontended atomic increment costs about the same as a
+plain increment."</div>
+
+<div class="exercise" id="ex22.11"><span class="ex-label">22.11</span> <span class="ex-tag stretch">stretch</span>
+Herlihy's consensus hierarchy ranks primitives by consensus number. (a) Explain what it means that atomic read/write has
+consensus number 1, and give the intuition for why two threads cannot reach consensus with reads and writes alone. (b)
+Explain what "CAS has consensus number infinity, and is universal" buys you — what class of objects can you build from CAS?
+(c) Connect this to the previous two chapters: in what sense is every lock and every lock-free structure "just" CAS (or an
+equivalent primitive), and why does the hardware bother to provide CAS specifically?</div>
+
+<div class="exercise" id="ex22.12"><span class="ex-label">22.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write four threads each doing one million <code>count++</code> on a shared <code>long</code>, compile
+at <code>-O0</code>, and confirm the total falls short of 4,000,000 and varies run to run; switch to
+<code>atomic_fetch_add</code> and confirm it is exactly 4,000,000 every run; then recompile the plain version at
+<code>-O2</code> and observe it may now "pass" (explain why). (b) Disassemble a plain memory increment and an
+<code>atomic_fetch_add</code> with <code>objdump -d</code> and find the <code>lock</code> prefix. (c) Build an atomic max
+from a <code>compare_exchange_weak</code> loop, run it under many threads, and confirm it agrees with the true maximum. Label
+your compiler and CPU; note the timing figures are illustrative.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch23">
+<h1>Chapter 23 — Lock-Free Data Structures</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch22">Chapter 22</a> (compare-and-swap and the retry loop
+— the one primitive this whole chapter is built from), <a href="#ch20">Chapter 20</a> (a lock serializes access; what if a
+delayed lock-holder must not stall everyone else?), <a href="#ch07">Chapter 7</a> (pointers and nodes — a stack and a queue
+are pointer surgery), <a href="#ch09">Chapter 9</a> (free and use-after-free — reclaiming a node another thread still holds
+is a disaster). &nbsp;·&nbsp; Chapter 22 gave you CAS; this chapter uses nothing but CAS in a loop to build shared stacks and
+queues that no thread ever locks.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch22">Chapter 22</a> — write the compare-and-swap retry-loop idiom in three
+steps (read, compute, commit-or-retry), and say what a failed CAS does to your local copy of the value. (2)
+<a href="#ch20">Chapter 20</a> — name one thing that goes wrong when the thread holding a lock is preempted, delayed, or
+crashes. (3) <em>Predict:</em> eight threads push and pop on a <em>shared</em> stack with no lock — just a CAS on the head
+pointer. Do you expect any pushed item to be lost or duplicated? And if a node can be freed and its address immediately
+reused, what could break? Write your guesses; §23.2 and §23.4 settle them.</p>
+</aside>
+
+<p>A lock makes concurrency correct by making it <em>sequential</em>: one thread at a time inside the critical section. That
+is simple and often right, but it has a structural weakness — the fate of every thread is tied to the one holding the lock.
+If that thread is preempted (Chapter 16), page-faults (Chapter 17), or is simply slow, everyone waiting is stuck, and if it
+dies holding the lock, they are stuck forever. <strong>Lock-free</strong> programming removes that coupling: many threads
+operate on the shared structure at once, each committing its change with a single compare-and-swap that succeeds only if
+nothing moved underneath it, and retrying if it did. No thread ever holds a lock, so no thread's delay can stall the others.
+This chapter builds the idea concretely. First, what "lock-free" actually guarantees — the ladder of progress conditions from
+blocking up to wait-free, and why "lock-free" is a promise about the <em>system</em>, not the absence of locks (§23.1). Then
+the two canonical structures, each a CAS loop over a pointer: the <strong>Treiber stack</strong> (§23.2) and the
+<strong>Michael–Scott queue</strong> (§23.3). Then the hazard that makes lock-free memory management genuinely hard — the
+<strong>ABA problem</strong> and safe reclamation (§23.4). We close by carrying the open question of <em>ordering</em> —
+which lock-free code depends on and which we have not yet justified — into the memory model (§23.5).</p>
+
+<h2>23.1 What "lock-free" means: the ladder of progress</h2>
+
+<p>"Lock-free" is a precise progress guarantee, not a synonym for "uses no mutex." The guarantees form a ladder. A
+<strong>blocking</strong> (lock-based) algorithm offers no non-blocking guarantee at all: a thread delayed inside the critical
+section blocks every other thread indefinitely. <strong>Obstruction-free</strong>, the weakest non-blocking level, promises
+that a thread will finish if it runs <em>in isolation</em> for long enough (no guarantee under contention).
+<strong>Lock-free</strong> promises that the <em>system as a whole</em> always makes progress: out of all contending threads,
+<em>some</em> thread completes its operation in a bounded number of steps, so the structure can never be globally stuck —
+though an unlucky individual thread might retry forever (starve) while others succeed. <strong>Wait-free</strong>, the
+strongest, promises that <em>every</em> thread completes in a bounded number of <em>its own</em> steps, with no starvation.
+These are Herlihy's conditions, and they trade strength for cost: wait-free is ideal but often intricate and slower, so most
+practical "lock-free" structures — including the two in this chapter — give the lock-free guarantee, which is enough to
+eliminate the lock-holder problem.</p>
+
+<p>Why does the guarantee matter in practice? Because a lock-free structure is immune to the pathologies that come from a
+thread being stopped at the wrong moment. There is no lock to hold, so there is no <strong>deadlock</strong> and no
+<strong>priority inversion</strong> (a low-priority thread cannot block a high-priority one by holding a lock, Chapter 16);
+a thread preempted mid-operation delays only itself, never the structure; and a thread that dies leaves the structure usable
+by everyone else. The price is subtlety: every operation must be designed so that its single committing CAS is a
+<strong>linearization point</strong> — the instant the operation appears to take effect atomically, in Herlihy and Wing's
+sense (1990), so that concurrent operations still look like <em>some</em> valid sequential order. Get the linearization point
+right and the structure is correct under any interleaving; get it wrong and you have a race that no test reliably catches.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Put the four progress conditions in order from weakest to strongest, and state the difference between the lock-free and
+wait-free guarantees (whose progress is promised?). Name one pathology that lock-free code cannot suffer, and why. (Answer
+after the next section.)</p>
+</aside>
+
+<h2>23.2 The Treiber stack: a CAS loop on the head pointer</h2>
+
+<p>The simplest lock-free structure is a stack, published by Treiber (IBM, 1986). It is a singly linked list with an atomic
+<code>top</code> pointer, and both operations are the CAS retry loop of Chapter 22 applied to that pointer. To
+<strong>push</strong>: set the new node's <code>next</code> to the current <code>top</code>, then CAS <code>top</code> from
+that old value to the new node; if the CAS fails (someone else pushed or popped first), the failure reloaded
+<code>top</code>, so re-point <code>next</code> and retry. To <strong>pop</strong>: read <code>top</code>, and CAS it to
+<code>top-&gt;next</code>; retry if it moved. That is the whole algorithm — no lock, no blocking. Eight threads pushing
+100,000 items each and then popping every node concurrently agree exactly (gcc 11.4.0, Linux 6.18, x86-64):</p>
+
+<pre><code>void push(long v) {
+    node *n = malloc(sizeof *n); n-&gt;val = v;
+    node *old = atomic_load(&amp;top);
+    do { n-&gt;next = old; }
+    while (!atomic_compare_exchange_weak(&amp;top, &amp;old, n));   /* old reloaded on failure */
+}
+node *pop(void) {
+    node *old = atomic_load(&amp;top);
+    while (old) { if (atomic_compare_exchange_weak(&amp;top, &amp;old, old-&gt;next)) return old; }
+    return NULL;
+}
+/* 8 threads push 100000 each, then 8 threads pop concurrently: */
+pushed total = 800000
+popped count = 800000, popped sum = 800000   (no node lost or duplicated)</code></pre>
+
+<p>Every one of the 800,000 nodes was popped exactly once — none lost, none returned twice — under eight-way contention with
+no lock. The linearization point is the successful CAS: a push "happens" the instant its CAS installs the new top, a pop the
+instant its CAS unlinks the old top, and any two concurrent operations therefore order by which CAS won. Under contention the
+losers simply retry, which is why the guarantee is lock-<em>free</em> (the system always advances — some CAS always wins) and
+not wait-free (a persistently unlucky thread could keep losing). One honest caveat, deferred to §23.4: this code
+<em>leaks</em> — it never frees popped nodes. Freeing them safely while other threads may still be reading them is the hard
+part of lock-free programming, and it is where the ABA problem lives.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: push is a CAS loop that installs a new head</span>
+<p><strong>1. In words.</strong> Point the new node at the current top, then compare-and-swap the top from that old value to
+the new node. If another thread changed the top first, the CAS fails and hands you the new top; re-point and try again.</p>
+<p><strong>2. As a picture.</strong> Figure 23.1: thread A reads <code>top = X</code>, sets <code>new-&gt;next = X</code>; thread
+B pushes first, so <code>top</code> is now Y; A's CAS(<code>top</code>, X, new) fails (top is Y, not X), reloads
+<code>old = Y</code>, re-points <code>new-&gt;next = Y</code>, and its second CAS succeeds.</p>
+<p><strong>3. As numbers.</strong> Eight threads &#215; 100,000 pushes then concurrent pops: 800,000 pushed, 800,000 popped,
+sum 800,000 — no node lost or duplicated. Under an 8-thread push/pop benchmark the lock-free stack ran at ~176 ns/op against
+a mutex-guarded stack's ~359 ns/op (illustrative, contention-dependent).</p>
+</aside>
+
+<p><em>(Answer to the §23.1 quick check: weakest to strongest — blocking, obstruction-free, lock-free, wait-free. Lock-free
+guarantees that the <strong>system</strong> makes progress (some thread always completes), allowing an individual thread to
+starve; wait-free guarantees that <strong>every</strong> thread completes in a bounded number of its own steps. Lock-free code
+cannot deadlock or suffer priority inversion, because there is no lock to hold — a delayed thread stalls only itself, never
+the structure.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Treiber push: CAS the head; retry if another thread moved it first.</text>
+<text x="24" y="42" font-size="9" fill="#14406b">A reads top = X, sets new-&gt;next = X</text>
+<rect x="120" y="30" width="34" height="20" fill="#f5f8fb" stroke="#14406b"/><text x="132" y="44">new</text>
+<rect x="220" y="30" width="26" height="20" fill="#eef" stroke="#14406b"/><text x="228" y="44">X</text>
+<rect x="300" y="30" width="26" height="20" fill="#eef" stroke="#14406b"/><text x="308" y="44">&#8230;</text>
+<line x1="154" y1="40" x2="220" y2="40" stroke="#14406b" marker-end="url(#a)"/>
+<text x="24" y="80" font-size="9" fill="#8c3a1d">Meanwhile B pushes Y: top is now Y, not X</text>
+<rect x="220" y="92" width="26" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="226" y="106">Y</text>
+<rect x="300" y="92" width="26" height="20" fill="#eef" stroke="#14406b"/><text x="308" y="106">X</text>
+<line x1="246" y1="102" x2="300" y2="102" stroke="#8c3a1d" marker-end="url(#a)"/>
+<text x="24" y="140" font-size="9" fill="#8c3a1d">A's CAS(top, X, new) FAILS &#8594; old reloaded to Y</text>
+<text x="24" y="165" font-size="9" fill="#2e6b34">A re-points new-&gt;next = Y, CAS(top, Y, new) SUCCEEDS</text>
+<rect x="300" y="152" width="34" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="312" y="166">new</text>
+<line x1="334" y1="162" x2="380" y2="162" stroke="#2e6b34" marker-end="url(#a)"/>
+<rect x="380" y="152" width="26" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="386" y="166">Y</text>
+<defs><marker id="a" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#555"/></marker></defs>
+</svg>
+<figcaption>Figure 23.1: The Treiber stack's push. Thread A prepares a node pointing at the top it read (X), but thread B
+pushes Y first, so A's compare-and-swap fails — and the failure reloads the current top (Y) into A's local variable. A
+re-points its node at Y and retries; the second CAS succeeds. The successful CAS is the push's linearization point.</figcaption>
+</figure>
+
+<h2>23.3 The Michael–Scott queue: two pointers, and helping</h2>
+
+<p>A FIFO queue is harder than a stack because two ends change independently: enqueue appends at the <code>Tail</code>, dequeue
+removes at the <code>Head</code>. The classic lock-free solution is the <strong>Michael–Scott queue</strong> (PODC 1996),
+the algorithm behind Java's <code>ConcurrentLinkedQueue</code> and countless runtimes. It keeps a permanent
+<strong>dummy node</strong> so the list is never empty (Head and Tail start pointing at it), which removes the awkward special
+cases at the boundaries. Enqueue is a two-step CAS: first CAS the current tail node's <code>next</code> from
+<code>NULL</code> to the new node (this is the linearization point — the item is now in the queue); then CAS <code>Tail</code>
+forward to the new node. Because those two CASes are not one atomic step, another thread can arrive between them and find
+<code>Tail</code> "lagging" — pointing at a node whose <code>next</code> is no longer <code>NULL</code>. The elegant fix is
+<strong>helping</strong>: any thread that observes a lagging tail advances it (CAS <code>Tail</code> to
+<code>tail-&gt;next</code>) before proceeding, so no operation ever waits for the thread that fell behind. Four producers and
+four consumers hammering the queue agree exactly (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>enqueue: link new node after tail (CAS tail-&gt;next: NULL -&gt; n)  // linearization point
+         then swing Tail forward   (CAS Tail: tail -&gt; n)       // may be done by a helper
+dequeue: read value from Head-&gt;next, then CAS Head forward to it
+
+4 producers x 200000, 4 consumers:
+expected  count=800000 sum=1279999600000
+dequeued  count=800000 sum=1279999600000   OK</code></pre>
+
+<p>All 800,000 items came out exactly once and the checksums matched, with no lock anywhere. The two lessons generalize
+beyond the queue. First, when a logical update spans more than one atomic step, you cannot hold a lock across them — so you
+design the structure to be <em>correct in every intermediate state</em> and let any thread <strong>help</strong> complete a
+half-finished operation it stumbles upon; this "help the laggard" pattern recurs throughout lock-free design. Second, the
+linearization point is a single, identifiable CAS (here, linking the new node), which is what lets you reason that the
+concurrent execution is equivalent to some sequential one. As with the stack, this code as written leaks nodes; making
+dequeue free the node it removed — safely, when no other thread is still looking at it — is the reclamation problem of the
+next section.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does the Michael–Scott queue keep a permanent dummy node? Enqueue takes two CAS steps — what can another thread observe
+between them, and what does "helping" do about it? Which single step is the enqueue's linearization point? (Answer below the
+communicate box.)</p>
+</aside>
+
+<h2>23.4 The ABA problem and safe memory reclamation</h2>
+
+<p>Everything so far leaked memory on purpose, because reclaiming it exposes the subtlest bug in lock-free programming. A CAS
+checks whether a pointer <em>still equals</em> the value you read — but "equal" means the same bits, not the same object. If
+between your read and your CAS a value changes from <strong>A</strong> to <strong>B</strong> and back to <strong>A</strong>,
+your CAS sees <code>A</code>, concludes "nothing changed," and succeeds — even though the world moved on underneath it. This
+is the <strong>ABA problem</strong>. It bites the Treiber stack precisely when nodes are freed and reused: a thread reads
+<code>top = A</code> and plans to CAS <code>top</code> to <code>A-&gt;next</code>; meanwhile other threads pop <code>A</code>
+and <code>B</code>, free <code>A</code>, and a fresh <code>malloc</code> hands back <code>A</code>'s address for a new node
+that is pushed, so <code>top</code> is <code>A</code> again — but <code>A-&gt;next</code> now points somewhere entirely
+different (or into freed memory). The stalled thread's CAS succeeds on the recycled address and installs a stale, dangling
+<code>next</code>, corrupting the stack. ABA is intermittent by nature — it needs a specific interleaving plus address reuse —
+which is exactly what makes it dangerous: it survives testing and strikes in production.</p>
+
+<p>There are three standard defenses, and every real lock-free system uses one. A <strong>tagged (versioned) pointer</strong>
+pairs the pointer with a counter that is incremented on every update, and CASes the pair; A-to-B-to-A now differs in the
+counter, so the CAS correctly fails. This needs a double-width CAS — on x86-64 the <code>lock cmpxchg16b</code> instruction
+(compile with <code>-mcx16</code>) — and the versioned Treiber stack passes the same 800,000-node test the plain one did.
+<strong>Hazard pointers</strong> (Michael, 2004) take a different tack: before dereferencing a node, a thread publishes it in
+a per-thread "hazard" slot; a thread that wants to free a node first checks that no hazard pointer references it, deferring
+reclamation until it is unreferenced — so a node in use is never freed, and ABA-via-reuse cannot happen. <strong>Epoch-based
+reclamation</strong> and <strong>RCU</strong> (read-copy-update) generalize this: readers announce they are active, and a
+retired node is freed only after every reader that could have seen it has departed. All three exist for one reason — a
+lock-free structure cannot <code>free</code> a node the moment it is unlinked, because another thread may still be about to
+read it, and freeing it is a use-after-free (Chapter 9) waiting to happen.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the ABA problem (a CAS sees the same value, not the same world)</span>
+<p>A compare-and-swap only checks that a location still holds the <em>bits</em> you read, so a value that goes A &#8594; B
+&#8594; A slips through: your CAS succeeds as if nothing happened, though the object those bits refer to may have been popped,
+freed, and replaced. In the Treiber stack this corrupts the list — the CAS installs a <code>next</code> pointer read from a
+node that has since been recycled, silently losing or duplicating items, or dangling into freed memory. It is intermittent
+(it needs a preemption at the wrong instant plus address reuse), so it passes tests and fails under production load. The tell
+is any lock-free code that frees nodes and reuses their memory while a CAS elsewhere depends on a pointer's identity. The
+fixes are the three of §23.4: a tagged pointer (version the value so A-to-A differs), hazard pointers, or epoch/RCU
+reclamation (never free a node another thread might still hold). If you are writing a lock-free structure that frees nodes and
+you have not chosen one of these, you have an ABA bug you simply have not hit yet.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "I wrote a lock-free stack — push and pop are just a CAS on the head, straight out
+of the textbook. In the unit test it's perfect. But under load it occasionally segfaults or loses an item, and I can't
+reproduce it in the debugger. The CAS is obviously correct — it only swaps the head if it hasn't changed. What's going on?"
+Cover the paragraph and respond in four or five sentences, drawing on §23.2 and §23.4.</p>
+<p><em>Model answer.</em> "The CAS logic is right; the bug is memory reclamation, and the symptom is the ABA problem. If pop
+frees the node it removed, that address can be handed back by <code>malloc</code> and pushed again while another thread is
+mid-pop holding the old head value — its CAS sees the same pointer bits, concludes nothing changed, and succeeds on a node
+whose <code>next</code> now points into recycled or freed memory, which is your segfault-or-lost-item. It's intermittent
+because it needs a preemption at exactly the wrong moment plus address reuse, so it never shows up in a single-stepping
+debugger. The fix isn't the CAS — it's safe reclamation: a tagged/versioned pointer with a double-width CAS so A-to-A differs
+by version, or hazard pointers, or epoch-based reclamation so you never free a node another thread might still be reading.
+Honestly, unless we need this specific structure, I'd use a vetted concurrent queue from the standard library — lock-free
+reclamation is exactly where hand-rolled code goes wrong." Naming ABA, tying it to reclamation rather than the CAS, and
+reaching for a vetted implementation is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §23.3 quick check: the dummy node keeps the list non-empty so Head and Tail always point at a real
+node, eliminating null-boundary special cases. Between enqueue's two CASes another thread can see <code>Tail</code> lagging —
+pointing at a node whose <code>next</code> is no longer <code>NULL</code>; "helping" means that thread advances <code>Tail</code>
+itself (CAS it to <code>tail-&gt;next</code>) rather than waiting. The linearization point is the first CAS, linking the new
+node after the tail — that is the instant the item is in the queue.)</em></p>
+
+<h2>23.5 What to carry forward</h2>
+
+<p>Lock-free programming trades the simplicity of a lock for immunity to the lock-holder's fate: many threads operate at once,
+each committing with a single compare-and-swap that wins only if nothing moved underneath, retrying if it lost, so no thread
+ever blocks another. "Lock-free" is a precise guarantee — the <em>system</em> always makes progress (some thread completes),
+which is weaker than <strong>wait-free</strong> (every thread completes) but strong enough to rule out deadlock and priority
+inversion. The two canonical structures are each a CAS loop over a pointer: the <strong>Treiber stack</strong> (CAS the head;
+our eight-threaded run pushed and popped 800,000 nodes with none lost) and the <strong>Michael–Scott queue</strong> (a dummy
+node, a two-step enqueue, and <em>helping</em> to advance a lagging tail; four producers and four consumers moved 800,000
+items exactly). Each operation has a single CAS as its <strong>linearization point</strong>, which is what makes the
+concurrent execution equivalent to a sequential one. The genuinely hard part is memory: a CAS checks bits, not identity, so a
+value that cycles A&ndash;B&ndash;A defeats it — the <strong>ABA problem</strong> — and you cannot free an unlinked node while
+another thread may still read it. The three defenses are tagged pointers (double-width CAS), hazard pointers, and epoch/RCU
+reclamation.</p>
+
+<p>Every algorithm in this chapter quietly assumed something we have not earned: that when one thread's CAS publishes a node,
+another thread that reads the updated pointer also sees the node's <em>contents</em> — its <code>val</code> and
+<code>next</code> — fully written. On the abstract machine that is obvious; on real multicore hardware it is not. Cores have
+store buffers and caches, and both the compiler and the processor reorder memory operations, so a thread can observe a new
+pointer while the writes that initialized what it points to are still in flight — a reader following a freshly published
+pointer into <em>garbage</em>. What saves the code is that the atomic operations carry <strong>ordering</strong> guarantees,
+and those guarantees are not automatic: they must be requested, by name, through the atomic's memory-ordering argument. The
+final chapter of this part makes that machinery explicit — the <strong>memory model</strong>: why a data race is undefined
+behavior, why plain loads and stores may be reordered across cores, and what <code>memory_order_relaxed</code>,
+<code>acquire</code>/<code>release</code>, and <code>seq_cst</code> actually promise. It is the specification that says
+precisely when the node you just published is safe for another thread to read.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Order the four progress conditions and state what lock-free versus wait-free each guarantee.</li>
+<li>Write the Treiber stack's push and pop as CAS loops, and name each operation's linearization point.</li>
+<li>Explain the Michael–Scott queue's dummy node, two-step enqueue, and the "helping" that advances a lagging tail.</li>
+<li>Explain the ABA problem: why a CAS on the same bits can be wrong, and where it bites the Treiber stack.</li>
+<li>Name the three safe-reclamation techniques (tagged pointers, hazard pointers, epoch/RCU) and what each prevents.</li>
+<li>Say why lock-free code cannot deadlock or suffer priority inversion.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does the lock-free guarantee promise, and how does it differ from wait-free? (§23.1)</li>
+<li><strong>R2.</strong> Write the Treiber stack's push and pop, and name the linearization point of each. (§23.2)</li>
+<li><strong>R3.</strong> Why does the Michael–Scott queue use a dummy node and "helping"? (§23.3)</li>
+<li><strong>R4.</strong> What is the ABA problem, and how does it corrupt the Treiber stack when nodes are freed? (§23.4)</li>
+<li><strong>R5.</strong> Name the three safe-reclamation techniques and what each does. (§23.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Michael &amp; Scott, "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms,"
+<em>Proc. 15th ACM PODC</em> (1996), pp. 267&ndash;275, DOI 10.1145/248052.248106.</strong> The lock-free queue of §23.3,
+with the dummy node and the tail-helping mechanism. Author, venue, and year verified via dblp and the ACM Digital
+Library.</li>
+<li><strong>Treiber, "Systems Programming: Coping with Parallelism," IBM Almaden Research Report RJ 5118 (April 1986).</strong>
+The compare-and-swap stack of §23.2 (the "Treiber stack"). Report number and date verified via the IBM Research report
+archive.</li>
+<li><strong>Herlihy &amp; Wing, "Linearizability: A Correctness Condition for Concurrent Objects," <em>ACM TOPLAS</em>
+12(3):463&ndash;492 (1990), DOI 10.1145/78969.78972.</strong> The definition of the linearization point used throughout this
+chapter. Verified via dblp and the ACM Digital Library.</li>
+<li><strong>Michael, "Hazard Pointers: Safe Memory Reclamation for Lock-Free Objects," <em>IEEE Transactions on Parallel and
+Distributed Systems</em> 15(6):491&ndash;504 (2004), DOI 10.1109/TPDS.2004.8.</strong> The hazard-pointer technique of §23.4
+and its explicit treatment of the ABA problem. Verified via the IEEE/ACM Digital Library.</li>
+<li><strong>Herlihy &amp; Shavit, <em>The Art of Multiprocessor Programming</em> (Morgan Kaufmann; 2nd ed. 2020), chapters on
+concurrent stacks, queues, and memory reclamation.</strong> The textbook development of everything here, with proofs of
+linearizability. <code>[⚠ reference — not free]</code>.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex23.1"><span class="ex-label">23.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does the <em>lock-free</em> progress guarantee promise about the system as a whole?</div>
+
+<div class="exercise" id="ex23.2"><span class="ex-label">23.2</span> <span class="ex-tag warm">warm-up</span>
+In the Treiber stack, what single machine operation is the linearization point of a push? Of a pop?</div>
+
+<div class="exercise" id="ex23.3"><span class="ex-label">23.3</span> <span class="ex-tag warm">warm-up</span>
+State the ABA problem in one sentence: what does a CAS check, and why can "the same value" be misleading?</div>
+
+<div class="exercise" id="ex23.4"><span class="ex-label">23.4</span> <span class="ex-tag core">core</span>
+Implement the Treiber stack's <code>push</code> and <code>pop</code> as CAS loops (pseudocode is fine). For each, explain (a)
+what a failed CAS tells you and how the loop recovers, (b) why the successful CAS is the linearization point, and (c) why the
+structure gives the lock-free guarantee but not the wait-free one.</div>
+
+<div class="exercise" id="ex23.5"><span class="ex-label">23.5</span> <span class="ex-tag core">core</span>
+The Michael–Scott queue enqueues in two CAS steps. (a) Why can it not be done in one? (b) Describe what a second thread can
+observe about <code>Tail</code> after the first CAS but before the second, and how "helping" keeps that from stalling anyone.
+(c) Explain why the dummy node removes the empty-queue special cases at both ends.</div>
+
+<div class="exercise" id="ex23.6"><span class="ex-label">23.6</span> <span class="ex-tag core">core</span>
+Walk through a concrete ABA interleaving on the Treiber stack with nodes freed and reused: thread A reads <code>top = A</code>
+and is about to CAS to <code>A-&gt;next</code>; describe the sequence of pops, frees, and a push that returns address
+<code>A</code>, and show exactly how A's CAS then corrupts the stack. Then say which of the three defenses would prevent it and
+how.</div>
+
+<div class="exercise" id="ex23.7"><span class="ex-label">23.7</span> <span class="ex-tag complexity">cost</span>
+(a) Under low contention, why can a lock-free stack beat a mutex-guarded one (recall the ~176 ns vs ~359 ns/op figure), and
+what is the lock-free structure spending its time on instead of blocking? (b) Under <em>very high</em> contention on a single
+hot pointer, why might the lock-free version's throughput <em>collapse</em> — what does a storm of failing CASes cost
+(Chapter 3's coherence traffic)? (c) Name one structural change (e.g. elimination, or per-thread sub-stacks) that reduces
+contention, and what it trades away.</div>
+
+<div class="exercise" id="ex23.8"><span class="ex-label">23.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> You must make the leaking Treiber stack free popped nodes safely.
+<br><strong>Step 1 (given):</strong> Freeing a node the instant <code>pop</code> unlinks it is unsafe: another thread mid-pop
+may still hold that node as its <code>old</code> and be about to read <code>old-&gt;next</code>.
+<br><strong>Step 2 (given):</strong> Immediate free also enables ABA: the freed address can be reused and pushed, so a stale
+CAS succeeds on recycled memory.
+<br><strong>Step 3 (given):</strong> Hazard pointers have each thread publish the node it is about to dereference; a would-be
+reclaimer frees a retired node only if no hazard pointer references it.
+<br><strong>Step 4 (you):</strong> Describe how a hazard-pointer-protected <code>pop</code> works step by step (publish
+<code>top</code> as hazardous, re-verify it is still <code>top</code>, then read <code>next</code> and CAS), and explain why
+this makes both the use-after-free and the ABA impossible.</div>
+
+<div class="exercise" id="ex23.9"><span class="ex-label">23.9</span> <span class="ex-tag mixed">mixed</span>
+For each requirement, choose between a mutex-guarded structure and a lock-free one, and justify in a line: (a) a shared work
+queue in a soft-real-time audio callback that must never block; (b) a rarely-contended configuration map read at startup; (c)
+a structure accessed from a signal handler (Chapter 18); (d) a structure whose operations are large and complex, with modest
+contention.</div>
+
+<div class="exercise" id="ex23.10"><span class="ex-label">23.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 20–23, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "Lock-free means the
+code uses no atomic instructions." (b) "A lock-free structure can deadlock if two threads retry forever." (c) "The
+Michael–Scott queue's dummy node is a performance optimization that can be omitted." (d) "A CAS that finds the pointer equal
+to what you read proves nothing was popped and freed in between." (e) "Wait-free is a strictly stronger guarantee than
+lock-free."</div>
+
+<div class="exercise" id="ex23.11"><span class="ex-label">23.11</span> <span class="ex-tag stretch">stretch</span>
+"Helping" is a recurring lock-free pattern. (a) Explain what problem helping solves in the Michael–Scott queue and why a
+thread advances <em>another</em> thread's half-finished operation rather than waiting. (b) Argue how helping relates to the
+lock-free guarantee: why does a design where every thread can complete any pending operation avoid a stall when one thread is
+preempted mid-update? (c) Contrast this with a lock, where a preempted holder stalls everyone — and explain the cost helping
+pays for that immunity (extra CASes, more complex invariants).</div>
+
+<div class="exercise" id="ex23.12"><span class="ex-label">23.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) implement the Treiber stack with CAS, run eight threads pushing a known number of items and then
+popping concurrently, and confirm no item is lost or duplicated (leak the nodes for now). (b) Benchmark it against a
+mutex-guarded stack under contention and report ns/op for both (note the result is workload-dependent). (c) Implement the
+tagged-pointer version using a double-width CAS (<code>-mcx16</code> on x86-64, linking <code>-latomic</code>), confirm it
+passes the same correctness test, and find the <code>lock cmpxchg16b</code> in the disassembly. Label your compiler and CPU;
+note the throughput figures are illustrative.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch24">
+<h1>Chapter 24 — The Memory Model: memory_order and Happens-Before</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch22">Chapter 22</a> (atomics — every one takes a
+memory-ordering argument we have so far ignored), <a href="#ch23">Chapter 23</a> (a lock-free structure publishes a pointer
+and trusts the reader to see what it points to — why is that safe?), <a href="#ch10">Chapter 10</a> (undefined behavior and
+the optimizing compiler — a data race is UB, and the compiler exploits it), <a href="#ch03">Chapter 3</a> (each core sees
+memory through its own cache and store buffer). &nbsp;·&nbsp; The last two chapters assumed memory operations become visible
+in a sensible order across cores; this chapter shows they do not, and specifies exactly what ordering you may demand and how
+to ask for it.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch10">Chapter 10</a> — what does it mean that something is <em>undefined
+behavior</em>, and what license does that give the optimizer? (2) <a href="#ch03">Chapter 3</a> — a store does not go
+straight to shared memory; where does it sit first, and why does that let one core lag another's view? (3)
+<em>Predict:</em> two threads run <code>x = 1; r0 = y;</code> and <code>y = 1; r1 = x;</code> from
+<code>x = y = 0</code>. On paper, can both <code>r0</code> and <code>r1</code> end up 0? On a real x86 machine, out of two
+million trials, how many times do you think both read 0? Write your guesses; §24.1 measures it.</p>
+</aside>
+
+<p>Every chapter of this part has leaned on an assumption so natural it was invisible: that there is <em>one</em> memory, and
+that all cores see writes to it in a single consistent order — the model Lamport named <strong>sequential consistency</strong>
+(1979). It is the mental picture behind "thread A sets the flag, thread B sees the flag, so thread B sees the data A wrote
+first." That picture is false. Real hardware has per-core store buffers and caches, and both the CPU and the optimizing
+compiler reorder memory operations for speed, so a program can observe outcomes no sequentially consistent execution allows.
+This chapter makes the true model precise. First, the demonstration that reordering is real, on x86 no less — a litmus test
+whose "impossible" outcome happens millions of times (§24.1). Then the framework the C11/C++11 standard built to tame it: a
+<strong>data race is undefined behavior</strong>, and correctness is defined through the <strong>happens-before</strong>
+relation (§24.2). Then the menu of orderings an atomic can request — <code>relaxed</code>, <code>acquire</code>/<code>release</code>,
+and <code>seq_cst</code> — and the <em>synchronizes-with</em> edge that makes one thread's writes visible to another (§24.3).
+Then the workhorse pattern, message passing with acquire/release, what it guarantees, and what it costs on real hardware
+(§24.4). We close the part by carrying this specification forward as the ground truth beneath every concurrent program
+(§24.5).</p>
+
+<h2>24.1 The single-memory illusion: reordering is real</h2>
+
+<p>Consider the <strong>store-buffering</strong> litmus test (it underlies Dekker's mutual-exclusion algorithm). Two threads,
+starting from <code>x = y = 0</code>: thread 0 does <code>x = 1</code> then reads <code>r0 = y</code>; thread 1 does
+<code>y = 1</code> then reads <code>r1 = x</code>. Reason it through under a single shared memory: whichever store happens
+first, the later thread's load must see a 1, so <code>r0 == 0 &amp;&amp; r1 == 0</code> is <em>impossible</em>. Yet it happens
+— because each core's store sits in a private <strong>store buffer</strong> (Chapter 3) before reaching cache, so each thread
+reads the other's not-yet-published value as 0. Here it is with relaxed atomics (to avoid the undefined behavior of a plain
+data race), two million trials on x86-64 (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>relaxed store-buffering, 2000000 trials:
+r0==0 &amp;&amp; r1==0 observed 349165 times   (about 1 in 5; sequential consistency forbids it)</code></pre>
+
+<p>The "impossible" outcome occurred in roughly one trial in five. This is not a bug in the program or the hardware: x86's
+memory model (formalized as <strong>x86-TSO</strong>, total store order, by Sewell et al., 2010) explicitly allows a store to
+be reordered after a later load to a <em>different</em> address, precisely because of the store buffer. And x86 is one of the
+<em>stronger</em> models — ARM and POWER reorder far more aggressively. Two forces reorder your memory operations: the
+<strong>hardware</strong>, as here, and the <strong>compiler</strong>, which freely reorders and elides plain loads and stores
+it cannot prove another thread observes. The consequence is stark: the intuitive single-memory, everyone-agrees-on-one-order
+model you have been using is not what the machine provides. To write correct concurrent code you need a precise model of what
+<em>is</em> guaranteed — and a way to buy back the ordering you need where you need it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In the store-buffering test, explain why <code>r0 == 0 &amp;&amp; r1 == 0</code> is impossible under sequential consistency
+but common on real x86. Name the hardware structure responsible, and name the <em>other</em> agent (besides the CPU) that
+reorders memory operations. (Answer after the next section.)</p>
+</aside>
+
+<h2>24.2 Data races are undefined behavior; happens-before</h2>
+
+<p>Faced with hardware and compilers that reorder, the C11/C++11 standard did not promise sequential consistency for ordinary
+code — that would forbid the optimizations that make programs fast. Instead it drew a bright line. A <strong>data race</strong>
+— two accesses to the same location from different threads, at least one a write, not ordered by synchronization, with at
+least one non-atomic — is <strong>undefined behavior</strong> (Chapter 10). Not "unspecified value," not "torn read":
+undefined, the compiler may assume it never happens and optimize accordingly, so a racy program has no meaning at all. The
+flip side is the contract: if your program is <strong>data-race-free</strong> — every conflicting pair of accesses ordered by
+synchronization through atomics — the standard guarantees it behaves as some sequentially consistent execution. This is the
+DRF-SC guarantee that Boehm and Adve's "Foundations of the C++ Concurrency Memory Model" (2008) established for C and C++:
+race-free code gets the simple model; racy code gets nothing.</p>
+
+<p>"Ordered by synchronization" is made precise by <strong>happens-before</strong>. Within a single thread, operations are
+<strong>sequenced-before</strong> one another in program order. Across threads, an atomic store and the atomic load that reads
+its value can form a <strong>synchronizes-with</strong> edge (the details in §24.3). Happens-before is, roughly, the
+transitive closure of sequenced-before and synchronizes-with: if A happens-before B, then A's effects are guaranteed visible
+to B. Two conflicting accesses <em>not</em> ordered by happens-before are a data race. And the default atomic ordering,
+<code>memory_order_seq_cst</code>, additionally forces all such atomic operations into a single global total order — restoring
+the sequentially consistent illusion for code that uses it. Rerun the store-buffering test with seq_cst instead of relaxed
+(gcc 11.4.0):</p>
+
+<pre><code>seq_cst store-buffering, 2000000 trials:
+r0==0 &amp;&amp; r1==0 observed 0 times   (sequential consistency restored)</code></pre>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: memory operations reorder unless an ordering forbids it</span>
+<p><strong>1. In words.</strong> Plain and relaxed memory operations may be reordered by the CPU and compiler, so one thread
+can see another's operations out of program order. Sequential consistency (the default <code>seq_cst</code> atomics) forces a
+single global order that forbids such reorderings; a data race — conflicting accesses not ordered by happens-before — is
+undefined behavior.</p>
+<p><strong>2. As a picture.</strong> Figure 24.1: each thread's store sits in a private store buffer before reaching shared
+memory, so thread 0 reads <code>y</code> (still 0) before thread 1's <code>y = 1</code> drains — and symmetrically — yielding
+<code>r0 == r1 == 0</code>.</p>
+<p><strong>3. As numbers.</strong> Store-buffering, two million trials: with relaxed atomics the SC-forbidden outcome happened
+349,165 times (~1 in 5); with seq_cst it happened 0 times.</p>
+</aside>
+
+<p><em>(Answer to the §24.1 quick check: under sequential consistency the two stores occur in some global order, and the
+thread that stores second must, when it later loads, see the first thread's already-committed store — so both loads reading 0
+cannot happen. On x86 each store first enters a private <strong>store buffer</strong> and is not yet visible to the other
+core, so each thread's load reads the other's stale 0. Besides the CPU, the <strong>compiler</strong> also reorders memory
+operations.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Store buffering: each store waits in a private buffer, so each load reads a stale 0.</text>
+<rect x="40" y="40" width="150" height="120" fill="#f5f8fb" stroke="#14406b"/><text x="70" y="56" font-size="9" fill="#14406b">Core 0</text>
+<rect x="55" y="66" width="120" height="22" fill="#fdeee6" stroke="#8c3a1d"/><text x="62" y="81" font-size="9">x = 1 &#8594; store buffer</text>
+<rect x="55" y="96" width="120" height="22" fill="#eef" stroke="#14406b"/><text x="62" y="111" font-size="9">r0 = y &#8594; reads 0</text>
+<rect x="450" y="40" width="150" height="120" fill="#f5f8fb" stroke="#14406b"/><text x="480" y="56" font-size="9" fill="#14406b">Core 1</text>
+<rect x="465" y="66" width="120" height="22" fill="#fdeee6" stroke="#8c3a1d"/><text x="472" y="81" font-size="9">y = 1 &#8594; store buffer</text>
+<rect x="465" y="96" width="120" height="22" fill="#eef" stroke="#14406b"/><text x="472" y="111" font-size="9">r1 = x &#8594; reads 0</text>
+<rect x="250" y="80" width="140" height="40" fill="#fff" stroke="#14406b"/><text x="270" y="104" font-size="9">shared memory: x=0, y=0</text>
+<line x1="175" y1="77" x2="250" y2="95" stroke="#8c3a1d" stroke-dasharray="3,2" marker-end="url(#b)"/><text x="182" y="72" font-size="8" fill="#8c3a1d">drains later</text>
+<line x1="450" y1="77" x2="390" y2="95" stroke="#8c3a1d" stroke-dasharray="3,2" marker-end="url(#b)"/>
+<text x="16" y="185" font-size="9" fill="#8c3a1d">Both loads see the pre-store value: r0 == r1 == 0, which sequential consistency forbids.</text>
+<defs><marker id="b" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#8c3a1d"/></marker></defs>
+</svg>
+<figcaption>Figure 24.1: Store buffering. Each core's store to <code>x</code> (resp. <code>y</code>) sits in a private store
+buffer before it reaches shared memory, so each core's subsequent load of the other variable reads the old value 0. The
+outcome <code>r0 == r1 == 0</code> is impossible under sequential consistency yet common on real x86 — measured here about
+one trial in five.</figcaption>
+</figure>
+
+<h2>24.3 The ordering menu: relaxed, acquire/release, seq_cst</h2>
+
+<p>Every atomic operation takes a <code>memory_order</code> argument choosing how much ordering it enforces — a dial from
+"atomic but unordered" to "globally ordered," trading cost for guarantees. There are three levels worth knowing.
+<strong><code>memory_order_relaxed</code></strong> guarantees only atomicity (no torn or lost updates) and coherence on the
+<em>same</em> object; it imposes <em>no</em> ordering on other memory operations and creates no synchronizes-with edge. It is
+right for a statistics counter whose exact interleaving with other data does not matter — the store-buffering test used it,
+and indeed it let the reordering show. <strong><code>memory_order_release</code></strong> (on a store) paired with
+<strong><code>memory_order_acquire</code></strong> (on a load) is the key construct: if an acquire-load reads the value
+written by a release-store to the same atomic, the store <strong>synchronizes-with</strong> the load, and everything
+sequenced-before the release in the storing thread happens-before everything sequenced-after the acquire in the loading
+thread. That is the machinery that makes a published pointer safe: all the writes that set up the object are visible to any
+thread that acquires the pointer. <strong><code>memory_order_seq_cst</code></strong>, the default, adds to acquire/release a
+single global total order over all seq_cst operations — the strongest and most expensive, and the only one that forbids the
+store-buffering reordering of §24.1.</p>
+
+<p>The relationships to keep straight: <em>sequenced-before</em> is ordering within one thread (program order);
+<em>synchronizes-with</em> is the cross-thread edge a release/acquire pair (or a lock release/acquire, or a thread create/join)
+creates; and <em>happens-before</em> is their transitive closure, the relation that actually determines visibility and defines
+a data race. Relaxed atomics participate in none of the cross-thread ordering — they are atomic dots with no edges — which is
+exactly why relaxed is cheap and why it cannot, by itself, publish anything but the atomic's own value. When you need one
+thread's ordinary writes to become visible to another, you need a release/acquire (or stronger) pair, not relaxed.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>memory_order_relaxed</code> guarantee, and what does it <em>not</em>? State precisely what a
+release-store/acquire-load pair establishes when the acquire reads the release's value. What does <code>seq_cst</code> add on
+top of acquire/release? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>24.4 Acquire/release in practice: message passing, and what it costs</h2>
+
+<p>The canonical use of acquire/release is <strong>message passing</strong>: one thread fills a payload with ordinary writes,
+then publishes a flag with a release-store; another thread waits on the flag with an acquire-load and, once it sees the flag,
+reads the payload. The release/acquire pair guarantees the payload writes happen-before the reads — so the reader never sees a
+published flag but stale payload. This is precisely the guarantee the lock-free structures of Chapter 23 needed when they
+published a node pointer. A producer and consumer handing off a four-word payload a million times, verifying every one (gcc
+11.4.0, Linux 6.18):</p>
+
+<pre><code>/* producer */                          /* consumer */
+payload[0..3] = ...;      /* plain */   while (load_acquire(&amp;flag) != r) {}
+store_release(&amp;flag, r);  /* publish */  read payload[0..3];   /* guaranteed visible */
+
+message passing via release/acquire, 1000000 rounds: payload mismatches = 0</code></pre>
+
+<p>Not one of a million handoffs saw a stale payload: the acquire that observed the flag was guaranteed, by synchronizes-with,
+to see every write sequenced before the release. Now the cost, which is where the memory model gets concrete and surprising.
+On x86 the ordering you pay for depends entirely on which order you ask for. Compare the compiler's code for stores and loads
+at each level (gcc 11.4.0, <code>-O2</code>, <code>objdump</code>):</p>
+
+<pre><code>store_relaxed :  mov   %edi, f(%rip)     &#8592; plain store
+store_release :  mov   %edi, f(%rip)     &#8592; plain store (identical!)
+store_seqcst  :  xchg  %edi, f(%rip)     &#8592; locked exchange — drains the store buffer
+load_acquire  :  mov   f(%rip), %eax     &#8592; plain load</code></pre>
+
+<p>On x86-TSO, release-stores and acquire-loads compile to <em>plain</em> <code>mov</code> instructions — identical to
+relaxed — because the hardware already guarantees the ordering they need (it never reorders store-store or load-load, only
+store-load). The ordering is enforced only by forbidding the <em>compiler</em> from reordering across them, at no runtime
+cost. Only <code>seq_cst</code>'s store costs a real instruction — the <code>xchg</code> (a locked operation) that drains the
+store buffer and thereby forbids the store-load reordering that produced §24.1's result. This is the honest picture of the
+memory model: acquire/release is often free on strong hardware and lets the compiler still forbid its own reorderings, while
+seq_cst buys a global order at the price of a fence. On weaker architectures (ARM, POWER) acquire and release require real
+barrier instructions too — which is why using the weakest ordering that is correct matters for portable performance. But the
+danger runs the other way: using an ordering that is too <em>weak</em> is not slow, it is <em>wrong</em>.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: using <code>relaxed</code> where you need release/acquire (relaxed orders nothing but itself)</span>
+<p>Because <code>memory_order_relaxed</code> is the cheapest ordering and "the flag is atomic anyway," it is tempting to
+publish data with a relaxed store and read it with a relaxed load. But relaxed creates <em>no</em> synchronizes-with edge and
+therefore <em>no</em> happens-before: it guarantees the atomic's own value is not torn, and nothing whatsoever about the
+ordinary writes around it. So a consumer can see the relaxed flag set to "ready" while the payload writes that preceded it are
+still invisible — it reads the flag as published and the data as garbage. Worse, it may work on x86 (where the hardware
+happens to order store-store) and fail on ARM, so it passes your tests and corrupts on a phone. The rule: to publish data, the
+store that publishes must be <code>release</code> and the load that observes it must be <code>acquire</code> (or use seq_cst);
+relaxed is only for atomics whose <em>ordering relative to other memory does not matter</em>, such as a statistics counter or
+a stop flag whose late arrival is harmless. If you are using an atomic to make <em>other</em> writes visible, relaxed is a
+correctness bug, not an optimization.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "I made the handoff faster. The producer fills the buffer and sets
+<code>ready</code> with a <code>relaxed</code> atomic store; the consumer spins on a <code>relaxed</code> load of
+<code>ready</code> and then reads the buffer. It's all atomic and it passes every test on our CI machines — why do you keep
+saying it's broken?" Cover the paragraph and respond in four or five sentences, drawing on §24.3 and §24.4.</p>
+<p><em>Model answer.</em> "It passes because your CI machines are x86, whose hardware happens to keep stores in order, so the
+buffer writes reach memory before the flag — but the C memory model gives you no such guarantee, and the bug is real. A
+<code>relaxed</code> store creates no synchronizes-with edge and thus no happens-before, so nothing orders the buffer writes
+relative to the flag; the consumer is entitled to see <code>ready</code> set and the buffer still empty, which is exactly what
+will happen on ARM. The fix costs nothing on x86: make the publishing store <code>release</code> and the observing load
+<code>acquire</code>, and now every write before the release is guaranteed visible after the acquire — that pairing is the
+whole point of the ordering argument. Relaxed is correct only when the atomic's ordering relative to other data doesn't matter,
+like a counter; here you're using it to <em>publish</em> data, so it's a correctness bug, not a speedup." Explaining that x86
+hides the bug, naming synchronizes-with/happens-before, and prescribing release/acquire is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §24.3 quick check: <code>relaxed</code> guarantees atomicity and same-object coherence but imposes no
+ordering on other memory and creates no synchronizes-with edge. A release-store paired with an acquire-load that reads its
+value establishes that the store synchronizes-with the load, so everything sequenced-before the release happens-before
+everything sequenced-after the acquire — making the storing thread's prior writes visible to the loading thread.
+<code>seq_cst</code> adds a single global total order over all seq_cst operations, restoring sequential consistency and
+forbidding the store-buffering reordering.)</em></p>
+
+<h2>24.5 What to carry forward</h2>
+
+<p>The single-memory, everyone-agrees model — <strong>sequential consistency</strong> — is an illusion real hardware and
+compilers break for speed. Our store-buffering litmus test produced the SC-forbidden outcome <code>r0 == r1 == 0</code> about
+one time in five on x86 (349,165 of two million), because each core's store waits in a private buffer before it is visible;
+the CPU and the compiler both reorder plain memory operations. The C11/C++11 memory model tames this with a bright line: a
+<strong>data race is undefined behavior</strong>, but a <strong>data-race-free</strong> program behaves as some sequentially
+consistent execution (Boehm and Adve's DRF-SC guarantee). Correctness is defined through <strong>happens-before</strong> — the
+transitive closure of <em>sequenced-before</em> (program order in a thread) and <em>synchronizes-with</em> (the cross-thread
+edge from a release-store to the acquire-load that reads it). The <code>memory_order</code> menu picks how much ordering an
+atomic buys: <code>relaxed</code> (atomic but unordered — no synchronizes-with), <code>acquire</code>/<code>release</code>
+(the publish/observe pair that makes prior writes visible — our message-passing handoff verified a million payloads with zero
+stale reads), and <code>seq_cst</code> (a global total order, the only one that forbade the store-buffering reordering, and on
+x86 the only one that costs a real fence). The trap: relaxed publishes nothing but its own value, so using it to hand off data
+is a correctness bug that x86 hides and ARM exposes.</p>
+
+<p>This closes the concurrency part, and with it the last piece of shared-memory correctness. You now hold the full toolkit
+and, more importantly, the model beneath it: threads share memory and race (Chapter 15); locks and condition variables give
+blocking mutual exclusion and coordination (Chapters 20&ndash;21); atomics and compare-and-swap are the hardware primitives
+they rest on (Chapter 22); lock-free structures use those primitives to avoid blocking entirely (Chapter 23); and the memory
+model is the specification that says, precisely, when a write by one thread is guaranteed visible to another (this chapter).
+The recurring lesson has been the same at every level — the abstract machine's simple, sequential memory is not what runs, and
+the gap between the two is where concurrency bugs live. What comes next is a language built to close that gap by construction.
+Everything in this part you had to prove by hand and hold in your head — which data is shared, which access needs a lock,
+which ordering an atomic requires, whether a pointer outlives the thread reading it — a type system can instead enforce at
+compile time, turning "I reasoned about it carefully" into "it does not compile otherwise." The next part turns to Rust:
+ownership, borrowing, and lifetimes as the machinery that encodes these very invariants — data-race freedom not as a
+discipline you maintain, but as a property the compiler checks.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Describe the store-buffering test and why <code>r0 == r1 == 0</code> is SC-forbidden yet common on x86, and name the
+store buffer.</li>
+<li>State the DRF-SC contract: what a data race is (and that it is UB), and what a race-free program is guaranteed.</li>
+<li>Define sequenced-before, synchronizes-with, and happens-before, and how they relate.</li>
+<li>Say what <code>relaxed</code>, <code>acquire</code>/<code>release</code>, and <code>seq_cst</code> each guarantee.</li>
+<li>Explain the message-passing pattern and why a release/acquire pair makes the payload visible.</li>
+<li>Explain why publishing data with a relaxed store is a bug, and why it can pass on x86 and fail on ARM.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why does the store-buffering outcome <code>r0 == r1 == 0</code> occur on x86, and what forbids it?
+(§24.1)</li>
+<li><strong>R2.</strong> What is a data race, what does the standard say it is, and what does DRF-SC guarantee? (§24.2)</li>
+<li><strong>R3.</strong> Define sequenced-before, synchronizes-with, and happens-before. (§24.2&ndash;§24.3)</li>
+<li><strong>R4.</strong> What do <code>relaxed</code>, <code>acquire</code>/<code>release</code>, and <code>seq_cst</code>
+guarantee, and which is free on x86? (§24.3&ndash;§24.4)</li>
+<li><strong>R5.</strong> Why is publishing data with a relaxed store a correctness bug, and why might it pass on x86? (§24.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Boehm &amp; Adve, "Foundations of the C++ Concurrency Memory Model," <em>Proc. ACM PLDI</em> (2008), pp.
+68&ndash;78, DOI 10.1145/1375581.1375591.</strong> The DRF-SC design of §24.2: race-free programs get sequential consistency,
+races are undefined. Author, venue, and year verified via dblp and the ACM Digital Library.</li>
+<li><strong>Lamport, "How to Make a Multiprocessor Computer That Correctly Executes Multiprocess Programs," <em>IEEE
+Transactions on Computers</em> C-28(9):690&ndash;691 (1979), DOI 10.1109/TC.1979.1675439.</strong> The definition of
+sequential consistency — the model §24.1 shows hardware violating. Verified via IEEE Xplore and dblp.</li>
+<li><strong>Sewell, Sarkar, Owens, Zappa Nardelli &amp; Myreen, "x86-TSO: A Rigorous and Usable Programmer's Model for x86
+Multiprocessors," <em>Communications of the ACM</em> 53(7):89&ndash;97 (2010), DOI 10.1145/1785414.1785443.</strong> The
+precise model of x86 memory ordering behind the store-buffering result of §24.1. Verified via the ACM Digital Library.</li>
+<li><strong>cppreference, <code>std::memory_order</code> (<code>en.cppreference.com</code>).</strong> The exact semantics of
+<code>relaxed</code>, <code>acquire</code>/<code>release</code>, and <code>seq_cst</code>, and of synchronizes-with and
+happens-before. Primary reference for §24.3&ndash;§24.4; verify per standard version.</li>
+<li><strong>Preshing, "Memory Reordering Caught in the Act" (blog, <code>preshing.com</code>, 2012).</strong> A hands-on
+walkthrough of the store-buffering experiment reproduced in §24.1, with the reordering measured directly. Accessible
+background; a blog, not a peer-reviewed source.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex24.1"><span class="ex-label">24.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is sequential consistency, and name one hardware structure that causes real machines to violate it.</div>
+
+<div class="exercise" id="ex24.2"><span class="ex-label">24.2</span> <span class="ex-tag warm">warm-up</span>
+What is a data race, and what does the C11/C++11 standard say a program containing one means?</div>
+
+<div class="exercise" id="ex24.3"><span class="ex-label">24.3</span> <span class="ex-tag warm">warm-up</span>
+What does <code>memory_order_relaxed</code> guarantee, and what does it not guarantee about other memory operations?</div>
+
+<div class="exercise" id="ex24.4"><span class="ex-label">24.4</span> <span class="ex-tag core">core</span>
+For the store-buffering test (<code>x = 1; r0 = y;</code> and <code>y = 1; r1 = x;</code> from <code>x = y = 0</code>): (a)
+prove <code>r0 == r1 == 0</code> is impossible under sequential consistency. (b) Explain, using the store buffer, why it
+happens on x86 anyway. (c) Which single change — and to which operations — forbids the outcome, and what does it cost on x86
+(name the instruction)?</div>
+
+<div class="exercise" id="ex24.5"><span class="ex-label">24.5</span> <span class="ex-tag core">core</span>
+Define <em>sequenced-before</em>, <em>synchronizes-with</em>, and <em>happens-before</em>, and state how happens-before is
+built from the other two. Then explain, in those terms, why two conflicting accesses not ordered by happens-before are a data
+race.</div>
+
+<div class="exercise" id="ex24.6"><span class="ex-label">24.6</span> <span class="ex-tag core">core</span>
+Write the message-passing pattern with a payload and a flag. (a) Mark which store must be <code>release</code> and which load
+must be <code>acquire</code>. (b) Explain, via synchronizes-with and happens-before, why the consumer is guaranteed to see the
+payload once it sees the flag. (c) Show what breaks if both are <code>relaxed</code>, and why it may still pass on x86.</div>
+
+<div class="exercise" id="ex24.7"><span class="ex-label">24.7</span> <span class="ex-tag complexity">cost</span>
+Using the disassembly (relaxed store = <code>mov</code>, release store = <code>mov</code>, seq_cst store = <code>xchg</code>,
+acquire load = <code>mov</code>): (a) explain why acquire/release are free on x86 but seq_cst's store is not. (b) What does the
+<code>xchg</code> do that the plain <code>mov</code> does not, and how does that forbid store-buffering? (c) Why might the same
+acquire/release require real barrier instructions on ARM, and what does that imply for "use the weakest correct ordering"?</div>
+
+<div class="exercise" id="ex24.8"><span class="ex-label">24.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A lock-free structure publishes a freshly built node by CAS-ing a pointer, and
+readers follow the pointer and read the node's fields. Occasionally on an ARM device a reader sees the new pointer but garbage
+fields.
+<br><strong>Step 1 (given):</strong> The node's fields are written with plain stores, then the pointer is published.
+<br><strong>Step 2 (given):</strong> The publish and the read use <code>relaxed</code> atomics, which create no
+synchronizes-with edge.
+<br><strong>Step 3 (given):</strong> With no happens-before between the field writes and the reader's field reads, the reader
+may observe the pointer before the field writes are visible — undefined behavior in general, and visible reordering on ARM.
+<br><strong>Step 4 (you):</strong> State the fix precisely (which operation becomes <code>release</code>, which becomes
+<code>acquire</code>), explain why that pairing makes the field writes visible, and say why the bug hid on x86.</div>
+
+<div class="exercise" id="ex24.9"><span class="ex-label">24.9</span> <span class="ex-tag mixed">mixed</span>
+For each atomic use, choose the weakest correct ordering — <code>relaxed</code>, <code>acquire</code>/<code>release</code>, or
+<code>seq_cst</code> — and justify in a line: (a) a hit counter incremented by many threads, read only at shutdown; (b) a flag
+that publishes a fully initialized buffer to a consumer; (c) a "please stop" flag a worker polls, where a slightly late stop
+is harmless; (d) two flags in a Dekker-style algorithm needing store-load ordering.</div>
+
+<div class="exercise" id="ex24.10"><span class="ex-label">24.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 22–24, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "A data race produces
+an unspecified value but defined behavior." (b) "On x86, a release-store compiles to the same instruction as a relaxed store."
+(c) "<code>memory_order_relaxed</code> makes the writes around it visible to other threads in order." (d) "A race-free program
+using seq_cst atomics behaves as some sequentially consistent execution." (e) "seq_cst is free on x86, just like
+acquire/release."</div>
+
+<div class="exercise" id="ex24.11"><span class="ex-label">24.11</span> <span class="ex-tag stretch">stretch</span>
+The DRF-SC guarantee says race-free programs get sequential consistency and racy ones get undefined behavior. (a) Explain why
+this bargain lets the compiler and hardware keep their reordering optimizations while still giving well-behaved programs a
+simple model. (b) Argue why "undefined," not merely "unspecified," is the right (if harsh) definition for a data race — what
+would the compiler be forbidden from doing under a weaker definition? (c) Connect this to Chapter 10: how is a data race like
+other undefined behavior the optimizer is allowed to assume never happens, and what does that mean for "but it worked when I
+tested it"?</div>
+
+<div class="exercise" id="ex24.12"><span class="ex-label">24.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) implement the store-buffering test with two threads and relaxed atomics, run a couple million trials,
+and count how often <code>r0 == r1 == 0</code> — confirm it is nonzero on x86; switch the atomics to <code>seq_cst</code> and
+confirm the count drops to zero. (b) Disassemble a relaxed store, a release store, a seq_cst store, and an acquire load with
+<code>objdump</code>, and identify which one differs (the seq_cst store's locked instruction). (c) Build the message-passing
+handoff with release/acquire and verify a large number of payloads with zero stale reads. Label your compiler and CPU
+architecture; note that the reordering counts are hardware-dependent.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part V</div><h1>Rust for Systems</h1><p class='part-blurb'>Ownership, borrowing, and lifetimes — memory safety without a GC, and how the type system encodes the invariants the previous parts made you prove by hand.</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VI</div><h1>Performance Engineering</h1><p class='part-blurb'>Measure before you optimize: profiling, benchmarking, cache-aware and data-oriented design, SIMD, and reasoning about where time actually goes.</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VII</div><h1>I/O & Networking, Low-Level</h1><p class='part-blurb'>Files, sockets, blocking vs async, epoll/io_uring, zero-copy — the systems substrate under every data pipeline and service.</p></div>
@@ -11599,6 +12768,365 @@ With a semaphore initialized to three, at most three of the ten threads are ever
 Label compiler/kernel; the CPU figures are illustrative. <em>Tempting wrong answer:</em> "the spinner is fine, it got the
 same result" — it wasted a core to do so; correctness plus efficiency both matter. <strong>Feed-forward:</strong> §21.1,
 §21.2, §21.3.</div>
+
+</section>
+
+<section class="solutions" id="sol22">
+<h1>Chapter 22 — Solutions</h1>
+
+<div class="solution" id="sol22.1"><span class="sol-label">22.1</span>
+Load <code>count</code> from memory into a register, add one, store the register back to memory. It is non-atomic across
+threads because another thread can read the same old value (or run in parallel) between the load and the store, so two
+increments produce one net change. <em>Tempting wrong answer:</em> "it's one C statement, so it's one operation" — one line
+of C is three machine instructions, and atomicity is a property of the machine operation, not the source. <strong>Feed-forward:</strong>
+§22.1.</div>
+
+<div class="solution" id="sol22.2"><span class="sol-label">22.2</span>
+The <code>LOCK</code> prefix makes the CPU hold the affected cache line exclusively for the entire duration of the
+read-modify-write, so no other core can read or write that line in between — the whole load-add-store is indivisible.
+<code>lock xadd</code> is <strong>one</strong> instruction, where a plain memory increment is three (<code>mov</code>,
+<code>lea</code>/<code>add</code>, <code>mov</code>). <em>Tempting wrong answer:</em> "it locks the whole bus so nothing else
+runs" — modern CPUs lock at the cache line via the coherence protocol, not the whole bus, except in rare unaligned cases.
+<strong>Feed-forward:</strong> §22.2.</div>
+
+<div class="solution" id="sol22.3"><span class="sol-label">22.3</span>
+On success it returns <strong>true</strong> (having written <code>desired</code> because <code>*obj</code> equalled
+<code>expected</code>). On failure it returns false and writes the <em>current</em> value of <code>*obj</code> into
+<code>expected</code>, leaving <code>*obj</code> unchanged. <em>Tempting wrong answer:</em> "on failure it leaves
+<code>expected</code> alone" — it overwrites <code>expected</code> with what it found, which is exactly what makes the retry
+loop reload for free. <strong>Feed-forward:</strong> §22.3.</div>
+
+<div class="solution" id="sol22.4"><span class="sol-label">22.4</span>
+(a) T1 load (0) &#8594; T2 load (0) &#8594; T1 add (1) &#8594; T1 store (1) &#8594; T2 add (1) &#8594; T2 store (1): final
+<code>count == 1</code>, one increment lost. (b) <code>atomic_fetch_add</code> compiles to a single <code>lock xadd</code>
+that holds the cache line exclusively for the whole read-modify-write, so T2's increment cannot begin until T1's has
+completed — the interleaving in (a) cannot occur. (c) At <code>-O2</code> the optimizer can collapse the million-iteration
+loop into a single <code>count += N</code>, shrinking each thread's race window to one load-add-store that rarely collides; a
+data race is undefined behavior, so "passes at <code>-O2</code>" proves nothing. <em>Tempting wrong answer:</em> "the
+<code>-O2</code> version is correct because it gives the right answer" — it is still a data race; it merely hides.
+<strong>Feed-forward:</strong> §22.1, §22.2.</div>
+
+<div class="solution" id="sol22.5"><span class="sol-label">22.5</span>
+<pre><code>void atomic_max(atomic_long *p, long v) {
+    long cur = atomic_load(p);
+    while (v &gt; cur)
+        if (atomic_compare_exchange_weak(p, &amp;cur, v))
+            return;                 /* installed v */
+}</code></pre>
+After a failed CAS, <code>cur</code> holds the value the CAS actually found in <code>*p</code>, so the <code>while</code>
+re-tests against fresh state and no explicit reload is needed. Use <code>_weak</code> in the loop because it is allowed to
+fail spuriously in exchange for cheaper code on load-linked/store-conditional machines, and a spurious failure merely costs
+one extra iteration. <em>Method-selection cue:</em> "update only if the old value satisfies a condition" &#8594; single CAS in
+a retry loop. <strong>Feed-forward:</strong> §22.3.</div>
+
+<div class="solution" id="sol22.6"><span class="sol-label">22.6</span>
+(a) T1 <code>atomic_load(&amp;owner) == 0</code> (true) &#8594; T2 <code>atomic_load(&amp;owner) == 0</code> (true) &#8594; T1
+<code>atomic_store(&amp;owner, 1)</code> &#8594; T2 <code>atomic_store(&amp;owner, 2)</code>: both passed the test, both stored,
+and now T2 "owns" but T1 also believed it did. (b) <code>long expected = 0; if
+(atomic_compare_exchange_strong(&amp;owner, &amp;expected, my_id)) { /* I claimed it */ }</code> — exactly one thread finds
+<code>owner == 0</code> and swaps in its id; the other's CAS fails. (c) Any update that reads a value, decides based on it,
+and writes a value depending on that decision ("if it's still X, make it Y") must be a single CAS, because a separate atomic
+load and store leave a gap. <em>Tempting wrong answer:</em> "put the load and store close together so nothing runs between"
+— proximity in source is irrelevant; only a single indivisible operation closes the gap. <strong>Feed-forward:</strong>
+§22.3, §22.4.</div>
+
+<div class="solution" id="sol22.7"><span class="sol-label">22.7</span>
+(a) The atomic must own the cache line exclusively and acts as a reordering barrier, so it cannot overlap with surrounding
+work the way a plain store can; that serialization is the ~15&#215;. (b) Under eight-core contention the same line ping-pongs
+between cores' caches — each atomic must first pull the line to its own core in exclusive state (coherence traffic, Chapter
+3) — so per-op cost rises well beyond the uncontended 15 ns, sometimes by an order of magnitude. (c) When updates vastly
+outnumber reads, give each thread its own counter (no sharing, no coherence traffic) and sum them only when a total is
+needed; the cost moves to the occasional summation and to cache footprint, not to every increment. <em>Tempting wrong
+answer:</em> "atomics have a fixed cost, so contention doesn't matter" — contention can dominate, which is why sharding a
+counter helps. <strong>Feed-forward:</strong> §22.4, and Ch 3.</div>
+
+<div class="solution" id="sol22.8"><span class="sol-label">22.8</span>
+<strong>Step 4:</strong>
+<pre><code>void record_max(atomic_long *hi, long v) {
+    long cur = atomic_load(hi);
+    while (v &gt; cur)
+        if (atomic_compare_exchange_weak(hi, &amp;cur, v))
+            return;
+}</code></pre>
+It terminates because each failed CAS means another thread installed a value at least as large, which is written back into
+<code>cur</code>; so <code>cur</code> is non-decreasing, and once <code>cur &gt;= v</code> the loop exits without another
+attempt. The invariant it guarantees: at all times <code>hi</code> is greater than or equal to every <code>v</code> that has
+been submitted, and eventually equals the maximum submitted. <em>Tempting wrong answer:</em> "it could loop forever under
+contention" — every retry is caused by a real increase in <code>hi</code>, which is bounded by the largest submitted value,
+so retries are finite. <strong>Feed-forward:</strong> §22.3.</div>
+
+<div class="solution" id="sol22.9"><span class="sol-label">22.9</span>
+(a) <strong>Atomic <code>fetch_add</code></strong> — a fixed arithmetic RMW with a dedicated instruction. (b) <strong>Single
+CAS</strong> (<code>expected = 0</code>, swap in 1) — the success/failure result tells you who won. (c) <strong>CAS retry
+loop</strong> — set the new node's <code>next</code> to the current head, then CAS the head; retry if it moved (the Treiber
+stack of Chapter 23). (d) <strong>Plain access</strong> — a value no thread writes concurrently needs no atomicity.
+<em>Method-selection cue:</em> fixed arithmetic &#8594; <code>fetch_*</code>; one-shot "claim" &#8594; single CAS; update
+depending on current shared state &#8594; CAS loop; no concurrent writer &#8594; plain. <strong>Feed-forward:</strong> §22.2,
+§22.3.</div>
+
+<div class="solution" id="sol22.10"><span class="sol-label">22.10</span>
+(a) <strong>False</strong> — a mutex is a program built <em>from</em> atomics (plus a blocking slow path); the atomic is the
+hardware primitive. (b) <strong>True</strong> — on x86 the atomic and plain forms differ by the one-byte <code>LOCK</code>
+prefix. (c) <strong>False</strong> — the two atomics leave a gap another thread can slip through; only a single CAS composes
+compare-and-set. (d) <strong>True</strong> — that is exactly the consensus hierarchy: CAS has consensus number infinity, plain
+reads/writes number 1. (e) <strong>False</strong> — an uncontended atomic increment is roughly an order of magnitude dearer
+than a plain one (~15 ns vs ~0.9 ns here), and worse under contention. <em>Tempting wrong answer:</em> calling (c) true
+because "each part is atomic" — atomicity of the parts is not atomicity of the whole. <strong>Feed-forward:</strong> §22.2,
+§22.3, §22.4.</div>
+
+<div class="solution" id="sol22.11"><span class="sol-label">22.11</span>
+(a) Consensus number 1 means reads and writes can solve consensus only for a single thread (trivially) — for two, no protocol
+of plain reads and writes lets both irrevocably agree on one value regardless of timing; whichever writes "last" is
+timing-dependent and a reader cannot atomically observe-and-decide, so the two can diverge. (b) CAS at infinity means any
+number of threads can reach consensus, and from CAS you can build a wait-free implementation of <em>any</em> object with a
+sequential specification (a universal construction) — CAS is a universal primitive. (c) Every lock's fast path is a CAS (or
+test-and-set) claiming the lock word, and every lock-free structure is a CAS loop committing an update only if nothing
+changed; the hardware provides CAS specifically because, unlike plain accesses or fixed-arithmetic atomics, it is strong
+enough to build all of them. <em>Tempting wrong answer:</em> "<code>fetch_add</code> is just as universal as CAS" —
+fetch-and-add has a finite consensus number; it cannot express arbitrary conditional commits. <strong>Feed-forward:</strong>
+§22.4.</div>
+
+<div class="solution" id="sol22.12"><span class="sol-label">22.12</span>
+Machine-specific by design. A correct write-up reports: (a) the plain <code>-O0</code> counter falls short of 4,000,000 (on
+the book's machine ~1.36 million, losing ~2.6 million) and varies run to run, while <code>atomic_fetch_add</code> is exactly
+4,000,000 every run; the <code>-O2</code> plain version may "pass" because the optimizer collapses the loop to one add per
+thread, shrinking the race window (still undefined behavior). (b) The disassembly shows the atomic form carries a
+<code>lock</code> prefix (<code>lock xadd</code>) absent from the plain increment. (c) The CAS-loop atomic max agrees with the
+true maximum under many threads. Label compiler/CPU; timing figures are illustrative. <em>Tempting wrong answer:</em> "the
+<code>-O2</code> plain version works, so the bug was the optimizer's fault" — the program was always racy; <code>-O2</code>
+only hid it. <strong>Feed-forward:</strong> §22.1, §22.2, §22.3.</div>
+
+</section>
+
+<section class="solutions" id="sol23">
+<h1>Chapter 23 — Solutions</h1>
+
+<div class="solution" id="sol23.1"><span class="sol-label">23.1</span>
+That the system as a whole always makes progress: out of all contending threads, some thread completes its operation in a
+bounded number of steps, so the structure can never be globally stuck. <em>Tempting wrong answer:</em> "every thread is
+guaranteed to complete" — that is wait-free; lock-free permits an individual thread to starve while others succeed.
+<strong>Feed-forward:</strong> §23.1.</div>
+
+<div class="solution" id="sol23.2"><span class="sol-label">23.2</span>
+Push: the successful CAS that installs the new node as <code>top</code>. Pop: the successful CAS that swings <code>top</code>
+to <code>old-&gt;next</code>. <em>Tempting wrong answer:</em> "the <code>malloc</code> (for push) or the return (for pop)" —
+the item is neither published nor removed until the CAS commits; that is the instant the operation takes effect.
+<strong>Feed-forward:</strong> §23.2.</div>
+
+<div class="solution" id="sol23.3"><span class="sol-label">23.3</span>
+A CAS checks only that a location still holds the same <em>bits</em> you read; if the value went A &#8594; B &#8594; A, the
+bits match and the CAS succeeds, even though the object those bits denote may have been removed, freed, and replaced.
+<em>Tempting wrong answer:</em> "the same value means nothing changed" — it means the value is <em>equal now</em>, not that
+it never changed. <strong>Feed-forward:</strong> §23.4.</div>
+
+<div class="solution" id="sol23.4"><span class="sol-label">23.4</span>
+<pre><code>push(v): n = new node(v)
+         old = load(top)
+         do { n.next = old } while (!CAS(&amp;top, &amp;old, n))
+pop():   old = load(top)
+         while (old) { if (CAS(&amp;top, &amp;old, old.next)) return old }
+         return NULL</code></pre>
+(a) A failed CAS means another thread changed <code>top</code> first; the failure reloads <code>old</code> with the current
+top, so the loop re-points <code>n.next</code> (push) or re-reads <code>old.next</code> (pop) and retries against fresh
+state. (b) The successful CAS is the single instant the operation takes effect for all threads — the linearization point — so
+concurrent operations order by whose CAS won. (c) Lock-free, not wait-free: the system always advances because some CAS
+always succeeds, but a persistently unlucky thread can keep losing the race and never complete.
+<em>Method-selection cue:</em> "update a shared pointer only if it hasn't moved" &#8594; CAS retry loop.
+<strong>Feed-forward:</strong> §23.2.</div>
+
+<div class="solution" id="sol23.5"><span class="sol-label">23.5</span>
+(a) It cannot be one CAS because enqueue must both link the new node (<code>tail.next: NULL -&gt; n</code>) and move
+<code>Tail</code>, two separate locations; no single-word CAS updates both. (b) After the first CAS but before the second, a
+second thread can see <code>Tail</code> lagging — pointing at a node whose <code>next</code> is no longer <code>NULL</code>;
+"helping" means that thread advances <code>Tail</code> to <code>tail.next</code> itself (via CAS) rather than waiting for the
+enqueuer, so no one stalls on the laggard. (c) The dummy node guarantees the list is never empty, so <code>Head</code> and
+<code>Tail</code> always reference a real node and there are no null-pointer boundary cases at either end.
+<em>Tempting wrong answer:</em> "the second thread must wait for the enqueuer to finish" — helping is precisely what avoids
+that wait. <strong>Feed-forward:</strong> §23.3.</div>
+
+<div class="solution" id="sol23.6"><span class="sol-label">23.6</span>
+Thread A reads <code>top = A</code>, reads <code>A.next = B</code>, and is preempted before its CAS. Now: another thread pops
+<code>A</code> (<code>top = B</code>), pops <code>B</code> (<code>top = C</code>), and frees both; then it allocates a new node
+that <code>malloc</code> places at <code>A</code>'s old address, sets some <code>next</code>, and pushes it, so
+<code>top = A</code> again — but this <code>A</code> is a different logical node and <code>A.next</code> is now <code>C</code>
+or garbage. A resumes and does <code>CAS(&amp;top, A, B)</code>: it sees <code>top == A</code> (same bits), succeeds, and sets
+<code>top = B</code> — a node that was already popped and freed. The stack is now corrupt (dangling or lost nodes). A tagged
+pointer prevents it: the version counter incremented on each of those pops/pushes makes the pair <code>(A, version)</code>
+differ, so A's CAS fails. Hazard pointers prevent it too: <code>A</code> and <code>B</code> could not have been freed while A
+still referenced them. <em>Tempting wrong answer:</em> "the CAS is buggy" — the CAS is correct; the bug is freeing and reusing
+memory under it. <strong>Feed-forward:</strong> §23.4.</div>
+
+<div class="solution" id="sol23.7"><span class="sol-label">23.7</span>
+(a) Under low contention a CAS usually succeeds on the first try, so a push/pop is one atomic op with no blocking, no context
+switch, and no futex system call — cheaper than a mutex's lock/unlock (hence ~176 vs ~359 ns/op here); it spends its time on
+the single CAS rather than on scheduler round-trips. (b) Under very high contention on one hot pointer, most CASes fail and
+retry, and each attempt drags the cache line to the current core in exclusive state — a coherence storm — so throughput can
+fall below even the lock's, as work is wasted on failed attempts. (c) Elimination (pairing a push with a concurrent pop so
+both skip the stack) or per-thread sub-stacks cut contention; they trade strict LIFO/global ordering and simplicity for
+scalability. <em>Tempting wrong answer:</em> "lock-free is always faster" — under heavy contention a lock can win because it
+serializes instead of burning cycles on retries. <strong>Feed-forward:</strong> §23.2, and Ch 3.</div>
+
+<div class="solution" id="sol23.8"><span class="sol-label">23.8</span>
+<strong>Step 4:</strong> Hazard-pointer <code>pop</code>: (1) read <code>t = load(top)</code>; (2) publish <code>t</code> in
+this thread's hazard slot; (3) re-check <code>load(top) == t</code> — if it changed, restart, because a node could have been
+retired between (1) and (2); (4) now safe to read <code>next = t.next</code> and attempt <code>CAS(&amp;top, t, next)</code>;
+(5) on success, <code>t</code> is unlinked — retire it to a per-thread list and free it later, only once no thread's hazard
+slot references it. This makes use-after-free impossible because a node any thread is dereferencing is published as hazardous
+and therefore never freed; and it makes ABA impossible because a node cannot be freed and its address reused while it is
+still referenced, so <code>top</code> cannot cycle back to a recycled <code>t</code> under a stalled reader.
+<em>Tempting wrong answer:</em> "just free in <code>pop</code> after the CAS" — another thread may still hold that node as its
+own <code>old</code>; the re-check-after-publish is what closes the window. <strong>Feed-forward:</strong> §23.4.</div>
+
+<div class="solution" id="sol23.9"><span class="sol-label">23.9</span>
+(a) <strong>Lock-free</strong> — an audio callback with a hard deadline must never block on a lock a slower thread holds. (b)
+<strong>Mutex</strong> — rarely contended and read once at startup; a lock is simpler and correctness is easier to reason
+about. (c) <strong>Lock-free</strong> (of a signal-safe kind) or a lock-free single-slot handoff — a signal handler must not
+take a lock the interrupted thread may already hold (Chapter 18's async-signal-safety). (d) <strong>Mutex</strong> — large,
+complex operations with modest contention favor the simplicity of a lock; making them lock-free would be intricate for little
+gain. <em>Method-selection cue:</em> must-never-block or signal context &#8594; lock-free; simplicity with tolerable
+contention &#8594; mutex. <strong>Feed-forward:</strong> §23.1, and Ch 18.</div>
+
+<div class="solution" id="sol23.10"><span class="sol-label">23.10</span>
+(a) <strong>False</strong> — lock-free code is built <em>from</em> atomic instructions (CAS); it means no locks and a
+system-progress guarantee, not no atomics. (b) <strong>False</strong> — a lock-free structure cannot deadlock; retries mean
+some other thread is succeeding (making progress), which is the opposite of deadlock, though one thread may starve. (c)
+<strong>False</strong> — the dummy node is a correctness device that removes null-boundary cases, not an optional
+optimization. (d) <strong>True</strong> — that is exactly the ABA problem: equal bits do not prove the object was untouched.
+(e) <strong>True</strong> — wait-free (every thread completes) implies lock-free (some thread completes) but not conversely.
+<em>Tempting wrong answer:</em> calling (b) true because "infinite retries look like being stuck" — the system is still
+making progress; only the unlucky thread is not. <strong>Feed-forward:</strong> §23.1, §23.3, §23.4.</div>
+
+<div class="solution" id="sol23.11"><span class="sol-label">23.11</span>
+(a) Helping solves the two-step enqueue: because linking the node and swinging <code>Tail</code> are separate CASes, an
+enqueuer can be preempted between them, leaving <code>Tail</code> lagging; a later thread advances <code>Tail</code> itself
+so it need not wait for the preempted enqueuer. (b) If every thread can finish any pending operation it encounters, then a
+thread preempted mid-update never blocks progress — whoever runs next completes (or helps complete) the operation, so the
+system always advances, which is the lock-free guarantee. (c) A lock has no helping: a preempted holder stalls everyone until
+it is rescheduled. Helping buys immunity to that at the cost of extra CASes (advancing another's tail) and more intricate
+invariants (every intermediate state must be well-defined and completable by anyone). <em>Tempting wrong answer:</em>
+"helping is just a nicety" — it is what makes the structure non-blocking despite the multi-step update.
+<strong>Feed-forward:</strong> §23.3.</div>
+
+<div class="solution" id="sol23.12"><span class="sol-label">23.12</span>
+Machine-specific by design. A correct write-up reports: (a) the eight-thread Treiber stack pushes and pops the full item
+count with none lost or duplicated (on the book's machine 800,000 in and 800,000 out, matching checksums). (b) Against a
+mutex-guarded stack under contention, ns/op for both, with the note that which wins depends on contention (here lock-free
+~176 vs mutex ~359 ns/op). (c) The tagged-pointer version compiles with <code>-mcx16 -latomic</code>, passes the same
+correctness test, and the disassembly shows <code>lock cmpxchg16b</code>. Label compiler/CPU; throughput figures are
+illustrative. <em>Tempting wrong answer:</em> "the leaking version is fine since the test passes" — it passes only because it
+never frees; adding <code>free</code> without safe reclamation reintroduces ABA. <strong>Feed-forward:</strong> §23.2,
+§23.4.</div>
+
+</section>
+
+<section class="solutions" id="sol24">
+<h1>Chapter 24 — Solutions</h1>
+
+<div class="solution" id="sol24.1"><span class="sol-label">24.1</span>
+Sequential consistency: all cores observe memory operations as if interleaved into a single global order that respects each
+thread's program order. Real machines violate it because of the per-core <strong>store buffer</strong> (a store is buffered
+locally before becoming globally visible). <em>Tempting wrong answer:</em> "caches cause it, and cache coherence would fix
+it" — coherence keeps a single value per location consistent; the reordering here is the store buffer delaying visibility,
+which coherence does not prevent. <strong>Feed-forward:</strong> §24.1.</div>
+
+<div class="solution" id="sol24.2"><span class="sol-label">24.2</span>
+A data race is two accesses to the same location from different threads, at least one a write, not ordered by synchronization
+(happens-before), with at least one non-atomic. The standard says such a program has <strong>undefined behavior</strong> — no
+meaning at all, and the compiler may assume it cannot occur. <em>Tempting wrong answer:</em> "a data race just gives a torn or
+stale value" — it is undefined behavior, strictly worse than an unspecified value. <strong>Feed-forward:</strong> §24.2.</div>
+
+<div class="solution" id="sol24.3"><span class="sol-label">24.3</span>
+It guarantees atomicity (no torn or lost updates) and coherence on the same object; it does <em>not</em> impose any ordering
+on other memory operations and creates no synchronizes-with edge, so it cannot make surrounding writes visible to another
+thread. <em>Tempting wrong answer:</em> "relaxed still orders the writes right before it" — it orders nothing but the atomic's
+own value. <strong>Feed-forward:</strong> §24.3.</div>
+
+<div class="solution" id="sol24.4"><span class="sol-label">24.4</span>
+(a) Under SC the two stores take some global order; say <code>x = 1</code> is first. Then thread 1's later <code>r1 = x</code>
+must read 1 (the store is already globally visible), so <code>r1 == 0</code> is impossible — and symmetrically if
+<code>y = 1</code> is first, <code>r0 == 0</code> is impossible; hence both zero cannot happen. (b) On x86 each store enters a
+private store buffer and is not yet visible to the other core, so each thread's load reads the other variable's old value 0
+before the store drains. (c) Make both stores (and ideally the loads) <code>seq_cst</code>; on x86 the seq_cst store compiles
+to a locked <code>xchg</code> that drains the store buffer, forbidding the store-load reorder. <em>Tempting wrong answer:</em>
+"making the loads acquire fixes it" — acquire/release does not forbid store-load reordering; only seq_cst (or an explicit full
+fence) does. <strong>Feed-forward:</strong> §24.1, §24.2, §24.4.</div>
+
+<div class="solution" id="sol24.5"><span class="sol-label">24.5</span>
+<em>Sequenced-before</em> is program order within a single thread. <em>Synchronizes-with</em> is a cross-thread edge, e.g.
+from a release-store to the acquire-load that reads its value. <em>Happens-before</em> is (roughly) the transitive closure of
+sequenced-before and synchronizes-with. Two conflicting accesses not ordered by happens-before are a data race because nothing
+establishes which is visible to the other — their relative order is undefined, so the standard declares it undefined behavior.
+<em>Tempting wrong answer:</em> "happens-before is just program order" — program order (sequenced-before) is only the
+within-thread part; the cross-thread edges come from synchronizes-with. <strong>Feed-forward:</strong> §24.2, §24.3.</div>
+
+<div class="solution" id="sol24.6"><span class="sol-label">24.6</span>
+<pre><code>producer:  payload = ...;                consumer:  while (load_acquire(&amp;flag) != R) {}
+           store_release(&amp;flag, R);                 use payload;</code></pre>
+(a) The publishing store is <code>release</code>; the observing load is <code>acquire</code>. (b) When the acquire-load reads
+the value the release-store wrote, the store synchronizes-with the load, so everything sequenced-before the release (the
+payload writes) happens-before everything sequenced-after the acquire (the payload reads) — the payload is guaranteed visible.
+(c) With both <code>relaxed</code> there is no synchronizes-with and no happens-before, so the consumer may see the flag set
+but the payload stale (undefined in general); it may still pass on x86 because the hardware does not reorder store-store or
+load-load, so the writes happen to reach memory in order. <em>Method-selection cue:</em> "publish data behind a flag" &#8594;
+release on the publish, acquire on the observe. <strong>Feed-forward:</strong> §24.3, §24.4.</div>
+
+<div class="solution" id="sol24.7"><span class="sol-label">24.7</span>
+(a) x86-TSO never reorders store-store or load-load, so acquire (a load) and release (a store) need no barrier — they compile
+to plain <code>mov</code>, and only the compiler is restrained from reordering across them; seq_cst additionally needs
+store-load ordering, which the hardware <em>does</em> relax, so its store needs a real fence. (b) The <code>xchg</code> is a
+locked read-modify-write that drains the store buffer before proceeding, so the store is globally visible before the following
+load — forbidding the store-buffering outcome that a plain <code>mov</code> allows. (c) ARM/POWER reorder store-store and
+load-load, so acquire and release require explicit barrier instructions there; hence the weakest correct ordering matters for
+portable performance — an unnecessary seq_cst costs a fence on every architecture. <em>Tempting wrong answer:</em> "seq_cst is
+free like acquire/release because x86 is strong" — the seq_cst store still pays for the <code>xchg</code>.
+<strong>Feed-forward:</strong> §24.4.</div>
+
+<div class="solution" id="sol24.8"><span class="sol-label">24.8</span>
+<strong>Step 4:</strong> Make the pointer-publishing store <code>memory_order_release</code> and the reader's pointer load
+<code>memory_order_acquire</code>. Then, when the reader's acquire-load observes the published pointer, the release-store
+synchronizes-with it, so all the node's field writes (sequenced-before the release in the writer) happen-before the reader's
+field reads (sequenced-after the acquire) — the fields are guaranteed visible, no garbage. The bug hid on x86 because x86-TSO
+does not reorder store-store, so the field writes reached memory before the pointer even with relaxed ordering; ARM reorders
+store-store, exposing it. <em>Tempting wrong answer:</em> "add a sleep or a second read to let the writes catch up" — timing
+hacks do not create happens-before; only the release/acquire pairing does. <strong>Feed-forward:</strong> §24.3, §24.4.</div>
+
+<div class="solution" id="sol24.9"><span class="sol-label">24.9</span>
+(a) <strong>relaxed</strong> — a counter whose ordering relative to other data is irrelevant; only the final sum matters. (b)
+<strong>release</strong> on the publish and <strong>acquire</strong> on the consumer's read — it must make the buffer's writes
+visible. (c) <strong>relaxed</strong> — a stop flag whose late observation is harmless needs only atomicity, not ordering. (d)
+<strong>seq_cst</strong> — Dekker needs store-load ordering across the two flags, which only seq_cst (or a full fence)
+provides. <em>Method-selection cue:</em> no cross-variable ordering &#8594; relaxed; publish/observe data &#8594;
+release/acquire; need store-load / global order &#8594; seq_cst. <strong>Feed-forward:</strong> §24.3, §24.4.</div>
+
+<div class="solution" id="sol24.10"><span class="sol-label">24.10</span>
+(a) <strong>False</strong> — a data race is undefined behavior, not merely an unspecified value. (b) <strong>True</strong> — on
+x86 a release-store and a relaxed store both compile to a plain <code>mov</code>. (c) <strong>False</strong> — relaxed orders
+nothing but the atomic's own value; it does not make surrounding writes visible in order. (d) <strong>True</strong> — that is
+the DRF-SC guarantee. (e) <strong>False</strong> — seq_cst's store costs a locked <code>xchg</code> on x86; acquire/release do
+not. <em>Tempting wrong answer:</em> calling (e) true because "x86 is a strong model" — strong enough to make acquire/release
+free, but the seq_cst store still needs a fence. <strong>Feed-forward:</strong> §24.2, §24.4.</div>
+
+<div class="solution" id="sol24.11"><span class="sol-label">24.11</span>
+(a) By promising SC only to race-free programs, the standard lets the compiler and CPU reorder and cache freely wherever no
+synchronization observes it, while a program that synchronizes correctly still sees the simple sequentially consistent model —
+the best of both. (b) "Undefined" (not "unspecified") lets the compiler assume races never occur and optimize on that basis
+(e.g. keeping a shared variable in a register across a supposedly racy read); under a weaker "unspecified value" definition the
+compiler would have to reload shared memory conservatively and could not make those transformations. (c) A data race is
+undefined behavior exactly like a buffer overflow or signed overflow (Chapter 10): the optimizer assumes it cannot happen, so
+a racy program may work in testing and break under a new compiler, optimization level, or CPU — "it worked when I tested it"
+proves nothing about a program with UB. <em>Tempting wrong answer:</em> "undefined is just pedantry; in practice you get a
+stale value" — the compiler is entitled to transformations that make the failure far worse than a stale value.
+<strong>Feed-forward:</strong> §24.2, and Ch 10.</div>
+
+<div class="solution" id="sol24.12"><span class="sol-label">24.12</span>
+Machine-specific by design. A correct write-up reports: (a) with relaxed atomics the store-buffering outcome
+<code>r0 == r1 == 0</code> occurs a nonzero number of times (on the book's machine ~349,000 of two million, about 1 in 5),
+and switching to seq_cst drops it to zero. (b) The disassembly shows relaxed store, release store, and acquire load as plain
+<code>mov</code>, while the seq_cst store is a locked <code>xchg</code> — the one that differs. (c) The release/acquire
+message-passing handoff verifies a large number of payloads (e.g. one million) with zero stale reads. Label compiler/CPU; the
+reordering counts are hardware-dependent. <em>Tempting wrong answer:</em> "zero SC violations means my relaxed publish is
+fine" — on x86 you may see zero even for buggy relaxed publishing; the counts are hardware-dependent, and ARM would differ.
+<strong>Feed-forward:</strong> §24.1, §24.4.</div>
 
 </section>
 </body></html>

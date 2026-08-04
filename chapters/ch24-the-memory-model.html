@@ -1,0 +1,385 @@
+<section class="chapter" id="ch24">
+<h1>Chapter 24 — The Memory Model: memory_order and Happens-Before</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch22">Chapter 22</a> (atomics — every one takes a
+memory-ordering argument we have so far ignored), <a href="#ch23">Chapter 23</a> (a lock-free structure publishes a pointer
+and trusts the reader to see what it points to — why is that safe?), <a href="#ch10">Chapter 10</a> (undefined behavior and
+the optimizing compiler — a data race is UB, and the compiler exploits it), <a href="#ch03">Chapter 3</a> (each core sees
+memory through its own cache and store buffer). &nbsp;·&nbsp; The last two chapters assumed memory operations become visible
+in a sensible order across cores; this chapter shows they do not, and specifies exactly what ordering you may demand and how
+to ask for it.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch10">Chapter 10</a> — what does it mean that something is <em>undefined
+behavior</em>, and what license does that give the optimizer? (2) <a href="#ch03">Chapter 3</a> — a store does not go
+straight to shared memory; where does it sit first, and why does that let one core lag another's view? (3)
+<em>Predict:</em> two threads run <code>x = 1; r0 = y;</code> and <code>y = 1; r1 = x;</code> from
+<code>x = y = 0</code>. On paper, can both <code>r0</code> and <code>r1</code> end up 0? On a real x86 machine, out of two
+million trials, how many times do you think both read 0? Write your guesses; §24.1 measures it.</p>
+</aside>
+
+<p>Every chapter of this part has leaned on an assumption so natural it was invisible: that there is <em>one</em> memory, and
+that all cores see writes to it in a single consistent order — the model Lamport named <strong>sequential consistency</strong>
+(1979). It is the mental picture behind "thread A sets the flag, thread B sees the flag, so thread B sees the data A wrote
+first." That picture is false. Real hardware has per-core store buffers and caches, and both the CPU and the optimizing
+compiler reorder memory operations for speed, so a program can observe outcomes no sequentially consistent execution allows.
+This chapter makes the true model precise. First, the demonstration that reordering is real, on x86 no less — a litmus test
+whose "impossible" outcome happens millions of times (§24.1). Then the framework the C11/C++11 standard built to tame it: a
+<strong>data race is undefined behavior</strong>, and correctness is defined through the <strong>happens-before</strong>
+relation (§24.2). Then the menu of orderings an atomic can request — <code>relaxed</code>, <code>acquire</code>/<code>release</code>,
+and <code>seq_cst</code> — and the <em>synchronizes-with</em> edge that makes one thread's writes visible to another (§24.3).
+Then the workhorse pattern, message passing with acquire/release, what it guarantees, and what it costs on real hardware
+(§24.4). We close the part by carrying this specification forward as the ground truth beneath every concurrent program
+(§24.5).</p>
+
+<h2>24.1 The single-memory illusion: reordering is real</h2>
+
+<p>Consider the <strong>store-buffering</strong> litmus test (it underlies Dekker's mutual-exclusion algorithm). Two threads,
+starting from <code>x = y = 0</code>: thread 0 does <code>x = 1</code> then reads <code>r0 = y</code>; thread 1 does
+<code>y = 1</code> then reads <code>r1 = x</code>. Reason it through under a single shared memory: whichever store happens
+first, the later thread's load must see a 1, so <code>r0 == 0 &amp;&amp; r1 == 0</code> is <em>impossible</em>. Yet it happens
+— because each core's store sits in a private <strong>store buffer</strong> (Chapter 3) before reaching cache, so each thread
+reads the other's not-yet-published value as 0. Here it is with relaxed atomics (to avoid the undefined behavior of a plain
+data race), two million trials on x86-64 (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>relaxed store-buffering, 2000000 trials:
+r0==0 &amp;&amp; r1==0 observed 349165 times   (about 1 in 5; sequential consistency forbids it)</code></pre>
+
+<p>The "impossible" outcome occurred in roughly one trial in five. This is not a bug in the program or the hardware: x86's
+memory model (formalized as <strong>x86-TSO</strong>, total store order, by Sewell et al., 2010) explicitly allows a store to
+be reordered after a later load to a <em>different</em> address, precisely because of the store buffer. And x86 is one of the
+<em>stronger</em> models — ARM and POWER reorder far more aggressively. Two forces reorder your memory operations: the
+<strong>hardware</strong>, as here, and the <strong>compiler</strong>, which freely reorders and elides plain loads and stores
+it cannot prove another thread observes. The consequence is stark: the intuitive single-memory, everyone-agrees-on-one-order
+model you have been using is not what the machine provides. To write correct concurrent code you need a precise model of what
+<em>is</em> guaranteed — and a way to buy back the ordering you need where you need it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In the store-buffering test, explain why <code>r0 == 0 &amp;&amp; r1 == 0</code> is impossible under sequential consistency
+but common on real x86. Name the hardware structure responsible, and name the <em>other</em> agent (besides the CPU) that
+reorders memory operations. (Answer after the next section.)</p>
+</aside>
+
+<h2>24.2 Data races are undefined behavior; happens-before</h2>
+
+<p>Faced with hardware and compilers that reorder, the C11/C++11 standard did not promise sequential consistency for ordinary
+code — that would forbid the optimizations that make programs fast. Instead it drew a bright line. A <strong>data race</strong>
+— two accesses to the same location from different threads, at least one a write, not ordered by synchronization, with at
+least one non-atomic — is <strong>undefined behavior</strong> (Chapter 10). Not "unspecified value," not "torn read":
+undefined, the compiler may assume it never happens and optimize accordingly, so a racy program has no meaning at all. The
+flip side is the contract: if your program is <strong>data-race-free</strong> — every conflicting pair of accesses ordered by
+synchronization through atomics — the standard guarantees it behaves as some sequentially consistent execution. This is the
+DRF-SC guarantee that Boehm and Adve's "Foundations of the C++ Concurrency Memory Model" (2008) established for C and C++:
+race-free code gets the simple model; racy code gets nothing.</p>
+
+<p>"Ordered by synchronization" is made precise by <strong>happens-before</strong>. Within a single thread, operations are
+<strong>sequenced-before</strong> one another in program order. Across threads, an atomic store and the atomic load that reads
+its value can form a <strong>synchronizes-with</strong> edge (the details in §24.3). Happens-before is, roughly, the
+transitive closure of sequenced-before and synchronizes-with: if A happens-before B, then A's effects are guaranteed visible
+to B. Two conflicting accesses <em>not</em> ordered by happens-before are a data race. And the default atomic ordering,
+<code>memory_order_seq_cst</code>, additionally forces all such atomic operations into a single global total order — restoring
+the sequentially consistent illusion for code that uses it. Rerun the store-buffering test with seq_cst instead of relaxed
+(gcc 11.4.0):</p>
+
+<pre><code>seq_cst store-buffering, 2000000 trials:
+r0==0 &amp;&amp; r1==0 observed 0 times   (sequential consistency restored)</code></pre>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: memory operations reorder unless an ordering forbids it</span>
+<p><strong>1. In words.</strong> Plain and relaxed memory operations may be reordered by the CPU and compiler, so one thread
+can see another's operations out of program order. Sequential consistency (the default <code>seq_cst</code> atomics) forces a
+single global order that forbids such reorderings; a data race — conflicting accesses not ordered by happens-before — is
+undefined behavior.</p>
+<p><strong>2. As a picture.</strong> Figure 24.1: each thread's store sits in a private store buffer before reaching shared
+memory, so thread 0 reads <code>y</code> (still 0) before thread 1's <code>y = 1</code> drains — and symmetrically — yielding
+<code>r0 == r1 == 0</code>.</p>
+<p><strong>3. As numbers.</strong> Store-buffering, two million trials: with relaxed atomics the SC-forbidden outcome happened
+349,165 times (~1 in 5); with seq_cst it happened 0 times.</p>
+</aside>
+
+<p><em>(Answer to the §24.1 quick check: under sequential consistency the two stores occur in some global order, and the
+thread that stores second must, when it later loads, see the first thread's already-committed store — so both loads reading 0
+cannot happen. On x86 each store first enters a private <strong>store buffer</strong> and is not yet visible to the other
+core, so each thread's load reads the other's stale 0. Besides the CPU, the <strong>compiler</strong> also reorders memory
+operations.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Store buffering: each store waits in a private buffer, so each load reads a stale 0.</text>
+<rect x="40" y="40" width="150" height="120" fill="#f5f8fb" stroke="#14406b"/><text x="70" y="56" font-size="9" fill="#14406b">Core 0</text>
+<rect x="55" y="66" width="120" height="22" fill="#fdeee6" stroke="#8c3a1d"/><text x="62" y="81" font-size="9">x = 1 &#8594; store buffer</text>
+<rect x="55" y="96" width="120" height="22" fill="#eef" stroke="#14406b"/><text x="62" y="111" font-size="9">r0 = y &#8594; reads 0</text>
+<rect x="450" y="40" width="150" height="120" fill="#f5f8fb" stroke="#14406b"/><text x="480" y="56" font-size="9" fill="#14406b">Core 1</text>
+<rect x="465" y="66" width="120" height="22" fill="#fdeee6" stroke="#8c3a1d"/><text x="472" y="81" font-size="9">y = 1 &#8594; store buffer</text>
+<rect x="465" y="96" width="120" height="22" fill="#eef" stroke="#14406b"/><text x="472" y="111" font-size="9">r1 = x &#8594; reads 0</text>
+<rect x="250" y="80" width="140" height="40" fill="#fff" stroke="#14406b"/><text x="270" y="104" font-size="9">shared memory: x=0, y=0</text>
+<line x1="175" y1="77" x2="250" y2="95" stroke="#8c3a1d" stroke-dasharray="3,2" marker-end="url(#b)"/><text x="182" y="72" font-size="8" fill="#8c3a1d">drains later</text>
+<line x1="450" y1="77" x2="390" y2="95" stroke="#8c3a1d" stroke-dasharray="3,2" marker-end="url(#b)"/>
+<text x="16" y="185" font-size="9" fill="#8c3a1d">Both loads see the pre-store value: r0 == r1 == 0, which sequential consistency forbids.</text>
+<defs><marker id="b" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#8c3a1d"/></marker></defs>
+</svg>
+<figcaption>Figure 24.1: Store buffering. Each core's store to <code>x</code> (resp. <code>y</code>) sits in a private store
+buffer before it reaches shared memory, so each core's subsequent load of the other variable reads the old value 0. The
+outcome <code>r0 == r1 == 0</code> is impossible under sequential consistency yet common on real x86 — measured here about
+one trial in five.</figcaption>
+</figure>
+
+<h2>24.3 The ordering menu: relaxed, acquire/release, seq_cst</h2>
+
+<p>Every atomic operation takes a <code>memory_order</code> argument choosing how much ordering it enforces — a dial from
+"atomic but unordered" to "globally ordered," trading cost for guarantees. There are three levels worth knowing.
+<strong><code>memory_order_relaxed</code></strong> guarantees only atomicity (no torn or lost updates) and coherence on the
+<em>same</em> object; it imposes <em>no</em> ordering on other memory operations and creates no synchronizes-with edge. It is
+right for a statistics counter whose exact interleaving with other data does not matter — the store-buffering test used it,
+and indeed it let the reordering show. <strong><code>memory_order_release</code></strong> (on a store) paired with
+<strong><code>memory_order_acquire</code></strong> (on a load) is the key construct: if an acquire-load reads the value
+written by a release-store to the same atomic, the store <strong>synchronizes-with</strong> the load, and everything
+sequenced-before the release in the storing thread happens-before everything sequenced-after the acquire in the loading
+thread. That is the machinery that makes a published pointer safe: all the writes that set up the object are visible to any
+thread that acquires the pointer. <strong><code>memory_order_seq_cst</code></strong>, the default, adds to acquire/release a
+single global total order over all seq_cst operations — the strongest and most expensive, and the only one that forbids the
+store-buffering reordering of §24.1.</p>
+
+<p>The relationships to keep straight: <em>sequenced-before</em> is ordering within one thread (program order);
+<em>synchronizes-with</em> is the cross-thread edge a release/acquire pair (or a lock release/acquire, or a thread create/join)
+creates; and <em>happens-before</em> is their transitive closure, the relation that actually determines visibility and defines
+a data race. Relaxed atomics participate in none of the cross-thread ordering — they are atomic dots with no edges — which is
+exactly why relaxed is cheap and why it cannot, by itself, publish anything but the atomic's own value. When you need one
+thread's ordinary writes to become visible to another, you need a release/acquire (or stronger) pair, not relaxed.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>memory_order_relaxed</code> guarantee, and what does it <em>not</em>? State precisely what a
+release-store/acquire-load pair establishes when the acquire reads the release's value. What does <code>seq_cst</code> add on
+top of acquire/release? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>24.4 Acquire/release in practice: message passing, and what it costs</h2>
+
+<p>The canonical use of acquire/release is <strong>message passing</strong>: one thread fills a payload with ordinary writes,
+then publishes a flag with a release-store; another thread waits on the flag with an acquire-load and, once it sees the flag,
+reads the payload. The release/acquire pair guarantees the payload writes happen-before the reads — so the reader never sees a
+published flag but stale payload. This is precisely the guarantee the lock-free structures of Chapter 23 needed when they
+published a node pointer. A producer and consumer handing off a four-word payload a million times, verifying every one (gcc
+11.4.0, Linux 6.18):</p>
+
+<pre><code>/* producer */                          /* consumer */
+payload[0..3] = ...;      /* plain */   while (load_acquire(&amp;flag) != r) {}
+store_release(&amp;flag, r);  /* publish */  read payload[0..3];   /* guaranteed visible */
+
+message passing via release/acquire, 1000000 rounds: payload mismatches = 0</code></pre>
+
+<p>Not one of a million handoffs saw a stale payload: the acquire that observed the flag was guaranteed, by synchronizes-with,
+to see every write sequenced before the release. Now the cost, which is where the memory model gets concrete and surprising.
+On x86 the ordering you pay for depends entirely on which order you ask for. Compare the compiler's code for stores and loads
+at each level (gcc 11.4.0, <code>-O2</code>, <code>objdump</code>):</p>
+
+<pre><code>store_relaxed :  mov   %edi, f(%rip)     &#8592; plain store
+store_release :  mov   %edi, f(%rip)     &#8592; plain store (identical!)
+store_seqcst  :  xchg  %edi, f(%rip)     &#8592; locked exchange — drains the store buffer
+load_acquire  :  mov   f(%rip), %eax     &#8592; plain load</code></pre>
+
+<p>On x86-TSO, release-stores and acquire-loads compile to <em>plain</em> <code>mov</code> instructions — identical to
+relaxed — because the hardware already guarantees the ordering they need (it never reorders store-store or load-load, only
+store-load). The ordering is enforced only by forbidding the <em>compiler</em> from reordering across them, at no runtime
+cost. Only <code>seq_cst</code>'s store costs a real instruction — the <code>xchg</code> (a locked operation) that drains the
+store buffer and thereby forbids the store-load reordering that produced §24.1's result. This is the honest picture of the
+memory model: acquire/release is often free on strong hardware and lets the compiler still forbid its own reorderings, while
+seq_cst buys a global order at the price of a fence. On weaker architectures (ARM, POWER) acquire and release require real
+barrier instructions too — which is why using the weakest ordering that is correct matters for portable performance. But the
+danger runs the other way: using an ordering that is too <em>weak</em> is not slow, it is <em>wrong</em>.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: using <code>relaxed</code> where you need release/acquire (relaxed orders nothing but itself)</span>
+<p>Because <code>memory_order_relaxed</code> is the cheapest ordering and "the flag is atomic anyway," it is tempting to
+publish data with a relaxed store and read it with a relaxed load. But relaxed creates <em>no</em> synchronizes-with edge and
+therefore <em>no</em> happens-before: it guarantees the atomic's own value is not torn, and nothing whatsoever about the
+ordinary writes around it. So a consumer can see the relaxed flag set to "ready" while the payload writes that preceded it are
+still invisible — it reads the flag as published and the data as garbage. Worse, it may work on x86 (where the hardware
+happens to order store-store) and fail on ARM, so it passes your tests and corrupts on a phone. The rule: to publish data, the
+store that publishes must be <code>release</code> and the load that observes it must be <code>acquire</code> (or use seq_cst);
+relaxed is only for atomics whose <em>ordering relative to other memory does not matter</em>, such as a statistics counter or
+a stop flag whose late arrival is harmless. If you are using an atomic to make <em>other</em> writes visible, relaxed is a
+correctness bug, not an optimization.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "I made the handoff faster. The producer fills the buffer and sets
+<code>ready</code> with a <code>relaxed</code> atomic store; the consumer spins on a <code>relaxed</code> load of
+<code>ready</code> and then reads the buffer. It's all atomic and it passes every test on our CI machines — why do you keep
+saying it's broken?" Cover the paragraph and respond in four or five sentences, drawing on §24.3 and §24.4.</p>
+<p><em>Model answer.</em> "It passes because your CI machines are x86, whose hardware happens to keep stores in order, so the
+buffer writes reach memory before the flag — but the C memory model gives you no such guarantee, and the bug is real. A
+<code>relaxed</code> store creates no synchronizes-with edge and thus no happens-before, so nothing orders the buffer writes
+relative to the flag; the consumer is entitled to see <code>ready</code> set and the buffer still empty, which is exactly what
+will happen on ARM. The fix costs nothing on x86: make the publishing store <code>release</code> and the observing load
+<code>acquire</code>, and now every write before the release is guaranteed visible after the acquire — that pairing is the
+whole point of the ordering argument. Relaxed is correct only when the atomic's ordering relative to other data doesn't matter,
+like a counter; here you're using it to <em>publish</em> data, so it's a correctness bug, not a speedup." Explaining that x86
+hides the bug, naming synchronizes-with/happens-before, and prescribing release/acquire is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §24.3 quick check: <code>relaxed</code> guarantees atomicity and same-object coherence but imposes no
+ordering on other memory and creates no synchronizes-with edge. A release-store paired with an acquire-load that reads its
+value establishes that the store synchronizes-with the load, so everything sequenced-before the release happens-before
+everything sequenced-after the acquire — making the storing thread's prior writes visible to the loading thread.
+<code>seq_cst</code> adds a single global total order over all seq_cst operations, restoring sequential consistency and
+forbidding the store-buffering reordering.)</em></p>
+
+<h2>24.5 What to carry forward</h2>
+
+<p>The single-memory, everyone-agrees model — <strong>sequential consistency</strong> — is an illusion real hardware and
+compilers break for speed. Our store-buffering litmus test produced the SC-forbidden outcome <code>r0 == r1 == 0</code> about
+one time in five on x86 (349,165 of two million), because each core's store waits in a private buffer before it is visible;
+the CPU and the compiler both reorder plain memory operations. The C11/C++11 memory model tames this with a bright line: a
+<strong>data race is undefined behavior</strong>, but a <strong>data-race-free</strong> program behaves as some sequentially
+consistent execution (Boehm and Adve's DRF-SC guarantee). Correctness is defined through <strong>happens-before</strong> — the
+transitive closure of <em>sequenced-before</em> (program order in a thread) and <em>synchronizes-with</em> (the cross-thread
+edge from a release-store to the acquire-load that reads it). The <code>memory_order</code> menu picks how much ordering an
+atomic buys: <code>relaxed</code> (atomic but unordered — no synchronizes-with), <code>acquire</code>/<code>release</code>
+(the publish/observe pair that makes prior writes visible — our message-passing handoff verified a million payloads with zero
+stale reads), and <code>seq_cst</code> (a global total order, the only one that forbade the store-buffering reordering, and on
+x86 the only one that costs a real fence). The trap: relaxed publishes nothing but its own value, so using it to hand off data
+is a correctness bug that x86 hides and ARM exposes.</p>
+
+<p>This closes the concurrency part, and with it the last piece of shared-memory correctness. You now hold the full toolkit
+and, more importantly, the model beneath it: threads share memory and race (Chapter 15); locks and condition variables give
+blocking mutual exclusion and coordination (Chapters 20&ndash;21); atomics and compare-and-swap are the hardware primitives
+they rest on (Chapter 22); lock-free structures use those primitives to avoid blocking entirely (Chapter 23); and the memory
+model is the specification that says, precisely, when a write by one thread is guaranteed visible to another (this chapter).
+The recurring lesson has been the same at every level — the abstract machine's simple, sequential memory is not what runs, and
+the gap between the two is where concurrency bugs live. What comes next is a language built to close that gap by construction.
+Everything in this part you had to prove by hand and hold in your head — which data is shared, which access needs a lock,
+which ordering an atomic requires, whether a pointer outlives the thread reading it — a type system can instead enforce at
+compile time, turning "I reasoned about it carefully" into "it does not compile otherwise." The next part turns to Rust:
+ownership, borrowing, and lifetimes as the machinery that encodes these very invariants — data-race freedom not as a
+discipline you maintain, but as a property the compiler checks.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Describe the store-buffering test and why <code>r0 == r1 == 0</code> is SC-forbidden yet common on x86, and name the
+store buffer.</li>
+<li>State the DRF-SC contract: what a data race is (and that it is UB), and what a race-free program is guaranteed.</li>
+<li>Define sequenced-before, synchronizes-with, and happens-before, and how they relate.</li>
+<li>Say what <code>relaxed</code>, <code>acquire</code>/<code>release</code>, and <code>seq_cst</code> each guarantee.</li>
+<li>Explain the message-passing pattern and why a release/acquire pair makes the payload visible.</li>
+<li>Explain why publishing data with a relaxed store is a bug, and why it can pass on x86 and fail on ARM.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why does the store-buffering outcome <code>r0 == r1 == 0</code> occur on x86, and what forbids it?
+(§24.1)</li>
+<li><strong>R2.</strong> What is a data race, what does the standard say it is, and what does DRF-SC guarantee? (§24.2)</li>
+<li><strong>R3.</strong> Define sequenced-before, synchronizes-with, and happens-before. (§24.2&ndash;§24.3)</li>
+<li><strong>R4.</strong> What do <code>relaxed</code>, <code>acquire</code>/<code>release</code>, and <code>seq_cst</code>
+guarantee, and which is free on x86? (§24.3&ndash;§24.4)</li>
+<li><strong>R5.</strong> Why is publishing data with a relaxed store a correctness bug, and why might it pass on x86? (§24.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Boehm &amp; Adve, "Foundations of the C++ Concurrency Memory Model," <em>Proc. ACM PLDI</em> (2008), pp.
+68&ndash;78, DOI 10.1145/1375581.1375591.</strong> The DRF-SC design of §24.2: race-free programs get sequential consistency,
+races are undefined. Author, venue, and year verified via dblp and the ACM Digital Library.</li>
+<li><strong>Lamport, "How to Make a Multiprocessor Computer That Correctly Executes Multiprocess Programs," <em>IEEE
+Transactions on Computers</em> C-28(9):690&ndash;691 (1979), DOI 10.1109/TC.1979.1675439.</strong> The definition of
+sequential consistency — the model §24.1 shows hardware violating. Verified via IEEE Xplore and dblp.</li>
+<li><strong>Sewell, Sarkar, Owens, Zappa Nardelli &amp; Myreen, "x86-TSO: A Rigorous and Usable Programmer's Model for x86
+Multiprocessors," <em>Communications of the ACM</em> 53(7):89&ndash;97 (2010), DOI 10.1145/1785414.1785443.</strong> The
+precise model of x86 memory ordering behind the store-buffering result of §24.1. Verified via the ACM Digital Library.</li>
+<li><strong>cppreference, <code>std::memory_order</code> (<code>en.cppreference.com</code>).</strong> The exact semantics of
+<code>relaxed</code>, <code>acquire</code>/<code>release</code>, and <code>seq_cst</code>, and of synchronizes-with and
+happens-before. Primary reference for §24.3&ndash;§24.4; verify per standard version.</li>
+<li><strong>Preshing, "Memory Reordering Caught in the Act" (blog, <code>preshing.com</code>, 2012).</strong> A hands-on
+walkthrough of the store-buffering experiment reproduced in §24.1, with the reordering measured directly. Accessible
+background; a blog, not a peer-reviewed source.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex24.1"><span class="ex-label">24.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is sequential consistency, and name one hardware structure that causes real machines to violate it.</div>
+
+<div class="exercise" id="ex24.2"><span class="ex-label">24.2</span> <span class="ex-tag warm">warm-up</span>
+What is a data race, and what does the C11/C++11 standard say a program containing one means?</div>
+
+<div class="exercise" id="ex24.3"><span class="ex-label">24.3</span> <span class="ex-tag warm">warm-up</span>
+What does <code>memory_order_relaxed</code> guarantee, and what does it not guarantee about other memory operations?</div>
+
+<div class="exercise" id="ex24.4"><span class="ex-label">24.4</span> <span class="ex-tag core">core</span>
+For the store-buffering test (<code>x = 1; r0 = y;</code> and <code>y = 1; r1 = x;</code> from <code>x = y = 0</code>): (a)
+prove <code>r0 == r1 == 0</code> is impossible under sequential consistency. (b) Explain, using the store buffer, why it
+happens on x86 anyway. (c) Which single change — and to which operations — forbids the outcome, and what does it cost on x86
+(name the instruction)?</div>
+
+<div class="exercise" id="ex24.5"><span class="ex-label">24.5</span> <span class="ex-tag core">core</span>
+Define <em>sequenced-before</em>, <em>synchronizes-with</em>, and <em>happens-before</em>, and state how happens-before is
+built from the other two. Then explain, in those terms, why two conflicting accesses not ordered by happens-before are a data
+race.</div>
+
+<div class="exercise" id="ex24.6"><span class="ex-label">24.6</span> <span class="ex-tag core">core</span>
+Write the message-passing pattern with a payload and a flag. (a) Mark which store must be <code>release</code> and which load
+must be <code>acquire</code>. (b) Explain, via synchronizes-with and happens-before, why the consumer is guaranteed to see the
+payload once it sees the flag. (c) Show what breaks if both are <code>relaxed</code>, and why it may still pass on x86.</div>
+
+<div class="exercise" id="ex24.7"><span class="ex-label">24.7</span> <span class="ex-tag complexity">cost</span>
+Using the disassembly (relaxed store = <code>mov</code>, release store = <code>mov</code>, seq_cst store = <code>xchg</code>,
+acquire load = <code>mov</code>): (a) explain why acquire/release are free on x86 but seq_cst's store is not. (b) What does the
+<code>xchg</code> do that the plain <code>mov</code> does not, and how does that forbid store-buffering? (c) Why might the same
+acquire/release require real barrier instructions on ARM, and what does that imply for "use the weakest correct ordering"?</div>
+
+<div class="exercise" id="ex24.8"><span class="ex-label">24.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A lock-free structure publishes a freshly built node by CAS-ing a pointer, and
+readers follow the pointer and read the node's fields. Occasionally on an ARM device a reader sees the new pointer but garbage
+fields.
+<br><strong>Step 1 (given):</strong> The node's fields are written with plain stores, then the pointer is published.
+<br><strong>Step 2 (given):</strong> The publish and the read use <code>relaxed</code> atomics, which create no
+synchronizes-with edge.
+<br><strong>Step 3 (given):</strong> With no happens-before between the field writes and the reader's field reads, the reader
+may observe the pointer before the field writes are visible — undefined behavior in general, and visible reordering on ARM.
+<br><strong>Step 4 (you):</strong> State the fix precisely (which operation becomes <code>release</code>, which becomes
+<code>acquire</code>), explain why that pairing makes the field writes visible, and say why the bug hid on x86.</div>
+
+<div class="exercise" id="ex24.9"><span class="ex-label">24.9</span> <span class="ex-tag mixed">mixed</span>
+For each atomic use, choose the weakest correct ordering — <code>relaxed</code>, <code>acquire</code>/<code>release</code>, or
+<code>seq_cst</code> — and justify in a line: (a) a hit counter incremented by many threads, read only at shutdown; (b) a flag
+that publishes a fully initialized buffer to a consumer; (c) a "please stop" flag a worker polls, where a slightly late stop
+is harmless; (d) two flags in a Dekker-style algorithm needing store-load ordering.</div>
+
+<div class="exercise" id="ex24.10"><span class="ex-label">24.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 22–24, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "A data race produces
+an unspecified value but defined behavior." (b) "On x86, a release-store compiles to the same instruction as a relaxed store."
+(c) "<code>memory_order_relaxed</code> makes the writes around it visible to other threads in order." (d) "A race-free program
+using seq_cst atomics behaves as some sequentially consistent execution." (e) "seq_cst is free on x86, just like
+acquire/release."</div>
+
+<div class="exercise" id="ex24.11"><span class="ex-label">24.11</span> <span class="ex-tag stretch">stretch</span>
+The DRF-SC guarantee says race-free programs get sequential consistency and racy ones get undefined behavior. (a) Explain why
+this bargain lets the compiler and hardware keep their reordering optimizations while still giving well-behaved programs a
+simple model. (b) Argue why "undefined," not merely "unspecified," is the right (if harsh) definition for a data race — what
+would the compiler be forbidden from doing under a weaker definition? (c) Connect this to Chapter 10: how is a data race like
+other undefined behavior the optimizer is allowed to assume never happens, and what does that mean for "but it worked when I
+tested it"?</div>
+
+<div class="exercise" id="ex24.12"><span class="ex-label">24.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) implement the store-buffering test with two threads and relaxed atomics, run a couple million trials,
+and count how often <code>r0 == r1 == 0</code> — confirm it is nonzero on x86; switch the atomics to <code>seq_cst</code> and
+confirm the count drops to zero. (b) Disassemble a relaxed store, a release store, a seq_cst store, and an acquire load with
+<code>objdump</code>, and identify which one differs (the seq_cst store's locked instruction). (c) Build the message-passing
+handoff with release/acquire and verify a large number of payloads with zero stale reads. Label your compiler and CPU
+architecture; note that the reordering counts are hardware-dependent.</div>
+
+</section>
+</section>

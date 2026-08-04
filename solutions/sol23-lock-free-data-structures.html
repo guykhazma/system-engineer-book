@@ -1,0 +1,120 @@
+<section class="solutions" id="sol23">
+<h1>Chapter 23 — Solutions</h1>
+
+<div class="solution" id="sol23.1"><span class="sol-label">23.1</span>
+That the system as a whole always makes progress: out of all contending threads, some thread completes its operation in a
+bounded number of steps, so the structure can never be globally stuck. <em>Tempting wrong answer:</em> "every thread is
+guaranteed to complete" — that is wait-free; lock-free permits an individual thread to starve while others succeed.
+<strong>Feed-forward:</strong> §23.1.</div>
+
+<div class="solution" id="sol23.2"><span class="sol-label">23.2</span>
+Push: the successful CAS that installs the new node as <code>top</code>. Pop: the successful CAS that swings <code>top</code>
+to <code>old-&gt;next</code>. <em>Tempting wrong answer:</em> "the <code>malloc</code> (for push) or the return (for pop)" —
+the item is neither published nor removed until the CAS commits; that is the instant the operation takes effect.
+<strong>Feed-forward:</strong> §23.2.</div>
+
+<div class="solution" id="sol23.3"><span class="sol-label">23.3</span>
+A CAS checks only that a location still holds the same <em>bits</em> you read; if the value went A &#8594; B &#8594; A, the
+bits match and the CAS succeeds, even though the object those bits denote may have been removed, freed, and replaced.
+<em>Tempting wrong answer:</em> "the same value means nothing changed" — it means the value is <em>equal now</em>, not that
+it never changed. <strong>Feed-forward:</strong> §23.4.</div>
+
+<div class="solution" id="sol23.4"><span class="sol-label">23.4</span>
+<pre><code>push(v): n = new node(v)
+         old = load(top)
+         do { n.next = old } while (!CAS(&amp;top, &amp;old, n))
+pop():   old = load(top)
+         while (old) { if (CAS(&amp;top, &amp;old, old.next)) return old }
+         return NULL</code></pre>
+(a) A failed CAS means another thread changed <code>top</code> first; the failure reloads <code>old</code> with the current
+top, so the loop re-points <code>n.next</code> (push) or re-reads <code>old.next</code> (pop) and retries against fresh
+state. (b) The successful CAS is the single instant the operation takes effect for all threads — the linearization point — so
+concurrent operations order by whose CAS won. (c) Lock-free, not wait-free: the system always advances because some CAS
+always succeeds, but a persistently unlucky thread can keep losing the race and never complete.
+<em>Method-selection cue:</em> "update a shared pointer only if it hasn't moved" &#8594; CAS retry loop.
+<strong>Feed-forward:</strong> §23.2.</div>
+
+<div class="solution" id="sol23.5"><span class="sol-label">23.5</span>
+(a) It cannot be one CAS because enqueue must both link the new node (<code>tail.next: NULL -&gt; n</code>) and move
+<code>Tail</code>, two separate locations; no single-word CAS updates both. (b) After the first CAS but before the second, a
+second thread can see <code>Tail</code> lagging — pointing at a node whose <code>next</code> is no longer <code>NULL</code>;
+"helping" means that thread advances <code>Tail</code> to <code>tail.next</code> itself (via CAS) rather than waiting for the
+enqueuer, so no one stalls on the laggard. (c) The dummy node guarantees the list is never empty, so <code>Head</code> and
+<code>Tail</code> always reference a real node and there are no null-pointer boundary cases at either end.
+<em>Tempting wrong answer:</em> "the second thread must wait for the enqueuer to finish" — helping is precisely what avoids
+that wait. <strong>Feed-forward:</strong> §23.3.</div>
+
+<div class="solution" id="sol23.6"><span class="sol-label">23.6</span>
+Thread A reads <code>top = A</code>, reads <code>A.next = B</code>, and is preempted before its CAS. Now: another thread pops
+<code>A</code> (<code>top = B</code>), pops <code>B</code> (<code>top = C</code>), and frees both; then it allocates a new node
+that <code>malloc</code> places at <code>A</code>'s old address, sets some <code>next</code>, and pushes it, so
+<code>top = A</code> again — but this <code>A</code> is a different logical node and <code>A.next</code> is now <code>C</code>
+or garbage. A resumes and does <code>CAS(&amp;top, A, B)</code>: it sees <code>top == A</code> (same bits), succeeds, and sets
+<code>top = B</code> — a node that was already popped and freed. The stack is now corrupt (dangling or lost nodes). A tagged
+pointer prevents it: the version counter incremented on each of those pops/pushes makes the pair <code>(A, version)</code>
+differ, so A's CAS fails. Hazard pointers prevent it too: <code>A</code> and <code>B</code> could not have been freed while A
+still referenced them. <em>Tempting wrong answer:</em> "the CAS is buggy" — the CAS is correct; the bug is freeing and reusing
+memory under it. <strong>Feed-forward:</strong> §23.4.</div>
+
+<div class="solution" id="sol23.7"><span class="sol-label">23.7</span>
+(a) Under low contention a CAS usually succeeds on the first try, so a push/pop is one atomic op with no blocking, no context
+switch, and no futex system call — cheaper than a mutex's lock/unlock (hence ~176 vs ~359 ns/op here); it spends its time on
+the single CAS rather than on scheduler round-trips. (b) Under very high contention on one hot pointer, most CASes fail and
+retry, and each attempt drags the cache line to the current core in exclusive state — a coherence storm — so throughput can
+fall below even the lock's, as work is wasted on failed attempts. (c) Elimination (pairing a push with a concurrent pop so
+both skip the stack) or per-thread sub-stacks cut contention; they trade strict LIFO/global ordering and simplicity for
+scalability. <em>Tempting wrong answer:</em> "lock-free is always faster" — under heavy contention a lock can win because it
+serializes instead of burning cycles on retries. <strong>Feed-forward:</strong> §23.2, and Ch 3.</div>
+
+<div class="solution" id="sol23.8"><span class="sol-label">23.8</span>
+<strong>Step 4:</strong> Hazard-pointer <code>pop</code>: (1) read <code>t = load(top)</code>; (2) publish <code>t</code> in
+this thread's hazard slot; (3) re-check <code>load(top) == t</code> — if it changed, restart, because a node could have been
+retired between (1) and (2); (4) now safe to read <code>next = t.next</code> and attempt <code>CAS(&amp;top, t, next)</code>;
+(5) on success, <code>t</code> is unlinked — retire it to a per-thread list and free it later, only once no thread's hazard
+slot references it. This makes use-after-free impossible because a node any thread is dereferencing is published as hazardous
+and therefore never freed; and it makes ABA impossible because a node cannot be freed and its address reused while it is
+still referenced, so <code>top</code> cannot cycle back to a recycled <code>t</code> under a stalled reader.
+<em>Tempting wrong answer:</em> "just free in <code>pop</code> after the CAS" — another thread may still hold that node as its
+own <code>old</code>; the re-check-after-publish is what closes the window. <strong>Feed-forward:</strong> §23.4.</div>
+
+<div class="solution" id="sol23.9"><span class="sol-label">23.9</span>
+(a) <strong>Lock-free</strong> — an audio callback with a hard deadline must never block on a lock a slower thread holds. (b)
+<strong>Mutex</strong> — rarely contended and read once at startup; a lock is simpler and correctness is easier to reason
+about. (c) <strong>Lock-free</strong> (of a signal-safe kind) or a lock-free single-slot handoff — a signal handler must not
+take a lock the interrupted thread may already hold (Chapter 18's async-signal-safety). (d) <strong>Mutex</strong> — large,
+complex operations with modest contention favor the simplicity of a lock; making them lock-free would be intricate for little
+gain. <em>Method-selection cue:</em> must-never-block or signal context &#8594; lock-free; simplicity with tolerable
+contention &#8594; mutex. <strong>Feed-forward:</strong> §23.1, and Ch 18.</div>
+
+<div class="solution" id="sol23.10"><span class="sol-label">23.10</span>
+(a) <strong>False</strong> — lock-free code is built <em>from</em> atomic instructions (CAS); it means no locks and a
+system-progress guarantee, not no atomics. (b) <strong>False</strong> — a lock-free structure cannot deadlock; retries mean
+some other thread is succeeding (making progress), which is the opposite of deadlock, though one thread may starve. (c)
+<strong>False</strong> — the dummy node is a correctness device that removes null-boundary cases, not an optional
+optimization. (d) <strong>True</strong> — that is exactly the ABA problem: equal bits do not prove the object was untouched.
+(e) <strong>True</strong> — wait-free (every thread completes) implies lock-free (some thread completes) but not conversely.
+<em>Tempting wrong answer:</em> calling (b) true because "infinite retries look like being stuck" — the system is still
+making progress; only the unlucky thread is not. <strong>Feed-forward:</strong> §23.1, §23.3, §23.4.</div>
+
+<div class="solution" id="sol23.11"><span class="sol-label">23.11</span>
+(a) Helping solves the two-step enqueue: because linking the node and swinging <code>Tail</code> are separate CASes, an
+enqueuer can be preempted between them, leaving <code>Tail</code> lagging; a later thread advances <code>Tail</code> itself
+so it need not wait for the preempted enqueuer. (b) If every thread can finish any pending operation it encounters, then a
+thread preempted mid-update never blocks progress — whoever runs next completes (or helps complete) the operation, so the
+system always advances, which is the lock-free guarantee. (c) A lock has no helping: a preempted holder stalls everyone until
+it is rescheduled. Helping buys immunity to that at the cost of extra CASes (advancing another's tail) and more intricate
+invariants (every intermediate state must be well-defined and completable by anyone). <em>Tempting wrong answer:</em>
+"helping is just a nicety" — it is what makes the structure non-blocking despite the multi-step update.
+<strong>Feed-forward:</strong> §23.3.</div>
+
+<div class="solution" id="sol23.12"><span class="sol-label">23.12</span>
+Machine-specific by design. A correct write-up reports: (a) the eight-thread Treiber stack pushes and pops the full item
+count with none lost or duplicated (on the book's machine 800,000 in and 800,000 out, matching checksums). (b) Against a
+mutex-guarded stack under contention, ns/op for both, with the note that which wins depends on contention (here lock-free
+~176 vs mutex ~359 ns/op). (c) The tagged-pointer version compiles with <code>-mcx16 -latomic</code>, passes the same
+correctness test, and the disassembly shows <code>lock cmpxchg16b</code>. Label compiler/CPU; throughput figures are
+illustrative. <em>Tempting wrong answer:</em> "the leaking version is fine since the test passes" — it passes only because it
+never frees; adding <code>free</code> without safe reclamation reintroduces ABA. <strong>Feed-forward:</strong> §23.2,
+§23.4.</div>
+
+</section>

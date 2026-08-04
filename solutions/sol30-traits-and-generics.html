@@ -1,0 +1,111 @@
+<section class="solutions" id="sol30">
+<h1>Chapter 30 — Solutions</h1>
+
+<div class="solution" id="sol30.1"><span class="sol-label">30.1</span>
+A <strong>generic function</strong> is written once over a type parameter <code>T</code> and reused at many concrete types. A
+<strong>trait</strong> names a set of behaviors a type can implement. A <strong>trait bound</strong> (<code>T: Trait</code>)
+requires a generic's type parameter to implement a trait, and in return lets the body use that trait's operations.
+<em>Tempting wrong answer:</em> &ldquo;a trait is a base class you inherit from&rdquo; — a trait is a set of required behaviors a
+type opts into, not an inheritance hierarchy. <strong>Feed-forward:</strong> &sect;30.2, &sect;30.3.</div>
+
+<div class="solution" id="sol30.2"><span class="sol-label">30.2</span>
+<strong>Monomorphization</strong> is the compiler emitting a separate specialized copy of a generic for each concrete type it is
+used with. After it, there is no type parameter at run time — each call goes to an ordinary type-specific function with direct,
+inlinable operations — so there is no runtime dispatch. <em>Tempting wrong answer:</em> &ldquo;generics carry a type tag checked at
+run time&rdquo; — the type is resolved and erased at compile time. <strong>Feed-forward:</strong> &sect;30.2.</div>
+
+<div class="solution" id="sol30.3"><span class="sol-label">30.3</span>
+<code>error[E0277]</code> — &ldquo;the trait bound <code>`T: Trait`</code> is not satisfied&rdquo; — meaning you used a type that
+doesn't implement a trait in a place that required it. <em>Tempting wrong answer:</em> &ldquo;it's a type-mismatch error, so cast
+the type&rdquo; — the type isn't mismatched; it lacks the required behavior, so you implement the trait or relax the bound.
+<strong>Feed-forward:</strong> &sect;30.3.</div>
+
+<div class="solution" id="sol30.4"><span class="sol-label">30.4</span>
+(a) <code>qsort</code> is generic in that it sorts arrays of any element type via <code>void*</code>; its two costs are lost type
+safety (element type erased to <code>void*</code>) and an indirect call through the comparator function pointer per comparison. (b)
+Passing, say, a <code>double</code> comparator while sorting <code>int</code>s compiles because both are <code>void*</code> to
+<code>qsort</code>; at run time the comparator reinterprets the bytes wrongly and produces a garbage ordering, and the compiler
+cannot catch it because the types were erased. (c) The <code>qsort</code> function-pointer mechanism corresponds to a Rust
+<strong>trait object</strong> (dynamic dispatch); <strong>generics with monomorphization</strong> give the duplication-free,
+fully-checked, fully-inlined alternative. <em>Tempting wrong answer:</em> &ldquo;<code>qsort</code> is type-safe because you cast
+inside the comparator&rdquo; — the cast is unchecked; a wrong-typed comparator still compiles. <strong>Feed-forward:</strong>
+&sect;30.1, &sect;30.4.</div>
+
+<div class="solution" id="sol30.5"><span class="sol-label">30.5</span>
+(a) The caller must supply a type <code>T</code> that implements <code>Summary</code>. (b) The body may call <code>summarize</code>
+(and any other <code>Summary</code> method) on <code>item</code> — impossible without the bound, since otherwise the compiler
+couldn't know <code>T</code> has it. (c) Rust checks the bound at the generic's <em>definition</em>, so the generic is verified
+once against its stated requirements; C++ checks at instantiation, so an unmet requirement surfaces as errors deep inside the
+template body, per call site. <em>Tempting wrong answer:</em> &ldquo;the bound is just documentation&rdquo; — it is enforced;
+violating it is <code>E0277</code>. <strong>Feed-forward:</strong> &sect;30.3.</div>
+
+<div class="solution" id="sol30.6"><span class="sol-label">30.6</span>
+(a) Static dispatch (generics) resolves at compile time — a direct, inlinable call, zero dispatch cost; dynamic dispatch (trait
+objects) resolves at run time through a vtable — an indirect call per method, not inlinable. (b) A trait object is a pair of
+pointers: one to the value, one to the vtable of the trait's method implementations for that concrete type. (c) Dynamic dispatch is
+required for a heterogeneous collection (e.g. <code>Vec&lt;Box&lt;dyn Draw&gt;&gt;</code>) or run-time-chosen implementations;
+static dispatch is preferable for a hot loop over a single known type where inlining matters. <em>Method-selection cue:</em> known
+type(s) at compile time and speed matters &rarr; static; heterogeneity or run-time choice &rarr; dynamic.
+<strong>Feed-forward:</strong> &sect;30.4.</div>
+
+<div class="solution" id="sol30.7"><span class="sol-label">30.7</span>
+(a) Monomorphization costs <strong>binary size</strong> (and compile time): a separate code copy per concrete type, which dynamic
+dispatch avoids by keeping one copy. (b) Dynamic dispatch costs an <strong>indirect call per method invocation</strong> (an
+indirect branch, not inlinable) that a monomorphized generic does not. (c) For a small method in a tight loop over a homogeneous
+collection, choose static dispatch — inlining and the absence of an indirect call dominate; for a large plugin interface with many
+implementations, choose dynamic dispatch — one code copy and run-time flexibility outweigh per-call cost, and monomorphizing over
+many types would bloat the binary. The deciding factor is per-call hot-path cost vs. code-size/heterogeneity.
+<em>Tempting wrong answer:</em> &ldquo;always use dynamic dispatch to keep binaries small&rdquo; — that pays indirect calls
+everywhere, including hot paths where static dispatch is free. <strong>Feed-forward:</strong> &sect;30.2, &sect;30.4.</div>
+
+<div class="solution" id="sol30.8"><span class="sol-label">30.8</span>
+<strong>Step 4:</strong> Corrected signature: <code>fn largest&lt;T: PartialOrd + Copy&gt;(list: &amp;[T]) -&gt; T</code> — the
+minimal bounds the body uses (<code>PartialOrd</code> for <code>&gt;</code>, <code>Copy</code> for copying elements out). Bounding
+at the definition, not the call site, is what lets the compiler verify the generic <em>once</em>: the body is checked against the
+declared requirements, and every call is then checked to supply a satisfying type, so there is no per-call re-checking of the body
+(the C++ failure mode). Casting or wrapping to silence <code>E0277</code> is wrong because the error isn't a type mismatch — it's
+that the body needs a capability the type must actually provide; the fix is to state the bound (or implement the trait), not to
+cast. <em>Tempting wrong answer:</em> &ldquo;add <code>T: Any</code> and downcast&rdquo; — that throws away static checking to
+paper over a missing bound. <strong>Feed-forward:</strong> &sect;30.3.</div>
+
+<div class="solution" id="sol30.9"><span class="sol-label">30.9</span>
+(a) <strong>Static</strong> — a hot numeric loop wants inlining and no indirect call; the type is known. (b) <strong>Dynamic</strong>
+— one <code>Vec</code> of mixed shape types needs a trait object (<code>Box&lt;dyn Draw&gt;</code>); a single monomorphized type
+can't hold different concrete types. (c) <strong>Static</strong> — one concrete type; monomorphization gives a direct call and no
+code bloat. (d) <strong>Dynamic</strong> — plugins chosen at run time can't be known at compile time, so a trait object is required.
+<em>Method-selection cue:</em> heterogeneity or run-time choice forces dynamic; otherwise static wins on cost.
+<strong>Feed-forward:</strong> &sect;30.4.</div>
+
+<div class="solution" id="sol30.10"><span class="sol-label">30.10</span>
+(a) <strong>False</strong> — a generic is monomorphized; there is no type parameter or dispatch at run time. (b) <strong>True</strong>
+— a trait object dispatches through a vtable at run time. (c) <strong>False</strong> — <code>E0277</code> means the type doesn't
+implement a required trait; fix by implementing it or relaxing the bound. (d) <strong>False</strong> — monomorphization can make
+binaries <em>larger</em> (a copy per type); it trades size for speed. (e) <strong>False</strong> — a trait object is still fully
+type-checked (it can only hold a type that implements the trait), unlike C's <code>void*</code>. <em>Tempting wrong answer:</em>
+marking (e) true by analogy to <code>void*</code> — the analogy holds for the dispatch mechanism, not for type safety.
+<strong>Feed-forward:</strong> &sect;30.2&ndash;&sect;30.4.</div>
+
+<div class="solution" id="sol30.11"><span class="sol-label">30.11</span>
+(a) <code>Copy</code> is a trait; whether <code>let y = x;</code> copies or moves is decided by whether <code>T</code> implements
+it — exactly the same mechanism as <code>T: PartialOrd</code> deciding whether <code>&gt;</code> is allowed: a capability named as
+a trait, required in the type, checked by the compiler. (b) <code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> are
+generic enums; being generic, they carry the success value's type and force the caller to pattern-match/handle the absent or error
+case, making &ldquo;did you check the return?&rdquo; a compile-time question. (c) <code>T: Send</code> would mean &ldquo;a value of
+<code>T</code> is safe to transfer to another thread&rdquo;; requiring it at a thread-spawn boundary means the compiler refuses to
+move a non-thread-safe value across threads, so the aliasing-plus-mutation that causes a data race can't be set up — a compile
+error instead of undefined behavior. <em>Tempting wrong answer:</em> &ldquo;traits are only for shared method behavior like
+<code>summarize</code>&rdquo; — they also encode capabilities and guarantees (<code>Copy</code>, <code>Send</code>,
+<code>Sync</code>). <strong>Feed-forward:</strong> &sect;30.5; the error-handling and concurrency chapters ahead, and Ch 24.</div>
+
+<div class="solution" id="sol30.12"><span class="sol-label">30.12</span>
+Toolchain-specific. A correct write-up reports: (a) the <code>qsort</code> demo prints the sorted array (e.g.
+<code>1 2 5 7 9</code>), and passing a comparator for a different element type still compiles because <code>qsort</code>'s
+parameters are <code>void*</code> — demonstrating type erasure. (b) With <code>rustc</code>, <code>largest&lt;T: PartialOrd +
+Copy&gt;</code> compiles at two types; removing the bounds yields <code>error[E0277]</code> on the comparison/copy lines (the
+<code>PartialOrd</code>/<code>Copy</code> bound is missing); without <code>rustc</code>, name those lines and bounds. (c) A
+<code>Vec&lt;Box&lt;dyn Draw&gt;&gt;</code> can hold two different implementors because each is a trait object dispatched via vtable;
+a single monomorphized generic <code>Vec&lt;T&gt;</code> is one concrete type and cannot hold two different types at once.
+<em>Tempting wrong answer:</em> &ldquo;the wrong-typed <code>qsort</code> comparator is fine because it compiled&rdquo; — it
+compiles but reinterprets bytes wrongly at run time. <strong>Feed-forward:</strong> &sect;30.1, &sect;30.4.</div>
+
+</section>

@@ -1,0 +1,108 @@
+<section class="solutions" id="sol29">
+<h1>Chapter 29 — Solutions</h1>
+
+<div class="solution" id="sol29.1"><span class="sol-label">29.1</span>
+A <strong>lifetime</strong> is a compile-time name for the region of the program over which a reference is valid (bounded by its
+referent's scope). The second borrow rule it enforces: a reference may never be used after the value it refers to has been dropped.
+<em>Tempting wrong answer:</em> &ldquo;a lifetime is how long the value lives, which you can set&rdquo; — it only <em>describes</em>
+existing scope facts; it cannot make anything live longer. <strong>Feed-forward:</strong> &sect;29.1, &sect;29.3.</div>
+
+<div class="solution" id="sol29.2"><span class="sol-label">29.2</span>
+<code>x</code> is a stack local dropped when the function returns, so the returned <code>&amp;x</code> would point at reclaimed
+storage — a dangling reference / use-after-scope. <em>Tempting wrong answer:</em> &ldquo;it's fine because <code>5</code> is a
+small constant&rdquo; — the value's size is irrelevant; its storage is gone once the frame is popped. <strong>Feed-forward:</strong>
+&sect;29.1.</div>
+
+<div class="solution" id="sol29.3"><span class="sol-label">29.3</span>
+The three <code>'a</code>s assert: there is some region <code>'a</code> such that both inputs <code>x</code> and <code>y</code> are
+valid for at least <code>'a</code>, and the returned reference is valid for <code>'a</code> — so the result may not outlive the
+shorter-lived of the two inputs. <em>Tempting wrong answer:</em> &ldquo;<code>'a</code> makes both inputs live equally long&rdquo;
+— it constrains the output's validity relative to the inputs; it does not change how long anything lives. <strong>Feed-forward:</strong>
+&sect;29.2.</div>
+
+<div class="solution" id="sol29.4"><span class="sol-label">29.4</span>
+(a) Both return (directly or through a struct field) the address of a stack local whose storage is reclaimed when the function
+returns, so dereferencing it in the caller is a use-after-scope. (b) <code>gcc</code>'s <code>-Wreturn-local-addr</code> follows
+simple direct data flow and catches <code>return &amp;local;</code>, but gives up when the address is stored in a struct and
+returned indirectly, so that version builds clean. (c) Rust's rule is not a heuristic — the borrow checker rejects <em>every</em>
+reference used past its referent's drop; the analogous Rust function is <code>error[E0597]</code>, &ldquo;does not live long
+enough.&rdquo; <em>Tempting wrong answer:</em> &ldquo;the struct version is safe because it compiled without warning&rdquo; — ASan
+shows stack-use-after-scope; no warning proves nothing. <strong>Feed-forward:</strong> &sect;29.1, &sect;29.3.</div>
+
+<div class="solution" id="sol29.5"><span class="sol-label">29.5</span>
+(a) The containment condition: for every use of a reference, the region over which the reference is used must be contained within
+the region its referent is alive. (b) You can't fix it by annotating a longer lifetime because a lifetime only describes existing
+scope facts — no name can extend a value past its owner's drop. (c) The two structural fixes: return an <em>owned</em> value (move
+ownership out — right when the caller should own the result), or borrow from something that genuinely outlives the use (an input
+reference or an outer-scope value — right when the data lives elsewhere). <em>Tempting wrong answer:</em> &ldquo;annotate it
+<code>'static</code>&rdquo; — that only compiles if the data really is static, which a fresh local isn't.
+<strong>Feed-forward:</strong> &sect;29.3, &sect;29.4.</div>
+
+<div class="solution" id="sol29.6"><span class="sol-label">29.6</span>
+The rules: (1) each elided input reference gets its own lifetime; (2) one input lifetime is assigned to all elided outputs; (3) if
+one input is <code>&amp;self</code>/<code>&amp;mut self</code>, its lifetime is assigned to all elided outputs. (a)
+<code>first</code> has one input reference, so rule 2 assigns its lifetime to the output — no annotation needed. (b)
+<code>get</code> is a method with <code>&amp;self</code>, so rule 3 gives the output <code>self</code>'s lifetime. (c)
+<code>longest</code> has two input references and neither is <code>self</code>, so rules 2 and 3 don't apply and the compiler can't
+tell which input the output borrows — you must write <code>'a</code>. <em>Method-selection cue:</em> one input ref &rarr; elided;
+method with <code>self</code> &rarr; elided; multiple non-self input refs feeding an output ref &rarr; annotate.
+<strong>Feed-forward:</strong> &sect;29.2, &sect;29.4.</div>
+
+<div class="solution" id="sol29.7"><span class="sol-label">29.7</span>
+(a) Lifetimes are checked during borrow-checking (compile time) and are <em>erased</em> before code generation. (b) A
+<code>&amp;'a T</code> has the same runtime representation as the C pointer it replaces — a bare address, no extra data (for sized
+<code>T</code>). (c) A GC answers &ldquo;still valid?&rdquo; by tracing/reachability at run time (time cost, pauses); reference
+counting answers it by per-reference counter updates at run time (time and space); Rust answers it once at compile time, paying
+nothing at run time. <em>Tempting wrong answer:</em> &ldquo;lifetimes are a runtime tag on each reference&rdquo; — they are purely
+static and erased. <strong>Feed-forward:</strong> &sect;29.3.</div>
+
+<div class="solution" id="sol29.8"><span class="sol-label">29.8</span>
+<strong>Step 4:</strong> Correct fix — change the return type to an owned <code>String</code> and return <code>s</code> by value:
+<code>fn greeting() -&gt; String { String::from("hi") }</code>; ownership moves out to the caller, so there is no dangling
+reference. Alternative — if the caller already owns suitable data, take it as an input reference and return a slice of that:
+<code>fn greeting(src: &amp;str) -&gt; &amp;str</code>, borrowing from something that outlives the call. Reaching for
+<code>'static</code> is wrong because a freshly built <code>String</code> is not static data; <code>'static</code> would either
+fail to compile or force an unintended constraint. <em>Tempting wrong answer:</em> &ldquo;annotate the return
+<code>&amp;'static str</code>&rdquo; — the local isn't static, so this doesn't fix the dangle. <strong>Feed-forward:</strong>
+&sect;29.3, and Ch 27 (moving ownership out).</div>
+
+<div class="solution" id="sol29.9"><span class="sol-label">29.9</span>
+(a) <strong>Elided</strong> — one input reference; rule 2 assigns its lifetime to the output. (b) <strong>Required</strong> — a
+struct with a reference field must name its lifetime (<code>&amp;'a u8</code>), else <code>E0106</code>. (c)
+<strong>Dangling-reference error</strong> — returning a reference to a local is <code>E0597</code>. (d) <strong>Required</strong> —
+two non-self input references feeding an output reference; elision can't choose, so annotate <code>'a</code>.
+<em>Method-selection cue:</em> reference field &rarr; annotate; return-a-local &rarr; error; multiple input refs to one output ref
+&rarr; annotate; single input ref &rarr; elided. <strong>Feed-forward:</strong> &sect;29.2, &sect;29.4.</div>
+
+<div class="solution" id="sol29.10"><span class="sol-label">29.10</span>
+(a) <strong>False</strong> — <code>'static</code> asserts the referent already lives for the whole program; it does not make an
+arbitrary value live forever. (b) <strong>False</strong> — lifetimes are erased before code generation; a reference is a bare
+pointer with no extra data. (c) <strong>False</strong> — a struct with a <code>&amp;str</code> field must name a lifetime, else
+<code>E0106</code>. (d) <strong>True</strong> — <code>E0597</code> fires precisely when a reference's use would extend past its
+referent's drop. (e) <strong>False</strong> — elision handles most signatures; explicit lifetimes are the exception.
+<em>Tempting wrong answer:</em> marking (b) true because &ldquo;the compiler must store the lifetime somewhere&rdquo; — it stores
+it only during checking, then erases it. <strong>Feed-forward:</strong> &sect;29.3, &sect;29.4.</div>
+
+<div class="solution" id="sol29.11"><span class="sol-label">29.11</span>
+(a) A struct storing a <code>String</code> owns its data — it costs an allocation but carries no lifetime parameter and may be used
+freely. A struct storing <code>&amp;'a str</code> avoids the allocation but gains a lifetime parameter and may not outlive the
+<code>str</code> it borrows — every use is constrained by that borrow. (b) A self-referential struct is hard because the borrowing
+field's lifetime would have to name the struct's own storage, which moves (Chapter 27) — after a move the internal pointer would
+dangle, so plain lifetimes cannot express it safely (it requires pinning or indirection). (c) The own-vs-borrow choice is exactly
+C's &ldquo;who owns this buffer, and who may free it&rdquo; question (Chapters 9, 27); lifetimes make that question explicit in the
+type and let the compiler check the answer, instead of leaving it to convention. <em>Tempting wrong answer:</em> &ldquo;always
+borrow to avoid allocations&rdquo; — borrowing threads lifetimes through everything and forbids outliving the source; owning is
+often the simpler, correct choice. <strong>Feed-forward:</strong> &sect;29.4, and Ch 27.</div>
+
+<div class="solution" id="sol29.12"><span class="sol-label">29.12</span>
+Toolchain-specific. A correct write-up reports: (a) under <code>-O2 -Wall</code> the direct <code>return &amp;local;</code> warns
+with <code>-Wreturn-local-addr</code> while the struct-laundered version builds without warning, and
+<code>-fsanitize=address</code> flags the latter as <strong>stack-use-after-scope</strong> at run time. (b) With <code>rustc</code>,
+<code>fn dangle() -&gt; &amp;str { let s = String::from("hi"); &amp;s }</code> fails with <code>error[E0597]</code>,
+&ldquo;<code>s</code> does not live long enough&rdquo;; without <code>rustc</code>, name the <code>&amp;s</code> return line and
+explain <code>s</code> is dropped at the closing brace. (c) The <code>longest</code> function needs <code>&lt;'a&gt;</code> because
+of two input references; a struct with a <code>&amp;str</code> field needs <code>&lt;'a&gt;</code> too, and omitting it is
+<code>E0106</code>, &ldquo;missing lifetime specifier.&rdquo; <em>Tempting wrong answer:</em> &ldquo;the struct C version is fine —
+no warning&rdquo; — ASan proves the use-after-scope. <strong>Feed-forward:</strong> &sect;29.1, &sect;29.4.</div>
+
+</section>

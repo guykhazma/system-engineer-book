@@ -1,0 +1,108 @@
+<section class="solutions" id="sol28">
+<h1>Chapter 28 — Solutions</h1>
+
+<div class="solution" id="sol28.1"><span class="sol-label">28.1</span>
+A <strong>shared reference</strong> <code>&amp;T</code> is a read-only borrow; any number may exist at once, and you may read but
+not mutate the value through one. A <strong>mutable reference</strong> <code>&amp;mut T</code> is a read-write borrow; exactly one
+may exist, and while it lives no other reference (of either kind) to the value may. <em>Tempting wrong answer:</em>
+&ldquo;<code>&amp;mut</code> is just a pointer, like <code>&amp;</code> but you can write&rdquo; — it is that plus an
+<em>exclusivity</em> guarantee the compiler enforces. <strong>Feed-forward:</strong> &sect;28.2, &sect;28.3.</div>
+
+<div class="solution" id="sol28.2"><span class="sol-label">28.2</span>
+<code>&amp;String</code> borrows: passing <code>&amp;owner</code> lends a reference without moving the value, so the caller keeps
+ownership and <code>owner</code> stays valid. <code>fn length(s: String)</code> takes by value, which <em>moves</em> the
+<code>String</code> into the function and invalidates <code>owner</code>. <em>Tempting wrong answer:</em> &ldquo;both work because
+the function only reads&rdquo; — reading is irrelevant; taking by value moves regardless of what the body does.
+<strong>Feed-forward:</strong> &sect;28.1.</div>
+
+<div class="solution" id="sol28.3"><span class="sol-label">28.3</span>
+The rule: at any time a value may be borrowed by <em>any number of shared references</em> (<code>&amp;T</code>) <em>or</em> by
+<em>exactly one mutable reference</em> (<code>&amp;mut T</code>), never both. It forbids two mutable borrows at once
+(<code>E0499</code>) and a mutable borrow while a shared borrow is live (<code>E0502</code>). <em>Tempting wrong answer:</em>
+&ldquo;you can mix one <code>&amp;mut</code> with a few <code>&amp;</code> if they don't overlap in code&rdquo; — if they are
+simultaneously live, that is exactly <code>E0502</code>. <strong>Feed-forward:</strong> &sect;28.3.</div>
+
+<div class="solution" id="sol28.4"><span class="sol-label">28.4</span>
+(a) The bug is the <code>printf("via p", *p)</code> line: after <code>realloc</code> may have moved the block, <code>p</code> is a
+dangling pointer, so the dereference is a use-after-free. (b) Plain <code>gcc -O2 -Wall</code> gives no warning because C's type
+system does not track whether <code>p</code> still points at live memory after <code>realloc</code>; only AddressSanitizer, at run
+time, reports <strong>heap-use-after-free</strong>. (c) In Rust <code>p = &amp;v[0]</code> is a shared borrow of <code>v</code>, and
+<code>v.push(4)</code> needs <code>&amp;mut v</code>; the mutable borrow cannot coexist with the live shared borrow, so it is
+<code>E0502</code> at compile time. The checker does not need to know <code>push</code> reallocates — the rule &ldquo;no mutable
+borrow while a shared borrow is live&rdquo; is sufficient. <em>Tempting wrong answer:</em> &ldquo;Rust catches it because it checks
+the reallocation at run time&rdquo; — it is a static rejection with no runtime check. <strong>Feed-forward:</strong> &sect;28.4.</div>
+
+<div class="solution" id="sol28.5"><span class="sol-label">28.5</span>
+(a) Two references to one value with at least one mutable would let one path write while another reads or writes — a torn or
+unexpectedly-changed read, or a pointer invalidated under the other, all in one thread. (b) That is the definition of a data race
+(Chapter 24) minus the threads: two accesses to one location, at least one a write, unsynchronized. (c) Exclusivity lets the
+compiler assume nothing else can see or change the value through the <code>&amp;mut</code>, which makes mutation safe and enables
+optimizations (no aliasing to worry about). <em>Tempting wrong answer:</em> &ldquo;exclusivity is just a style rule&rdquo; — it is
+a soundness requirement; without it Rust could not rule out aliasing-plus-mutation. <strong>Feed-forward:</strong> &sect;28.3,
+&sect;28.4.</div>
+
+<div class="solution" id="sol28.6"><span class="sol-label">28.6</span>
+(a) Compiles — many shared references are allowed. (b) <code>E0499</code> — two mutable borrows at once. (c) <code>E0502</code> —
+mutable borrow while a shared borrow is live. (d) Compiles — because the shared borrow has ended (last use) before the mutable
+borrow starts, they do not overlap (non-lexical lifetimes). <em>Method-selection cue:</em> count simultaneously-live borrows; many
+<code>&amp;</code> ok, one <code>&amp;mut</code> alone ok, any overlap of a writer with anything else is rejected.
+<strong>Feed-forward:</strong> &sect;28.2, &sect;28.3.</div>
+
+<div class="solution" id="sol28.7"><span class="sol-label">28.7</span>
+(a) A <code>&amp;T</code> is, at the machine level, just a pointer — the same pointer C would use — carrying no extra runtime data
+(for a sized <code>T</code>). (b) The borrow checking happens entirely at compile time; it adds zero runtime cost. (c)
+<code>RefCell</code> enforces the same one-writer-XOR-many-readers rule at run time, so it carries a borrow-flag it checks and
+updates on each borrow (a small time cost and a possible panic on violation); paying it is justified only when the borrow structure
+cannot be proven statically but you still need shared mutability. <em>Tempting wrong answer:</em> &ldquo;references are cheap
+because they're reference-counted&rdquo; — plain references are not counted at all; that is <code>Rc</code>/<code>Arc</code>, a
+separate mechanism. <strong>Feed-forward:</strong> &sect;28.2, &sect;28.3.</div>
+
+<div class="solution" id="sol28.8"><span class="sol-label">28.8</span>
+<strong>Step 4:</strong> Fix A (separate the passes): during a read-only pass, collect what you want to add into a new vector
+(<code>let additions: Vec&lt;i32&gt; = v.iter().map(|x| 2 * x).collect();</code>), then, after that shared borrow ends,
+<code>v.extend(additions)</code> under a single mutable borrow. Fix B (in-place, if that were the task): use
+<code>for x in v.iter_mut() { *x *= 2; }</code>, which is one exclusive borrow and is allowed because there is no aliasing.
+Cloning the entire vector to iterate a copy while mutating the original is the wrong default because it pays a full O(n) copy to
+hide a real hazard; separating read from write costs nothing extra and is what the rule is pointing at. <em>Tempting wrong
+answer:</em> &ldquo;just <code>v.clone()</code> and iterate that&rdquo; — needless copy, and it silently changes semantics (you
+iterate the old contents). <strong>Feed-forward:</strong> &sect;28.4.</div>
+
+<div class="solution" id="sol28.9"><span class="sol-label">28.9</span>
+(a) Allowed — many shared references may coexist (no writer). (b) Forbidden — a mutable and a shared borrow simultaneously is
+<code>E0502</code>. (c) Forbidden — two mutable borrows is <code>E0499</code>. (d) Allowed — the shared borrows have ended, so the
+mutable borrow is the only live one. <em>Method-selection cue:</em> the only legal states are &ldquo;N readers, 0 writers&rdquo;
+or &ldquo;0 readers, 1 writer.&rdquo; <strong>Feed-forward:</strong> &sect;28.3.</div>
+
+<div class="solution" id="sol28.10"><span class="sol-label">28.10</span>
+(a) <strong>False</strong> — at most one <code>&amp;mut</code> may exist at a time, regardless of timing (<code>E0499</code>). (b)
+<strong>False</strong> — a shared reference is read-only; mutation needs <code>&amp;mut</code>. (c) <strong>False</strong> — borrow
+checking is compile-time; a dereference is just a pointer load. (d) <strong>True</strong> — that is the iterator-invalidation
+hazard; it is <code>E0502</code>. (e) <strong>False</strong> — a reference does not own the value and drops nothing; only the owner
+drops it. <em>Tempting wrong answer:</em> marking (c) true because &ldquo;safety must cost something at run time&rdquo; — the borrow
+rule's cost is paid entirely at compile time. <strong>Feed-forward:</strong> &sect;28.2&ndash;&sect;28.4.</div>
+
+<div class="solution" id="sol28.11"><span class="sol-label">28.11</span>
+(a) A use-after-free through an aliased pointer is one alias mutating/freeing memory another alias still reads; a data race is two
+threads accessing one location, one writing, unsynchronized — both are &ldquo;two paths to one value, at least one writing.&rdquo;
+The single rule &ldquo;aliasing XOR mutation&rdquo; forbids that combination, attacking the shared root rather than the two
+symptoms. (b) Unlimited shared references are safe because with no writer no reader can observe a changing value — reads never
+conflict with reads. Access becomes a problem only when a write is introduced, which the rule permits solely under exclusivity. (c)
+To extend &ldquo;no data races&rdquo; across threads you need the <code>Send</code>/<code>Sync</code> traits (and, for shared
+mutation, synchronization such as <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>): the borrow rule governs one value in one thread, but
+sending references between threads requires the type system to also track which types are safe to share or move across threads.
+<em>Tempting wrong answer:</em> &ldquo;the borrow rule alone already prevents all data races&rdquo; — it prevents intra-thread
+aliasing; cross-thread safety needs <code>Send</code>/<code>Sync</code> on top. <strong>Feed-forward:</strong> &sect;28.4, and Ch
+24; the concurrency chapter ahead.</div>
+
+<div class="solution" id="sol28.12"><span class="sol-label">28.12</span>
+Toolchain-specific. A correct write-up reports: (a) the C snippet builds with no warning under <code>-O2 -Wall</code> and, rebuilt
+with <code>-fsanitize=address</code>, reports <strong>heap-use-after-free</strong> when the old pointer is dereferenced after a
+moving <code>realloc</code> — the C type system misses the dangling alias. (b) With <code>rustc</code>, the
+<code>let p = &amp;v[0]; v.push(4); println!("{p}")</code> program fails with <code>error[E0502]</code> because
+<code>push</code>'s mutable borrow conflicts with the live shared borrow <code>p</code>; without <code>rustc</code>, name those two
+conflicting borrows. (c) The compiling version ends the shared borrow (use <code>p</code> before the <code>push</code>, or index
+<code>v[0]</code> directly and copy the value out) so no borrow overlaps the mutable one. <em>Tempting wrong answer:</em> &ldquo;the
+C program is fine because it compiled without warning&rdquo; — no warning proves nothing about UB; the sanitizer shows the
+use-after-free. <strong>Feed-forward:</strong> &sect;28.4.</div>
+
+</section>

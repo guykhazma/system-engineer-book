@@ -1,0 +1,395 @@
+<section class="chapter" id="ch29">
+<h1>Chapter 29 — Lifetimes</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch28">Chapter 28</a> (borrowing — a lifetime is how the compiler
+proves the second borrow rule, that a reference never outlives its value), <a href="#ch27">Chapter 27</a> (ownership and drop — a
+value is dropped at end of scope, so a reference to it must not be used past that point), <a href="#ch08">Chapter 8</a> (the stack:
+a local's storage is reclaimed when its scope ends), <a href="#ch09">Chapter 9</a> (dangling pointers and use-after-free — exactly
+what lifetimes rule out). &nbsp;·&nbsp; Chapter 28 left one borrow rule unproven: a reference must never be used after the value it
+points at is gone. This chapter is how the compiler proves it — by tracking, and sometimes making you name, the spans over which
+references are valid.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch08">Chapter 8</a> — when is a stack local's storage reclaimed, and what becomes of a
+pointer to it afterward? (2) <a href="#ch28">Chapter 28</a> — a reference does not own its value; who is responsible for dropping the
+value, and when? (3) <em>Predict:</em> in C you write a function that returns <code>&amp;local</code> (the address of one of its
+own stack variables) and the caller dereferences it. Does <code>gcc -Wall</code> warn? In Rust, a function that returns a
+reference to one of its own locals — will the compiler accept it? Write your guesses; &sect;29.1 and &sect;29.3 answer all
+three.</p>
+</aside>
+
+<p>Chapter 28 gave one borrow rule in full — aliasing XOR mutation — and named a second only in passing: a reference must never be
+used after the value it refers to is gone. That second rule is what this chapter is about, and the machinery that enforces it is
+<strong>lifetimes</strong>. A lifetime is not a runtime thing and it changes nothing about the code the machine runs; it is a
+<em>compile-time</em> name for a region of the program over which a reference is valid, and the borrow checker uses lifetimes to
+prove that every reference is dereferenced only while its referent is still alive. First, the hazard: the dangling reference — the C
+return-a-pointer-to-a-local bug — and why the compiler must forbid it (&sect;29.1). Then how references usually need no annotation,
+and when they do: naming a lifetime <code>'a</code> in a function signature to relate an output reference to its inputs
+(&sect;29.2). Then what the borrow checker actually checks, and the <code>E0597</code> error it produces when a value does not live
+long enough (&sect;29.3). Then lifetime <strong>elision</strong> — why most signatures omit lifetimes — and structs that hold
+references, where a lifetime is mandatory (<code>E0106</code>) (&sect;29.4). We close by carrying lifetimes forward: ownership,
+borrowing, and lifetimes together are the whole memory-safety story, and the next chapters build reusable abstractions on top of it
+(&sect;29.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust error index, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>29.1 The dangling reference, and why it must be forbidden</h2>
+
+<p>A reference is a pointer into a value it does not own. The value is dropped by its owner at end of scope (Chapters 27, 28); if a
+reference is used after that point, it points at reclaimed storage — a <strong>dangling reference</strong>, the use-after-free of
+Chapter 9 in reference form. The archetype is returning a pointer to a stack local. Here is real C; the trivial form is caught by a
+best-effort warning, but that warning is a heuristic, not a guarantee. Compiled in this environment (gcc 11.4.0):</p>
+
+<pre><code>int *make(void) {
+    int local = 42;
+    return &amp;local;      /* address of a stack local; reclaimed when make returns */
+}
+/* caller: */ int *r = make(); printf("%d\n", *r);   /* dangling: use-after-scope */
+
+$ gcc -O2 -Wall dangle.c -o dangle
+dangle.c: In function 'make':
+dangle.c:3:12: warning: function returns address of local variable [-Wreturn-local-addr]</code></pre>
+
+<p>gcc catches this direct form. But launder the same pointer through a struct and the heuristic misses it — the program compiles
+clean and is only caught at run time by a sanitizer (gcc 11.4.0, this environment):</p>
+
+<pre><code>struct Ref { int *p; };
+struct Ref borrow_local(void) {
+    int local = 42;
+    struct Ref r; r.p = &amp;local;   /* store address of a local in a struct */
+    return r;                       /* r.p now dangles */
+}
+/* caller: */ struct Ref r = borrow_local(); printf("%d\n", *r.p);
+
+$ gcc -O2 -Wall dangle2.c -o dangle2      # compiles, NO warning
+$ gcc -O1 -fsanitize=address dangle2.c -o d && ./d
+==ERROR: AddressSanitizer: stack-use-after-scope ... in main</code></pre>
+
+<p>The point is not that C never warns — it is that C's warnings are a best-effort heuristic that follows only simple data flow and
+gives up as soon as the pointer passes through a struct, a second function, or a container. The general problem — does this
+reference outlive the value it points at? — is not something C's type system tracks at all. Rust makes it a rule the type system
+enforces in <em>every</em> case: a reference may not be used after its referent is dropped, no exceptions, checked at compile time.
+To do that in the general case — references flowing into and out of functions, stored in structs, returned — the compiler needs a
+way to <em>name</em> and <em>compare</em> the spans over which references and values are valid. That name is a lifetime.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is returning <code>&amp;local</code> from a function a bug — what has happened to <code>local</code>'s storage by the time the
+caller dereferences the result? Why does <code>gcc -Wall</code> catch the direct form but not the version laundered through a
+struct? State the general rule Rust enforces that the C heuristic only approximates. (Answer after the next section.)</p>
+</aside>
+
+<h2>29.2 Lifetimes named: relating an output reference to its inputs</h2>
+
+<p>Most of the time you never write a lifetime — the compiler infers the valid regions on its own (&sect;29.4). You must name one
+when a function returns a reference and the compiler cannot tell, from the signature alone, <em>which</em> input the returned
+reference borrows from — because that determines how long the result stays valid. The canonical case is a function returning
+whichever of two string slices is longer (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>fn longest&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str {
+    if x.len() &gt; y.len() { x } else { y }
+}</code></pre>
+
+<p>The <code>&lt;'a&gt;</code> declares a <strong>lifetime parameter</strong> named <code>'a</code> (lifetimes are written with a
+leading apostrophe and are usually short and lowercase). The signature now says: for some region <code>'a</code>, both inputs are
+references valid for at least <code>'a</code>, and the returned reference is valid for <code>'a</code> too. This is a
+<em>constraint</em>, not a runtime value — it does not change what the function does or make anything live longer; it tells the
+borrow checker how the output's validity relates to the inputs'. The payoff is at the call sites: the compiler now knows the
+returned reference cannot outlive the shorter-lived of the two arguments, and it will reject any caller that tries to use the result
+after either input has gone. Without the annotation the compiler could not know whether the result borrows from <code>x</code> or
+<code>y</code>, so it could not check the callers — which is exactly why the annotation is required here. Lifetime parameters, then,
+are how a function's signature carries a promise about the validity of the references it returns, so that borrow-checking composes
+across function boundaries.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a reference may not outlive its referent</span>
+<p><strong>1. In words.</strong> Every reference is valid only for a region — its lifetime — bounded by the scope of the value it
+points at. The borrow checker requires that a reference is used only within that region; using it after the referent is dropped is
+rejected. A lifetime parameter like <code>'a</code> lets a signature state how an output reference's region relates to its
+inputs'.</p>
+<p><strong>2. As a picture.</strong> Figure 29.1: a value's lifetime drawn as a bar from its creation to its drop; a reference's use
+drawn as a shorter bar that must fit <em>inside</em> the value's bar. A reference bar that extends past the value's drop is the
+error.</p>
+<p><strong>3. As numbers/contrast.</strong> The C function of &sect;29.1 returns a pointer whose referent's storage is reclaimed the
+instant the function returns — the reference bar extends past the value bar &rarr; use-after-scope (ASan-confirmed). The Rust
+equivalent is <code>E0597</code> at compile time: the borrowed value does not live long enough, so the reference cannot be
+returned.</p>
+</aside>
+
+<p><em>(Answer to the &sect;29.1 quick check: <code>local</code> lives on the function's stack frame, which is reclaimed the moment
+the function returns, so by the time the caller dereferences the returned pointer the storage is gone — a use-after-scope. gcc's
+<code>-Wreturn-local-addr</code> follows simple direct data flow and catches <code>return &amp;local;</code>, but it gives up once
+the address is stored in a struct and returned indirectly, so that version compiles clean. Rust's rule, enforced in all cases at
+compile time, is that a reference may never be used after the value it refers to has been dropped.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">A reference's use must fit inside its referent's lifetime. Extending past the drop is the error.</text>
+<text x="20" y="52" font-size="9" fill="#14406b">OK: reference used only while value is alive</text>
+<rect x="60" y="60" width="360" height="16" fill="#eef" stroke="#14406b"/><text x="200" y="72" font-size="9">value v alive (owner's scope)</text>
+<line x1="420" y1="68" x2="440" y2="68" stroke="#8c3a1d"/><text x="424" y="82" font-size="8" fill="#8c3a1d">drop(v)</text>
+<rect x="120" y="82" width="220" height="12" fill="#dfeee0" stroke="#2f7d32"/><text x="150" y="92" font-size="8" fill="#2f7d32">&amp;v used here — fits inside</text>
+<text x="20" y="128" font-size="9" fill="#8c3a1d">BAD: reference used after value dropped &rarr; E0597</text>
+<rect x="60" y="136" width="200" height="16" fill="#fdeee6" stroke="#8c3a1d"/><text x="120" y="148" font-size="9">value alive</text>
+<line x1="260" y1="144" x2="280" y2="144" stroke="#8c3a1d"/><text x="264" y="134" font-size="8" fill="#8c3a1d">drop</text>
+<rect x="120" y="158" width="300" height="12" fill="#f7d9d0" stroke="#8c3a1d"/><text x="150" y="168" font-size="8" fill="#8c3a1d">reference used here — extends past drop (dangling)</text>
+</svg>
+<figcaption>Figure 29.1: Lifetimes as fitting. A reference is valid only within its referent's lifetime (top, allowed). A reference
+used after the value is dropped (bottom) is a dangling reference — the C use-after-scope of &sect;29.1, and in Rust a compile error,
+<code>E0597</code>, &ldquo;borrowed value does not live long enough.&rdquo;</figcaption>
+</figure>
+
+<h2>29.3 What the borrow checker proves, and E0597</h2>
+
+<p>With lifetimes as its vocabulary, the borrow checker's second rule is a containment check: for every use of a reference, the
+region over which the reference is used must be contained in the region over which its referent is alive. When it is not, the
+compiler reports that the borrowed value does not live long enough. Here is the dangling-reference bug of &sect;29.1 in Rust — a
+function trying to return a reference to its own local (Rust; not compiled here — diagnostic quoted from the official Rust error
+index):</p>
+
+<pre><code>fn dangle&lt;'a&gt;() -&gt; &amp;'a str {
+    let s = String::from("hello");   // s is a local; it will be dropped at the `}`
+    &amp;s                               // return a reference to s
+}                                    // s is dropped here — the reference would dangle
+
+error[E0597]: `s` does not live long enough
+  = note: values in a scope are dropped in the opposite order they are defined</code></pre>
+
+<p>The compiler rejects it with <code>E0597</code> — <em>the borrowed value does not live long enough</em>, per the official Rust
+error index — because <code>s</code> is dropped at the closing brace, so the returned reference would point at freed storage; its
+required lifetime (as long as the caller keeps it) exceeds <code>s</code>'s actual lifetime (the function body). This is the C
+use-after-scope of &sect;29.1, but caught at compile time in every case, not by a heuristic that a struct can defeat. The fix is
+never to make the reference live longer — you cannot extend a dropped value — but to return an <em>owned</em> value (return
+<code>String</code>, moving ownership out, Chapter 27) or to borrow from something that outlives the function (an input reference,
+&sect;29.2). Note again that lifetimes are inert at run time: they are erased before code generation, so a correct program pays
+nothing for them, and the reference compiles to the same bare pointer C would use. The entire cost of the guarantee is borne by the
+compiler, once.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>E0597</code> report, and what condition on regions is the borrow checker verifying when it fires? Why can't you
+fix a &ldquo;does not live long enough&rdquo; error by making the reference live longer, and what are the two real fixes? At run
+time, what does a lifetime cost? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>29.4 Elision, and structs that hold references</h2>
+
+<p>If every reference needed an explicit lifetime, Rust would be unbearable. It does not, because of <strong>lifetime
+elision</strong>: a set of deterministic rules by which the compiler fills in the common cases so you write no annotation at all. The
+three elision rules (Klabnik &amp; Nichols, 2023, ch. 10) are: (1) each elided input reference gets its own distinct lifetime; (2)
+if there is exactly one input lifetime, it is assigned to all elided output lifetimes; and (3) if there are multiple input lifetimes
+but one of them is <code>&amp;self</code> or <code>&amp;mut self</code> (a method), the lifetime of <code>self</code> is assigned to
+all elided outputs. When these rules determine every lifetime, you write none; the <code>longest</code> function of &sect;29.2
+needed an explicit <code>'a</code> only because it has two input references and neither is <code>self</code>, so rule 2 and rule 3
+do not apply and the compiler cannot guess which input the output borrows. Elision is not a special case in the type system — it is
+pure syntactic sugar for lifetimes you could always write out.</p>
+
+<p>One place a lifetime is never optional: a struct that <em>holds</em> a reference. Such a struct is only valid as long as the
+value it borrows, and that relationship must be named. Omitting it is <code>E0106</code> (Rust; not compiled here — diagnostic per
+the official Rust error index):</p>
+
+<pre><code>struct Excerpt { part: &amp;str }        // ERROR: reference field with no lifetime
+error[E0106]: missing lifetime specifier
+
+struct Excerpt&lt;'a&gt; { part: &amp;'a str } // OK: the struct borrows for 'a and may not
+                                     //     outlive the &amp;str it holds</code></pre>
+
+<p>The first is rejected with <code>E0106</code> — <em>missing lifetime specifier</em> — because a struct with a reference field
+carries an implicit promise (&ldquo;I do not outlive what I borrow&rdquo;) that must be written into the type as
+<code>&lt;'a&gt;</code>. Once annotated, the borrow checker enforces that no <code>Excerpt</code> value is used after the
+<code>str</code> it points into has been dropped — the same containment rule as &sect;29.3, now for a reference living inside a
+struct. This is why data structures that own their data (holding <code>String</code>, <code>Vec</code>) are simpler than ones that
+borrow it (holding <code>&amp;str</code>, <code>&amp;[T]</code>): owning avoids lifetime parameters entirely, at the cost of an
+allocation; borrowing avoids the allocation, at the cost of threading a lifetime through the type. That trade — own vs. borrow — is a
+recurring design decision, and lifetimes are the language in which the borrowing side of it is expressed.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: reading a lifetime as &ldquo;how long the value lives&rdquo; and trying to make references live longer</span>
+<p>The word &ldquo;lifetime&rdquo; misleads newcomers into thinking <code>'a</code> is a duration you set — that annotating a
+reference with a longer lifetime makes the underlying value live longer, the way a smart pointer or a garbage collector would keep
+it alive. It does not. A lifetime is purely <em>descriptive</em>: it names a region that the reference is valid for, bounded by
+facts already fixed by ownership — when the value is created and when its owner drops it. Writing <code>'a</code> does not extend
+anything; it only lets the compiler <em>check</em> a relationship. So when you hit <code>E0597</code>, &ldquo;<code>s</code> does
+not live long enough,&rdquo; the wrong instinct is to search for a lifetime annotation that will make the error disappear — adding
+<code>'static</code>, or inventing longer-named lifetimes — because no annotation can make a value outlive its owner's scope. The
+error is telling you a structural truth: you are trying to use a reference past the life of what it points at. The real fixes are to
+change ownership, not the annotation: return an owned value (move it out, Chapter 27), borrow from something that genuinely
+outlives the use (an input reference, or a value in an outer scope), or restructure so the reference is never needed past the
+value's death. Reaching for <code>'static</code> to silence <code>E0597</code> is the analog of casting a pointer to make a type
+error vanish — it either does not compile anyway or forces the value to be truly static, which is rarely what you meant.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I have a function that builds a string and returns a <code>&amp;str</code> to it,
+and I keep getting <code>E0597</code>, does not live long enough. I tried annotating it <code>'a</code>, then <code>'static</code>,
+and it still won't compile. Lifetimes are just confusing syntax — why can't I just tell it the reference lives as long as I need?&rdquo;
+Cover the paragraph and respond in four or five sentences, drawing on &sect;29.3&ndash;&sect;29.4.</p>
+<p><em>Model answer.</em> &ldquo;The annotation can't fix it because a lifetime doesn't <em>make</em> anything live longer — it only
+names how long a value already lives, which ownership fixed: your local string is dropped when the function returns, so any
+reference to it would dangle, which is exactly the C 'return a pointer to a local' bug. That's what <code>E0597</code> is
+reporting, and no lifetime name, not even <code>'static</code>, can extend a value past its owner's scope. The fix is about
+ownership, not syntax: return the <code>String</code> by value so ownership moves out to the caller, or borrow from an input that
+outlives the call. Adding <code>'static</code> only makes it compile if the data really is static, which a freshly built string
+isn't. So don't hunt for the magic annotation — decide who should own the result.&rdquo; Framing the error as the C
+return-a-local bug and the fix as an ownership decision, not an annotation search, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;29.3 quick check: <code>E0597</code> reports that a borrowed value does not live long enough; the borrow
+checker is verifying that the region over which a reference is used is contained within the region its referent is alive. You
+cannot fix it by making the reference &ldquo;live longer&rdquo; because a lifetime only describes existing facts — it cannot extend
+a value past its owner's drop; the two real fixes are to return an owned value (move ownership out) or to borrow from something that
+genuinely outlives the use. At run time a lifetime costs nothing — lifetimes are erased before code generation.)</em></p>
+
+<h2>29.5 What to carry forward</h2>
+
+<p>Lifetimes complete the memory-safety story. Ownership (Chapter 27) says every value has one owner and is dropped at end of scope;
+borrowing (Chapter 28) lets you use a value without owning it, under aliasing-XOR-mutation; and lifetimes enforce the second borrow
+rule — that a reference is never used after its referent is dropped. A <strong>lifetime</strong> is a compile-time name for the
+region a reference is valid over; the borrow checker proves, for every use, that the reference's region is contained in its
+referent's, and reports <code>E0597</code> — &ldquo;borrowed value does not live long enough&rdquo; — when it is not, catching the C
+dangling-pointer/use-after-scope bug in every case, where C's warning is only a best-effort heuristic a struct can defeat. Most
+lifetimes are inferred by <strong>elision</strong>, so you rarely write one; you must name a lifetime (<code>'a</code>) when a
+function returns a reference whose origin among several inputs is ambiguous, and you must give a struct a lifetime parameter when it
+holds a reference (<code>E0106</code>, &ldquo;missing lifetime specifier&rdquo;). Crucially, lifetimes are inert at run time — erased
+before code generation — so the whole guarantee is paid for once, at compile time, and a Rust reference is the same bare pointer C
+would emit.</p>
+
+<p>You now have the three pillars — ownership, borrowing, lifetimes — that let Rust guarantee memory safety without a garbage
+collector, encoding in the type system the very invariants you proved by hand across the C volumes: memory freed exactly once, used
+only while valid, and never shared-and-mutated in a way that races. What is missing is not safety but <em>reuse</em>. The
+<code>longest</code> function worked on <code>&amp;str</code>; what about a function that finds the largest element of any slice, of
+any type that can be compared? Writing one version per type is the C-with-copy-paste world these volumes have been leaving behind.
+The next chapter is how Rust expresses code that is generic over types while staying fully checked and monomorphized to concrete,
+zero-overhead machine code: <strong>traits and generics</strong>. And traits, it will turn out, are also how the concurrency
+guarantee is finally stated — the <code>Send</code> and <code>Sync</code> markers that lift borrowing's aliasing discipline across
+threads. The machine underneath is unchanged; what grows is the vocabulary in which you state, and the compiler checks, what your
+code requires of the types it works with.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Define a lifetime as a compile-time region, and say what the second borrow rule is.</li>
+<li>Explain why returning <code>&amp;local</code> is a dangling reference, and why C's warning is only a heuristic.</li>
+<li>Read the <code>longest&lt;'a&gt;</code> signature and say what the <code>'a</code> asserts and why it is needed there.</li>
+<li>State what <code>E0597</code> reports and the two real fixes (own vs. borrow-from-something-longer-lived).</li>
+<li>Give the elision intuition and say why a struct holding a reference needs a lifetime (<code>E0106</code>).</li>
+<li>Say what a lifetime costs at run time, and why.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a dangling reference, and why does returning <code>&amp;local</code> create one? Why is C's <code>-Wreturn-local-addr</code> only best-effort? (&sect;29.1)</li>
+<li><strong>R2.</strong> In <code>fn longest&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str</code>, what does <code>'a</code> assert, and why is an annotation required here? (&sect;29.2)</li>
+<li><strong>R3.</strong> What does <code>E0597</code> report, and what containment condition is the borrow checker verifying? (&sect;29.3)</li>
+<li><strong>R4.</strong> State the intuition for lifetime elision, and why a struct with a reference field needs a lifetime (<code>E0106</code>). (&sect;29.4)</li>
+<li><strong>R5.</strong> What do lifetimes cost at run time, and how do the three pillars (ownership, borrowing, lifetimes) fit together? (&sect;29.3, &sect;29.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 10.3
+&ldquo;Validating References with Lifetimes&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source
+for lifetime syntax, the <code>longest</code> example, and the three elision rules of &sect;29.2 and &sect;29.4. Authors and
+edition verified via the publisher; the book was not compiled in this environment.</li>
+<li><strong>The Rust Error Index, entries <code>E0597</code> and <code>E0106</code> (<code>doc.rust-lang.org/error_codes</code>).</strong>
+The official meanings quoted in &sect;29.3&ndash;&sect;29.4: <code>E0597</code> &ldquo;a value was dropped while it was still
+borrowed&rdquo; (borrowed value does not live long enough) and <code>E0106</code> &ldquo;a lifetime is missing from a type&rdquo;
+(missing lifetime specifier). Each verified against the current error index.</li>
+<li><strong>Jung, Jourdan, Krebbers &amp; Dreyer, &ldquo;RustBelt: Securing the Foundations of the Rust Programming Language,&rdquo;
+<em>Proc. ACM on Programming Languages</em> 2(POPL), Article 66 (2018), DOI 10.1145/3158154.</strong> The formal model in which
+lifetimes-as-regions and the &ldquo;references never outlive their referent&rdquo; guarantee are proved sound. First author Ralf
+Jung; verified via the ACM Digital Library.</li>
+<li><strong>The &ldquo;non-lexical lifetimes&rdquo; RFC 2094 and the Polonius project notes (<code>rust-lang.github.io</code>).</strong>
+How the borrow checker computes lifetime regions precisely (last-use rather than lexical scope) — the modern engine behind
+&sect;29.3. Reference for the checker's internals; verify against the current edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex29.1"><span class="ex-label">29.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is a lifetime, and what is the second borrow rule that lifetimes enforce?</div>
+
+<div class="exercise" id="ex29.2"><span class="ex-label">29.2</span> <span class="ex-tag warm">warm-up</span>
+Why is <code>fn make() -&gt; &amp;i32 { let x = 5; &amp;x }</code> a bug? What has happened to <code>x</code> by the time the caller
+would dereference the result?</div>
+
+<div class="exercise" id="ex29.3"><span class="ex-label">29.3</span> <span class="ex-tag warm">warm-up</span>
+In <code>fn longest&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str</code>, state in words what the three occurrences of
+<code>'a</code> jointly assert.</div>
+
+<div class="exercise" id="ex29.4"><span class="ex-label">29.4</span> <span class="ex-tag core">core</span>
+Take the two C snippets of &sect;29.1 (direct <code>return &amp;local;</code> and the version laundered through a struct). (a) Why
+is each a use-after-scope? (b) Why does <code>gcc -Wall</code> warn on the first but not the second? (c) Explain how Rust's rule
+differs from a best-effort warning, and what error code the analogous Rust function produces.</div>
+
+<div class="exercise" id="ex29.5"><span class="ex-label">29.5</span> <span class="ex-tag core">core</span>
+Explain what the borrow checker verifies when it emits <code>E0597</code>. (a) State the containment condition on regions. (b) Why
+can't the error be fixed by annotating a longer lifetime? (c) Give the two structural fixes and say which each is appropriate
+for.</div>
+
+<div class="exercise" id="ex29.6"><span class="ex-label">29.6</span> <span class="ex-tag core">core</span>
+State the three lifetime-elision rules and apply them: (a) <code>fn first(s: &amp;str) -&gt; &amp;str</code> — why is no annotation
+needed? (b) <code>fn get(&amp;self, i: usize) -&gt; &amp;T</code> — which rule supplies the output lifetime? (c)
+<code>fn longest(x: &amp;str, y: &amp;str) -&gt; &amp;str</code> — why do the rules fail to determine the output, forcing you to write
+<code>'a</code>?</div>
+
+<div class="exercise" id="ex29.7"><span class="ex-label">29.7</span> <span class="ex-tag complexity">cost</span>
+Lifetimes are &ldquo;zero-cost.&rdquo; (a) At what phase are lifetimes checked, and what happens to them before code generation? (b)
+What is the runtime representation of a <code>&amp;'a T</code> compared with the C pointer it replaces? (c) Contrast this with a
+garbage-collected or reference-counted language's approach to the same &ldquo;is this reference still valid?&rdquo; question: what
+does each pay, and when?</div>
+
+<div class="exercise" id="ex29.8"><span class="ex-label">29.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer writes <code>fn greeting() -&gt; &amp;str { let s =
+String::from("hi"); &amp;s }</code> and gets <code>error[E0597]: `s` does not live long enough</code>.
+<br><strong>Step 1 (given):</strong> <code>s</code> is a local <code>String</code>, dropped at the function's closing brace.
+<br><strong>Step 2 (given):</strong> <code>&amp;s</code> would be returned to the caller, who could use it after <code>s</code> is
+dropped — a dangling reference.
+<br><strong>Step 3 (given):</strong> no lifetime annotation (including <code>'static</code>) can make <code>s</code> outlive its
+scope, so the error is structural, not syntactic.
+<br><strong>Step 4 (you):</strong> Give the correct fix (change the return type so ownership moves out) and one alternative
+(borrow from an input that outlives the call), and explain why reaching for <code>'static</code> is the wrong instinct here.</div>
+
+<div class="exercise" id="ex29.9"><span class="ex-label">29.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether a lifetime annotation is <em>required</em>, <em>elided</em>, or the code is a <em>dangling-reference
+error</em>, and justify: (a) <code>fn id(x: &amp;i32) -&gt; &amp;i32</code>; (b) <code>struct Wrapper { r: &amp;u8 }</code>; (c) a
+function returning a reference to its own local; (d) <code>fn pick(a: &amp;str, b: &amp;str) -&gt; &amp;str</code> returning one of
+the two.</div>
+
+<div class="exercise" id="ex29.10"><span class="ex-label">29.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Annotating a reference <code>'static</code>
+makes the value it points at live forever.&rdquo; (b) &ldquo;Lifetimes exist at run time and cost a pointer of extra data.&rdquo;
+(c) &ldquo;A struct with a <code>&amp;str</code> field can omit its lifetime.&rdquo; (d) &ldquo;<code>E0597</code> means the
+reference outlives its referent.&rdquo; (e) &ldquo;Most function signatures need explicit lifetimes.&rdquo;</div>
+
+<div class="exercise" id="ex29.11"><span class="ex-label">29.11</span> <span class="ex-tag stretch">stretch</span>
+Owning vs. borrowing in data structures. (a) Contrast a struct that stores a <code>String</code> with one that stores a
+<code>&amp;'a str</code>: what does each cost (allocation vs. lifetime parameter), and what constraint does the borrowing version
+place on how the struct may be used? (b) Explain why a self-referential struct (a field that borrows from another field of the same
+struct) is hard to express with lifetimes, and why. (c) Relate the own-vs-borrow choice back to the C question of &ldquo;who owns
+this buffer&rdquo; from Chapters 9 and 27, and argue that lifetimes are just that question made explicit and checked.</div>
+
+<div class="exercise" id="ex29.12"><span class="ex-label">29.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile the two C snippets of &sect;29.1 with
+<code>-O2 -Wall</code>; confirm the direct <code>return &amp;local;</code> warns (<code>-Wreturn-local-addr</code>) and the
+struct-laundered version does not, then catch the latter with <code>-fsanitize=address</code> (stack-use-after-scope). (b) If you
+have <code>rustc</code>, write the <code>fn dangle() -&gt; &amp;str</code> version and confirm <code>E0597</code>; if not, explain
+from this chapter which line is rejected and why. (c) Write the <code>longest</code> function with its lifetime annotation, then a
+struct with a <code>&amp;str</code> field, and note what happens if you omit the struct's lifetime (<code>E0106</code>). Note your
+toolchain versions.</div>
+
+</section>
+</section>

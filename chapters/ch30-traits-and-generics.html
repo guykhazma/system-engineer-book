@@ -1,0 +1,406 @@
+<section class="chapter" id="ch30">
+<h1>Chapter 30 — Traits and Generics</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch29">Chapter 29</a> (lifetimes — with ownership and borrowing,
+the memory-safety story is complete; this chapter is about <em>reuse</em> on top of it), <a href="#ch27">Chapter 27</a> (ownership;
+<code>Copy</code>, <code>Clone</code>, and <code>Drop</code> are <em>traits</em>, so this chapter names machinery you have already
+met), <a href="#ch10">Chapter 10</a> (the optimizing compiler — monomorphization is a compile-time specialization that makes
+generics free), <a href="#ch05">Chapter 5</a> (mechanical sympathy — static vs. dynamic dispatch is a real cost you can now name).
+&nbsp;·&nbsp; The <code>longest</code> function of Chapter 29 worked only on string slices; this chapter is how to write code once
+that works over many types, fully checked and with no runtime cost.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch27">Chapter 27</a> — <code>Copy</code> decided whether <code>let y = x;</code> copies
+or moves; what kind of thing is <code>Copy</code> (a keyword? a type? something a type can implement)? (2) <a href="#ch10">Chapter
+10</a> — what does it mean to specialize code at compile time, and why can a compile-time transformation be free at run time? (3)
+<em>Predict:</em> in C you write a generic sort with <code>qsort</code>, passing a comparison <em>function pointer</em>; how is the
+comparison call dispatched — is the target known at compile time or chosen at run time? In Rust, a function generic over a type
+<code>T</code> that you compare with <code>&lt;</code> — does the compiler need to know something about <code>T</code> to allow the
+comparison? Write your guesses; &sect;30.2 and &sect;30.3 answer all three.</p>
+</aside>
+
+<p>Ownership, borrowing, and lifetimes made Rust memory-safe; they did nothing for <em>reuse</em>. The <code>longest</code> function
+worked on <code>&amp;str</code>; a function to find the largest element of a slice would, in C, be written once per element type or
+smeared over <code>void*</code> and function pointers that throw away compile-time type checking. Rust's answer is two intertwined
+features. <strong>Generics</strong> let you write code parameterized over a type <code>T</code>; <strong>traits</strong> let you say
+what a <code>T</code> must be able to <em>do</em>, and are how shared behavior is named and required. First, the reuse problem in C,
+concretely, with a real <code>qsort</code> run (&sect;30.1). Then generics and <strong>monomorphization</strong>: the compiler
+stamps out a specialized copy per concrete type, so generic code is as fast as hand-written type-specific code — zero-cost static
+dispatch (&sect;30.2). Then traits and <strong>trait bounds</strong>: a generic can only use capabilities its bounds guarantee, and
+a missing bound is a compile error, <code>E0277</code> (&sect;30.3). Then the other dispatch strategy — <strong>trait
+objects</strong> (<code>dyn Trait</code>), one shared version that dispatches through a vtable at run time, exactly the C
+function-pointer mechanism — and the cost trade between the two (&sect;30.4). We close by carrying traits forward: they are also how
+error handling and, later, thread-safety are expressed (&sect;30.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust error index, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>30.1 The reuse problem in C</h2>
+
+<p>C gives you two ways to write code that works over many types, and both are unsatisfying. The first is duplication: write
+<code>max_int</code>, <code>max_float</code>, <code>max_long</code>, one per type, differing only in a type name. The second is
+type erasure through <code>void*</code> plus a function pointer — how the standard library's <code>qsort</code> sorts anything. Here
+is a real <code>qsort</code>, compiled and run in this environment (gcc 11.4.0):</p>
+
+<pre><code>int cmp_int(const void *a, const void *b) {
+    return (*(const int*)a) - (*(const int*)b);   /* caller-supplied comparison */
+}
+int a[] = {5, 2, 9, 1, 7};
+qsort(a, 5, sizeof(int), cmp_int);                /* generic sort via void* + fn ptr */
+
+$ gcc -O2 -Wall gen.c -o gen &amp;&amp; ./gen
+1 2 5 7 9</code></pre>
+
+<p>This works, and it is genuinely generic — <code>qsort</code> sorts arrays of any element type. But look at the two costs. First,
+<em>type safety is gone</em>: <code>qsort</code> sees <code>void*</code>, so if you pass a comparator written for
+<code>double</code> while sorting <code>int</code>s, it compiles cleanly and corrupts silently — the compiler cannot check that the
+comparator matches the array, because the types were erased. Second, every comparison is an <strong>indirect call through a function
+pointer</strong>: <code>cmp_int</code> is chosen at run time, so the CPU cannot inline it and pays an indirect branch per
+comparison (Chapter 5). Rust's generics fix the first cost entirely and let you <em>choose</em> whether to pay the second. The
+<code>qsort</code> pattern — a function pointer resolved at run time — is exactly what Rust calls a trait object (&sect;30.4); the
+duplication-free, fully-checked, fully-inlined alternative is generics with monomorphization (&sect;30.2). Both start from a single
+idea: name the behavior a type must provide, and let the type system check it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the two ways C lets you write code over many types, and the cost of each. In the <code>qsort</code> call, why can the
+compiler not check that <code>cmp_int</code> matches the array being sorted? How is each comparison dispatched — is the target known
+at compile time? (Answer after the next section.)</p>
+</aside>
+
+<h2>30.2 Generics and monomorphization</h2>
+
+<p>A <strong>generic</strong> function is parameterized over a type. You write it once, with a type parameter <code>T</code>, and the
+compiler generates a specialized copy for each concrete type you actually use it with — a process called
+<strong>monomorphization</strong> (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>fn largest&lt;T: PartialOrd + Copy&gt;(list: &amp;[T]) -&gt; T {
+    let mut biggest = list[0];
+    for &amp;item in list {
+        if item &gt; biggest { biggest = item; }   // needs T: PartialOrd to use `&gt;`
+    }
+    biggest
+}
+// called with &amp;[i32] and &amp;[f64]; the compiler emits a separate specialized
+// copy of `largest` for i32 and for f64 — as if you'd written each by hand.</code></pre>
+
+<p>At compile time the compiler sees that you called <code>largest</code> with an <code>&amp;[i32]</code> and an
+<code>&amp;[f64]</code>, and it stamps out two concrete functions — one operating on <code>i32</code>, one on <code>f64</code> — each
+with the type filled in. There is no type parameter left at run time: each call goes to an ordinary, type-specific function whose
+comparison is a direct, inlinable operation, not an indirect call. This is <strong>static dispatch</strong>, and it is
+<em>zero-cost</em>: generic code runs exactly as fast as the hand-duplicated <code>max_int</code>/<code>max_float</code> of
+&sect;30.1, because after monomorphization that is literally what it is — but you wrote it once and the compiler checked it once. The
+price, paid only in binary size and compile time, is that each concrete instantiation is a separate copy of the code (code bloat if
+a large generic is used at many types). The abstraction is free where it matters — at run time — which is the recurring promise of
+this whole part: expressive source, no runtime tax.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: write once, specialize per type, pay nothing at run time</span>
+<p><strong>1. In words.</strong> A generic function is written once over a type parameter <code>T</code>. The compiler
+monomorphizes it — emits a separate specialized copy for each concrete type used — so at run time there is no type parameter and no
+dispatch: each call is an ordinary direct call, as fast as hand-written type-specific code.</p>
+<p><strong>2. As a picture.</strong> Figure 30.1: one generic <code>largest&lt;T&gt;</code> box fanning out at compile time into
+<code>largest_i32</code> and <code>largest_f64</code> (static dispatch, direct calls), contrasted with one
+<code>largest(&amp;dyn ..)</code> box that stays single and dispatches through a vtable at run time (dynamic dispatch).</p>
+<p><strong>3. As numbers/contrast.</strong> The C <code>qsort</code> of &sect;30.1 pays one indirect function-pointer call per
+comparison (chosen at run time, not inlinable). Monomorphized Rust generics pay zero: the comparison is a direct, inlinable
+operation in each specialized copy — the same machine code you'd get from writing the type-specific function by hand.</p>
+</aside>
+
+<p><em>(Answer to the &sect;30.1 quick check: C lets you write over many types by (1) duplicating code per type — a maintenance
+cost — or (2) erasing types through <code>void*</code> plus a function pointer, as <code>qsort</code> does — which costs type
+safety and an indirect call. The compiler cannot check that <code>cmp_int</code> matches the array because <code>qsort</code>'s
+parameters are <code>void*</code>: the element type is erased, so a mismatched comparator compiles anyway. Each comparison is
+dispatched through the function pointer at run time, so the target is not known at compile time and cannot be inlined.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Two dispatch strategies from one generic idea: monomorphized (static) vs. trait object (dynamic).</text>
+<rect x="30" y="40" width="150" height="34" fill="#f5f8fb" stroke="#14406b"/><text x="45" y="61" font-size="10">generic largest&lt;T&gt;</text>
+<text x="30" y="92" font-size="9" fill="#2f7d32">STATIC: compiler stamps a copy per type</text>
+<rect x="220" y="44" width="130" height="26" fill="#dfeee0" stroke="#2f7d32"/><text x="235" y="61" font-size="9">largest_i32 (direct)</text>
+<rect x="220" y="78" width="130" height="26" fill="#dfeee0" stroke="#2f7d32"/><text x="233" y="95" font-size="9">largest_f64 (direct)</text>
+<line x1="180" y1="55" x2="220" y2="57" stroke="#2f7d32" marker-end="url(#d)"/>
+<line x1="180" y1="63" x2="220" y2="90" stroke="#2f7d32" marker-end="url(#d)"/>
+<text x="30" y="140" font-size="9" fill="#8c3a1d">DYNAMIC: one copy, dispatch through a vtable at run time</text>
+<rect x="30" y="150" width="150" height="34" fill="#fdeee6" stroke="#8c3a1d"/><text x="42" y="171" font-size="10">fn(&amp;dyn Trait)</text>
+<rect x="230" y="150" width="120" height="34" fill="#f7d9d0" stroke="#8c3a1d"/><text x="242" y="164" font-size="8">vtable: ptr to</text><text x="242" y="178" font-size="8">method impls</text>
+<line x1="180" y1="167" x2="230" y2="167" stroke="#8c3a1d" marker-end="url(#e)"/><text x="185" y="162" font-size="7" fill="#8c3a1d">indirect</text>
+<text x="380" y="60" font-size="8" fill="#2f7d32">no type param at run time;</text><text x="380" y="72" font-size="8" fill="#2f7d32">inlinable; larger binary</text>
+<text x="380" y="164" font-size="8" fill="#8c3a1d">one copy; indirect call per</text><text x="380" y="176" font-size="8" fill="#8c3a1d">method; smaller binary</text>
+<defs>
+<marker id="d" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#2f7d32"/></marker>
+<marker id="e" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#8c3a1d"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 30.1: Static vs. dynamic dispatch. A generic monomorphizes into a direct, inlinable copy per concrete type
+(top, zero runtime cost, larger binary). A trait object keeps one copy and dispatches each method through a vtable at run time
+(bottom, an indirect call, smaller binary) — the same mechanism as C's <code>qsort</code> function pointer.</figcaption>
+</figure>
+
+<h2>30.3 Traits and trait bounds</h2>
+
+<p>The <code>largest</code> function used <code>item &gt; biggest</code>. For that to typecheck, the compiler must know that
+<code>T</code> supports comparison — otherwise a caller could instantiate <code>largest</code> with a type that has no ordering, and
+<code>&gt;</code> would be meaningless. A <strong>trait</strong> names a set of behaviors a type can implement; a <strong>trait
+bound</strong> on a generic (<code>T: PartialOrd</code>) requires that <code>T</code> implement the trait, and in return lets the
+generic body use that trait's operations. You have already met traits: <code>Copy</code>, <code>Clone</code>, and
+<code>Drop</code> from Chapter 27 are traits, which is why &ldquo;<code>i32</code> is <code>Copy</code>&rdquo; was phrased as
+implementing something. A trait definition and an implementation look like this (Rust; not compiled here — behavior per the cited
+book):</p>
+
+<pre><code>trait Summary {                       // a named set of behavior
+    fn summarize(&amp;self) -&gt; String;
+}
+impl Summary for Article {            // Article promises to provide it
+    fn summarize(&amp;self) -&gt; String { format!("{}: ...", self.title) }
+}
+
+fn notify&lt;T: Summary&gt;(item: &amp;T) {     // bound: T must implement Summary
+    println!("Breaking! {}", item.summarize());   // allowed BECAUSE of the bound
+}</code></pre>
+
+<p>The bound <code>T: Summary</code> is a contract in both directions: the caller must supply a type implementing
+<code>Summary</code>, and in exchange the body of <code>notify</code> may call <code>summarize</code>. If you drop the bound and try
+to call <code>summarize</code> anyway, or call <code>notify</code> with a type that does not implement <code>Summary</code>, the
+compiler rejects it with <code>E0277</code> — <em>the trait bound is not satisfied</em> (per the official Rust error index):</p>
+
+<pre><code>notify(&amp;5);   // i32 does not implement Summary
+error[E0277]: the trait bound `i32: Summary` is not satisfied</code></pre>
+
+<p>This is the decisive difference from C's <code>void*</code> genericity of &sect;30.1. There, a type mismatch was invisible and
+corrupted silently at run time; here, &ldquo;this type does not provide the required behavior&rdquo; is a compile error naming the
+exact unmet bound. It is also, notably, different from C++ templates, where an unsatisfied requirement surfaces as an error deep
+inside the instantiated body; Rust checks the bound at the <em>definition</em>, so the generic is verified once, against its stated
+requirements, independent of any caller. Trait bounds are how a generic states precisely what it needs of its type parameters —
+no more (so it stays maximally reusable) and no less (so the body is fully checked) — and <code>E0277</code> is the compiler holding
+both sides to the contract.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What is a trait, and what does a trait bound like <code>T: PartialOrd</code> give the caller and the body of a generic
+respectively? Which error code fires when a required bound is unmet, and what does it say? Why is that better than C's silent
+<code>void*</code> mismatch and than a C++ template error deep in the body? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>30.4 Static vs. dynamic dispatch: trait objects</h2>
+
+<p>Monomorphization needs to know every concrete type at compile time. Sometimes you cannot — you want a single
+<code>Vec</code> holding a mix of types that all implement one trait, or a plugin resolved at run time. For that Rust offers a
+<strong>trait object</strong>, written <code>dyn Trait</code> behind a pointer (<code>&amp;dyn Summary</code> or
+<code>Box&lt;dyn Summary&gt;</code>). A trait object is a pair of pointers: one to the value, one to a <strong>vtable</strong> — a
+table of the trait's method implementations for that value's concrete type — and each method call is dispatched indirectly through
+the vtable at run time (Klabnik &amp; Nichols, 2023, ch. 17.2). This is <strong>dynamic dispatch</strong>, and it is precisely the
+C <code>qsort</code> mechanism of &sect;30.1: an indirect call through a pointer chosen at run time (Rust; not compiled here —
+behavior per the cited book):</p>
+
+<pre><code>// static dispatch: one specialized copy per type, direct/inlinable calls, larger binary
+fn notify&lt;T: Summary&gt;(item: &amp;T) { println!("{}", item.summarize()); }
+
+// dynamic dispatch: one copy, vtable call per invocation, smaller binary, any Summary type
+fn notify_dyn(item: &amp;dyn Summary) { println!("{}", item.summarize()); }
+
+let items: Vec&lt;Box&lt;dyn Summary&gt;&gt; = vec![Box::new(article), Box::new(tweet)];
+// a heterogeneous collection — impossible with a single monomorphized type</code></pre>
+
+<p>The trade is explicit and it is a cost trade you can now name from Chapter 5. Static dispatch (generics) resolves the call at
+compile time: direct, inlinable, zero dispatch cost, but a separate code copy per type (larger binary) and every type known at
+compile time. Dynamic dispatch (trait objects) resolves at run time through the vtable: one copy of the code and the ability to mix
+types or choose at run time, but an indirect call per method (not inlinable, an indirect branch — the same cost as
+<code>qsort</code>'s function pointer) and the values must sit behind a pointer. Neither is &ldquo;better&rdquo;; the default in Rust
+is generics (pay nothing, specialize) and you reach for <code>dyn</code> deliberately when you need heterogeneity or run-time
+choice, or to bound code size. The important thing is that unlike C — where <code>void*</code> dynamic dispatch also threw away type
+safety — a Rust trait object is still fully type-checked: <code>&amp;dyn Summary</code> can only hold a type that actually
+implements <code>Summary</code>, so you get the flexibility of the function-pointer approach without the silent-corruption risk of
+&sect;30.1.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: reaching for <code>Box&lt;dyn Trait&gt;</code> by default, and misreading <code>E0277</code> as &ldquo;my type is broken&rdquo;</span>
+<p>Two related early mistakes. The first: coming from an object-oriented language, newcomers make everything a
+<code>Box&lt;dyn Trait&gt;</code> because it feels like the familiar interface/subclass pattern — and thereby pay an indirect call
+on every method and give up inlining, when a generic with a trait bound would have cost nothing at run time and inlined fully.
+Dynamic dispatch is a real tool (heterogeneous collections, run-time-chosen implementations, keeping binary size down), but it is
+not the default; generics with bounds are, and reaching for <code>dyn</code> reflexively is the analog of making every C call go
+through a function pointer for uniformity's sake. The second: reading <code>error[E0277]: the trait bound `T: Foo` is not
+satisfied</code> as &ldquo;my type is wrong&rdquo; and casting or wrapping to make it quiet. The error is not saying your type is
+broken; it is saying the type does not (yet) provide the behavior the generic requires — and the two correct responses are to
+<em>implement the trait</em> for your type (give it the behavior) or, if the generic asked for more than it needs, to
+<em>relax the bound</em> to what the body actually uses. Neither is a cast. As with a C warning, <code>E0277</code> is naming a real
+gap between what the code requires and what the type provides; the fix is to close the gap, not to silence the message.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;My generic function won't compile until I add <code>T: PartialOrd</code> — Rust
+makes me spell out every requirement, when in C++ a template just works and in Python I'd never write any of this. Isn't this bound
+stuff just ceremony?&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;30.2&ndash;&sect;30.4.</p>
+<p><em>Model answer.</em> &ldquo;The bound isn't ceremony — it's what lets the compiler check the generic <em>once</em>, at its
+definition, instead of C++'s way where a missing requirement blows up deep inside the instantiated template with a wall of errors,
+or Python's way where it blows up at run time on some input you didn't test. <code>T: PartialOrd</code> is you telling the compiler
+exactly what the body needs (an ordering to use <code>&gt;</code>), and in exchange it guarantees every caller supplies a type that
+has it — that's the <code>E0277</code> you'd get otherwise, caught at compile time and naming the missing trait. It also costs
+nothing at run time: the generic monomorphizes into a direct, inlinable copy per type, so it's as fast as a hand-written
+type-specific function. So the bound buys you C's performance with checking C++ and Python can't give you at that stage. Write the
+minimal bound the body actually uses and you get maximal reuse with full checking.&rdquo; Framing the bound as check-once-at-the-
+definition and zero-cost after monomorphization is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;30.3 quick check: a trait names a set of behaviors a type can implement; a bound <code>T: PartialOrd</code>
+requires the caller to supply a <code>T</code> that implements <code>PartialOrd</code>, and in return lets the generic's body use
+that trait's operations (here <code>&gt;</code>). An unmet bound is <code>E0277</code>, &ldquo;the trait bound is not
+satisfied.&rdquo; It beats C's silent <code>void*</code> mismatch — which corrupts at run time — and a C++ template error deep in
+the instantiated body, because Rust checks the bound at the generic's definition and names the exact missing trait.)</em></p>
+
+<h2>30.5 What to carry forward</h2>
+
+<p>Generics and traits are how Rust gets reuse without giving up the checking or the performance of the earlier volumes. A
+<strong>generic</strong> function is written once over a type parameter and <strong>monomorphized</strong> — the compiler emits a
+specialized copy per concrete type — so it runs as fast as hand-written type-specific code with no runtime dispatch: zero-cost
+<strong>static dispatch</strong>. A <strong>trait</strong> names behavior a type can implement (you already knew <code>Copy</code>,
+<code>Clone</code>, <code>Drop</code>), and a <strong>trait bound</strong> (<code>T: PartialOrd</code>) states exactly what a generic
+requires of its type — checked once, at the definition, with an unmet bound reported as <code>E0277</code>, &ldquo;the trait bound
+is not satisfied.&rdquo; When you need heterogeneity or a run-time-chosen implementation, a <strong>trait object</strong>
+(<code>dyn Trait</code>) gives <strong>dynamic dispatch</strong> through a vtable — the same indirect-call mechanism as C's
+<code>qsort</code> function pointer, but still fully type-checked, unlike C's <code>void*</code>. The choice between them is the
+Chapter 5 cost trade made explicit: static is the default (free, specialized, larger binary), dynamic is deliberate (one copy,
+flexible, an indirect call per method).</p>
+
+<p>With ownership, borrowing, lifetimes, generics, and traits, you now have the whole conceptual core of Rust — and the last two
+chapters of this part put it to work. Traits are not only for behavior like <code>summarize</code>; they are how Rust expresses its
+most important guarantees as ordinary, checkable requirements. The next chapter is <strong>error handling</strong>:
+<code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> are generic types (built on exactly the generics of this chapter),
+and they replace C's error-code-and-<code>errno</code> conventions and null pointers with types the compiler forces you to handle —
+turning &ldquo;forgot to check the return value&rdquo; into a thing that does not compile. And the chapter after it, on fearless
+concurrency, rests on two traits — <code>Send</code> and <code>Sync</code> — that lift the aliasing discipline of borrowing across
+threads, making the data races of Chapter 24 a compile error rather than undefined behavior. The pattern to carry forward is that in
+Rust, a guarantee is usually a trait: name the behavior or the capability, require it in the type, and let the compiler check it —
+the same move, now applied to errors and to threads.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the two ways C writes code over many types and the cost of each (duplication; <code>void*</code>+function pointer).</li>
+<li>Define monomorphization and explain why generic code is zero-cost at run time.</li>
+<li>Say what a trait and a trait bound are, and what each side of a bound gets.</li>
+<li>Name the error code for an unmet bound (<code>E0277</code>) and why compile-time checking beats C's silent mismatch.</li>
+<li>Contrast static and dynamic dispatch: mechanism, cost, and when to choose each.</li>
+<li>Explain how a trait object is like C's <code>qsort</code> function pointer but still type-safe.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are C's two options for generic code, and what does each cost? Why can't <code>qsort</code>'s comparator be type-checked? (&sect;30.1)</li>
+<li><strong>R2.</strong> What is monomorphization, and why is a Rust generic zero-cost at run time? (&sect;30.2)</li>
+<li><strong>R3.</strong> What is a trait bound, what does each side gain, and which error reports an unmet one? (&sect;30.3)</li>
+<li><strong>R4.</strong> What is a trait object, how is a method call on it dispatched, and how does that compare to <code>qsort</code>? (&sect;30.4)</li>
+<li><strong>R5.</strong> When do you choose static dispatch vs. dynamic dispatch, and what is the cost of each? (&sect;30.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 10.1
+&ldquo;Generic Data Types&rdquo; and ch. 10.2 &ldquo;Traits&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The
+primary source for generics, monomorphization, traits, and trait bounds of &sect;30.2&ndash;&sect;30.3, including the
+<code>largest</code> and <code>Summary</code>/<code>notify</code> examples. Authors and edition verified via the publisher; not
+compiled here.</li>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 17.2
+&ldquo;Using Trait Objects That Allow for Values of Different Types.&rdquo;</strong> The source for trait objects, the
+value-plus-vtable representation, and dynamic dispatch of &sect;30.4. Chapter number and title verified via the publisher's
+listing and <code>doc.rust-lang.org/book</code>.</li>
+<li><strong>The Rust Error Index, entry <code>E0277</code> (<code>doc.rust-lang.org/error_codes</code>).</strong> The official
+meaning quoted in &sect;30.3: &ldquo;you tried to use a type which doesn't implement some trait in a place which expected that
+trait&rdquo; — the unmet-trait-bound error. Verified against the current error index.</li>
+<li><strong>Stroustrup, <em>The C++ Programming Language</em>, 4th ed. (Addison-Wesley, 2013), on templates.</strong> The C++
+template model — instantiation-time errors deep in the body — that Rust's define-time bound checking of &sect;30.3 improves on;
+useful contrast for where trait bounds come from and what they fix.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex30.1"><span class="ex-label">30.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define a generic function, a trait, and a trait bound.</div>
+
+<div class="exercise" id="ex30.2"><span class="ex-label">30.2</span> <span class="ex-tag warm">warm-up</span>
+What is monomorphization, and why does it mean a generic function has no runtime dispatch cost?</div>
+
+<div class="exercise" id="ex30.3"><span class="ex-label">30.3</span> <span class="ex-tag warm">warm-up</span>
+What error code does the compiler produce when a generic is used with a type that does not satisfy its trait bound, and what does
+the message say?</div>
+
+<div class="exercise" id="ex30.4"><span class="ex-label">30.4</span> <span class="ex-tag core">core</span>
+Take the C <code>qsort</code> of &sect;30.1. (a) In what sense is it generic, and what are the two costs it pays? (b) Show
+concretely how passing a comparator written for the wrong element type would compile yet misbehave, and why the compiler cannot
+catch it. (c) Explain which Rust feature (generics or trait objects) corresponds to the <code>qsort</code> mechanism, and which
+gives the duplication-free, fully-checked, fully-inlined alternative.</div>
+
+<div class="exercise" id="ex30.5"><span class="ex-label">30.5</span> <span class="ex-tag core">core</span>
+Explain the two-directional contract of a trait bound <code>T: Summary</code> on <code>fn notify&lt;T: Summary&gt;(item: &amp;T)</code>.
+(a) What must the caller supply? (b) What may the body do that it could not without the bound? (c) Contrast Rust's checking the bound
+at the definition with C++'s reporting an unmet requirement inside the instantiated template body.</div>
+
+<div class="exercise" id="ex30.6"><span class="ex-label">30.6</span> <span class="ex-tag core">core</span>
+Contrast static dispatch (generics) with dynamic dispatch (trait objects). (a) How is a call resolved in each — at compile time or
+run time — and what is the machine-level cost of each? (b) What is a trait object's runtime representation? (c) Give one situation
+that requires dynamic dispatch and one where static dispatch is clearly preferable.</div>
+
+<div class="exercise" id="ex30.7"><span class="ex-label">30.7</span> <span class="ex-tag complexity">cost</span>
+Weigh the costs of monomorphization vs. trait objects. (a) What does monomorphization cost that dynamic dispatch does not, and in
+what resource? (b) What does dynamic dispatch cost per call that a monomorphized generic does not? (c) For a small trait method
+called in a tight loop over a homogeneous collection, which dispatch would you choose and why; for a large plugin interface with
+many implementations, which — and what is the deciding factor each time?</div>
+
+<div class="exercise" id="ex30.8"><span class="ex-label">30.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer writes <code>fn largest&lt;T&gt;(list: &amp;[T]) -&gt; T { let mut b =
+list[0]; for &amp;x in list { if x &gt; b { b = x; } } b }</code> and gets <code>error[E0277]: the trait bound `T: PartialOrd` is
+not satisfied</code> on the <code>x &gt; b</code> line (and a second on the <code>Copy</code> requirement).
+<br><strong>Step 1 (given):</strong> the body uses <code>&gt;</code>, which requires <code>T</code> to have an ordering — the
+<code>PartialOrd</code> trait.
+<br><strong>Step 2 (given):</strong> the body also copies elements out of the slice (<code>b = x</code>, <code>list[0]</code>),
+which requires <code>T: Copy</code>.
+<br><strong>Step 3 (given):</strong> without those bounds, the compiler cannot know <code>T</code> supports the operations, so it
+rejects the definition — before any caller exists.
+<br><strong>Step 4 (you):</strong> Give the corrected signature with the minimal bounds, explain why bounding at the definition
+(not the call site) is what lets the generic be checked once, and say why casting or wrapping to silence <code>E0277</code> is the
+wrong instinct.</div>
+
+<div class="exercise" id="ex30.9"><span class="ex-label">30.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether static dispatch (generic + bound) or dynamic dispatch (trait object) is the better fit, and why: (a) summing a
+slice of any numeric type in a hot loop; (b) a <code>Vec</code> holding several different shape types that all implement
+<code>Draw</code>; (c) a function called at exactly one concrete type; (d) a rendering pipeline that loads drawable plugins chosen
+at run time.</div>
+
+<div class="exercise" id="ex30.10"><span class="ex-label">30.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A generic function carries a type parameter at
+run time and dispatches on it.&rdquo; (b) &ldquo;A trait object is dispatched at run time through a vtable.&rdquo; (c)
+&ldquo;<code>E0277</code> means your type has a bug.&rdquo; (d) &ldquo;Monomorphization makes binaries smaller.&rdquo; (e) &ldquo;Like
+C's <code>void*</code> generics, Rust trait objects give up type safety.&rdquo;</div>
+
+<div class="exercise" id="ex30.11"><span class="ex-label">30.11</span> <span class="ex-tag stretch">stretch</span>
+&ldquo;A guarantee in Rust is usually a trait.&rdquo; (a) Explain how <code>Copy</code> (Chapter 27) is a trait that governs whether
+assignment moves or copies, and how <code>T: PartialOrd</code> governs whether <code>&gt;</code> is allowed — both the same
+mechanism. (b) Preview how <code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> (next chapter) use generics to make
+error handling checkable. (c) Preview how thread-safety could be expressed as a trait requirement (<code>Send</code>/<code>Sync</code>):
+what would a bound like &ldquo;<code>T: Send</code>&rdquo; have to mean, and why would requiring it at a thread-spawn boundary turn a
+data race into a compile error?</div>
+
+<div class="exercise" id="ex30.12"><span class="ex-label">30.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile and run the &sect;30.1 <code>qsort</code> demo;
+then deliberately pass a comparator written for a different element type and confirm it still compiles (type erasure). (b) If you
+have <code>rustc</code>, write <code>largest&lt;T: PartialOrd + Copy&gt;</code>, call it at two types, and confirm it compiles; then
+remove the bounds and observe <code>E0277</code>; if not, explain from this chapter which line is rejected and which bound is
+missing. (c) Write a trait <code>Draw</code> with two implementors and put them in a <code>Vec&lt;Box&lt;dyn Draw&gt;&gt;</code>;
+explain why a monomorphized generic could not hold both in one vector. Note your toolchain versions.</div>
+
+</section>
+</section>

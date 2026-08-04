@@ -269,6 +269,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch26">Chapter 26 — Scalability: Amdahl's Law, Contention, and False Sharing</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part V &mdash; Rust for Systems</li>
 <li class="toc-ch"><a href="#ch27">Chapter 27 — Ownership and Moves</a></li>
+<li class="toc-ch"><a href="#ch28">Chapter 28 — Borrowing and References</a></li>
+<li class="toc-ch"><a href="#ch29">Chapter 29 — Lifetimes</a></li>
+<li class="toc-ch"><a href="#ch30">Chapter 30 — Traits and Generics</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VI &mdash; Performance Engineering</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VII &mdash; I/O & Networking, Low-Level</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part VIII &mdash; Storage & the Disk</li>
@@ -11356,6 +11359,1217 @@ versions.</div>
 </section>
 </section>
 
+<section class="chapter" id="ch28">
+<h1>Chapter 28 — Borrowing and References</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch27">Chapter 27</a> (ownership and moves — borrowing is the way to
+use a value <em>without</em> taking ownership, so the source stays valid), <a href="#ch09">Chapter 9</a>
+(<code>malloc</code>/<code>free</code> and use-after-free — a reference that outlives or aliases badly is the same bug),
+<a href="#ch11">Chapter 11</a> (iterator/pointer invalidation when a buffer is reallocated), <a href="#ch24">Chapter 24</a> (a data
+race is two accesses to one location, one a write, unsynchronized — the borrow rule is exactly the aliasing discipline that rules
+it out). &nbsp;·&nbsp; Chapter 27 left us moving values in and out of functions just to read them; this chapter is how to lend
+access instead, and the one rule the compiler enforces to keep lending safe.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch27">Chapter 27</a> — after <code>let s2 = s1;</code> for a <code>String</code>, why
+is <code>s1</code> dead, and what problem would arise if it were <em>not</em>? (2) <a href="#ch11">Chapter 11</a> — in C, you hold a
+pointer into a growable array and then the array is reallocated larger; what can happen to that pointer? (3) <em>Predict:</em> in
+Rust you take <code>let r = &amp;v;</code> (a shared reference to a vector) and then, while <code>r</code> is still in use, call
+<code>v.push(x)</code> (which needs to mutate <code>v</code>). Does the compiler accept it? Write your guesses; &sect;28.2 and
+&sect;28.3 answer all three.</p>
+</aside>
+
+<p>Ownership alone is not enough to write real programs. If the only way to give a function access to a value were to <em>move</em>
+it in (Chapter 27), every function that merely reads a value would have to move it back out, and two functions could never look at
+the same value at once. What you want is to <strong>lend</strong> access without transferring ownership — a <strong>reference</strong>
+— and the discipline that keeps lending safe is <strong>borrowing</strong>. This chapter is only about references and the borrow
+rule. First, why references are needed and what a shared reference (<code>&amp;T</code>) is: read-only access, any number at once
+(&sect;28.1&ndash;&sect;28.2). Then the mutable reference (<code>&amp;mut T</code>): exclusive write access, and why there may be
+only one, with no other reference alive alongside it (&sect;28.3). Then the borrow checker's single rule — <em>one writer XOR many
+readers</em> — and how it turns the iterator-invalidation and data-race hazards of the earlier volumes into compile errors
+(&sect;28.4). We close by carrying borrowing forward to the question it forces open: how long may a reference live relative to the
+value it points at — lifetimes (&sect;28.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust error index, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>28.1 Why references: using without owning</h2>
+
+<p>Recall the awkwardness at the end of Chapter 27: a function that only wants to <em>read</em> a <code>String</code> — say, to
+compute its length — must take it by value, which <em>moves</em> it in and leaves the caller unable to use it afterward. To keep
+the value, the function would have to return it back out, threading ownership through every call. That is untenable. A
+<strong>reference</strong> solves it: <code>&amp;s</code> creates a value that <em>points at</em> <code>s</code> without owning it,
+so the caller keeps ownership and the function borrows access for the duration of the call (Rust; not compiled here — behavior per
+the cited book):</p>
+
+<pre><code>fn length(s: &amp;String) -&gt; usize {   // s borrows: it does NOT own the String
+    s.len()
+}                                     // s goes out of scope, but nothing is dropped —
+                                      // the reference did not own the buffer
+
+let owner = String::from("hello");
+let n = length(&amp;owner);              // lend a reference; ownership stays with `owner`
+println!("{owner} has len {n}");      // `owner` is STILL valid — it was never moved</code></pre>
+
+<p>The <code>&amp;</code> in <code>&amp;owner</code> is &ldquo;take a reference to&rdquo;; the <code>&amp;String</code> in the
+signature is &ldquo;a reference to a <code>String</code>.&rdquo; The reference is a borrow: the callee may use the value through it,
+but it does not own the value and so does not drop it when the reference goes out of scope — only the owner drops. Because no move
+happened, <code>owner</code> is still usable after the call. This is the everyday shape of Rust code: pass owning values by
+reference to read them, and reserve moves for when you genuinely mean to hand off ownership. But a reference is a pointer into
+someone else's value, and Chapters 9 and 11 are a catalogue of how pointers into other people's memory go wrong — dangling after a
+free, aliasing a buffer that is then mutated out from under you. The rest of the chapter is the two kinds of reference and the one
+rule that makes them safe where the C pointer was not.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does passing <code>&amp;owner</code> to <code>length</code> leave <code>owner</code> usable afterward, when passing
+<code>owner</code> by value would not? When the reference parameter <code>s</code> goes out of scope at the end of
+<code>length</code>, is the <code>String</code>'s buffer freed? Why or why not? (Answer after the next section.)</p>
+</aside>
+
+<h2>28.2 Shared references: many readers, no writers</h2>
+
+<p>The reference of &sect;28.1 is a <strong>shared reference</strong>, written <code>&amp;T</code>. Its defining property: you may
+have <em>any number</em> of shared references to a value at the same time, and through a shared reference you may <em>read</em> the
+value but not mutate it. That is safe for the same reason many threads reading (but not writing) shared memory is safe (Chapter
+24): if nobody writes, no reader can observe a torn or stale value, and no two accesses conflict. Shared references are
+<code>Copy</code> — cheap to duplicate, since they are just pointers — so handing the same value to several readers is free (Rust;
+not compiled here — behavior per the cited book):</p>
+
+<pre><code>let v = vec![1, 2, 3];
+let a = &amp;v;          // shared reference #1
+let b = &amp;v;          // shared reference #2 — fine, many readers allowed
+println!("{} {}", a.len(), b.len());   // both read v; no conflict</code></pre>
+
+<p>Two immutable views of one vector coexist without trouble because neither can change it. The read-only-ness is not a convention
+you must remember — it is in the type: a <code>&amp;T</code> simply has no method that mutates, so an attempt to write through one
+does not compile. This is the &ldquo;many readers&rdquo; half of Rust's borrowing rule, and it is exactly as permissive as it can
+safely be: sharing is unlimited precisely while nothing mutates. The moment you need to <em>change</em> the value, you need a
+different, stricter kind of reference — because mutation plus aliasing is where every hazard lived.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: one writer XOR many readers</span>
+<p><strong>1. In words.</strong> At any point a value may be borrowed either by any number of shared references
+(<code>&amp;T</code>, read-only) <em>or</em> by exactly one mutable reference (<code>&amp;mut T</code>, read-write) — never both,
+never two mutable ones. Sharing is safe while nothing writes; writing is safe only when nothing else can observe the value
+meanwhile.</p>
+<p><strong>2. As a picture.</strong> Figure 28.1: a value with several thin arrows labelled <code>&amp;</code> pointing in (all
+readers, allowed together), versus the same value with one bold arrow labelled <code>&amp;mut</code> and no other arrow permitted
+(the exclusive writer).</p>
+<p><strong>3. As numbers/contrast.</strong> The C program of &sect;28.4 holds one pointer into a buffer and then reallocates the
+buffer &rarr; the pointer dangles &rarr; heap-use-after-free (ASan-confirmed). The Rust equivalent cannot compile: the reallocation
+needs <code>&amp;mut</code>, which the outstanding shared reference forbids (<code>E0502</code>) &rarr; the bug is rejected before
+it runs.</p>
+</aside>
+
+<p><em>(Answer to the &sect;28.1 quick check: passing <code>&amp;owner</code> lends a reference and does not move the value, so
+<code>owner</code> keeps ownership and stays valid; passing by value would move the <code>String</code> into the function and
+invalidate <code>owner</code>. When the reference parameter <code>s</code> goes out of scope, nothing is freed, because a reference
+does not own the buffer — only the owner drops it, and the owner is still <code>owner</code> back in the caller.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Borrowing rule: many shared readers together, OR one exclusive writer alone — never both.</text>
+<rect x="40" y="44" width="150" height="40" fill="#f5f8fb" stroke="#14406b"/><text x="60" y="68" font-size="10">value v</text>
+<text x="30" y="104" font-size="9" fill="#14406b">SHARED: any number of &amp;v (read-only)</text>
+<line x1="210" y1="52" x2="300" y2="52" stroke="#14406b" marker-end="url(#b)"/><text x="240" y="47" font-size="9" fill="#14406b">&amp;v</text>
+<line x1="210" y1="64" x2="300" y2="64" stroke="#14406b" marker-end="url(#b)"/><text x="240" y="78" font-size="9" fill="#14406b">&amp;v</text>
+<line x1="210" y1="76" x2="300" y2="76" stroke="#14406b" marker-end="url(#b)"/><text x="240" y="90" font-size="9" fill="#14406b">&amp;v</text>
+<rect x="40" y="140" width="150" height="40" fill="#fdeee6" stroke="#8c3a1d"/><text x="60" y="164" font-size="10">value v</text>
+<text x="30" y="200" font-size="9" fill="#8c3a1d">EXCLUSIVE: exactly one &amp;mut v (read-write), no other reference</text>
+<line x1="210" y1="160" x2="330" y2="160" stroke="#8c3a1d" stroke-width="3" marker-end="url(#c)"/><text x="250" y="153" font-size="9" fill="#8c3a1d">&amp;mut v</text>
+<text x="360" y="150" font-size="9" fill="#8c3a1d">a second reference here (of either kind)</text>
+<text x="360" y="164" font-size="9" fill="#8c3a1d">is rejected: E0499 / E0502</text>
+<defs>
+<marker id="b" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#14406b"/></marker>
+<marker id="c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#8c3a1d"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 28.1: The borrowing rule. Top: a value may have any number of shared references (<code>&amp;T</code>, read-only)
+at once. Bottom: or exactly one mutable reference (<code>&amp;mut T</code>, read-write), with no other reference of either kind
+alive alongside it. Never both. This is aliasing XOR mutation, enforced by the type system.</figcaption>
+</figure>
+
+<h2>28.3 Mutable references: exactly one writer, no aliases</h2>
+
+<p>To mutate a value through a reference you take a <strong>mutable reference</strong>, <code>&amp;mut T</code>. Its rule is the
+opposite of the shared reference's permissiveness: while a <code>&amp;mut T</code> to a value exists, it must be the <em>only</em>
+live reference to that value — no second mutable reference, and no shared reference either. A mutable borrow is <em>exclusive</em>.
+The reason is precisely the aliasing-plus-mutation hazard: if two references could reach one value and at least one could write,
+you would have, in a single thread, the same conflict a data race is across threads (Chapter 24) — a write that another accessor
+can observe half-done or unexpectedly, or that invalidates a pointer the other holds. Rust rules it out by construction (Rust; not
+compiled here — diagnostics quoted from the official Rust error index):</p>
+
+<pre><code>let mut v = vec![1, 2, 3];
+let m = &amp;mut v;         // exclusive mutable borrow of v
+let n = &amp;mut v;         // ERROR: a second mutable borrow while m is live
+m.push(4);
+
+error[E0499]: cannot borrow `v` as mutable more than once at a time</code></pre>
+
+<pre><code>let mut v = vec![1, 2, 3];
+let r = &amp;v;             // shared (read) borrow
+let m = &amp;mut v;         // ERROR: mutable borrow while a shared borrow is live
+println!("{}", r[0]);
+
+error[E0502]: cannot borrow `v` as mutable because it is also borrowed as immutable</code></pre>
+
+<p>The first is rejected with <code>E0499</code> — <em>&ldquo;cannot borrow as mutable more than once at a time&rdquo;</em> — because
+two mutable references would be two writers to one value. The second is rejected with <code>E0502</code> —
+<em>&ldquo;cannot borrow as mutable because it is also borrowed as immutable&rdquo;</em> — because a writer alongside a reader is
+exactly aliasing-plus-mutation. Both diagnostics are from the official Rust error index. Note what the exclusivity buys: through a
+<code>&amp;mut T</code> the compiler <em>knows</em> nothing else can see the value, so mutation through it is as safe and as
+optimizable as if the value were not shared at all — the reference is effectively a compiler-checked exclusive lock, but one with
+zero runtime cost, resolved entirely at compile time. The borrow of a value ends when the reference is last used (this is
+&ldquo;non-lexical lifetimes&rdquo;: the borrow's span is how long the reference is actually used, not the enclosing braces), so
+you can take a shared borrow, finish with it, and then take a mutable one — just never overlapping.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the two-part borrowing rule in one sentence. Which error code fires when you take two <code>&amp;mut</code> to one value,
+and which when you take a <code>&amp;mut</code> while a <code>&amp;</code> is still live? Why is a <code>&amp;mut T</code> being
+exclusive the single-threaded analog of preventing a data race? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>28.4 The borrow checker, and how it kills iterator invalidation and data races</h2>
+
+<p>The two rules — many shared XOR one exclusive, and (next chapter) references must not outlive their value — are enforced by the
+<strong>borrow checker</strong>, a compile-time pass. To see it earning its keep, take a bug from Chapter 11 that C compiles
+without complaint. Here is real C: hold a pointer into a heap buffer, then grow the buffer with <code>realloc</code>, which is free
+to move it — after which the old pointer dangles. Compiled and run in this environment (gcc 11.4.0):</p>
+
+<pre><code>int *v = malloc(4 * sizeof(int));
+for (int i = 0; i &lt; 4; i++) v[i] = i * 10;
+int *p = &amp;v[0];                    /* alias into the buffer */
+v = realloc(v, 4096 * sizeof(int)); /* may move the block, invalidating p */
+printf("via p: %d\n", *p);          /* use-after-free if the block moved */
+free(v);
+
+$ gcc -O2 -Wall borrow.c -o borrow          # compiles, NO warning
+$ gcc -O1 -fsanitize=address borrow.c -o borrow && ./borrow
+==ERROR: AddressSanitizer: heap-use-after-free on address 0x502000000010
+    ... in main
+SUMMARY: AddressSanitizer: heap-use-after-free</code></pre>
+
+<p>The plain build gives no warning at all; only AddressSanitizer, at run time, catches the <strong>heap-use-after-free</strong>.
+This is the iterator-invalidation hazard of Chapter 11 in its rawest form — a live pointer into a container that is then
+reallocated. Now the Rust equivalent. A <code>Vec</code>'s <code>push</code> may reallocate, so its signature takes
+<code>&amp;mut self</code>; holding a reference into the vector means holding a <code>&amp;</code> borrow of it. The two cannot
+overlap (Rust; not compiled here — diagnostic per the official Rust error index):</p>
+
+<pre><code>let mut v = vec![1, 2, 3];
+let p = &amp;v[0];          // shared borrow: a reference INTO the vector
+v.push(4);               // push needs &amp;mut v — conflicts with the live borrow p
+println!("{}", p);       // use of p after the (attempted) reallocation
+
+error[E0502]: cannot borrow `v` as mutable because it is also borrowed as immutable</code></pre>
+
+<p>The exact bug the C program hid until run time — a reference into a buffer that is then reallocated — is a compile error in
+Rust, <code>E0502</code>, because <code>push</code>'s mutable borrow cannot coexist with the shared borrow <code>p</code>. The
+borrow checker does not need to know that <code>push</code> reallocates; the rule &ldquo;no mutable borrow while a shared borrow is
+live&rdquo; is enough. And this is the same rule that forbids data races: a data race (Chapter 24) is two accesses to one location,
+at least one a write, without synchronization — which is aliasing (two accessors) plus mutation (a write). Rust's borrow rule bans
+exactly that combination for a single value, and, extended across threads by the <code>Send</code>/<code>Sync</code> traits (a
+later chapter), it is why safe Rust cannot have a data race. The undefined behavior you proved absent by hand in Chapters 11 and 24
+is, here, a property the compiler checks.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: mutating a collection while a reference into it is alive (the &ldquo;fighting the borrow checker&rdquo; reflex)</span>
+<p>The most common early-Rust frustration is writing a loop that reads from a collection and mutates it in the same breath —
+<code>for x in &amp;v { if cond(x) { v.push(...) } }</code> — and being stopped by <code>E0502</code>: <em>cannot borrow
+<code>v</code> as mutable because it is also borrowed as immutable</em>. Beginners read this as the compiler being pedantic about a
+program that &ldquo;obviously works,&rdquo; and reach for the wrong escapes: cloning the whole collection to get an owned copy to
+iterate, or wrapping everything in <code>RefCell</code> to push the check to run time, or dropping into <code>unsafe</code>. But
+the error is reporting a <em>real</em> hazard — the exact iterator-invalidation bug the C program above hit at run time, where
+mutating the container can reallocate its buffer and dangle the reference you are iterating through. The right responses match what
+you actually mean: if you only need to <em>read</em> while deciding what to change, collect the decisions first (e.g. gather the
+indices or new items into a separate vector) and then apply the mutations after the read-borrow ends; if you need to mutate in
+place without growing, iterate with <code>&amp;mut</code> (<code>iter_mut</code>), which is a single exclusive borrow and is
+allowed; if you genuinely need shared mutable access with runtime-checked rules, <code>RefCell</code> is a deliberate,
+documented choice, not a way to silence the compiler. Fighting the borrow checker by cloning or reaching for <code>unsafe</code>
+to make the message go away is the analog of casting away a warning in C — it works and discards the thing the warning was
+protecting you from.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;The borrow checker is being ridiculous. I'm iterating over a vector and pushing to
+it inside the loop, and it won't compile — <code>E0502</code>, can't borrow as mutable because it's borrowed as immutable. This is
+a five-line loop that would just work in C++ or Python. Why is Rust making me clone the whole thing?&rdquo; Cover the paragraph and
+respond in four or five sentences, drawing on &sect;28.3&ndash;&sect;28.4.</p>
+<p><em>Model answer.</em> &ldquo;That loop in C++ is the classic iterator-invalidation bug: pushing can reallocate the vector's
+buffer, and the reference you're iterating through then dangles — in C the same pattern is a silent heap-use-after-free that only
+a sanitizer catches at run time. Rust's rule is that a mutable borrow (<code>push</code> needs one) can't coexist with the shared
+borrow your loop is holding, which is exactly why it flags it. So the checker isn't being pedantic; it caught the reallocation
+hazard before the program ran. Don't clone the whole vector to dodge it — that pays for a full copy to hide a real bug. Collect the
+items you want to add into a separate vector during the read pass, then push them after the loop, or use <code>iter_mut</code> if
+you're mutating in place; the fix is to separate the read from the write, which is what the rule is telling you to do.&rdquo;
+Framing <code>E0502</code> as the compile-time form of the C use-after-free, and offering the collect-then-mutate fix instead of a
+clone, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;28.3 quick check: the rule is &ldquo;at any time a value may have either any number of shared references
+<code>&amp;T</code> or exactly one mutable reference <code>&amp;mut T</code>, never both.&rdquo; Two <code>&amp;mut</code> to one
+value is <code>E0499</code> (&ldquo;cannot borrow as mutable more than once at a time&rdquo;); a <code>&amp;mut</code> while a
+<code>&amp;</code> is live is <code>E0502</code> (&ldquo;cannot borrow as mutable because it is also borrowed as immutable&rdquo;). A
+<code>&amp;mut T</code> being exclusive is the single-threaded analog of preventing a data race because a data race is aliasing plus
+a write; exclusivity guarantees no other accessor can observe the value while it is being written.)</em></p>
+
+<h2>28.5 What to carry forward</h2>
+
+<p>Borrowing is how you use a value without owning it. A <strong>reference</strong> points at a value it does not own, so lending
+one leaves the owner intact and drops nothing when the reference's scope ends. There are two kinds, and the whole of borrowing is
+one rule dividing them: a value may be borrowed by <em>any number of shared references</em> (<code>&amp;T</code>, read-only) or by
+<em>exactly one mutable reference</em> (<code>&amp;mut T</code>, read-write), never both at once and never two mutable ones. That
+is <strong>aliasing XOR mutation</strong>: unlimited sharing is safe precisely while nothing writes, and writing is safe precisely
+when nothing else can see the value meanwhile. The <strong>borrow checker</strong> enforces this at compile time, at zero runtime
+cost, and in doing so it turns concrete hazards from the earlier volumes into compile errors: the iterator-invalidation
+use-after-free that the C program of &sect;28.4 hid until a sanitizer caught it is, in Rust, <code>E0502</code> at compile time
+(<code>push</code>'s mutable borrow cannot coexist with a live shared borrow into the vector), and two writers to one value are
+<code>E0499</code>. The same &ldquo;no aliasing with mutation&rdquo; rule, lifted across threads later, is why safe Rust has no data
+races — the Chapter 24 hazard made structural.</p>
+
+<p>One question is now unavoidable, and it is the whole of the next chapter. A reference is a pointer into another value; the second
+borrow rule is that a reference must never be used after the value it points at is gone — a dangling reference (the C
+return-a-pointer-to-a-local bug) must be impossible. But how does the compiler <em>know</em>, at the point you use a reference,
+that the value behind it is still alive — especially when references are passed into and out of functions, stored in structs, and
+returned? The answer is <strong>lifetimes</strong>: a way to name and relate the spans over which references are valid, so the
+borrow checker can prove that no reference outlives its referent. Everything the machine does underneath is unchanged — a Rust
+reference compiles to exactly the pointer C would use, with no extra runtime data — but the compiler now carries a proof, expressed
+in lifetimes, that the pointer is always valid when dereferenced. That proof, and the small annotations it sometimes needs from
+you, is where we go next.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Say what a reference is, and why lending one leaves the owner valid where moving would not.</li>
+<li>State the two-part borrowing rule (many shared XOR one exclusive) and why each half is safe.</li>
+<li>Explain why a <code>&amp;mut T</code> must be the only live reference, in terms of aliasing plus mutation.</li>
+<li>Name the error codes for two mutable borrows (<code>E0499</code>) and a mutable-while-shared borrow (<code>E0502</code>).</li>
+<li>Show how the borrow rule turns the C iterator-invalidation use-after-free into a compile error.</li>
+<li>Connect the borrow rule to data-race prevention (aliasing XOR mutation, Chapter 24).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a reference, and why does passing <code>&amp;owner</code> leave <code>owner</code> usable while passing it by value does not? (&sect;28.1)</li>
+<li><strong>R2.</strong> How many shared references (<code>&amp;T</code>) to one value may exist at once, and what may you do through them? (&sect;28.2)</li>
+<li><strong>R3.</strong> State the exclusivity rule for <code>&amp;mut T</code>, and give the two error codes it is enforced by. (&sect;28.3)</li>
+<li><strong>R4.</strong> Take the C realloc/dangling-pointer bug; explain why the analogous Rust code is <code>E0502</code> at compile time. (&sect;28.4)</li>
+<li><strong>R5.</strong> Why is &ldquo;aliasing XOR mutation&rdquo; the same rule that prevents data races? (&sect;28.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 4.2
+&ldquo;References and Borrowing&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source for shared
+vs. mutable references and the borrowing rule of &sect;28.2&ndash;&sect;28.3. Authors and edition verified via the publisher; the
+book was not compiled in this environment.</li>
+<li><strong>The Rust Error Index, entries <code>E0499</code>, <code>E0502</code>, and <code>E0505</code>
+(<code>doc.rust-lang.org/error_codes</code>).</strong> The official one-line meanings quoted in &sect;28.3&ndash;&sect;28.4:
+<code>E0499</code> &ldquo;borrowed as mutable more than once,&rdquo; <code>E0502</code> &ldquo;borrowed as mutable because also
+borrowed as immutable,&rdquo; <code>E0505</code> &ldquo;a value was moved out while it was still borrowed.&rdquo; Each verified
+against the current error index.</li>
+<li><strong>Jung, Jourdan, Krebbers &amp; Dreyer, &ldquo;RustBelt: Securing the Foundations of the Rust Programming Language,&rdquo;
+<em>Proc. ACM on Programming Languages</em> 2(POPL), Article 66 (2018), DOI 10.1145/3158154.</strong> The machine-checked proof
+that the borrowing discipline of this chapter is sound. First author Ralf Jung; verified via the ACM Digital Library.</li>
+<li><strong>The Rust reference and the &ldquo;non-lexical lifetimes&rdquo; RFC 2094 (<code>rust-lang.github.io/rfcs</code>).</strong>
+Why a borrow ends at last use rather than at the closing brace — the refinement noted in &sect;28.3. Reference for the precise
+model; verify against the current edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex28.1"><span class="ex-label">28.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define a shared reference (<code>&amp;T</code>) and a mutable reference (<code>&amp;mut T</code>), saying what
+you may do through each and how many of each may exist at once.</div>
+
+<div class="exercise" id="ex28.2"><span class="ex-label">28.2</span> <span class="ex-tag warm">warm-up</span>
+Why does <code>fn length(s: &amp;String)</code> leave the caller's <code>String</code> usable after the call, whereas
+<code>fn length(s: String)</code> would not?</div>
+
+<div class="exercise" id="ex28.3"><span class="ex-label">28.3</span> <span class="ex-tag warm">warm-up</span>
+State the two-part borrowing rule in one sentence, and name the two situations it forbids together with their error codes.</div>
+
+<div class="exercise" id="ex28.4"><span class="ex-label">28.4</span> <span class="ex-tag core">core</span>
+Take the C snippet of &sect;28.4 (pointer into a buffer, <code>realloc</code>, use the old pointer). (a) Identify the bug and the
+line it occurs on. (b) Explain why the plain <code>gcc -O2 -Wall</code> build gives no warning, and what AddressSanitizer reports
+at run time. (c) Explain precisely why the analogous Rust code is <code>E0502</code> at compile time — which borrow conflicts with
+which, and why the checker does not need to know that <code>push</code> reallocates.</div>
+
+<div class="exercise" id="ex28.5"><span class="ex-label">28.5</span> <span class="ex-tag core">core</span>
+Explain why a mutable reference must be exclusive. (a) What single-threaded hazard would two references to one value, at least one
+mutable, reproduce? (b) Connect this to the definition of a data race from Chapter 24. (c) What does the exclusivity of
+<code>&amp;mut T</code> let the compiler assume, and why is that good for optimization?</div>
+
+<div class="exercise" id="ex28.6"><span class="ex-label">28.6</span> <span class="ex-tag core">core</span>
+For each, say whether it compiles, and if not, which error code fires and why: (a) <code>let a = &amp;v; let b = &amp;v;</code>
+(both shared); (b) <code>let m = &amp;mut v; let n = &amp;mut v;</code>; (c) <code>let r = &amp;v; let m = &amp;mut v;</code>; (d) a
+shared borrow used and finished, then a mutable borrow taken afterward (non-overlapping).</div>
+
+<div class="exercise" id="ex28.7"><span class="ex-label">28.7</span> <span class="ex-tag complexity">cost</span>
+References are &ldquo;zero-cost.&rdquo; (a) At the machine level, what is a <code>&amp;T</code> — how much runtime data does it carry
+beyond the pointer C would use? (b) At what time is the borrow checking done, and what runtime cost does it add? (c) Contrast this
+with <code>RefCell</code>, which enforces the same borrow rule at run time: what does <code>RefCell</code> cost that a plain
+<code>&amp;mut</code> does not, and when is paying it justified?</div>
+
+<div class="exercise" id="ex28.8"><span class="ex-label">28.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer writes a loop that scans a <code>Vec&lt;i32&gt;</code> and pushes each
+value's double back onto the same vector, and gets <code>error[E0502]: cannot borrow `v` as mutable because it is also borrowed as
+immutable</code>.
+<br><strong>Step 1 (given):</strong> <code>for x in &amp;v { ... }</code> holds a shared borrow of <code>v</code> for the whole loop
+body.
+<br><strong>Step 2 (given):</strong> <code>v.push(2 * x)</code> inside the body needs a mutable borrow of <code>v</code>, which
+cannot coexist with the shared borrow.
+<br><strong>Step 3 (given):</strong> this is the iterator-invalidation hazard: a push could reallocate <code>v</code> and dangle
+the iterator.
+<br><strong>Step 4 (you):</strong> Give two correct fixes — one that separates the read pass from the write pass without cloning
+the whole vector, and one using <code>iter_mut</code> if the mutation were in place — and say why cloning the entire vector to
+dodge the error is the wrong default.</div>
+
+<div class="exercise" id="ex28.9"><span class="ex-label">28.9</span> <span class="ex-tag mixed">mixed</span>
+For each, state whether it is allowed by the borrow rule and justify in a line: (a) three <code>&amp;v</code> at once; (b) one
+<code>&amp;mut v</code> and one <code>&amp;v</code> at once; (c) two <code>&amp;mut v</code> at once; (d) a <code>&amp;mut v</code>
+after all shared borrows of <code>v</code> have ended.</div>
+
+<div class="exercise" id="ex28.10"><span class="ex-label">28.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;You may have many mutable references to a value
+as long as they don't write at the same time.&rdquo; (b) &ldquo;A shared reference lets you mutate the value it points at.&rdquo;
+(c) &ldquo;The borrow checker adds runtime overhead to every dereference.&rdquo; (d) &ldquo;Holding a reference into a vector and
+then pushing to it is a compile error.&rdquo; (e) &ldquo;A reference drops (frees) the value when it goes out of scope.&rdquo;</div>
+
+<div class="exercise" id="ex28.11"><span class="ex-label">28.11</span> <span class="ex-tag stretch">stretch</span>
+The borrow rule is &ldquo;aliasing XOR mutation.&rdquo; (a) Show that both a use-after-free through an aliased pointer (Chapter 9/11)
+and a data race (Chapter 24) are instances of &ldquo;two paths to one value, at least one writing,&rdquo; and how the single rule
+attacks their shared root. (b) Explain why unlimited <em>shared</em> references are nonetheless safe, and unlimited access is only a
+problem once mutation enters. (c) The rule as stated is for a single value in one thread; name what still has to be added to extend
+&ldquo;no data races&rdquo; across threads, and why the borrow rule alone is not yet enough there.</div>
+
+<div class="exercise" id="ex28.12"><span class="ex-label">28.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile and run the &sect;28.4 C snippet (pointer into
+a buffer, <code>realloc</code> to a much larger size, use the old pointer). Confirm it builds without warning under
+<code>-O2 -Wall</code>, then rebuild with <code>-fsanitize=address</code> and observe the heap-use-after-free. (b) If you have
+<code>rustc</code>, write the <code>let p = &amp;v[0]; v.push(4); println!("{p}");</code> version and confirm it fails with
+<code>E0502</code>; if not, name the exact conflicting borrows from this chapter. (c) Write a version that compiles by ending the
+shared borrow before the <code>push</code>, and explain why it is now allowed. Note your toolchain versions.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch29">
+<h1>Chapter 29 — Lifetimes</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch28">Chapter 28</a> (borrowing — a lifetime is how the compiler
+proves the second borrow rule, that a reference never outlives its value), <a href="#ch27">Chapter 27</a> (ownership and drop — a
+value is dropped at end of scope, so a reference to it must not be used past that point), <a href="#ch08">Chapter 8</a> (the stack:
+a local's storage is reclaimed when its scope ends), <a href="#ch09">Chapter 9</a> (dangling pointers and use-after-free — exactly
+what lifetimes rule out). &nbsp;·&nbsp; Chapter 28 left one borrow rule unproven: a reference must never be used after the value it
+points at is gone. This chapter is how the compiler proves it — by tracking, and sometimes making you name, the spans over which
+references are valid.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch08">Chapter 8</a> — when is a stack local's storage reclaimed, and what becomes of a
+pointer to it afterward? (2) <a href="#ch28">Chapter 28</a> — a reference does not own its value; who is responsible for dropping the
+value, and when? (3) <em>Predict:</em> in C you write a function that returns <code>&amp;local</code> (the address of one of its
+own stack variables) and the caller dereferences it. Does <code>gcc -Wall</code> warn? In Rust, a function that returns a
+reference to one of its own locals — will the compiler accept it? Write your guesses; &sect;29.1 and &sect;29.3 answer all
+three.</p>
+</aside>
+
+<p>Chapter 28 gave one borrow rule in full — aliasing XOR mutation — and named a second only in passing: a reference must never be
+used after the value it refers to is gone. That second rule is what this chapter is about, and the machinery that enforces it is
+<strong>lifetimes</strong>. A lifetime is not a runtime thing and it changes nothing about the code the machine runs; it is a
+<em>compile-time</em> name for a region of the program over which a reference is valid, and the borrow checker uses lifetimes to
+prove that every reference is dereferenced only while its referent is still alive. First, the hazard: the dangling reference — the C
+return-a-pointer-to-a-local bug — and why the compiler must forbid it (&sect;29.1). Then how references usually need no annotation,
+and when they do: naming a lifetime <code>'a</code> in a function signature to relate an output reference to its inputs
+(&sect;29.2). Then what the borrow checker actually checks, and the <code>E0597</code> error it produces when a value does not live
+long enough (&sect;29.3). Then lifetime <strong>elision</strong> — why most signatures omit lifetimes — and structs that hold
+references, where a lifetime is mandatory (<code>E0106</code>) (&sect;29.4). We close by carrying lifetimes forward: ownership,
+borrowing, and lifetimes together are the whole memory-safety story, and the next chapters build reusable abstractions on top of it
+(&sect;29.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust error index, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>29.1 The dangling reference, and why it must be forbidden</h2>
+
+<p>A reference is a pointer into a value it does not own. The value is dropped by its owner at end of scope (Chapters 27, 28); if a
+reference is used after that point, it points at reclaimed storage — a <strong>dangling reference</strong>, the use-after-free of
+Chapter 9 in reference form. The archetype is returning a pointer to a stack local. Here is real C; the trivial form is caught by a
+best-effort warning, but that warning is a heuristic, not a guarantee. Compiled in this environment (gcc 11.4.0):</p>
+
+<pre><code>int *make(void) {
+    int local = 42;
+    return &amp;local;      /* address of a stack local; reclaimed when make returns */
+}
+/* caller: */ int *r = make(); printf("%d\n", *r);   /* dangling: use-after-scope */
+
+$ gcc -O2 -Wall dangle.c -o dangle
+dangle.c: In function 'make':
+dangle.c:3:12: warning: function returns address of local variable [-Wreturn-local-addr]</code></pre>
+
+<p>gcc catches this direct form. But launder the same pointer through a struct and the heuristic misses it — the program compiles
+clean and is only caught at run time by a sanitizer (gcc 11.4.0, this environment):</p>
+
+<pre><code>struct Ref { int *p; };
+struct Ref borrow_local(void) {
+    int local = 42;
+    struct Ref r; r.p = &amp;local;   /* store address of a local in a struct */
+    return r;                       /* r.p now dangles */
+}
+/* caller: */ struct Ref r = borrow_local(); printf("%d\n", *r.p);
+
+$ gcc -O2 -Wall dangle2.c -o dangle2      # compiles, NO warning
+$ gcc -O1 -fsanitize=address dangle2.c -o d && ./d
+==ERROR: AddressSanitizer: stack-use-after-scope ... in main</code></pre>
+
+<p>The point is not that C never warns — it is that C's warnings are a best-effort heuristic that follows only simple data flow and
+gives up as soon as the pointer passes through a struct, a second function, or a container. The general problem — does this
+reference outlive the value it points at? — is not something C's type system tracks at all. Rust makes it a rule the type system
+enforces in <em>every</em> case: a reference may not be used after its referent is dropped, no exceptions, checked at compile time.
+To do that in the general case — references flowing into and out of functions, stored in structs, returned — the compiler needs a
+way to <em>name</em> and <em>compare</em> the spans over which references and values are valid. That name is a lifetime.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is returning <code>&amp;local</code> from a function a bug — what has happened to <code>local</code>'s storage by the time the
+caller dereferences the result? Why does <code>gcc -Wall</code> catch the direct form but not the version laundered through a
+struct? State the general rule Rust enforces that the C heuristic only approximates. (Answer after the next section.)</p>
+</aside>
+
+<h2>29.2 Lifetimes named: relating an output reference to its inputs</h2>
+
+<p>Most of the time you never write a lifetime — the compiler infers the valid regions on its own (&sect;29.4). You must name one
+when a function returns a reference and the compiler cannot tell, from the signature alone, <em>which</em> input the returned
+reference borrows from — because that determines how long the result stays valid. The canonical case is a function returning
+whichever of two string slices is longer (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>fn longest&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str {
+    if x.len() &gt; y.len() { x } else { y }
+}</code></pre>
+
+<p>The <code>&lt;'a&gt;</code> declares a <strong>lifetime parameter</strong> named <code>'a</code> (lifetimes are written with a
+leading apostrophe and are usually short and lowercase). The signature now says: for some region <code>'a</code>, both inputs are
+references valid for at least <code>'a</code>, and the returned reference is valid for <code>'a</code> too. This is a
+<em>constraint</em>, not a runtime value — it does not change what the function does or make anything live longer; it tells the
+borrow checker how the output's validity relates to the inputs'. The payoff is at the call sites: the compiler now knows the
+returned reference cannot outlive the shorter-lived of the two arguments, and it will reject any caller that tries to use the result
+after either input has gone. Without the annotation the compiler could not know whether the result borrows from <code>x</code> or
+<code>y</code>, so it could not check the callers — which is exactly why the annotation is required here. Lifetime parameters, then,
+are how a function's signature carries a promise about the validity of the references it returns, so that borrow-checking composes
+across function boundaries.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a reference may not outlive its referent</span>
+<p><strong>1. In words.</strong> Every reference is valid only for a region — its lifetime — bounded by the scope of the value it
+points at. The borrow checker requires that a reference is used only within that region; using it after the referent is dropped is
+rejected. A lifetime parameter like <code>'a</code> lets a signature state how an output reference's region relates to its
+inputs'.</p>
+<p><strong>2. As a picture.</strong> Figure 29.1: a value's lifetime drawn as a bar from its creation to its drop; a reference's use
+drawn as a shorter bar that must fit <em>inside</em> the value's bar. A reference bar that extends past the value's drop is the
+error.</p>
+<p><strong>3. As numbers/contrast.</strong> The C function of &sect;29.1 returns a pointer whose referent's storage is reclaimed the
+instant the function returns — the reference bar extends past the value bar &rarr; use-after-scope (ASan-confirmed). The Rust
+equivalent is <code>E0597</code> at compile time: the borrowed value does not live long enough, so the reference cannot be
+returned.</p>
+</aside>
+
+<p><em>(Answer to the &sect;29.1 quick check: <code>local</code> lives on the function's stack frame, which is reclaimed the moment
+the function returns, so by the time the caller dereferences the returned pointer the storage is gone — a use-after-scope. gcc's
+<code>-Wreturn-local-addr</code> follows simple direct data flow and catches <code>return &amp;local;</code>, but it gives up once
+the address is stored in a struct and returned indirectly, so that version compiles clean. Rust's rule, enforced in all cases at
+compile time, is that a reference may never be used after the value it refers to has been dropped.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">A reference's use must fit inside its referent's lifetime. Extending past the drop is the error.</text>
+<text x="20" y="52" font-size="9" fill="#14406b">OK: reference used only while value is alive</text>
+<rect x="60" y="60" width="360" height="16" fill="#eef" stroke="#14406b"/><text x="200" y="72" font-size="9">value v alive (owner's scope)</text>
+<line x1="420" y1="68" x2="440" y2="68" stroke="#8c3a1d"/><text x="424" y="82" font-size="8" fill="#8c3a1d">drop(v)</text>
+<rect x="120" y="82" width="220" height="12" fill="#dfeee0" stroke="#2f7d32"/><text x="150" y="92" font-size="8" fill="#2f7d32">&amp;v used here — fits inside</text>
+<text x="20" y="128" font-size="9" fill="#8c3a1d">BAD: reference used after value dropped &rarr; E0597</text>
+<rect x="60" y="136" width="200" height="16" fill="#fdeee6" stroke="#8c3a1d"/><text x="120" y="148" font-size="9">value alive</text>
+<line x1="260" y1="144" x2="280" y2="144" stroke="#8c3a1d"/><text x="264" y="134" font-size="8" fill="#8c3a1d">drop</text>
+<rect x="120" y="158" width="300" height="12" fill="#f7d9d0" stroke="#8c3a1d"/><text x="150" y="168" font-size="8" fill="#8c3a1d">reference used here — extends past drop (dangling)</text>
+</svg>
+<figcaption>Figure 29.1: Lifetimes as fitting. A reference is valid only within its referent's lifetime (top, allowed). A reference
+used after the value is dropped (bottom) is a dangling reference — the C use-after-scope of &sect;29.1, and in Rust a compile error,
+<code>E0597</code>, &ldquo;borrowed value does not live long enough.&rdquo;</figcaption>
+</figure>
+
+<h2>29.3 What the borrow checker proves, and E0597</h2>
+
+<p>With lifetimes as its vocabulary, the borrow checker's second rule is a containment check: for every use of a reference, the
+region over which the reference is used must be contained in the region over which its referent is alive. When it is not, the
+compiler reports that the borrowed value does not live long enough. Here is the dangling-reference bug of &sect;29.1 in Rust — a
+function trying to return a reference to its own local (Rust; not compiled here — diagnostic quoted from the official Rust error
+index):</p>
+
+<pre><code>fn dangle&lt;'a&gt;() -&gt; &amp;'a str {
+    let s = String::from("hello");   // s is a local; it will be dropped at the `}`
+    &amp;s                               // return a reference to s
+}                                    // s is dropped here — the reference would dangle
+
+error[E0597]: `s` does not live long enough
+  = note: values in a scope are dropped in the opposite order they are defined</code></pre>
+
+<p>The compiler rejects it with <code>E0597</code> — <em>the borrowed value does not live long enough</em>, per the official Rust
+error index — because <code>s</code> is dropped at the closing brace, so the returned reference would point at freed storage; its
+required lifetime (as long as the caller keeps it) exceeds <code>s</code>'s actual lifetime (the function body). This is the C
+use-after-scope of &sect;29.1, but caught at compile time in every case, not by a heuristic that a struct can defeat. The fix is
+never to make the reference live longer — you cannot extend a dropped value — but to return an <em>owned</em> value (return
+<code>String</code>, moving ownership out, Chapter 27) or to borrow from something that outlives the function (an input reference,
+&sect;29.2). Note again that lifetimes are inert at run time: they are erased before code generation, so a correct program pays
+nothing for them, and the reference compiles to the same bare pointer C would use. The entire cost of the guarantee is borne by the
+compiler, once.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>E0597</code> report, and what condition on regions is the borrow checker verifying when it fires? Why can't you
+fix a &ldquo;does not live long enough&rdquo; error by making the reference live longer, and what are the two real fixes? At run
+time, what does a lifetime cost? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>29.4 Elision, and structs that hold references</h2>
+
+<p>If every reference needed an explicit lifetime, Rust would be unbearable. It does not, because of <strong>lifetime
+elision</strong>: a set of deterministic rules by which the compiler fills in the common cases so you write no annotation at all. The
+three elision rules (Klabnik &amp; Nichols, 2023, ch. 10) are: (1) each elided input reference gets its own distinct lifetime; (2)
+if there is exactly one input lifetime, it is assigned to all elided output lifetimes; and (3) if there are multiple input lifetimes
+but one of them is <code>&amp;self</code> or <code>&amp;mut self</code> (a method), the lifetime of <code>self</code> is assigned to
+all elided outputs. When these rules determine every lifetime, you write none; the <code>longest</code> function of &sect;29.2
+needed an explicit <code>'a</code> only because it has two input references and neither is <code>self</code>, so rule 2 and rule 3
+do not apply and the compiler cannot guess which input the output borrows. Elision is not a special case in the type system — it is
+pure syntactic sugar for lifetimes you could always write out.</p>
+
+<p>One place a lifetime is never optional: a struct that <em>holds</em> a reference. Such a struct is only valid as long as the
+value it borrows, and that relationship must be named. Omitting it is <code>E0106</code> (Rust; not compiled here — diagnostic per
+the official Rust error index):</p>
+
+<pre><code>struct Excerpt { part: &amp;str }        // ERROR: reference field with no lifetime
+error[E0106]: missing lifetime specifier
+
+struct Excerpt&lt;'a&gt; { part: &amp;'a str } // OK: the struct borrows for 'a and may not
+                                     //     outlive the &amp;str it holds</code></pre>
+
+<p>The first is rejected with <code>E0106</code> — <em>missing lifetime specifier</em> — because a struct with a reference field
+carries an implicit promise (&ldquo;I do not outlive what I borrow&rdquo;) that must be written into the type as
+<code>&lt;'a&gt;</code>. Once annotated, the borrow checker enforces that no <code>Excerpt</code> value is used after the
+<code>str</code> it points into has been dropped — the same containment rule as &sect;29.3, now for a reference living inside a
+struct. This is why data structures that own their data (holding <code>String</code>, <code>Vec</code>) are simpler than ones that
+borrow it (holding <code>&amp;str</code>, <code>&amp;[T]</code>): owning avoids lifetime parameters entirely, at the cost of an
+allocation; borrowing avoids the allocation, at the cost of threading a lifetime through the type. That trade — own vs. borrow — is a
+recurring design decision, and lifetimes are the language in which the borrowing side of it is expressed.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: reading a lifetime as &ldquo;how long the value lives&rdquo; and trying to make references live longer</span>
+<p>The word &ldquo;lifetime&rdquo; misleads newcomers into thinking <code>'a</code> is a duration you set — that annotating a
+reference with a longer lifetime makes the underlying value live longer, the way a smart pointer or a garbage collector would keep
+it alive. It does not. A lifetime is purely <em>descriptive</em>: it names a region that the reference is valid for, bounded by
+facts already fixed by ownership — when the value is created and when its owner drops it. Writing <code>'a</code> does not extend
+anything; it only lets the compiler <em>check</em> a relationship. So when you hit <code>E0597</code>, &ldquo;<code>s</code> does
+not live long enough,&rdquo; the wrong instinct is to search for a lifetime annotation that will make the error disappear — adding
+<code>'static</code>, or inventing longer-named lifetimes — because no annotation can make a value outlive its owner's scope. The
+error is telling you a structural truth: you are trying to use a reference past the life of what it points at. The real fixes are to
+change ownership, not the annotation: return an owned value (move it out, Chapter 27), borrow from something that genuinely
+outlives the use (an input reference, or a value in an outer scope), or restructure so the reference is never needed past the
+value's death. Reaching for <code>'static</code> to silence <code>E0597</code> is the analog of casting a pointer to make a type
+error vanish — it either does not compile anyway or forces the value to be truly static, which is rarely what you meant.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I have a function that builds a string and returns a <code>&amp;str</code> to it,
+and I keep getting <code>E0597</code>, does not live long enough. I tried annotating it <code>'a</code>, then <code>'static</code>,
+and it still won't compile. Lifetimes are just confusing syntax — why can't I just tell it the reference lives as long as I need?&rdquo;
+Cover the paragraph and respond in four or five sentences, drawing on &sect;29.3&ndash;&sect;29.4.</p>
+<p><em>Model answer.</em> &ldquo;The annotation can't fix it because a lifetime doesn't <em>make</em> anything live longer — it only
+names how long a value already lives, which ownership fixed: your local string is dropped when the function returns, so any
+reference to it would dangle, which is exactly the C 'return a pointer to a local' bug. That's what <code>E0597</code> is
+reporting, and no lifetime name, not even <code>'static</code>, can extend a value past its owner's scope. The fix is about
+ownership, not syntax: return the <code>String</code> by value so ownership moves out to the caller, or borrow from an input that
+outlives the call. Adding <code>'static</code> only makes it compile if the data really is static, which a freshly built string
+isn't. So don't hunt for the magic annotation — decide who should own the result.&rdquo; Framing the error as the C
+return-a-local bug and the fix as an ownership decision, not an annotation search, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;29.3 quick check: <code>E0597</code> reports that a borrowed value does not live long enough; the borrow
+checker is verifying that the region over which a reference is used is contained within the region its referent is alive. You
+cannot fix it by making the reference &ldquo;live longer&rdquo; because a lifetime only describes existing facts — it cannot extend
+a value past its owner's drop; the two real fixes are to return an owned value (move ownership out) or to borrow from something that
+genuinely outlives the use. At run time a lifetime costs nothing — lifetimes are erased before code generation.)</em></p>
+
+<h2>29.5 What to carry forward</h2>
+
+<p>Lifetimes complete the memory-safety story. Ownership (Chapter 27) says every value has one owner and is dropped at end of scope;
+borrowing (Chapter 28) lets you use a value without owning it, under aliasing-XOR-mutation; and lifetimes enforce the second borrow
+rule — that a reference is never used after its referent is dropped. A <strong>lifetime</strong> is a compile-time name for the
+region a reference is valid over; the borrow checker proves, for every use, that the reference's region is contained in its
+referent's, and reports <code>E0597</code> — &ldquo;borrowed value does not live long enough&rdquo; — when it is not, catching the C
+dangling-pointer/use-after-scope bug in every case, where C's warning is only a best-effort heuristic a struct can defeat. Most
+lifetimes are inferred by <strong>elision</strong>, so you rarely write one; you must name a lifetime (<code>'a</code>) when a
+function returns a reference whose origin among several inputs is ambiguous, and you must give a struct a lifetime parameter when it
+holds a reference (<code>E0106</code>, &ldquo;missing lifetime specifier&rdquo;). Crucially, lifetimes are inert at run time — erased
+before code generation — so the whole guarantee is paid for once, at compile time, and a Rust reference is the same bare pointer C
+would emit.</p>
+
+<p>You now have the three pillars — ownership, borrowing, lifetimes — that let Rust guarantee memory safety without a garbage
+collector, encoding in the type system the very invariants you proved by hand across the C volumes: memory freed exactly once, used
+only while valid, and never shared-and-mutated in a way that races. What is missing is not safety but <em>reuse</em>. The
+<code>longest</code> function worked on <code>&amp;str</code>; what about a function that finds the largest element of any slice, of
+any type that can be compared? Writing one version per type is the C-with-copy-paste world these volumes have been leaving behind.
+The next chapter is how Rust expresses code that is generic over types while staying fully checked and monomorphized to concrete,
+zero-overhead machine code: <strong>traits and generics</strong>. And traits, it will turn out, are also how the concurrency
+guarantee is finally stated — the <code>Send</code> and <code>Sync</code> markers that lift borrowing's aliasing discipline across
+threads. The machine underneath is unchanged; what grows is the vocabulary in which you state, and the compiler checks, what your
+code requires of the types it works with.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Define a lifetime as a compile-time region, and say what the second borrow rule is.</li>
+<li>Explain why returning <code>&amp;local</code> is a dangling reference, and why C's warning is only a heuristic.</li>
+<li>Read the <code>longest&lt;'a&gt;</code> signature and say what the <code>'a</code> asserts and why it is needed there.</li>
+<li>State what <code>E0597</code> reports and the two real fixes (own vs. borrow-from-something-longer-lived).</li>
+<li>Give the elision intuition and say why a struct holding a reference needs a lifetime (<code>E0106</code>).</li>
+<li>Say what a lifetime costs at run time, and why.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a dangling reference, and why does returning <code>&amp;local</code> create one? Why is C's <code>-Wreturn-local-addr</code> only best-effort? (&sect;29.1)</li>
+<li><strong>R2.</strong> In <code>fn longest&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str</code>, what does <code>'a</code> assert, and why is an annotation required here? (&sect;29.2)</li>
+<li><strong>R3.</strong> What does <code>E0597</code> report, and what containment condition is the borrow checker verifying? (&sect;29.3)</li>
+<li><strong>R4.</strong> State the intuition for lifetime elision, and why a struct with a reference field needs a lifetime (<code>E0106</code>). (&sect;29.4)</li>
+<li><strong>R5.</strong> What do lifetimes cost at run time, and how do the three pillars (ownership, borrowing, lifetimes) fit together? (&sect;29.3, &sect;29.5)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 10.3
+&ldquo;Validating References with Lifetimes&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source
+for lifetime syntax, the <code>longest</code> example, and the three elision rules of &sect;29.2 and &sect;29.4. Authors and
+edition verified via the publisher; the book was not compiled in this environment.</li>
+<li><strong>The Rust Error Index, entries <code>E0597</code> and <code>E0106</code> (<code>doc.rust-lang.org/error_codes</code>).</strong>
+The official meanings quoted in &sect;29.3&ndash;&sect;29.4: <code>E0597</code> &ldquo;a value was dropped while it was still
+borrowed&rdquo; (borrowed value does not live long enough) and <code>E0106</code> &ldquo;a lifetime is missing from a type&rdquo;
+(missing lifetime specifier). Each verified against the current error index.</li>
+<li><strong>Jung, Jourdan, Krebbers &amp; Dreyer, &ldquo;RustBelt: Securing the Foundations of the Rust Programming Language,&rdquo;
+<em>Proc. ACM on Programming Languages</em> 2(POPL), Article 66 (2018), DOI 10.1145/3158154.</strong> The formal model in which
+lifetimes-as-regions and the &ldquo;references never outlive their referent&rdquo; guarantee are proved sound. First author Ralf
+Jung; verified via the ACM Digital Library.</li>
+<li><strong>The &ldquo;non-lexical lifetimes&rdquo; RFC 2094 and the Polonius project notes (<code>rust-lang.github.io</code>).</strong>
+How the borrow checker computes lifetime regions precisely (last-use rather than lexical scope) — the modern engine behind
+&sect;29.3. Reference for the checker's internals; verify against the current edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex29.1"><span class="ex-label">29.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is a lifetime, and what is the second borrow rule that lifetimes enforce?</div>
+
+<div class="exercise" id="ex29.2"><span class="ex-label">29.2</span> <span class="ex-tag warm">warm-up</span>
+Why is <code>fn make() -&gt; &amp;i32 { let x = 5; &amp;x }</code> a bug? What has happened to <code>x</code> by the time the caller
+would dereference the result?</div>
+
+<div class="exercise" id="ex29.3"><span class="ex-label">29.3</span> <span class="ex-tag warm">warm-up</span>
+In <code>fn longest&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str</code>, state in words what the three occurrences of
+<code>'a</code> jointly assert.</div>
+
+<div class="exercise" id="ex29.4"><span class="ex-label">29.4</span> <span class="ex-tag core">core</span>
+Take the two C snippets of &sect;29.1 (direct <code>return &amp;local;</code> and the version laundered through a struct). (a) Why
+is each a use-after-scope? (b) Why does <code>gcc -Wall</code> warn on the first but not the second? (c) Explain how Rust's rule
+differs from a best-effort warning, and what error code the analogous Rust function produces.</div>
+
+<div class="exercise" id="ex29.5"><span class="ex-label">29.5</span> <span class="ex-tag core">core</span>
+Explain what the borrow checker verifies when it emits <code>E0597</code>. (a) State the containment condition on regions. (b) Why
+can't the error be fixed by annotating a longer lifetime? (c) Give the two structural fixes and say which each is appropriate
+for.</div>
+
+<div class="exercise" id="ex29.6"><span class="ex-label">29.6</span> <span class="ex-tag core">core</span>
+State the three lifetime-elision rules and apply them: (a) <code>fn first(s: &amp;str) -&gt; &amp;str</code> — why is no annotation
+needed? (b) <code>fn get(&amp;self, i: usize) -&gt; &amp;T</code> — which rule supplies the output lifetime? (c)
+<code>fn longest(x: &amp;str, y: &amp;str) -&gt; &amp;str</code> — why do the rules fail to determine the output, forcing you to write
+<code>'a</code>?</div>
+
+<div class="exercise" id="ex29.7"><span class="ex-label">29.7</span> <span class="ex-tag complexity">cost</span>
+Lifetimes are &ldquo;zero-cost.&rdquo; (a) At what phase are lifetimes checked, and what happens to them before code generation? (b)
+What is the runtime representation of a <code>&amp;'a T</code> compared with the C pointer it replaces? (c) Contrast this with a
+garbage-collected or reference-counted language's approach to the same &ldquo;is this reference still valid?&rdquo; question: what
+does each pay, and when?</div>
+
+<div class="exercise" id="ex29.8"><span class="ex-label">29.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer writes <code>fn greeting() -&gt; &amp;str { let s =
+String::from("hi"); &amp;s }</code> and gets <code>error[E0597]: `s` does not live long enough</code>.
+<br><strong>Step 1 (given):</strong> <code>s</code> is a local <code>String</code>, dropped at the function's closing brace.
+<br><strong>Step 2 (given):</strong> <code>&amp;s</code> would be returned to the caller, who could use it after <code>s</code> is
+dropped — a dangling reference.
+<br><strong>Step 3 (given):</strong> no lifetime annotation (including <code>'static</code>) can make <code>s</code> outlive its
+scope, so the error is structural, not syntactic.
+<br><strong>Step 4 (you):</strong> Give the correct fix (change the return type so ownership moves out) and one alternative
+(borrow from an input that outlives the call), and explain why reaching for <code>'static</code> is the wrong instinct here.</div>
+
+<div class="exercise" id="ex29.9"><span class="ex-label">29.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether a lifetime annotation is <em>required</em>, <em>elided</em>, or the code is a <em>dangling-reference
+error</em>, and justify: (a) <code>fn id(x: &amp;i32) -&gt; &amp;i32</code>; (b) <code>struct Wrapper { r: &amp;u8 }</code>; (c) a
+function returning a reference to its own local; (d) <code>fn pick(a: &amp;str, b: &amp;str) -&gt; &amp;str</code> returning one of
+the two.</div>
+
+<div class="exercise" id="ex29.10"><span class="ex-label">29.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Annotating a reference <code>'static</code>
+makes the value it points at live forever.&rdquo; (b) &ldquo;Lifetimes exist at run time and cost a pointer of extra data.&rdquo;
+(c) &ldquo;A struct with a <code>&amp;str</code> field can omit its lifetime.&rdquo; (d) &ldquo;<code>E0597</code> means the
+reference outlives its referent.&rdquo; (e) &ldquo;Most function signatures need explicit lifetimes.&rdquo;</div>
+
+<div class="exercise" id="ex29.11"><span class="ex-label">29.11</span> <span class="ex-tag stretch">stretch</span>
+Owning vs. borrowing in data structures. (a) Contrast a struct that stores a <code>String</code> with one that stores a
+<code>&amp;'a str</code>: what does each cost (allocation vs. lifetime parameter), and what constraint does the borrowing version
+place on how the struct may be used? (b) Explain why a self-referential struct (a field that borrows from another field of the same
+struct) is hard to express with lifetimes, and why. (c) Relate the own-vs-borrow choice back to the C question of &ldquo;who owns
+this buffer&rdquo; from Chapters 9 and 27, and argue that lifetimes are just that question made explicit and checked.</div>
+
+<div class="exercise" id="ex29.12"><span class="ex-label">29.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile the two C snippets of &sect;29.1 with
+<code>-O2 -Wall</code>; confirm the direct <code>return &amp;local;</code> warns (<code>-Wreturn-local-addr</code>) and the
+struct-laundered version does not, then catch the latter with <code>-fsanitize=address</code> (stack-use-after-scope). (b) If you
+have <code>rustc</code>, write the <code>fn dangle() -&gt; &amp;str</code> version and confirm <code>E0597</code>; if not, explain
+from this chapter which line is rejected and why. (c) Write the <code>longest</code> function with its lifetime annotation, then a
+struct with a <code>&amp;str</code> field, and note what happens if you omit the struct's lifetime (<code>E0106</code>). Note your
+toolchain versions.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch30">
+<h1>Chapter 30 — Traits and Generics</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch29">Chapter 29</a> (lifetimes — with ownership and borrowing,
+the memory-safety story is complete; this chapter is about <em>reuse</em> on top of it), <a href="#ch27">Chapter 27</a> (ownership;
+<code>Copy</code>, <code>Clone</code>, and <code>Drop</code> are <em>traits</em>, so this chapter names machinery you have already
+met), <a href="#ch10">Chapter 10</a> (the optimizing compiler — monomorphization is a compile-time specialization that makes
+generics free), <a href="#ch05">Chapter 5</a> (mechanical sympathy — static vs. dynamic dispatch is a real cost you can now name).
+&nbsp;·&nbsp; The <code>longest</code> function of Chapter 29 worked only on string slices; this chapter is how to write code once
+that works over many types, fully checked and with no runtime cost.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch27">Chapter 27</a> — <code>Copy</code> decided whether <code>let y = x;</code> copies
+or moves; what kind of thing is <code>Copy</code> (a keyword? a type? something a type can implement)? (2) <a href="#ch10">Chapter
+10</a> — what does it mean to specialize code at compile time, and why can a compile-time transformation be free at run time? (3)
+<em>Predict:</em> in C you write a generic sort with <code>qsort</code>, passing a comparison <em>function pointer</em>; how is the
+comparison call dispatched — is the target known at compile time or chosen at run time? In Rust, a function generic over a type
+<code>T</code> that you compare with <code>&lt;</code> — does the compiler need to know something about <code>T</code> to allow the
+comparison? Write your guesses; &sect;30.2 and &sect;30.3 answer all three.</p>
+</aside>
+
+<p>Ownership, borrowing, and lifetimes made Rust memory-safe; they did nothing for <em>reuse</em>. The <code>longest</code> function
+worked on <code>&amp;str</code>; a function to find the largest element of a slice would, in C, be written once per element type or
+smeared over <code>void*</code> and function pointers that throw away compile-time type checking. Rust's answer is two intertwined
+features. <strong>Generics</strong> let you write code parameterized over a type <code>T</code>; <strong>traits</strong> let you say
+what a <code>T</code> must be able to <em>do</em>, and are how shared behavior is named and required. First, the reuse problem in C,
+concretely, with a real <code>qsort</code> run (&sect;30.1). Then generics and <strong>monomorphization</strong>: the compiler
+stamps out a specialized copy per concrete type, so generic code is as fast as hand-written type-specific code — zero-cost static
+dispatch (&sect;30.2). Then traits and <strong>trait bounds</strong>: a generic can only use capabilities its bounds guarantee, and
+a missing bound is a compile error, <code>E0277</code> (&sect;30.3). Then the other dispatch strategy — <strong>trait
+objects</strong> (<code>dyn Trait</code>), one shared version that dispatches through a vtable at run time, exactly the C
+function-pointer mechanism — and the cost trade between the two (&sect;30.4). We close by carrying traits forward: they are also how
+error handling and, later, thread-safety are expressed (&sect;30.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust error index, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>30.1 The reuse problem in C</h2>
+
+<p>C gives you two ways to write code that works over many types, and both are unsatisfying. The first is duplication: write
+<code>max_int</code>, <code>max_float</code>, <code>max_long</code>, one per type, differing only in a type name. The second is
+type erasure through <code>void*</code> plus a function pointer — how the standard library's <code>qsort</code> sorts anything. Here
+is a real <code>qsort</code>, compiled and run in this environment (gcc 11.4.0):</p>
+
+<pre><code>int cmp_int(const void *a, const void *b) {
+    return (*(const int*)a) - (*(const int*)b);   /* caller-supplied comparison */
+}
+int a[] = {5, 2, 9, 1, 7};
+qsort(a, 5, sizeof(int), cmp_int);                /* generic sort via void* + fn ptr */
+
+$ gcc -O2 -Wall gen.c -o gen &amp;&amp; ./gen
+1 2 5 7 9</code></pre>
+
+<p>This works, and it is genuinely generic — <code>qsort</code> sorts arrays of any element type. But look at the two costs. First,
+<em>type safety is gone</em>: <code>qsort</code> sees <code>void*</code>, so if you pass a comparator written for
+<code>double</code> while sorting <code>int</code>s, it compiles cleanly and corrupts silently — the compiler cannot check that the
+comparator matches the array, because the types were erased. Second, every comparison is an <strong>indirect call through a function
+pointer</strong>: <code>cmp_int</code> is chosen at run time, so the CPU cannot inline it and pays an indirect branch per
+comparison (Chapter 5). Rust's generics fix the first cost entirely and let you <em>choose</em> whether to pay the second. The
+<code>qsort</code> pattern — a function pointer resolved at run time — is exactly what Rust calls a trait object (&sect;30.4); the
+duplication-free, fully-checked, fully-inlined alternative is generics with monomorphization (&sect;30.2). Both start from a single
+idea: name the behavior a type must provide, and let the type system check it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the two ways C lets you write code over many types, and the cost of each. In the <code>qsort</code> call, why can the
+compiler not check that <code>cmp_int</code> matches the array being sorted? How is each comparison dispatched — is the target known
+at compile time? (Answer after the next section.)</p>
+</aside>
+
+<h2>30.2 Generics and monomorphization</h2>
+
+<p>A <strong>generic</strong> function is parameterized over a type. You write it once, with a type parameter <code>T</code>, and the
+compiler generates a specialized copy for each concrete type you actually use it with — a process called
+<strong>monomorphization</strong> (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>fn largest&lt;T: PartialOrd + Copy&gt;(list: &amp;[T]) -&gt; T {
+    let mut biggest = list[0];
+    for &amp;item in list {
+        if item &gt; biggest { biggest = item; }   // needs T: PartialOrd to use `&gt;`
+    }
+    biggest
+}
+// called with &amp;[i32] and &amp;[f64]; the compiler emits a separate specialized
+// copy of `largest` for i32 and for f64 — as if you'd written each by hand.</code></pre>
+
+<p>At compile time the compiler sees that you called <code>largest</code> with an <code>&amp;[i32]</code> and an
+<code>&amp;[f64]</code>, and it stamps out two concrete functions — one operating on <code>i32</code>, one on <code>f64</code> — each
+with the type filled in. There is no type parameter left at run time: each call goes to an ordinary, type-specific function whose
+comparison is a direct, inlinable operation, not an indirect call. This is <strong>static dispatch</strong>, and it is
+<em>zero-cost</em>: generic code runs exactly as fast as the hand-duplicated <code>max_int</code>/<code>max_float</code> of
+&sect;30.1, because after monomorphization that is literally what it is — but you wrote it once and the compiler checked it once. The
+price, paid only in binary size and compile time, is that each concrete instantiation is a separate copy of the code (code bloat if
+a large generic is used at many types). The abstraction is free where it matters — at run time — which is the recurring promise of
+this whole part: expressive source, no runtime tax.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: write once, specialize per type, pay nothing at run time</span>
+<p><strong>1. In words.</strong> A generic function is written once over a type parameter <code>T</code>. The compiler
+monomorphizes it — emits a separate specialized copy for each concrete type used — so at run time there is no type parameter and no
+dispatch: each call is an ordinary direct call, as fast as hand-written type-specific code.</p>
+<p><strong>2. As a picture.</strong> Figure 30.1: one generic <code>largest&lt;T&gt;</code> box fanning out at compile time into
+<code>largest_i32</code> and <code>largest_f64</code> (static dispatch, direct calls), contrasted with one
+<code>largest(&amp;dyn ..)</code> box that stays single and dispatches through a vtable at run time (dynamic dispatch).</p>
+<p><strong>3. As numbers/contrast.</strong> The C <code>qsort</code> of &sect;30.1 pays one indirect function-pointer call per
+comparison (chosen at run time, not inlinable). Monomorphized Rust generics pay zero: the comparison is a direct, inlinable
+operation in each specialized copy — the same machine code you'd get from writing the type-specific function by hand.</p>
+</aside>
+
+<p><em>(Answer to the &sect;30.1 quick check: C lets you write over many types by (1) duplicating code per type — a maintenance
+cost — or (2) erasing types through <code>void*</code> plus a function pointer, as <code>qsort</code> does — which costs type
+safety and an indirect call. The compiler cannot check that <code>cmp_int</code> matches the array because <code>qsort</code>'s
+parameters are <code>void*</code>: the element type is erased, so a mismatched comparator compiles anyway. Each comparison is
+dispatched through the function pointer at run time, so the target is not known at compile time and cannot be inlined.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Two dispatch strategies from one generic idea: monomorphized (static) vs. trait object (dynamic).</text>
+<rect x="30" y="40" width="150" height="34" fill="#f5f8fb" stroke="#14406b"/><text x="45" y="61" font-size="10">generic largest&lt;T&gt;</text>
+<text x="30" y="92" font-size="9" fill="#2f7d32">STATIC: compiler stamps a copy per type</text>
+<rect x="220" y="44" width="130" height="26" fill="#dfeee0" stroke="#2f7d32"/><text x="235" y="61" font-size="9">largest_i32 (direct)</text>
+<rect x="220" y="78" width="130" height="26" fill="#dfeee0" stroke="#2f7d32"/><text x="233" y="95" font-size="9">largest_f64 (direct)</text>
+<line x1="180" y1="55" x2="220" y2="57" stroke="#2f7d32" marker-end="url(#d)"/>
+<line x1="180" y1="63" x2="220" y2="90" stroke="#2f7d32" marker-end="url(#d)"/>
+<text x="30" y="140" font-size="9" fill="#8c3a1d">DYNAMIC: one copy, dispatch through a vtable at run time</text>
+<rect x="30" y="150" width="150" height="34" fill="#fdeee6" stroke="#8c3a1d"/><text x="42" y="171" font-size="10">fn(&amp;dyn Trait)</text>
+<rect x="230" y="150" width="120" height="34" fill="#f7d9d0" stroke="#8c3a1d"/><text x="242" y="164" font-size="8">vtable: ptr to</text><text x="242" y="178" font-size="8">method impls</text>
+<line x1="180" y1="167" x2="230" y2="167" stroke="#8c3a1d" marker-end="url(#e)"/><text x="185" y="162" font-size="7" fill="#8c3a1d">indirect</text>
+<text x="380" y="60" font-size="8" fill="#2f7d32">no type param at run time;</text><text x="380" y="72" font-size="8" fill="#2f7d32">inlinable; larger binary</text>
+<text x="380" y="164" font-size="8" fill="#8c3a1d">one copy; indirect call per</text><text x="380" y="176" font-size="8" fill="#8c3a1d">method; smaller binary</text>
+<defs>
+<marker id="d" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#2f7d32"/></marker>
+<marker id="e" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#8c3a1d"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 30.1: Static vs. dynamic dispatch. A generic monomorphizes into a direct, inlinable copy per concrete type
+(top, zero runtime cost, larger binary). A trait object keeps one copy and dispatches each method through a vtable at run time
+(bottom, an indirect call, smaller binary) — the same mechanism as C's <code>qsort</code> function pointer.</figcaption>
+</figure>
+
+<h2>30.3 Traits and trait bounds</h2>
+
+<p>The <code>largest</code> function used <code>item &gt; biggest</code>. For that to typecheck, the compiler must know that
+<code>T</code> supports comparison — otherwise a caller could instantiate <code>largest</code> with a type that has no ordering, and
+<code>&gt;</code> would be meaningless. A <strong>trait</strong> names a set of behaviors a type can implement; a <strong>trait
+bound</strong> on a generic (<code>T: PartialOrd</code>) requires that <code>T</code> implement the trait, and in return lets the
+generic body use that trait's operations. You have already met traits: <code>Copy</code>, <code>Clone</code>, and
+<code>Drop</code> from Chapter 27 are traits, which is why &ldquo;<code>i32</code> is <code>Copy</code>&rdquo; was phrased as
+implementing something. A trait definition and an implementation look like this (Rust; not compiled here — behavior per the cited
+book):</p>
+
+<pre><code>trait Summary {                       // a named set of behavior
+    fn summarize(&amp;self) -&gt; String;
+}
+impl Summary for Article {            // Article promises to provide it
+    fn summarize(&amp;self) -&gt; String { format!("{}: ...", self.title) }
+}
+
+fn notify&lt;T: Summary&gt;(item: &amp;T) {     // bound: T must implement Summary
+    println!("Breaking! {}", item.summarize());   // allowed BECAUSE of the bound
+}</code></pre>
+
+<p>The bound <code>T: Summary</code> is a contract in both directions: the caller must supply a type implementing
+<code>Summary</code>, and in exchange the body of <code>notify</code> may call <code>summarize</code>. If you drop the bound and try
+to call <code>summarize</code> anyway, or call <code>notify</code> with a type that does not implement <code>Summary</code>, the
+compiler rejects it with <code>E0277</code> — <em>the trait bound is not satisfied</em> (per the official Rust error index):</p>
+
+<pre><code>notify(&amp;5);   // i32 does not implement Summary
+error[E0277]: the trait bound `i32: Summary` is not satisfied</code></pre>
+
+<p>This is the decisive difference from C's <code>void*</code> genericity of &sect;30.1. There, a type mismatch was invisible and
+corrupted silently at run time; here, &ldquo;this type does not provide the required behavior&rdquo; is a compile error naming the
+exact unmet bound. It is also, notably, different from C++ templates, where an unsatisfied requirement surfaces as an error deep
+inside the instantiated body; Rust checks the bound at the <em>definition</em>, so the generic is verified once, against its stated
+requirements, independent of any caller. Trait bounds are how a generic states precisely what it needs of its type parameters —
+no more (so it stays maximally reusable) and no less (so the body is fully checked) — and <code>E0277</code> is the compiler holding
+both sides to the contract.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What is a trait, and what does a trait bound like <code>T: PartialOrd</code> give the caller and the body of a generic
+respectively? Which error code fires when a required bound is unmet, and what does it say? Why is that better than C's silent
+<code>void*</code> mismatch and than a C++ template error deep in the body? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>30.4 Static vs. dynamic dispatch: trait objects</h2>
+
+<p>Monomorphization needs to know every concrete type at compile time. Sometimes you cannot — you want a single
+<code>Vec</code> holding a mix of types that all implement one trait, or a plugin resolved at run time. For that Rust offers a
+<strong>trait object</strong>, written <code>dyn Trait</code> behind a pointer (<code>&amp;dyn Summary</code> or
+<code>Box&lt;dyn Summary&gt;</code>). A trait object is a pair of pointers: one to the value, one to a <strong>vtable</strong> — a
+table of the trait's method implementations for that value's concrete type — and each method call is dispatched indirectly through
+the vtable at run time (Klabnik &amp; Nichols, 2023, ch. 17.2). This is <strong>dynamic dispatch</strong>, and it is precisely the
+C <code>qsort</code> mechanism of &sect;30.1: an indirect call through a pointer chosen at run time (Rust; not compiled here —
+behavior per the cited book):</p>
+
+<pre><code>// static dispatch: one specialized copy per type, direct/inlinable calls, larger binary
+fn notify&lt;T: Summary&gt;(item: &amp;T) { println!("{}", item.summarize()); }
+
+// dynamic dispatch: one copy, vtable call per invocation, smaller binary, any Summary type
+fn notify_dyn(item: &amp;dyn Summary) { println!("{}", item.summarize()); }
+
+let items: Vec&lt;Box&lt;dyn Summary&gt;&gt; = vec![Box::new(article), Box::new(tweet)];
+// a heterogeneous collection — impossible with a single monomorphized type</code></pre>
+
+<p>The trade is explicit and it is a cost trade you can now name from Chapter 5. Static dispatch (generics) resolves the call at
+compile time: direct, inlinable, zero dispatch cost, but a separate code copy per type (larger binary) and every type known at
+compile time. Dynamic dispatch (trait objects) resolves at run time through the vtable: one copy of the code and the ability to mix
+types or choose at run time, but an indirect call per method (not inlinable, an indirect branch — the same cost as
+<code>qsort</code>'s function pointer) and the values must sit behind a pointer. Neither is &ldquo;better&rdquo;; the default in Rust
+is generics (pay nothing, specialize) and you reach for <code>dyn</code> deliberately when you need heterogeneity or run-time
+choice, or to bound code size. The important thing is that unlike C — where <code>void*</code> dynamic dispatch also threw away type
+safety — a Rust trait object is still fully type-checked: <code>&amp;dyn Summary</code> can only hold a type that actually
+implements <code>Summary</code>, so you get the flexibility of the function-pointer approach without the silent-corruption risk of
+&sect;30.1.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: reaching for <code>Box&lt;dyn Trait&gt;</code> by default, and misreading <code>E0277</code> as &ldquo;my type is broken&rdquo;</span>
+<p>Two related early mistakes. The first: coming from an object-oriented language, newcomers make everything a
+<code>Box&lt;dyn Trait&gt;</code> because it feels like the familiar interface/subclass pattern — and thereby pay an indirect call
+on every method and give up inlining, when a generic with a trait bound would have cost nothing at run time and inlined fully.
+Dynamic dispatch is a real tool (heterogeneous collections, run-time-chosen implementations, keeping binary size down), but it is
+not the default; generics with bounds are, and reaching for <code>dyn</code> reflexively is the analog of making every C call go
+through a function pointer for uniformity's sake. The second: reading <code>error[E0277]: the trait bound `T: Foo` is not
+satisfied</code> as &ldquo;my type is wrong&rdquo; and casting or wrapping to make it quiet. The error is not saying your type is
+broken; it is saying the type does not (yet) provide the behavior the generic requires — and the two correct responses are to
+<em>implement the trait</em> for your type (give it the behavior) or, if the generic asked for more than it needs, to
+<em>relax the bound</em> to what the body actually uses. Neither is a cast. As with a C warning, <code>E0277</code> is naming a real
+gap between what the code requires and what the type provides; the fix is to close the gap, not to silence the message.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;My generic function won't compile until I add <code>T: PartialOrd</code> — Rust
+makes me spell out every requirement, when in C++ a template just works and in Python I'd never write any of this. Isn't this bound
+stuff just ceremony?&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;30.2&ndash;&sect;30.4.</p>
+<p><em>Model answer.</em> &ldquo;The bound isn't ceremony — it's what lets the compiler check the generic <em>once</em>, at its
+definition, instead of C++'s way where a missing requirement blows up deep inside the instantiated template with a wall of errors,
+or Python's way where it blows up at run time on some input you didn't test. <code>T: PartialOrd</code> is you telling the compiler
+exactly what the body needs (an ordering to use <code>&gt;</code>), and in exchange it guarantees every caller supplies a type that
+has it — that's the <code>E0277</code> you'd get otherwise, caught at compile time and naming the missing trait. It also costs
+nothing at run time: the generic monomorphizes into a direct, inlinable copy per type, so it's as fast as a hand-written
+type-specific function. So the bound buys you C's performance with checking C++ and Python can't give you at that stage. Write the
+minimal bound the body actually uses and you get maximal reuse with full checking.&rdquo; Framing the bound as check-once-at-the-
+definition and zero-cost after monomorphization is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;30.3 quick check: a trait names a set of behaviors a type can implement; a bound <code>T: PartialOrd</code>
+requires the caller to supply a <code>T</code> that implements <code>PartialOrd</code>, and in return lets the generic's body use
+that trait's operations (here <code>&gt;</code>). An unmet bound is <code>E0277</code>, &ldquo;the trait bound is not
+satisfied.&rdquo; It beats C's silent <code>void*</code> mismatch — which corrupts at run time — and a C++ template error deep in
+the instantiated body, because Rust checks the bound at the generic's definition and names the exact missing trait.)</em></p>
+
+<h2>30.5 What to carry forward</h2>
+
+<p>Generics and traits are how Rust gets reuse without giving up the checking or the performance of the earlier volumes. A
+<strong>generic</strong> function is written once over a type parameter and <strong>monomorphized</strong> — the compiler emits a
+specialized copy per concrete type — so it runs as fast as hand-written type-specific code with no runtime dispatch: zero-cost
+<strong>static dispatch</strong>. A <strong>trait</strong> names behavior a type can implement (you already knew <code>Copy</code>,
+<code>Clone</code>, <code>Drop</code>), and a <strong>trait bound</strong> (<code>T: PartialOrd</code>) states exactly what a generic
+requires of its type — checked once, at the definition, with an unmet bound reported as <code>E0277</code>, &ldquo;the trait bound
+is not satisfied.&rdquo; When you need heterogeneity or a run-time-chosen implementation, a <strong>trait object</strong>
+(<code>dyn Trait</code>) gives <strong>dynamic dispatch</strong> through a vtable — the same indirect-call mechanism as C's
+<code>qsort</code> function pointer, but still fully type-checked, unlike C's <code>void*</code>. The choice between them is the
+Chapter 5 cost trade made explicit: static is the default (free, specialized, larger binary), dynamic is deliberate (one copy,
+flexible, an indirect call per method).</p>
+
+<p>With ownership, borrowing, lifetimes, generics, and traits, you now have the whole conceptual core of Rust — and the last two
+chapters of this part put it to work. Traits are not only for behavior like <code>summarize</code>; they are how Rust expresses its
+most important guarantees as ordinary, checkable requirements. The next chapter is <strong>error handling</strong>:
+<code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> are generic types (built on exactly the generics of this chapter),
+and they replace C's error-code-and-<code>errno</code> conventions and null pointers with types the compiler forces you to handle —
+turning &ldquo;forgot to check the return value&rdquo; into a thing that does not compile. And the chapter after it, on fearless
+concurrency, rests on two traits — <code>Send</code> and <code>Sync</code> — that lift the aliasing discipline of borrowing across
+threads, making the data races of Chapter 24 a compile error rather than undefined behavior. The pattern to carry forward is that in
+Rust, a guarantee is usually a trait: name the behavior or the capability, require it in the type, and let the compiler check it —
+the same move, now applied to errors and to threads.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the two ways C writes code over many types and the cost of each (duplication; <code>void*</code>+function pointer).</li>
+<li>Define monomorphization and explain why generic code is zero-cost at run time.</li>
+<li>Say what a trait and a trait bound are, and what each side of a bound gets.</li>
+<li>Name the error code for an unmet bound (<code>E0277</code>) and why compile-time checking beats C's silent mismatch.</li>
+<li>Contrast static and dynamic dispatch: mechanism, cost, and when to choose each.</li>
+<li>Explain how a trait object is like C's <code>qsort</code> function pointer but still type-safe.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are C's two options for generic code, and what does each cost? Why can't <code>qsort</code>'s comparator be type-checked? (&sect;30.1)</li>
+<li><strong>R2.</strong> What is monomorphization, and why is a Rust generic zero-cost at run time? (&sect;30.2)</li>
+<li><strong>R3.</strong> What is a trait bound, what does each side gain, and which error reports an unmet one? (&sect;30.3)</li>
+<li><strong>R4.</strong> What is a trait object, how is a method call on it dispatched, and how does that compare to <code>qsort</code>? (&sect;30.4)</li>
+<li><strong>R5.</strong> When do you choose static dispatch vs. dynamic dispatch, and what is the cost of each? (&sect;30.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 10.1
+&ldquo;Generic Data Types&rdquo; and ch. 10.2 &ldquo;Traits&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The
+primary source for generics, monomorphization, traits, and trait bounds of &sect;30.2&ndash;&sect;30.3, including the
+<code>largest</code> and <code>Summary</code>/<code>notify</code> examples. Authors and edition verified via the publisher; not
+compiled here.</li>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 17.2
+&ldquo;Using Trait Objects That Allow for Values of Different Types.&rdquo;</strong> The source for trait objects, the
+value-plus-vtable representation, and dynamic dispatch of &sect;30.4. Chapter number and title verified via the publisher's
+listing and <code>doc.rust-lang.org/book</code>.</li>
+<li><strong>The Rust Error Index, entry <code>E0277</code> (<code>doc.rust-lang.org/error_codes</code>).</strong> The official
+meaning quoted in &sect;30.3: &ldquo;you tried to use a type which doesn't implement some trait in a place which expected that
+trait&rdquo; — the unmet-trait-bound error. Verified against the current error index.</li>
+<li><strong>Stroustrup, <em>The C++ Programming Language</em>, 4th ed. (Addison-Wesley, 2013), on templates.</strong> The C++
+template model — instantiation-time errors deep in the body — that Rust's define-time bound checking of &sect;30.3 improves on;
+useful contrast for where trait bounds come from and what they fix.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex30.1"><span class="ex-label">30.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define a generic function, a trait, and a trait bound.</div>
+
+<div class="exercise" id="ex30.2"><span class="ex-label">30.2</span> <span class="ex-tag warm">warm-up</span>
+What is monomorphization, and why does it mean a generic function has no runtime dispatch cost?</div>
+
+<div class="exercise" id="ex30.3"><span class="ex-label">30.3</span> <span class="ex-tag warm">warm-up</span>
+What error code does the compiler produce when a generic is used with a type that does not satisfy its trait bound, and what does
+the message say?</div>
+
+<div class="exercise" id="ex30.4"><span class="ex-label">30.4</span> <span class="ex-tag core">core</span>
+Take the C <code>qsort</code> of &sect;30.1. (a) In what sense is it generic, and what are the two costs it pays? (b) Show
+concretely how passing a comparator written for the wrong element type would compile yet misbehave, and why the compiler cannot
+catch it. (c) Explain which Rust feature (generics or trait objects) corresponds to the <code>qsort</code> mechanism, and which
+gives the duplication-free, fully-checked, fully-inlined alternative.</div>
+
+<div class="exercise" id="ex30.5"><span class="ex-label">30.5</span> <span class="ex-tag core">core</span>
+Explain the two-directional contract of a trait bound <code>T: Summary</code> on <code>fn notify&lt;T: Summary&gt;(item: &amp;T)</code>.
+(a) What must the caller supply? (b) What may the body do that it could not without the bound? (c) Contrast Rust's checking the bound
+at the definition with C++'s reporting an unmet requirement inside the instantiated template body.</div>
+
+<div class="exercise" id="ex30.6"><span class="ex-label">30.6</span> <span class="ex-tag core">core</span>
+Contrast static dispatch (generics) with dynamic dispatch (trait objects). (a) How is a call resolved in each — at compile time or
+run time — and what is the machine-level cost of each? (b) What is a trait object's runtime representation? (c) Give one situation
+that requires dynamic dispatch and one where static dispatch is clearly preferable.</div>
+
+<div class="exercise" id="ex30.7"><span class="ex-label">30.7</span> <span class="ex-tag complexity">cost</span>
+Weigh the costs of monomorphization vs. trait objects. (a) What does monomorphization cost that dynamic dispatch does not, and in
+what resource? (b) What does dynamic dispatch cost per call that a monomorphized generic does not? (c) For a small trait method
+called in a tight loop over a homogeneous collection, which dispatch would you choose and why; for a large plugin interface with
+many implementations, which — and what is the deciding factor each time?</div>
+
+<div class="exercise" id="ex30.8"><span class="ex-label">30.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer writes <code>fn largest&lt;T&gt;(list: &amp;[T]) -&gt; T { let mut b =
+list[0]; for &amp;x in list { if x &gt; b { b = x; } } b }</code> and gets <code>error[E0277]: the trait bound `T: PartialOrd` is
+not satisfied</code> on the <code>x &gt; b</code> line (and a second on the <code>Copy</code> requirement).
+<br><strong>Step 1 (given):</strong> the body uses <code>&gt;</code>, which requires <code>T</code> to have an ordering — the
+<code>PartialOrd</code> trait.
+<br><strong>Step 2 (given):</strong> the body also copies elements out of the slice (<code>b = x</code>, <code>list[0]</code>),
+which requires <code>T: Copy</code>.
+<br><strong>Step 3 (given):</strong> without those bounds, the compiler cannot know <code>T</code> supports the operations, so it
+rejects the definition — before any caller exists.
+<br><strong>Step 4 (you):</strong> Give the corrected signature with the minimal bounds, explain why bounding at the definition
+(not the call site) is what lets the generic be checked once, and say why casting or wrapping to silence <code>E0277</code> is the
+wrong instinct.</div>
+
+<div class="exercise" id="ex30.9"><span class="ex-label">30.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether static dispatch (generic + bound) or dynamic dispatch (trait object) is the better fit, and why: (a) summing a
+slice of any numeric type in a hot loop; (b) a <code>Vec</code> holding several different shape types that all implement
+<code>Draw</code>; (c) a function called at exactly one concrete type; (d) a rendering pipeline that loads drawable plugins chosen
+at run time.</div>
+
+<div class="exercise" id="ex30.10"><span class="ex-label">30.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A generic function carries a type parameter at
+run time and dispatches on it.&rdquo; (b) &ldquo;A trait object is dispatched at run time through a vtable.&rdquo; (c)
+&ldquo;<code>E0277</code> means your type has a bug.&rdquo; (d) &ldquo;Monomorphization makes binaries smaller.&rdquo; (e) &ldquo;Like
+C's <code>void*</code> generics, Rust trait objects give up type safety.&rdquo;</div>
+
+<div class="exercise" id="ex30.11"><span class="ex-label">30.11</span> <span class="ex-tag stretch">stretch</span>
+&ldquo;A guarantee in Rust is usually a trait.&rdquo; (a) Explain how <code>Copy</code> (Chapter 27) is a trait that governs whether
+assignment moves or copies, and how <code>T: PartialOrd</code> governs whether <code>&gt;</code> is allowed — both the same
+mechanism. (b) Preview how <code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> (next chapter) use generics to make
+error handling checkable. (c) Preview how thread-safety could be expressed as a trait requirement (<code>Send</code>/<code>Sync</code>):
+what would a bound like &ldquo;<code>T: Send</code>&rdquo; have to mean, and why would requiring it at a thread-spawn boundary turn a
+data race into a compile error?</div>
+
+<div class="exercise" id="ex30.12"><span class="ex-label">30.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile and run the &sect;30.1 <code>qsort</code> demo;
+then deliberately pass a comparator written for a different element type and confirm it still compiles (type erasure). (b) If you
+have <code>rustc</code>, write <code>largest&lt;T: PartialOrd + Copy&gt;</code>, call it at two types, and confirm it compiles; then
+remove the bounds and observe <code>E0277</code>; if not, explain from this chapter which line is rejected and which bound is
+missing. (c) Write a trait <code>Draw</code> with two implementors and put them in a <code>Vec&lt;Box&lt;dyn Draw&gt;&gt;</code>;
+explain why a monomorphized generic could not hold both in one vector. Note your toolchain versions.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VI</div><h1>Performance Engineering</h1><p class='part-blurb'>Measure before you optimize: profiling, benchmarking, cache-aware and data-oriented design, SIMD, and reasoning about where time actually goes.</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VII</div><h1>I/O & Networking, Low-Level</h1><p class='part-blurb'>Files, sockets, blocking vs async, epoll/io_uring, zero-copy — the systems substrate under every data pipeline and service.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part VIII</div><h1>Storage & the Disk</h1><p class='part-blurb'>Pages, files, the buffer pool, and the storage manager — the foundation you build a database on.</p></div>
@@ -14619,6 +15833,336 @@ invalidated <code>s1</code>. (c) For three variables, correctly label each assig
 &rarr; move; <code>Copy</code> stack type &rarr; copy). <em>Tempting wrong answer:</em> &ldquo;the C program is fine because it
 compiled&rdquo; — compiling proves nothing about UB; it aborts (or corrupts) at run time. <strong>Feed-forward:</strong>
 &sect;27.1, &sect;27.3.</div>
+
+</section>
+
+<section class="solutions" id="sol28">
+<h1>Chapter 28 — Solutions</h1>
+
+<div class="solution" id="sol28.1"><span class="sol-label">28.1</span>
+A <strong>shared reference</strong> <code>&amp;T</code> is a read-only borrow; any number may exist at once, and you may read but
+not mutate the value through one. A <strong>mutable reference</strong> <code>&amp;mut T</code> is a read-write borrow; exactly one
+may exist, and while it lives no other reference (of either kind) to the value may. <em>Tempting wrong answer:</em>
+&ldquo;<code>&amp;mut</code> is just a pointer, like <code>&amp;</code> but you can write&rdquo; — it is that plus an
+<em>exclusivity</em> guarantee the compiler enforces. <strong>Feed-forward:</strong> &sect;28.2, &sect;28.3.</div>
+
+<div class="solution" id="sol28.2"><span class="sol-label">28.2</span>
+<code>&amp;String</code> borrows: passing <code>&amp;owner</code> lends a reference without moving the value, so the caller keeps
+ownership and <code>owner</code> stays valid. <code>fn length(s: String)</code> takes by value, which <em>moves</em> the
+<code>String</code> into the function and invalidates <code>owner</code>. <em>Tempting wrong answer:</em> &ldquo;both work because
+the function only reads&rdquo; — reading is irrelevant; taking by value moves regardless of what the body does.
+<strong>Feed-forward:</strong> &sect;28.1.</div>
+
+<div class="solution" id="sol28.3"><span class="sol-label">28.3</span>
+The rule: at any time a value may be borrowed by <em>any number of shared references</em> (<code>&amp;T</code>) <em>or</em> by
+<em>exactly one mutable reference</em> (<code>&amp;mut T</code>), never both. It forbids two mutable borrows at once
+(<code>E0499</code>) and a mutable borrow while a shared borrow is live (<code>E0502</code>). <em>Tempting wrong answer:</em>
+&ldquo;you can mix one <code>&amp;mut</code> with a few <code>&amp;</code> if they don't overlap in code&rdquo; — if they are
+simultaneously live, that is exactly <code>E0502</code>. <strong>Feed-forward:</strong> &sect;28.3.</div>
+
+<div class="solution" id="sol28.4"><span class="sol-label">28.4</span>
+(a) The bug is the <code>printf("via p", *p)</code> line: after <code>realloc</code> may have moved the block, <code>p</code> is a
+dangling pointer, so the dereference is a use-after-free. (b) Plain <code>gcc -O2 -Wall</code> gives no warning because C's type
+system does not track whether <code>p</code> still points at live memory after <code>realloc</code>; only AddressSanitizer, at run
+time, reports <strong>heap-use-after-free</strong>. (c) In Rust <code>p = &amp;v[0]</code> is a shared borrow of <code>v</code>, and
+<code>v.push(4)</code> needs <code>&amp;mut v</code>; the mutable borrow cannot coexist with the live shared borrow, so it is
+<code>E0502</code> at compile time. The checker does not need to know <code>push</code> reallocates — the rule &ldquo;no mutable
+borrow while a shared borrow is live&rdquo; is sufficient. <em>Tempting wrong answer:</em> &ldquo;Rust catches it because it checks
+the reallocation at run time&rdquo; — it is a static rejection with no runtime check. <strong>Feed-forward:</strong> &sect;28.4.</div>
+
+<div class="solution" id="sol28.5"><span class="sol-label">28.5</span>
+(a) Two references to one value with at least one mutable would let one path write while another reads or writes — a torn or
+unexpectedly-changed read, or a pointer invalidated under the other, all in one thread. (b) That is the definition of a data race
+(Chapter 24) minus the threads: two accesses to one location, at least one a write, unsynchronized. (c) Exclusivity lets the
+compiler assume nothing else can see or change the value through the <code>&amp;mut</code>, which makes mutation safe and enables
+optimizations (no aliasing to worry about). <em>Tempting wrong answer:</em> &ldquo;exclusivity is just a style rule&rdquo; — it is
+a soundness requirement; without it Rust could not rule out aliasing-plus-mutation. <strong>Feed-forward:</strong> &sect;28.3,
+&sect;28.4.</div>
+
+<div class="solution" id="sol28.6"><span class="sol-label">28.6</span>
+(a) Compiles — many shared references are allowed. (b) <code>E0499</code> — two mutable borrows at once. (c) <code>E0502</code> —
+mutable borrow while a shared borrow is live. (d) Compiles — because the shared borrow has ended (last use) before the mutable
+borrow starts, they do not overlap (non-lexical lifetimes). <em>Method-selection cue:</em> count simultaneously-live borrows; many
+<code>&amp;</code> ok, one <code>&amp;mut</code> alone ok, any overlap of a writer with anything else is rejected.
+<strong>Feed-forward:</strong> &sect;28.2, &sect;28.3.</div>
+
+<div class="solution" id="sol28.7"><span class="sol-label">28.7</span>
+(a) A <code>&amp;T</code> is, at the machine level, just a pointer — the same pointer C would use — carrying no extra runtime data
+(for a sized <code>T</code>). (b) The borrow checking happens entirely at compile time; it adds zero runtime cost. (c)
+<code>RefCell</code> enforces the same one-writer-XOR-many-readers rule at run time, so it carries a borrow-flag it checks and
+updates on each borrow (a small time cost and a possible panic on violation); paying it is justified only when the borrow structure
+cannot be proven statically but you still need shared mutability. <em>Tempting wrong answer:</em> &ldquo;references are cheap
+because they're reference-counted&rdquo; — plain references are not counted at all; that is <code>Rc</code>/<code>Arc</code>, a
+separate mechanism. <strong>Feed-forward:</strong> &sect;28.2, &sect;28.3.</div>
+
+<div class="solution" id="sol28.8"><span class="sol-label">28.8</span>
+<strong>Step 4:</strong> Fix A (separate the passes): during a read-only pass, collect what you want to add into a new vector
+(<code>let additions: Vec&lt;i32&gt; = v.iter().map(|x| 2 * x).collect();</code>), then, after that shared borrow ends,
+<code>v.extend(additions)</code> under a single mutable borrow. Fix B (in-place, if that were the task): use
+<code>for x in v.iter_mut() { *x *= 2; }</code>, which is one exclusive borrow and is allowed because there is no aliasing.
+Cloning the entire vector to iterate a copy while mutating the original is the wrong default because it pays a full O(n) copy to
+hide a real hazard; separating read from write costs nothing extra and is what the rule is pointing at. <em>Tempting wrong
+answer:</em> &ldquo;just <code>v.clone()</code> and iterate that&rdquo; — needless copy, and it silently changes semantics (you
+iterate the old contents). <strong>Feed-forward:</strong> &sect;28.4.</div>
+
+<div class="solution" id="sol28.9"><span class="sol-label">28.9</span>
+(a) Allowed — many shared references may coexist (no writer). (b) Forbidden — a mutable and a shared borrow simultaneously is
+<code>E0502</code>. (c) Forbidden — two mutable borrows is <code>E0499</code>. (d) Allowed — the shared borrows have ended, so the
+mutable borrow is the only live one. <em>Method-selection cue:</em> the only legal states are &ldquo;N readers, 0 writers&rdquo;
+or &ldquo;0 readers, 1 writer.&rdquo; <strong>Feed-forward:</strong> &sect;28.3.</div>
+
+<div class="solution" id="sol28.10"><span class="sol-label">28.10</span>
+(a) <strong>False</strong> — at most one <code>&amp;mut</code> may exist at a time, regardless of timing (<code>E0499</code>). (b)
+<strong>False</strong> — a shared reference is read-only; mutation needs <code>&amp;mut</code>. (c) <strong>False</strong> — borrow
+checking is compile-time; a dereference is just a pointer load. (d) <strong>True</strong> — that is the iterator-invalidation
+hazard; it is <code>E0502</code>. (e) <strong>False</strong> — a reference does not own the value and drops nothing; only the owner
+drops it. <em>Tempting wrong answer:</em> marking (c) true because &ldquo;safety must cost something at run time&rdquo; — the borrow
+rule's cost is paid entirely at compile time. <strong>Feed-forward:</strong> &sect;28.2&ndash;&sect;28.4.</div>
+
+<div class="solution" id="sol28.11"><span class="sol-label">28.11</span>
+(a) A use-after-free through an aliased pointer is one alias mutating/freeing memory another alias still reads; a data race is two
+threads accessing one location, one writing, unsynchronized — both are &ldquo;two paths to one value, at least one writing.&rdquo;
+The single rule &ldquo;aliasing XOR mutation&rdquo; forbids that combination, attacking the shared root rather than the two
+symptoms. (b) Unlimited shared references are safe because with no writer no reader can observe a changing value — reads never
+conflict with reads. Access becomes a problem only when a write is introduced, which the rule permits solely under exclusivity. (c)
+To extend &ldquo;no data races&rdquo; across threads you need the <code>Send</code>/<code>Sync</code> traits (and, for shared
+mutation, synchronization such as <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>): the borrow rule governs one value in one thread, but
+sending references between threads requires the type system to also track which types are safe to share or move across threads.
+<em>Tempting wrong answer:</em> &ldquo;the borrow rule alone already prevents all data races&rdquo; — it prevents intra-thread
+aliasing; cross-thread safety needs <code>Send</code>/<code>Sync</code> on top. <strong>Feed-forward:</strong> &sect;28.4, and Ch
+24; the concurrency chapter ahead.</div>
+
+<div class="solution" id="sol28.12"><span class="sol-label">28.12</span>
+Toolchain-specific. A correct write-up reports: (a) the C snippet builds with no warning under <code>-O2 -Wall</code> and, rebuilt
+with <code>-fsanitize=address</code>, reports <strong>heap-use-after-free</strong> when the old pointer is dereferenced after a
+moving <code>realloc</code> — the C type system misses the dangling alias. (b) With <code>rustc</code>, the
+<code>let p = &amp;v[0]; v.push(4); println!("{p}")</code> program fails with <code>error[E0502]</code> because
+<code>push</code>'s mutable borrow conflicts with the live shared borrow <code>p</code>; without <code>rustc</code>, name those two
+conflicting borrows. (c) The compiling version ends the shared borrow (use <code>p</code> before the <code>push</code>, or index
+<code>v[0]</code> directly and copy the value out) so no borrow overlaps the mutable one. <em>Tempting wrong answer:</em> &ldquo;the
+C program is fine because it compiled without warning&rdquo; — no warning proves nothing about UB; the sanitizer shows the
+use-after-free. <strong>Feed-forward:</strong> &sect;28.4.</div>
+
+</section>
+
+<section class="solutions" id="sol29">
+<h1>Chapter 29 — Solutions</h1>
+
+<div class="solution" id="sol29.1"><span class="sol-label">29.1</span>
+A <strong>lifetime</strong> is a compile-time name for the region of the program over which a reference is valid (bounded by its
+referent's scope). The second borrow rule it enforces: a reference may never be used after the value it refers to has been dropped.
+<em>Tempting wrong answer:</em> &ldquo;a lifetime is how long the value lives, which you can set&rdquo; — it only <em>describes</em>
+existing scope facts; it cannot make anything live longer. <strong>Feed-forward:</strong> &sect;29.1, &sect;29.3.</div>
+
+<div class="solution" id="sol29.2"><span class="sol-label">29.2</span>
+<code>x</code> is a stack local dropped when the function returns, so the returned <code>&amp;x</code> would point at reclaimed
+storage — a dangling reference / use-after-scope. <em>Tempting wrong answer:</em> &ldquo;it's fine because <code>5</code> is a
+small constant&rdquo; — the value's size is irrelevant; its storage is gone once the frame is popped. <strong>Feed-forward:</strong>
+&sect;29.1.</div>
+
+<div class="solution" id="sol29.3"><span class="sol-label">29.3</span>
+The three <code>'a</code>s assert: there is some region <code>'a</code> such that both inputs <code>x</code> and <code>y</code> are
+valid for at least <code>'a</code>, and the returned reference is valid for <code>'a</code> — so the result may not outlive the
+shorter-lived of the two inputs. <em>Tempting wrong answer:</em> &ldquo;<code>'a</code> makes both inputs live equally long&rdquo;
+— it constrains the output's validity relative to the inputs; it does not change how long anything lives. <strong>Feed-forward:</strong>
+&sect;29.2.</div>
+
+<div class="solution" id="sol29.4"><span class="sol-label">29.4</span>
+(a) Both return (directly or through a struct field) the address of a stack local whose storage is reclaimed when the function
+returns, so dereferencing it in the caller is a use-after-scope. (b) <code>gcc</code>'s <code>-Wreturn-local-addr</code> follows
+simple direct data flow and catches <code>return &amp;local;</code>, but gives up when the address is stored in a struct and
+returned indirectly, so that version builds clean. (c) Rust's rule is not a heuristic — the borrow checker rejects <em>every</em>
+reference used past its referent's drop; the analogous Rust function is <code>error[E0597]</code>, &ldquo;does not live long
+enough.&rdquo; <em>Tempting wrong answer:</em> &ldquo;the struct version is safe because it compiled without warning&rdquo; — ASan
+shows stack-use-after-scope; no warning proves nothing. <strong>Feed-forward:</strong> &sect;29.1, &sect;29.3.</div>
+
+<div class="solution" id="sol29.5"><span class="sol-label">29.5</span>
+(a) The containment condition: for every use of a reference, the region over which the reference is used must be contained within
+the region its referent is alive. (b) You can't fix it by annotating a longer lifetime because a lifetime only describes existing
+scope facts — no name can extend a value past its owner's drop. (c) The two structural fixes: return an <em>owned</em> value (move
+ownership out — right when the caller should own the result), or borrow from something that genuinely outlives the use (an input
+reference or an outer-scope value — right when the data lives elsewhere). <em>Tempting wrong answer:</em> &ldquo;annotate it
+<code>'static</code>&rdquo; — that only compiles if the data really is static, which a fresh local isn't.
+<strong>Feed-forward:</strong> &sect;29.3, &sect;29.4.</div>
+
+<div class="solution" id="sol29.6"><span class="sol-label">29.6</span>
+The rules: (1) each elided input reference gets its own lifetime; (2) one input lifetime is assigned to all elided outputs; (3) if
+one input is <code>&amp;self</code>/<code>&amp;mut self</code>, its lifetime is assigned to all elided outputs. (a)
+<code>first</code> has one input reference, so rule 2 assigns its lifetime to the output — no annotation needed. (b)
+<code>get</code> is a method with <code>&amp;self</code>, so rule 3 gives the output <code>self</code>'s lifetime. (c)
+<code>longest</code> has two input references and neither is <code>self</code>, so rules 2 and 3 don't apply and the compiler can't
+tell which input the output borrows — you must write <code>'a</code>. <em>Method-selection cue:</em> one input ref &rarr; elided;
+method with <code>self</code> &rarr; elided; multiple non-self input refs feeding an output ref &rarr; annotate.
+<strong>Feed-forward:</strong> &sect;29.2, &sect;29.4.</div>
+
+<div class="solution" id="sol29.7"><span class="sol-label">29.7</span>
+(a) Lifetimes are checked during borrow-checking (compile time) and are <em>erased</em> before code generation. (b) A
+<code>&amp;'a T</code> has the same runtime representation as the C pointer it replaces — a bare address, no extra data (for sized
+<code>T</code>). (c) A GC answers &ldquo;still valid?&rdquo; by tracing/reachability at run time (time cost, pauses); reference
+counting answers it by per-reference counter updates at run time (time and space); Rust answers it once at compile time, paying
+nothing at run time. <em>Tempting wrong answer:</em> &ldquo;lifetimes are a runtime tag on each reference&rdquo; — they are purely
+static and erased. <strong>Feed-forward:</strong> &sect;29.3.</div>
+
+<div class="solution" id="sol29.8"><span class="sol-label">29.8</span>
+<strong>Step 4:</strong> Correct fix — change the return type to an owned <code>String</code> and return <code>s</code> by value:
+<code>fn greeting() -&gt; String { String::from("hi") }</code>; ownership moves out to the caller, so there is no dangling
+reference. Alternative — if the caller already owns suitable data, take it as an input reference and return a slice of that:
+<code>fn greeting(src: &amp;str) -&gt; &amp;str</code>, borrowing from something that outlives the call. Reaching for
+<code>'static</code> is wrong because a freshly built <code>String</code> is not static data; <code>'static</code> would either
+fail to compile or force an unintended constraint. <em>Tempting wrong answer:</em> &ldquo;annotate the return
+<code>&amp;'static str</code>&rdquo; — the local isn't static, so this doesn't fix the dangle. <strong>Feed-forward:</strong>
+&sect;29.3, and Ch 27 (moving ownership out).</div>
+
+<div class="solution" id="sol29.9"><span class="sol-label">29.9</span>
+(a) <strong>Elided</strong> — one input reference; rule 2 assigns its lifetime to the output. (b) <strong>Required</strong> — a
+struct with a reference field must name its lifetime (<code>&amp;'a u8</code>), else <code>E0106</code>. (c)
+<strong>Dangling-reference error</strong> — returning a reference to a local is <code>E0597</code>. (d) <strong>Required</strong> —
+two non-self input references feeding an output reference; elision can't choose, so annotate <code>'a</code>.
+<em>Method-selection cue:</em> reference field &rarr; annotate; return-a-local &rarr; error; multiple input refs to one output ref
+&rarr; annotate; single input ref &rarr; elided. <strong>Feed-forward:</strong> &sect;29.2, &sect;29.4.</div>
+
+<div class="solution" id="sol29.10"><span class="sol-label">29.10</span>
+(a) <strong>False</strong> — <code>'static</code> asserts the referent already lives for the whole program; it does not make an
+arbitrary value live forever. (b) <strong>False</strong> — lifetimes are erased before code generation; a reference is a bare
+pointer with no extra data. (c) <strong>False</strong> — a struct with a <code>&amp;str</code> field must name a lifetime, else
+<code>E0106</code>. (d) <strong>True</strong> — <code>E0597</code> fires precisely when a reference's use would extend past its
+referent's drop. (e) <strong>False</strong> — elision handles most signatures; explicit lifetimes are the exception.
+<em>Tempting wrong answer:</em> marking (b) true because &ldquo;the compiler must store the lifetime somewhere&rdquo; — it stores
+it only during checking, then erases it. <strong>Feed-forward:</strong> &sect;29.3, &sect;29.4.</div>
+
+<div class="solution" id="sol29.11"><span class="sol-label">29.11</span>
+(a) A struct storing a <code>String</code> owns its data — it costs an allocation but carries no lifetime parameter and may be used
+freely. A struct storing <code>&amp;'a str</code> avoids the allocation but gains a lifetime parameter and may not outlive the
+<code>str</code> it borrows — every use is constrained by that borrow. (b) A self-referential struct is hard because the borrowing
+field's lifetime would have to name the struct's own storage, which moves (Chapter 27) — after a move the internal pointer would
+dangle, so plain lifetimes cannot express it safely (it requires pinning or indirection). (c) The own-vs-borrow choice is exactly
+C's &ldquo;who owns this buffer, and who may free it&rdquo; question (Chapters 9, 27); lifetimes make that question explicit in the
+type and let the compiler check the answer, instead of leaving it to convention. <em>Tempting wrong answer:</em> &ldquo;always
+borrow to avoid allocations&rdquo; — borrowing threads lifetimes through everything and forbids outliving the source; owning is
+often the simpler, correct choice. <strong>Feed-forward:</strong> &sect;29.4, and Ch 27.</div>
+
+<div class="solution" id="sol29.12"><span class="sol-label">29.12</span>
+Toolchain-specific. A correct write-up reports: (a) under <code>-O2 -Wall</code> the direct <code>return &amp;local;</code> warns
+with <code>-Wreturn-local-addr</code> while the struct-laundered version builds without warning, and
+<code>-fsanitize=address</code> flags the latter as <strong>stack-use-after-scope</strong> at run time. (b) With <code>rustc</code>,
+<code>fn dangle() -&gt; &amp;str { let s = String::from("hi"); &amp;s }</code> fails with <code>error[E0597]</code>,
+&ldquo;<code>s</code> does not live long enough&rdquo;; without <code>rustc</code>, name the <code>&amp;s</code> return line and
+explain <code>s</code> is dropped at the closing brace. (c) The <code>longest</code> function needs <code>&lt;'a&gt;</code> because
+of two input references; a struct with a <code>&amp;str</code> field needs <code>&lt;'a&gt;</code> too, and omitting it is
+<code>E0106</code>, &ldquo;missing lifetime specifier.&rdquo; <em>Tempting wrong answer:</em> &ldquo;the struct C version is fine —
+no warning&rdquo; — ASan proves the use-after-scope. <strong>Feed-forward:</strong> &sect;29.1, &sect;29.4.</div>
+
+</section>
+
+<section class="solutions" id="sol30">
+<h1>Chapter 30 — Solutions</h1>
+
+<div class="solution" id="sol30.1"><span class="sol-label">30.1</span>
+A <strong>generic function</strong> is written once over a type parameter <code>T</code> and reused at many concrete types. A
+<strong>trait</strong> names a set of behaviors a type can implement. A <strong>trait bound</strong> (<code>T: Trait</code>)
+requires a generic's type parameter to implement a trait, and in return lets the body use that trait's operations.
+<em>Tempting wrong answer:</em> &ldquo;a trait is a base class you inherit from&rdquo; — a trait is a set of required behaviors a
+type opts into, not an inheritance hierarchy. <strong>Feed-forward:</strong> &sect;30.2, &sect;30.3.</div>
+
+<div class="solution" id="sol30.2"><span class="sol-label">30.2</span>
+<strong>Monomorphization</strong> is the compiler emitting a separate specialized copy of a generic for each concrete type it is
+used with. After it, there is no type parameter at run time — each call goes to an ordinary type-specific function with direct,
+inlinable operations — so there is no runtime dispatch. <em>Tempting wrong answer:</em> &ldquo;generics carry a type tag checked at
+run time&rdquo; — the type is resolved and erased at compile time. <strong>Feed-forward:</strong> &sect;30.2.</div>
+
+<div class="solution" id="sol30.3"><span class="sol-label">30.3</span>
+<code>error[E0277]</code> — &ldquo;the trait bound <code>`T: Trait`</code> is not satisfied&rdquo; — meaning you used a type that
+doesn't implement a trait in a place that required it. <em>Tempting wrong answer:</em> &ldquo;it's a type-mismatch error, so cast
+the type&rdquo; — the type isn't mismatched; it lacks the required behavior, so you implement the trait or relax the bound.
+<strong>Feed-forward:</strong> &sect;30.3.</div>
+
+<div class="solution" id="sol30.4"><span class="sol-label">30.4</span>
+(a) <code>qsort</code> is generic in that it sorts arrays of any element type via <code>void*</code>; its two costs are lost type
+safety (element type erased to <code>void*</code>) and an indirect call through the comparator function pointer per comparison. (b)
+Passing, say, a <code>double</code> comparator while sorting <code>int</code>s compiles because both are <code>void*</code> to
+<code>qsort</code>; at run time the comparator reinterprets the bytes wrongly and produces a garbage ordering, and the compiler
+cannot catch it because the types were erased. (c) The <code>qsort</code> function-pointer mechanism corresponds to a Rust
+<strong>trait object</strong> (dynamic dispatch); <strong>generics with monomorphization</strong> give the duplication-free,
+fully-checked, fully-inlined alternative. <em>Tempting wrong answer:</em> &ldquo;<code>qsort</code> is type-safe because you cast
+inside the comparator&rdquo; — the cast is unchecked; a wrong-typed comparator still compiles. <strong>Feed-forward:</strong>
+&sect;30.1, &sect;30.4.</div>
+
+<div class="solution" id="sol30.5"><span class="sol-label">30.5</span>
+(a) The caller must supply a type <code>T</code> that implements <code>Summary</code>. (b) The body may call <code>summarize</code>
+(and any other <code>Summary</code> method) on <code>item</code> — impossible without the bound, since otherwise the compiler
+couldn't know <code>T</code> has it. (c) Rust checks the bound at the generic's <em>definition</em>, so the generic is verified
+once against its stated requirements; C++ checks at instantiation, so an unmet requirement surfaces as errors deep inside the
+template body, per call site. <em>Tempting wrong answer:</em> &ldquo;the bound is just documentation&rdquo; — it is enforced;
+violating it is <code>E0277</code>. <strong>Feed-forward:</strong> &sect;30.3.</div>
+
+<div class="solution" id="sol30.6"><span class="sol-label">30.6</span>
+(a) Static dispatch (generics) resolves at compile time — a direct, inlinable call, zero dispatch cost; dynamic dispatch (trait
+objects) resolves at run time through a vtable — an indirect call per method, not inlinable. (b) A trait object is a pair of
+pointers: one to the value, one to the vtable of the trait's method implementations for that concrete type. (c) Dynamic dispatch is
+required for a heterogeneous collection (e.g. <code>Vec&lt;Box&lt;dyn Draw&gt;&gt;</code>) or run-time-chosen implementations;
+static dispatch is preferable for a hot loop over a single known type where inlining matters. <em>Method-selection cue:</em> known
+type(s) at compile time and speed matters &rarr; static; heterogeneity or run-time choice &rarr; dynamic.
+<strong>Feed-forward:</strong> &sect;30.4.</div>
+
+<div class="solution" id="sol30.7"><span class="sol-label">30.7</span>
+(a) Monomorphization costs <strong>binary size</strong> (and compile time): a separate code copy per concrete type, which dynamic
+dispatch avoids by keeping one copy. (b) Dynamic dispatch costs an <strong>indirect call per method invocation</strong> (an
+indirect branch, not inlinable) that a monomorphized generic does not. (c) For a small method in a tight loop over a homogeneous
+collection, choose static dispatch — inlining and the absence of an indirect call dominate; for a large plugin interface with many
+implementations, choose dynamic dispatch — one code copy and run-time flexibility outweigh per-call cost, and monomorphizing over
+many types would bloat the binary. The deciding factor is per-call hot-path cost vs. code-size/heterogeneity.
+<em>Tempting wrong answer:</em> &ldquo;always use dynamic dispatch to keep binaries small&rdquo; — that pays indirect calls
+everywhere, including hot paths where static dispatch is free. <strong>Feed-forward:</strong> &sect;30.2, &sect;30.4.</div>
+
+<div class="solution" id="sol30.8"><span class="sol-label">30.8</span>
+<strong>Step 4:</strong> Corrected signature: <code>fn largest&lt;T: PartialOrd + Copy&gt;(list: &amp;[T]) -&gt; T</code> — the
+minimal bounds the body uses (<code>PartialOrd</code> for <code>&gt;</code>, <code>Copy</code> for copying elements out). Bounding
+at the definition, not the call site, is what lets the compiler verify the generic <em>once</em>: the body is checked against the
+declared requirements, and every call is then checked to supply a satisfying type, so there is no per-call re-checking of the body
+(the C++ failure mode). Casting or wrapping to silence <code>E0277</code> is wrong because the error isn't a type mismatch — it's
+that the body needs a capability the type must actually provide; the fix is to state the bound (or implement the trait), not to
+cast. <em>Tempting wrong answer:</em> &ldquo;add <code>T: Any</code> and downcast&rdquo; — that throws away static checking to
+paper over a missing bound. <strong>Feed-forward:</strong> &sect;30.3.</div>
+
+<div class="solution" id="sol30.9"><span class="sol-label">30.9</span>
+(a) <strong>Static</strong> — a hot numeric loop wants inlining and no indirect call; the type is known. (b) <strong>Dynamic</strong>
+— one <code>Vec</code> of mixed shape types needs a trait object (<code>Box&lt;dyn Draw&gt;</code>); a single monomorphized type
+can't hold different concrete types. (c) <strong>Static</strong> — one concrete type; monomorphization gives a direct call and no
+code bloat. (d) <strong>Dynamic</strong> — plugins chosen at run time can't be known at compile time, so a trait object is required.
+<em>Method-selection cue:</em> heterogeneity or run-time choice forces dynamic; otherwise static wins on cost.
+<strong>Feed-forward:</strong> &sect;30.4.</div>
+
+<div class="solution" id="sol30.10"><span class="sol-label">30.10</span>
+(a) <strong>False</strong> — a generic is monomorphized; there is no type parameter or dispatch at run time. (b) <strong>True</strong>
+— a trait object dispatches through a vtable at run time. (c) <strong>False</strong> — <code>E0277</code> means the type doesn't
+implement a required trait; fix by implementing it or relaxing the bound. (d) <strong>False</strong> — monomorphization can make
+binaries <em>larger</em> (a copy per type); it trades size for speed. (e) <strong>False</strong> — a trait object is still fully
+type-checked (it can only hold a type that implements the trait), unlike C's <code>void*</code>. <em>Tempting wrong answer:</em>
+marking (e) true by analogy to <code>void*</code> — the analogy holds for the dispatch mechanism, not for type safety.
+<strong>Feed-forward:</strong> &sect;30.2&ndash;&sect;30.4.</div>
+
+<div class="solution" id="sol30.11"><span class="sol-label">30.11</span>
+(a) <code>Copy</code> is a trait; whether <code>let y = x;</code> copies or moves is decided by whether <code>T</code> implements
+it — exactly the same mechanism as <code>T: PartialOrd</code> deciding whether <code>&gt;</code> is allowed: a capability named as
+a trait, required in the type, checked by the compiler. (b) <code>Option&lt;T&gt;</code> and <code>Result&lt;T, E&gt;</code> are
+generic enums; being generic, they carry the success value's type and force the caller to pattern-match/handle the absent or error
+case, making &ldquo;did you check the return?&rdquo; a compile-time question. (c) <code>T: Send</code> would mean &ldquo;a value of
+<code>T</code> is safe to transfer to another thread&rdquo;; requiring it at a thread-spawn boundary means the compiler refuses to
+move a non-thread-safe value across threads, so the aliasing-plus-mutation that causes a data race can't be set up — a compile
+error instead of undefined behavior. <em>Tempting wrong answer:</em> &ldquo;traits are only for shared method behavior like
+<code>summarize</code>&rdquo; — they also encode capabilities and guarantees (<code>Copy</code>, <code>Send</code>,
+<code>Sync</code>). <strong>Feed-forward:</strong> &sect;30.5; the error-handling and concurrency chapters ahead, and Ch 24.</div>
+
+<div class="solution" id="sol30.12"><span class="sol-label">30.12</span>
+Toolchain-specific. A correct write-up reports: (a) the <code>qsort</code> demo prints the sorted array (e.g.
+<code>1 2 5 7 9</code>), and passing a comparator for a different element type still compiles because <code>qsort</code>'s
+parameters are <code>void*</code> — demonstrating type erasure. (b) With <code>rustc</code>, <code>largest&lt;T: PartialOrd +
+Copy&gt;</code> compiles at two types; removing the bounds yields <code>error[E0277]</code> on the comparison/copy lines (the
+<code>PartialOrd</code>/<code>Copy</code> bound is missing); without <code>rustc</code>, name those lines and bounds. (c) A
+<code>Vec&lt;Box&lt;dyn Draw&gt;&gt;</code> can hold two different implementors because each is a trait object dispatched via vtable;
+a single monomorphized generic <code>Vec&lt;T&gt;</code> is one concrete type and cannot hold two different types at once.
+<em>Tempting wrong answer:</em> &ldquo;the wrong-typed <code>qsort</code> comparator is fine because it compiled&rdquo; — it
+compiles but reinterprets bytes wrongly at run time. <strong>Feed-forward:</strong> &sect;30.1, &sect;30.4.</div>
 
 </section>
 </body></html>

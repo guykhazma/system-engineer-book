@@ -1,0 +1,407 @@
+<section class="chapter" id="ch28">
+<h1>Chapter 28 — Borrowing and References</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch27">Chapter 27</a> (ownership and moves — borrowing is the way to
+use a value <em>without</em> taking ownership, so the source stays valid), <a href="#ch09">Chapter 9</a>
+(<code>malloc</code>/<code>free</code> and use-after-free — a reference that outlives or aliases badly is the same bug),
+<a href="#ch11">Chapter 11</a> (iterator/pointer invalidation when a buffer is reallocated), <a href="#ch24">Chapter 24</a> (a data
+race is two accesses to one location, one a write, unsynchronized — the borrow rule is exactly the aliasing discipline that rules
+it out). &nbsp;·&nbsp; Chapter 27 left us moving values in and out of functions just to read them; this chapter is how to lend
+access instead, and the one rule the compiler enforces to keep lending safe.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch27">Chapter 27</a> — after <code>let s2 = s1;</code> for a <code>String</code>, why
+is <code>s1</code> dead, and what problem would arise if it were <em>not</em>? (2) <a href="#ch11">Chapter 11</a> — in C, you hold a
+pointer into a growable array and then the array is reallocated larger; what can happen to that pointer? (3) <em>Predict:</em> in
+Rust you take <code>let r = &amp;v;</code> (a shared reference to a vector) and then, while <code>r</code> is still in use, call
+<code>v.push(x)</code> (which needs to mutate <code>v</code>). Does the compiler accept it? Write your guesses; &sect;28.2 and
+&sect;28.3 answer all three.</p>
+</aside>
+
+<p>Ownership alone is not enough to write real programs. If the only way to give a function access to a value were to <em>move</em>
+it in (Chapter 27), every function that merely reads a value would have to move it back out, and two functions could never look at
+the same value at once. What you want is to <strong>lend</strong> access without transferring ownership — a <strong>reference</strong>
+— and the discipline that keeps lending safe is <strong>borrowing</strong>. This chapter is only about references and the borrow
+rule. First, why references are needed and what a shared reference (<code>&amp;T</code>) is: read-only access, any number at once
+(&sect;28.1&ndash;&sect;28.2). Then the mutable reference (<code>&amp;mut T</code>): exclusive write access, and why there may be
+only one, with no other reference alive alongside it (&sect;28.3). Then the borrow checker's single rule — <em>one writer XOR many
+readers</em> — and how it turns the iterator-invalidation and data-race hazards of the earlier volumes into compile errors
+(&sect;28.4). We close by carrying borrowing forward to the question it forces open: how long may a reference live relative to the
+value it points at — lifetimes (&sect;28.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust error index, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>28.1 Why references: using without owning</h2>
+
+<p>Recall the awkwardness at the end of Chapter 27: a function that only wants to <em>read</em> a <code>String</code> — say, to
+compute its length — must take it by value, which <em>moves</em> it in and leaves the caller unable to use it afterward. To keep
+the value, the function would have to return it back out, threading ownership through every call. That is untenable. A
+<strong>reference</strong> solves it: <code>&amp;s</code> creates a value that <em>points at</em> <code>s</code> without owning it,
+so the caller keeps ownership and the function borrows access for the duration of the call (Rust; not compiled here — behavior per
+the cited book):</p>
+
+<pre><code>fn length(s: &amp;String) -&gt; usize {   // s borrows: it does NOT own the String
+    s.len()
+}                                     // s goes out of scope, but nothing is dropped —
+                                      // the reference did not own the buffer
+
+let owner = String::from("hello");
+let n = length(&amp;owner);              // lend a reference; ownership stays with `owner`
+println!("{owner} has len {n}");      // `owner` is STILL valid — it was never moved</code></pre>
+
+<p>The <code>&amp;</code> in <code>&amp;owner</code> is &ldquo;take a reference to&rdquo;; the <code>&amp;String</code> in the
+signature is &ldquo;a reference to a <code>String</code>.&rdquo; The reference is a borrow: the callee may use the value through it,
+but it does not own the value and so does not drop it when the reference goes out of scope — only the owner drops. Because no move
+happened, <code>owner</code> is still usable after the call. This is the everyday shape of Rust code: pass owning values by
+reference to read them, and reserve moves for when you genuinely mean to hand off ownership. But a reference is a pointer into
+someone else's value, and Chapters 9 and 11 are a catalogue of how pointers into other people's memory go wrong — dangling after a
+free, aliasing a buffer that is then mutated out from under you. The rest of the chapter is the two kinds of reference and the one
+rule that makes them safe where the C pointer was not.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does passing <code>&amp;owner</code> to <code>length</code> leave <code>owner</code> usable afterward, when passing
+<code>owner</code> by value would not? When the reference parameter <code>s</code> goes out of scope at the end of
+<code>length</code>, is the <code>String</code>'s buffer freed? Why or why not? (Answer after the next section.)</p>
+</aside>
+
+<h2>28.2 Shared references: many readers, no writers</h2>
+
+<p>The reference of &sect;28.1 is a <strong>shared reference</strong>, written <code>&amp;T</code>. Its defining property: you may
+have <em>any number</em> of shared references to a value at the same time, and through a shared reference you may <em>read</em> the
+value but not mutate it. That is safe for the same reason many threads reading (but not writing) shared memory is safe (Chapter
+24): if nobody writes, no reader can observe a torn or stale value, and no two accesses conflict. Shared references are
+<code>Copy</code> — cheap to duplicate, since they are just pointers — so handing the same value to several readers is free (Rust;
+not compiled here — behavior per the cited book):</p>
+
+<pre><code>let v = vec![1, 2, 3];
+let a = &amp;v;          // shared reference #1
+let b = &amp;v;          // shared reference #2 — fine, many readers allowed
+println!("{} {}", a.len(), b.len());   // both read v; no conflict</code></pre>
+
+<p>Two immutable views of one vector coexist without trouble because neither can change it. The read-only-ness is not a convention
+you must remember — it is in the type: a <code>&amp;T</code> simply has no method that mutates, so an attempt to write through one
+does not compile. This is the &ldquo;many readers&rdquo; half of Rust's borrowing rule, and it is exactly as permissive as it can
+safely be: sharing is unlimited precisely while nothing mutates. The moment you need to <em>change</em> the value, you need a
+different, stricter kind of reference — because mutation plus aliasing is where every hazard lived.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: one writer XOR many readers</span>
+<p><strong>1. In words.</strong> At any point a value may be borrowed either by any number of shared references
+(<code>&amp;T</code>, read-only) <em>or</em> by exactly one mutable reference (<code>&amp;mut T</code>, read-write) — never both,
+never two mutable ones. Sharing is safe while nothing writes; writing is safe only when nothing else can observe the value
+meanwhile.</p>
+<p><strong>2. As a picture.</strong> Figure 28.1: a value with several thin arrows labelled <code>&amp;</code> pointing in (all
+readers, allowed together), versus the same value with one bold arrow labelled <code>&amp;mut</code> and no other arrow permitted
+(the exclusive writer).</p>
+<p><strong>3. As numbers/contrast.</strong> The C program of &sect;28.4 holds one pointer into a buffer and then reallocates the
+buffer &rarr; the pointer dangles &rarr; heap-use-after-free (ASan-confirmed). The Rust equivalent cannot compile: the reallocation
+needs <code>&amp;mut</code>, which the outstanding shared reference forbids (<code>E0502</code>) &rarr; the bug is rejected before
+it runs.</p>
+</aside>
+
+<p><em>(Answer to the &sect;28.1 quick check: passing <code>&amp;owner</code> lends a reference and does not move the value, so
+<code>owner</code> keeps ownership and stays valid; passing by value would move the <code>String</code> into the function and
+invalidate <code>owner</code>. When the reference parameter <code>s</code> goes out of scope, nothing is freed, because a reference
+does not own the buffer — only the owner drops it, and the owner is still <code>owner</code> back in the caller.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Borrowing rule: many shared readers together, OR one exclusive writer alone — never both.</text>
+<rect x="40" y="44" width="150" height="40" fill="#f5f8fb" stroke="#14406b"/><text x="60" y="68" font-size="10">value v</text>
+<text x="30" y="104" font-size="9" fill="#14406b">SHARED: any number of &amp;v (read-only)</text>
+<line x1="210" y1="52" x2="300" y2="52" stroke="#14406b" marker-end="url(#b)"/><text x="240" y="47" font-size="9" fill="#14406b">&amp;v</text>
+<line x1="210" y1="64" x2="300" y2="64" stroke="#14406b" marker-end="url(#b)"/><text x="240" y="78" font-size="9" fill="#14406b">&amp;v</text>
+<line x1="210" y1="76" x2="300" y2="76" stroke="#14406b" marker-end="url(#b)"/><text x="240" y="90" font-size="9" fill="#14406b">&amp;v</text>
+<rect x="40" y="140" width="150" height="40" fill="#fdeee6" stroke="#8c3a1d"/><text x="60" y="164" font-size="10">value v</text>
+<text x="30" y="200" font-size="9" fill="#8c3a1d">EXCLUSIVE: exactly one &amp;mut v (read-write), no other reference</text>
+<line x1="210" y1="160" x2="330" y2="160" stroke="#8c3a1d" stroke-width="3" marker-end="url(#c)"/><text x="250" y="153" font-size="9" fill="#8c3a1d">&amp;mut v</text>
+<text x="360" y="150" font-size="9" fill="#8c3a1d">a second reference here (of either kind)</text>
+<text x="360" y="164" font-size="9" fill="#8c3a1d">is rejected: E0499 / E0502</text>
+<defs>
+<marker id="b" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#14406b"/></marker>
+<marker id="c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#8c3a1d"/></marker>
+</defs>
+</svg>
+<figcaption>Figure 28.1: The borrowing rule. Top: a value may have any number of shared references (<code>&amp;T</code>, read-only)
+at once. Bottom: or exactly one mutable reference (<code>&amp;mut T</code>, read-write), with no other reference of either kind
+alive alongside it. Never both. This is aliasing XOR mutation, enforced by the type system.</figcaption>
+</figure>
+
+<h2>28.3 Mutable references: exactly one writer, no aliases</h2>
+
+<p>To mutate a value through a reference you take a <strong>mutable reference</strong>, <code>&amp;mut T</code>. Its rule is the
+opposite of the shared reference's permissiveness: while a <code>&amp;mut T</code> to a value exists, it must be the <em>only</em>
+live reference to that value — no second mutable reference, and no shared reference either. A mutable borrow is <em>exclusive</em>.
+The reason is precisely the aliasing-plus-mutation hazard: if two references could reach one value and at least one could write,
+you would have, in a single thread, the same conflict a data race is across threads (Chapter 24) — a write that another accessor
+can observe half-done or unexpectedly, or that invalidates a pointer the other holds. Rust rules it out by construction (Rust; not
+compiled here — diagnostics quoted from the official Rust error index):</p>
+
+<pre><code>let mut v = vec![1, 2, 3];
+let m = &amp;mut v;         // exclusive mutable borrow of v
+let n = &amp;mut v;         // ERROR: a second mutable borrow while m is live
+m.push(4);
+
+error[E0499]: cannot borrow `v` as mutable more than once at a time</code></pre>
+
+<pre><code>let mut v = vec![1, 2, 3];
+let r = &amp;v;             // shared (read) borrow
+let m = &amp;mut v;         // ERROR: mutable borrow while a shared borrow is live
+println!("{}", r[0]);
+
+error[E0502]: cannot borrow `v` as mutable because it is also borrowed as immutable</code></pre>
+
+<p>The first is rejected with <code>E0499</code> — <em>&ldquo;cannot borrow as mutable more than once at a time&rdquo;</em> — because
+two mutable references would be two writers to one value. The second is rejected with <code>E0502</code> —
+<em>&ldquo;cannot borrow as mutable because it is also borrowed as immutable&rdquo;</em> — because a writer alongside a reader is
+exactly aliasing-plus-mutation. Both diagnostics are from the official Rust error index. Note what the exclusivity buys: through a
+<code>&amp;mut T</code> the compiler <em>knows</em> nothing else can see the value, so mutation through it is as safe and as
+optimizable as if the value were not shared at all — the reference is effectively a compiler-checked exclusive lock, but one with
+zero runtime cost, resolved entirely at compile time. The borrow of a value ends when the reference is last used (this is
+&ldquo;non-lexical lifetimes&rdquo;: the borrow's span is how long the reference is actually used, not the enclosing braces), so
+you can take a shared borrow, finish with it, and then take a mutable one — just never overlapping.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the two-part borrowing rule in one sentence. Which error code fires when you take two <code>&amp;mut</code> to one value,
+and which when you take a <code>&amp;mut</code> while a <code>&amp;</code> is still live? Why is a <code>&amp;mut T</code> being
+exclusive the single-threaded analog of preventing a data race? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>28.4 The borrow checker, and how it kills iterator invalidation and data races</h2>
+
+<p>The two rules — many shared XOR one exclusive, and (next chapter) references must not outlive their value — are enforced by the
+<strong>borrow checker</strong>, a compile-time pass. To see it earning its keep, take a bug from Chapter 11 that C compiles
+without complaint. Here is real C: hold a pointer into a heap buffer, then grow the buffer with <code>realloc</code>, which is free
+to move it — after which the old pointer dangles. Compiled and run in this environment (gcc 11.4.0):</p>
+
+<pre><code>int *v = malloc(4 * sizeof(int));
+for (int i = 0; i &lt; 4; i++) v[i] = i * 10;
+int *p = &amp;v[0];                    /* alias into the buffer */
+v = realloc(v, 4096 * sizeof(int)); /* may move the block, invalidating p */
+printf("via p: %d\n", *p);          /* use-after-free if the block moved */
+free(v);
+
+$ gcc -O2 -Wall borrow.c -o borrow          # compiles, NO warning
+$ gcc -O1 -fsanitize=address borrow.c -o borrow && ./borrow
+==ERROR: AddressSanitizer: heap-use-after-free on address 0x502000000010
+    ... in main
+SUMMARY: AddressSanitizer: heap-use-after-free</code></pre>
+
+<p>The plain build gives no warning at all; only AddressSanitizer, at run time, catches the <strong>heap-use-after-free</strong>.
+This is the iterator-invalidation hazard of Chapter 11 in its rawest form — a live pointer into a container that is then
+reallocated. Now the Rust equivalent. A <code>Vec</code>'s <code>push</code> may reallocate, so its signature takes
+<code>&amp;mut self</code>; holding a reference into the vector means holding a <code>&amp;</code> borrow of it. The two cannot
+overlap (Rust; not compiled here — diagnostic per the official Rust error index):</p>
+
+<pre><code>let mut v = vec![1, 2, 3];
+let p = &amp;v[0];          // shared borrow: a reference INTO the vector
+v.push(4);               // push needs &amp;mut v — conflicts with the live borrow p
+println!("{}", p);       // use of p after the (attempted) reallocation
+
+error[E0502]: cannot borrow `v` as mutable because it is also borrowed as immutable</code></pre>
+
+<p>The exact bug the C program hid until run time — a reference into a buffer that is then reallocated — is a compile error in
+Rust, <code>E0502</code>, because <code>push</code>'s mutable borrow cannot coexist with the shared borrow <code>p</code>. The
+borrow checker does not need to know that <code>push</code> reallocates; the rule &ldquo;no mutable borrow while a shared borrow is
+live&rdquo; is enough. And this is the same rule that forbids data races: a data race (Chapter 24) is two accesses to one location,
+at least one a write, without synchronization — which is aliasing (two accessors) plus mutation (a write). Rust's borrow rule bans
+exactly that combination for a single value, and, extended across threads by the <code>Send</code>/<code>Sync</code> traits (a
+later chapter), it is why safe Rust cannot have a data race. The undefined behavior you proved absent by hand in Chapters 11 and 24
+is, here, a property the compiler checks.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: mutating a collection while a reference into it is alive (the &ldquo;fighting the borrow checker&rdquo; reflex)</span>
+<p>The most common early-Rust frustration is writing a loop that reads from a collection and mutates it in the same breath —
+<code>for x in &amp;v { if cond(x) { v.push(...) } }</code> — and being stopped by <code>E0502</code>: <em>cannot borrow
+<code>v</code> as mutable because it is also borrowed as immutable</em>. Beginners read this as the compiler being pedantic about a
+program that &ldquo;obviously works,&rdquo; and reach for the wrong escapes: cloning the whole collection to get an owned copy to
+iterate, or wrapping everything in <code>RefCell</code> to push the check to run time, or dropping into <code>unsafe</code>. But
+the error is reporting a <em>real</em> hazard — the exact iterator-invalidation bug the C program above hit at run time, where
+mutating the container can reallocate its buffer and dangle the reference you are iterating through. The right responses match what
+you actually mean: if you only need to <em>read</em> while deciding what to change, collect the decisions first (e.g. gather the
+indices or new items into a separate vector) and then apply the mutations after the read-borrow ends; if you need to mutate in
+place without growing, iterate with <code>&amp;mut</code> (<code>iter_mut</code>), which is a single exclusive borrow and is
+allowed; if you genuinely need shared mutable access with runtime-checked rules, <code>RefCell</code> is a deliberate,
+documented choice, not a way to silence the compiler. Fighting the borrow checker by cloning or reaching for <code>unsafe</code>
+to make the message go away is the analog of casting away a warning in C — it works and discards the thing the warning was
+protecting you from.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;The borrow checker is being ridiculous. I'm iterating over a vector and pushing to
+it inside the loop, and it won't compile — <code>E0502</code>, can't borrow as mutable because it's borrowed as immutable. This is
+a five-line loop that would just work in C++ or Python. Why is Rust making me clone the whole thing?&rdquo; Cover the paragraph and
+respond in four or five sentences, drawing on &sect;28.3&ndash;&sect;28.4.</p>
+<p><em>Model answer.</em> &ldquo;That loop in C++ is the classic iterator-invalidation bug: pushing can reallocate the vector's
+buffer, and the reference you're iterating through then dangles — in C the same pattern is a silent heap-use-after-free that only
+a sanitizer catches at run time. Rust's rule is that a mutable borrow (<code>push</code> needs one) can't coexist with the shared
+borrow your loop is holding, which is exactly why it flags it. So the checker isn't being pedantic; it caught the reallocation
+hazard before the program ran. Don't clone the whole vector to dodge it — that pays for a full copy to hide a real bug. Collect the
+items you want to add into a separate vector during the read pass, then push them after the loop, or use <code>iter_mut</code> if
+you're mutating in place; the fix is to separate the read from the write, which is what the rule is telling you to do.&rdquo;
+Framing <code>E0502</code> as the compile-time form of the C use-after-free, and offering the collect-then-mutate fix instead of a
+clone, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;28.3 quick check: the rule is &ldquo;at any time a value may have either any number of shared references
+<code>&amp;T</code> or exactly one mutable reference <code>&amp;mut T</code>, never both.&rdquo; Two <code>&amp;mut</code> to one
+value is <code>E0499</code> (&ldquo;cannot borrow as mutable more than once at a time&rdquo;); a <code>&amp;mut</code> while a
+<code>&amp;</code> is live is <code>E0502</code> (&ldquo;cannot borrow as mutable because it is also borrowed as immutable&rdquo;). A
+<code>&amp;mut T</code> being exclusive is the single-threaded analog of preventing a data race because a data race is aliasing plus
+a write; exclusivity guarantees no other accessor can observe the value while it is being written.)</em></p>
+
+<h2>28.5 What to carry forward</h2>
+
+<p>Borrowing is how you use a value without owning it. A <strong>reference</strong> points at a value it does not own, so lending
+one leaves the owner intact and drops nothing when the reference's scope ends. There are two kinds, and the whole of borrowing is
+one rule dividing them: a value may be borrowed by <em>any number of shared references</em> (<code>&amp;T</code>, read-only) or by
+<em>exactly one mutable reference</em> (<code>&amp;mut T</code>, read-write), never both at once and never two mutable ones. That
+is <strong>aliasing XOR mutation</strong>: unlimited sharing is safe precisely while nothing writes, and writing is safe precisely
+when nothing else can see the value meanwhile. The <strong>borrow checker</strong> enforces this at compile time, at zero runtime
+cost, and in doing so it turns concrete hazards from the earlier volumes into compile errors: the iterator-invalidation
+use-after-free that the C program of &sect;28.4 hid until a sanitizer caught it is, in Rust, <code>E0502</code> at compile time
+(<code>push</code>'s mutable borrow cannot coexist with a live shared borrow into the vector), and two writers to one value are
+<code>E0499</code>. The same &ldquo;no aliasing with mutation&rdquo; rule, lifted across threads later, is why safe Rust has no data
+races — the Chapter 24 hazard made structural.</p>
+
+<p>One question is now unavoidable, and it is the whole of the next chapter. A reference is a pointer into another value; the second
+borrow rule is that a reference must never be used after the value it points at is gone — a dangling reference (the C
+return-a-pointer-to-a-local bug) must be impossible. But how does the compiler <em>know</em>, at the point you use a reference,
+that the value behind it is still alive — especially when references are passed into and out of functions, stored in structs, and
+returned? The answer is <strong>lifetimes</strong>: a way to name and relate the spans over which references are valid, so the
+borrow checker can prove that no reference outlives its referent. Everything the machine does underneath is unchanged — a Rust
+reference compiles to exactly the pointer C would use, with no extra runtime data — but the compiler now carries a proof, expressed
+in lifetimes, that the pointer is always valid when dereferenced. That proof, and the small annotations it sometimes needs from
+you, is where we go next.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Say what a reference is, and why lending one leaves the owner valid where moving would not.</li>
+<li>State the two-part borrowing rule (many shared XOR one exclusive) and why each half is safe.</li>
+<li>Explain why a <code>&amp;mut T</code> must be the only live reference, in terms of aliasing plus mutation.</li>
+<li>Name the error codes for two mutable borrows (<code>E0499</code>) and a mutable-while-shared borrow (<code>E0502</code>).</li>
+<li>Show how the borrow rule turns the C iterator-invalidation use-after-free into a compile error.</li>
+<li>Connect the borrow rule to data-race prevention (aliasing XOR mutation, Chapter 24).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a reference, and why does passing <code>&amp;owner</code> leave <code>owner</code> usable while passing it by value does not? (&sect;28.1)</li>
+<li><strong>R2.</strong> How many shared references (<code>&amp;T</code>) to one value may exist at once, and what may you do through them? (&sect;28.2)</li>
+<li><strong>R3.</strong> State the exclusivity rule for <code>&amp;mut T</code>, and give the two error codes it is enforced by. (&sect;28.3)</li>
+<li><strong>R4.</strong> Take the C realloc/dangling-pointer bug; explain why the analogous Rust code is <code>E0502</code> at compile time. (&sect;28.4)</li>
+<li><strong>R5.</strong> Why is &ldquo;aliasing XOR mutation&rdquo; the same rule that prevents data races? (&sect;28.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 4.2
+&ldquo;References and Borrowing&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source for shared
+vs. mutable references and the borrowing rule of &sect;28.2&ndash;&sect;28.3. Authors and edition verified via the publisher; the
+book was not compiled in this environment.</li>
+<li><strong>The Rust Error Index, entries <code>E0499</code>, <code>E0502</code>, and <code>E0505</code>
+(<code>doc.rust-lang.org/error_codes</code>).</strong> The official one-line meanings quoted in &sect;28.3&ndash;&sect;28.4:
+<code>E0499</code> &ldquo;borrowed as mutable more than once,&rdquo; <code>E0502</code> &ldquo;borrowed as mutable because also
+borrowed as immutable,&rdquo; <code>E0505</code> &ldquo;a value was moved out while it was still borrowed.&rdquo; Each verified
+against the current error index.</li>
+<li><strong>Jung, Jourdan, Krebbers &amp; Dreyer, &ldquo;RustBelt: Securing the Foundations of the Rust Programming Language,&rdquo;
+<em>Proc. ACM on Programming Languages</em> 2(POPL), Article 66 (2018), DOI 10.1145/3158154.</strong> The machine-checked proof
+that the borrowing discipline of this chapter is sound. First author Ralf Jung; verified via the ACM Digital Library.</li>
+<li><strong>The Rust reference and the &ldquo;non-lexical lifetimes&rdquo; RFC 2094 (<code>rust-lang.github.io/rfcs</code>).</strong>
+Why a borrow ends at last use rather than at the closing brace — the refinement noted in &sect;28.3. Reference for the precise
+model; verify against the current edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex28.1"><span class="ex-label">28.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define a shared reference (<code>&amp;T</code>) and a mutable reference (<code>&amp;mut T</code>), saying what
+you may do through each and how many of each may exist at once.</div>
+
+<div class="exercise" id="ex28.2"><span class="ex-label">28.2</span> <span class="ex-tag warm">warm-up</span>
+Why does <code>fn length(s: &amp;String)</code> leave the caller's <code>String</code> usable after the call, whereas
+<code>fn length(s: String)</code> would not?</div>
+
+<div class="exercise" id="ex28.3"><span class="ex-label">28.3</span> <span class="ex-tag warm">warm-up</span>
+State the two-part borrowing rule in one sentence, and name the two situations it forbids together with their error codes.</div>
+
+<div class="exercise" id="ex28.4"><span class="ex-label">28.4</span> <span class="ex-tag core">core</span>
+Take the C snippet of &sect;28.4 (pointer into a buffer, <code>realloc</code>, use the old pointer). (a) Identify the bug and the
+line it occurs on. (b) Explain why the plain <code>gcc -O2 -Wall</code> build gives no warning, and what AddressSanitizer reports
+at run time. (c) Explain precisely why the analogous Rust code is <code>E0502</code> at compile time — which borrow conflicts with
+which, and why the checker does not need to know that <code>push</code> reallocates.</div>
+
+<div class="exercise" id="ex28.5"><span class="ex-label">28.5</span> <span class="ex-tag core">core</span>
+Explain why a mutable reference must be exclusive. (a) What single-threaded hazard would two references to one value, at least one
+mutable, reproduce? (b) Connect this to the definition of a data race from Chapter 24. (c) What does the exclusivity of
+<code>&amp;mut T</code> let the compiler assume, and why is that good for optimization?</div>
+
+<div class="exercise" id="ex28.6"><span class="ex-label">28.6</span> <span class="ex-tag core">core</span>
+For each, say whether it compiles, and if not, which error code fires and why: (a) <code>let a = &amp;v; let b = &amp;v;</code>
+(both shared); (b) <code>let m = &amp;mut v; let n = &amp;mut v;</code>; (c) <code>let r = &amp;v; let m = &amp;mut v;</code>; (d) a
+shared borrow used and finished, then a mutable borrow taken afterward (non-overlapping).</div>
+
+<div class="exercise" id="ex28.7"><span class="ex-label">28.7</span> <span class="ex-tag complexity">cost</span>
+References are &ldquo;zero-cost.&rdquo; (a) At the machine level, what is a <code>&amp;T</code> — how much runtime data does it carry
+beyond the pointer C would use? (b) At what time is the borrow checking done, and what runtime cost does it add? (c) Contrast this
+with <code>RefCell</code>, which enforces the same borrow rule at run time: what does <code>RefCell</code> cost that a plain
+<code>&amp;mut</code> does not, and when is paying it justified?</div>
+
+<div class="exercise" id="ex28.8"><span class="ex-label">28.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A newcomer writes a loop that scans a <code>Vec&lt;i32&gt;</code> and pushes each
+value's double back onto the same vector, and gets <code>error[E0502]: cannot borrow `v` as mutable because it is also borrowed as
+immutable</code>.
+<br><strong>Step 1 (given):</strong> <code>for x in &amp;v { ... }</code> holds a shared borrow of <code>v</code> for the whole loop
+body.
+<br><strong>Step 2 (given):</strong> <code>v.push(2 * x)</code> inside the body needs a mutable borrow of <code>v</code>, which
+cannot coexist with the shared borrow.
+<br><strong>Step 3 (given):</strong> this is the iterator-invalidation hazard: a push could reallocate <code>v</code> and dangle
+the iterator.
+<br><strong>Step 4 (you):</strong> Give two correct fixes — one that separates the read pass from the write pass without cloning
+the whole vector, and one using <code>iter_mut</code> if the mutation were in place — and say why cloning the entire vector to
+dodge the error is the wrong default.</div>
+
+<div class="exercise" id="ex28.9"><span class="ex-label">28.9</span> <span class="ex-tag mixed">mixed</span>
+For each, state whether it is allowed by the borrow rule and justify in a line: (a) three <code>&amp;v</code> at once; (b) one
+<code>&amp;mut v</code> and one <code>&amp;v</code> at once; (c) two <code>&amp;mut v</code> at once; (d) a <code>&amp;mut v</code>
+after all shared borrows of <code>v</code> have ended.</div>
+
+<div class="exercise" id="ex28.10"><span class="ex-label">28.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;You may have many mutable references to a value
+as long as they don't write at the same time.&rdquo; (b) &ldquo;A shared reference lets you mutate the value it points at.&rdquo;
+(c) &ldquo;The borrow checker adds runtime overhead to every dereference.&rdquo; (d) &ldquo;Holding a reference into a vector and
+then pushing to it is a compile error.&rdquo; (e) &ldquo;A reference drops (frees) the value when it goes out of scope.&rdquo;</div>
+
+<div class="exercise" id="ex28.11"><span class="ex-label">28.11</span> <span class="ex-tag stretch">stretch</span>
+The borrow rule is &ldquo;aliasing XOR mutation.&rdquo; (a) Show that both a use-after-free through an aliased pointer (Chapter 9/11)
+and a data race (Chapter 24) are instances of &ldquo;two paths to one value, at least one writing,&rdquo; and how the single rule
+attacks their shared root. (b) Explain why unlimited <em>shared</em> references are nonetheless safe, and unlimited access is only a
+problem once mutation enters. (c) The rule as stated is for a single value in one thread; name what still has to be added to extend
+&ldquo;no data races&rdquo; across threads, and why the borrow rule alone is not yet enough there.</div>
+
+<div class="exercise" id="ex28.12"><span class="ex-label">28.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal): (a) Compile and run the &sect;28.4 C snippet (pointer into
+a buffer, <code>realloc</code> to a much larger size, use the old pointer). Confirm it builds without warning under
+<code>-O2 -Wall</code>, then rebuild with <code>-fsanitize=address</code> and observe the heap-use-after-free. (b) If you have
+<code>rustc</code>, write the <code>let p = &amp;v[0]; v.push(4); println!("{p}");</code> version and confirm it fails with
+<code>E0502</code>; if not, name the exact conflicting borrows from this chapter. (c) Write a version that compiles by ending the
+shared borrow before the <code>push</code>, and explain why it is now allowed. Note your toolchain versions.</div>
+
+</section>
+</section>

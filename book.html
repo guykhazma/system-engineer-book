@@ -290,6 +290,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch44">Chapter 44 — io_uring and Completion-Based Asynchronous I/O</a></li>
 <li class="toc-ch"><a href="#ch45">Chapter 45 — Zero-Copy: sendfile, splice, and the Data Path</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part VIII &mdash; Storage & the Disk</li>
+<li class="toc-ch"><a href="#ch46">Chapter 46 — Storage &amp; the Disk: How Devices Really Work</a></li>
+<li class="toc-ch"><a href="#ch47">Chapter 47 — Files and Pages: The Database on Disk</a></li>
+<li class="toc-ch"><a href="#ch48">Chapter 48 — The Buffer Pool</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part IX &mdash; Storage Engines</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part X &mdash; Durability & Recovery</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XI &mdash; Transactions & Concurrency Control</li>
@@ -18286,6 +18289,1094 @@ naming the hardware feature (scatter-gather DMA) that removes the last copy.</di
 </section>
 
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part VIII</div><h1>Storage & the Disk</h1><p class='part-blurb'>Pages, files, the buffer pool, and the storage manager — the foundation you build a database on.</p></div>
+<section class="chapter" id="ch46">
+<h1>Chapter 46 — Storage &amp; the Disk: How Devices Really Work</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch03">Chapter 3</a> (the memory hierarchy and the cost cliff between a cache hit and
+DRAM), <a href="#ch40">Chapter 40</a> (the page cache — how the OS keeps disk blocks in memory), <a href="#ch41">Chapter 41</a> (durability and
+<code>fsync</code>), <a href="#ch17">Chapter 17</a> (demand paging and page replacement — the same problem a buffer pool will solve by hand),
+<a href="#ch05">Chapter 5</a> (mechanical sympathy — knowing the device you run on). &nbsp;·&nbsp; This chapter opens the second volume. The first
+built the machine and its I/O; the second builds a database on top, and a database is, before anything else, a program that is honest about where
+its data physically lives. That place is the disk, and the disk is nothing like RAM. This chapter is the floor the whole volume stands on.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch03">Chapter 3</a> — a cache miss to DRAM costs on the order of a hundred nanoseconds against a hit's fraction of
+one; storage sits one more cliff below DRAM. Roughly how much slower is a disk access than a DRAM access? (2) <a href="#ch40">Chapter 40</a> —
+when you <code>read</code> a file the OS may serve it from the page cache in memory; what has to happen the first time, when it is <em>not</em>
+cached? (3) <em>Predict:</em> a program reads a 1&nbsp;GiB file with the page cache bypassed, two ways — streaming it in large sequential blocks,
+and fetching 4&nbsp;KiB pages at random offsets. Two questions: which is faster, and by what factor — 2&times;, 10&times;, 50&times;? And would a
+spinning hard disk and a flash SSD give the <em>same</em> ratio? Write your guesses; &sect;46.2&ndash;&sect;46.4 answer them.</p>
+</aside>
+
+<p>Everything in Volume 1 could pretend the machine had one kind of memory. The RAM model of <a href="#ch01">Chapter 1</a> says any location costs
+the same to touch, and even after Chapter 3 punctured that with caches, the whole hierarchy — registers, L1, L2, L3, DRAM — was still
+<em>memory</em>: electrically addressed, uniform within a level, measured in nanoseconds. A database cannot live in that world, because its data
+outlives the process and outgrows the RAM, so it must live on <strong>persistent storage</strong> — a disk — and the disk breaks every
+assumption the memory hierarchy let you keep. It is slower than DRAM by three to five orders of magnitude; it is addressed not in bytes but in
+fixed <strong>blocks</strong>; and, most consequentially, its cost depends violently on <em>access pattern</em> — reading the same amount of data
+sequentially versus at random can differ by fifty times. Every structure a database builds — the page, the B-tree, the log, the buffer pool —
+is a specific, disciplined answer to those three facts. This chapter establishes them in five steps: the storage hierarchy and why the disk is
+the floor (&sect;46.1); the spinning hard disk, its geometry, and why a seek is the enemy (&sect;46.2); the flash SSD, its erase blocks, the
+translation layer, and why it has no seek but hates small writes (&sect;46.3); the block layer and the sequential-versus-random gap, measured on
+this machine (&sect;46.4); and the storage discipline the rest of the volume inherits (&sect;46.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The program is C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as the best of several trials; times are wall-clock and a
+hardware-counter profiler (<code>perf</code>) is <em>not</em> installed. Reads use <code>O_DIRECT</code> to bypass the page cache so the
+measurement reaches the storage stack rather than DRAM. This machine runs under <strong>WSL2</strong>: the working directory is an
+<code>ext4</code> filesystem on a virtual disk (<code>/dev/sdd</code>), whose <code>/sys/block/sdd/queue/physical_block_size</code> reads
+<strong>4096</strong> and whose <code>rotational</code> flag reads <strong>1</strong> — a virtio artifact, not a real platter; the host backing
+store is an NVMe SSD. So the absolute numbers below reflect a <em>virtualised SSD through a hypervisor at queue depth one</em>, not a bare device,
+and the published hard-disk and SSD latencies quoted in &sect;46.1&ndash;&sect;46.3 are labeled <strong>published/typical</strong>, not measured
+here. Device values were read from <code>/sys/block</code> on this machine.</p>
+
+<h2>46.1 The storage hierarchy and why the disk is the floor</h2>
+
+<p>Extend the memory hierarchy of Chapter 3 downward past DRAM and you reach a different kind of device. The numbers, as
+<em>published/typical</em> figures (Bryant &amp; O'Hallaron, CS:APP, Chapter 6; the orders of magnitude, not the exact digits, are the point):
+an L1 cache hit is about one nanosecond; a miss to DRAM is on the order of a hundred nanoseconds; a read from a flash <strong>SSD</strong> is on
+the order of tens to a hundred <strong>microseconds</strong> — a thousand times slower than DRAM; and a read from a spinning <strong>hard
+disk</strong> that must physically move its head is on the order of <strong>ten milliseconds</strong> — a hundred thousand times slower than DRAM,
+and roughly ten million times slower than the L1 hit. If a DRAM access were one second, a hard-disk seek would be about four months. That is not
+a slower level of the same hierarchy; it is a cliff, and a database spends its life on the wrong side of it. The consequence is the founding
+principle of storage engineering: <strong>an access to disk is so expensive relative to computation that the entire design is organized around
+avoiding, batching, and amortizing it.</strong> A B-tree is shaped to reach any record in three or four disk accesses instead of thousands; a log
+is written sequentially so that durability costs one kind of I/O instead of the worst kind; a buffer pool (Chapter 48) keeps hot pages in DRAM so
+that most accesses never reach the cliff at all. You cannot make the disk fast. You can only touch it rarely, in bulk, and in the pattern it
+prefers — and to do that you must know what pattern it prefers, which is the subject of the next three sections.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Order these by access latency and give the published/typical magnitude of each: an L1 cache hit, a DRAM access, a flash-SSD read, a hard-disk
+seek. Roughly how many DRAM accesses fit in the time of one hard-disk seek? (Answer after the next section.)</p>
+</aside>
+
+<h2>46.2 The spinning hard disk: geometry, seek, and rotation</h2>
+
+<p>A mechanical hard disk stores bits as magnetic patterns on the surfaces of rigid spinning <strong>platters</strong>. Each surface is divided
+into concentric <strong>tracks</strong>, and each track into fixed-size <strong>sectors</strong> (historically 512 bytes, now commonly 4096); a
+<strong>head</strong> on a moving arm reads and writes whichever sector passes beneath it. To read a given sector, two mechanical motions must
+finish: the arm must move the head to the right track — a <strong>seek</strong> — and the platter must rotate until the target sector arrives
+under the head — <strong>rotational latency</strong>. Both are governed by physics, not electronics, and both are slow. Published/typical figures
+(OSTEP, &ldquo;Hard Disk Drives&rdquo;): an average seek is on the order of several to ten milliseconds, and a 7200-RPM drive turns once every
+about 8.3&nbsp;ms, so the average rotational wait — half a turn — is roughly 4&nbsp;ms. Only after both finish does the actual data
+<strong>transfer</strong> begin, and the transfer itself is fast (100+&nbsp;MB/s). This decomposition is the whole story of the hard disk: the
+time to read a sector is dominated by <em>getting to it</em>, not by reading it. Now consider what that means for access pattern. A
+<strong>sequential</strong> read walks sectors that are already adjacent — same track, then the next — so after one initial seek the head barely
+moves and the platter simply feeds sector after sector; the per-sector cost collapses toward the raw transfer rate. A <strong>random</strong>
+read jumps to an unrelated sector each time, paying a fresh seek plus rotational latency — call it roughly 10&nbsp;ms — for every single access.
+The difference is not a constant factor; it is the difference between paying mechanical positioning <em>once</em> and paying it <em>every
+time</em>. This is why, on a hard disk, a few hundred random reads per second is a realistic ceiling while sequential throughput is hundreds of
+megabytes per second, and it is the physical reason databases were built, from the beginning, to turn random work into sequential work wherever
+they possibly can (McKusick's fast file system, Chapter 47's on-disk layout, and the log-structured designs of the next part all descend from
+this one fact).</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: the disk is not RAM — random access costs far more than sequential</span>
+<p><strong>1. In words.</strong> On storage, the cost of reaching data dominates the cost of reading it. On a spinning disk the reach is a
+mechanical seek plus rotation (~10&nbsp;ms); even on an SSD, small random I/O forfeits the streaming efficiency of large sequential I/O. So the
+same number of bytes costs far more fetched at random than fetched in order — the opposite of the uniform-cost RAM model.</p>
+<p><strong>2. As a picture.</strong> Figure 46.1: the latency cliff from L1 (~1&nbsp;ns) down to DRAM (~100&nbsp;ns), SSD (~100&nbsp;&micro;s), and
+hard disk (~10&nbsp;ms) on a log scale; beside it, two bars for the same 1&nbsp;GiB moved through this machine's storage stack — large sequential
+streaming versus small random 4&nbsp;KiB reads — the random bar a sliver of the sequential one.</p>
+<p><strong>3. As numbers/contrast.</strong> Measured here (1&nbsp;GiB, <code>O_DIRECT</code>, queue depth 1): sequential 1&nbsp;MiB-block streaming
+at <strong>~916&nbsp;MB/s</strong> against random 4&nbsp;KiB reads at <strong>~19&nbsp;MB/s</strong> and ~221&nbsp;&micro;s per read — about
+<strong>49&times;</strong> more throughput for the same device when the access is sequential (&sect;46.4).</p>
+</aside>
+
+<p><em>(Answer to the &sect;46.1 quick check: fastest to slowest — L1 hit ~1&nbsp;ns, DRAM ~100&nbsp;ns, flash-SSD read ~tens&ndash;100&nbsp;&micro;s,
+hard-disk seek ~10&nbsp;ms, all published/typical. A hard-disk seek is roughly <strong>100,000&times;</strong> a DRAM access, so on the order of a
+hundred thousand DRAM accesses fit in one seek — the cliff a database spends its life avoiding.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The storage cliff (log scale), and the same 1 GiB moved sequentially vs at random on this machine.</text>
+<text x="12" y="38" font-size="9" fill="#8c3a1d">Latency, published/typical (log scale) &mdash; each step is ~1000x</text>
+<rect x="20" y="48" width="40" height="16" fill="#dfe8f4" stroke="#14406b"/><text x="66" y="60" font-size="8">L1 hit ~1 ns</text>
+<rect x="20" y="70" width="90" height="16" fill="#dfe8f4" stroke="#14406b"/><text x="116" y="82" font-size="8">DRAM ~100 ns</text>
+<rect x="20" y="92" width="150" height="16" fill="#e7dff4" stroke="#5a3a8c"/><text x="176" y="104" font-size="8">SSD read ~100 &micro;s (~1000x DRAM)</text>
+<rect x="20" y="114" width="230" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="256" y="126" font-size="8">hard-disk seek ~10 ms (~100,000x DRAM)</text>
+<text x="20" y="150" font-size="8" fill="#8c3a1d">A database lives below DRAM: every access it fails to avoid falls off this cliff.</text>
+<line x1="12" y1="162" x2="628" y2="162" stroke="#b9c2cc"/>
+<text x="12" y="182" font-size="9" fill="#2f7d32">Measured (1 GiB, O_DIRECT, queue depth 1): sequential streaming vs random 4 KiB</text>
+<rect x="20" y="192" width="500" height="22" fill="#dfe8f4" stroke="#14406b"/><text x="26" y="207" font-size="9" fill="#14406b">sequential 1 MiB blocks &mdash; ~916 MB/s</text>
+<rect x="20" y="220" width="10" height="22" fill="#f6dcd2" stroke="#8c3a1d"/><text x="36" y="235" font-size="9" fill="#8c3a1d">random 4 KiB &mdash; ~19 MB/s, ~221 &micro;s/read (~49x less)</text>
+<text x="12" y="266" font-size="8" fill="#14406b">Same device, same bytes: the access pattern &mdash; not the hardware &mdash; is the 49x.</text>
+<text x="12" y="286" font-size="8" fill="#5a3a8c">On flash there is no seek, so single 4 KiB random ~= sequential (~1.24x here); the gap above is streaming vs small I/O.</text>
+</svg>
+<figcaption>Figure 46.1: Storage sits one to five orders of magnitude below DRAM (top, log scale). For the same 1&nbsp;GiB on this machine
+(bottom), large sequential streaming reaches ~916&nbsp;MB/s while small random 4&nbsp;KiB reads reach ~19&nbsp;MB/s — a ~49&times; gap set by the
+<em>access pattern</em>, not by the device.</figcaption>
+</figure>
+
+<h2>46.3 The flash SSD: erase blocks, the FTL, and wear</h2>
+
+<p>A solid-state drive has no moving parts: it stores bits as trapped charge in <strong>NAND flash</strong> cells, and reads them electronically,
+so there is no seek and no rotation. That single fact changes the cost model — random reads on an SSD are cheap, close to sequential, because
+there is nothing mechanical to reposition. But flash has its own awkward physics, and a database that assumes an SSD is just &ldquo;a fast
+disk&rdquo; will be surprised by writes. Flash is organized into <strong>pages</strong> (typically a few kilobytes, the unit of read and
+<em>program</em>/write) grouped into <strong>erase blocks</strong> (typically hundreds of pages, the unit of <em>erase</em>). The awkward rule is
+this: you can read any page and you can program an <em>empty</em> page, but you <strong>cannot overwrite a page in place</strong> — to rewrite it
+you must first erase its entire surrounding block, and erase is slow and can only be done a limited number of times before the cells wear out. No
+sane system erases a whole block to change one page, so every SSD hides a <strong>Flash Translation Layer</strong> (FTL): a controller that maps
+logical block addresses (what the OS sees) to physical flash pages (where the data actually is), writes updated data to a fresh already-erased
+page and remaps the pointer, garbage-collects blocks whose pages are mostly stale, and spreads writes across all blocks so no cell wears out
+first — <strong>wear leveling</strong> (Agrawal et al., &ldquo;Design Tradeoffs for SSD Performance,&rdquo; USENIX ATC 2008; OSTEP,
+&ldquo;Flash-based SSDs&rdquo;). The consequences a database designer must keep in mind: reads are fast and pattern-insensitive; a random small
+<em>write</em> can trigger far more physical work than it seems (a read-erase-reprogram cycle plus garbage collection), an effect called
+<strong>write amplification</strong>; and the device has a finite write lifetime. So the sequential-write preference that the hard disk taught for
+mechanical reasons survives on the SSD for a completely different reason — large sequential writes are friendlier to the FTL's erase-block
+structure and cause less amplification. As a small confirmation that flash has no seek, the single-4&nbsp;KiB reads measured on this machine came
+out only about <strong>1.24&times;</strong> slower at random offsets than at sequential ones (&sect;46.4) — a hard disk would show that same
+comparison as a chasm, because each random read there would pay a fresh ~10&nbsp;ms seek.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>On an SSD, why is a random <em>read</em> nearly as cheap as a sequential one, when on a hard disk it is far more expensive? Why is a small
+random <em>write</em> the operation an SSD dislikes, and what is the layer that hides in-place-overwrite from the OS called? (Answer below the
+communicate box.)</p>
+</aside>
+
+<h2>46.4 The block layer and sequential vs random, measured</h2>
+
+<p>Above the device, the operating system presents storage as the <strong>block layer</strong>: a linear array of fixed-size blocks, addressed by
+number, that you read and write a whole block at a time. On this machine, <code>/sys/block/sdd/queue/logical_block_size</code> is
+<strong>512</strong> (the smallest addressable unit the device advertises) and <code>physical_block_size</code> is <strong>4096</strong> (the size
+the device actually operates on internally); a database will choose a page size that is a multiple of that physical block — 4, 8, or 16&nbsp;KiB
+— precisely so that one page is one natural unit of device I/O. The block abstraction is why a database thinks in <em>pages</em>, not bytes
+(Chapter 47): the smallest thing you can fetch or store is a block, so making the byte the unit of I/O would waste almost all of every transfer.
+To measure the sequential-versus-random gap directly, the program reads a 1&nbsp;GiB file with <code>O_DIRECT</code> — which bypasses the page
+cache so each read reaches the storage stack — two ways: streaming the whole file in 1&nbsp;MiB blocks, and fetching 4&nbsp;KiB pages at
+uniformly random offsets. Best of several trials on this machine:</p>
+
+<pre><code>read 1 GiB, O_DIRECT (page cache bypassed), single thread, queue depth 1:
+  sequential, 1 MiB blocks :  ~916 MB/s
+  random,     4 KiB pages   :  ~19 MB/s   (~221 &micro;s/read, ~4,500 IOPS)
+  sequential streaming is ~49x the throughput of small random I/O
+  (single 4 KiB reads: random only ~1.24x slower than sequential -> flash has no seek)
+</code></pre>
+
+<p>The sequential stream moved bytes at about <strong>49&times;</strong> the throughput of the small random reads — 916 against 19&nbsp;MB/s —
+on the exact same device, in the same run. Two distinct effects combine to produce that gap, and it is worth separating them because they teach
+different lessons. The first is <strong>I/O size</strong>: the sequential test asks for 1&nbsp;MiB at a time and the random test for 4&nbsp;KiB, so
+the sequential test amortizes each request's fixed overhead over 256&times; more data; big requests are efficient, tiny requests are not. The
+second is <strong>access pattern</strong>: the random test scatters its reads, forfeiting any readahead or locality the stack could exploit. That
+the <em>single</em>-4&nbsp;KiB comparison (sequential vs random at the same small size) came out only ~1.24&times; apart tells you that on this
+flash-backed device the pattern penalty alone is modest — there is no seek — and that most of the 49&times; is the I/O-<em>size</em> effect, the
+reward for fetching in bulk. On a real spinning disk the same experiment would show the pattern penalty exploding instead, because each random
+read would pay a mechanical seek. Either way the engineering conclusion is identical, and it is the reason a database is built the way it is:
+<strong>read and write in large, sequential, block-aligned units, and avoid a storm of tiny random accesses.</strong> Hold the WSL2 caveat
+firmly, though — 221&nbsp;&micro;s per random read and 4,500 IOPS are the numbers for <em>this virtualised disk at queue depth one</em>; a bare
+NVMe SSD driven with deep request queues does far more, and a spinning disk far less. The <em>shape</em> of the result — sequential vastly beats
+small random — is the portable lesson; the digits are this machine's.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: treating the disk as random-access memory &mdash; assuming any access costs the same</span>
+<p>The most expensive mistake in storage design is to carry the RAM model (Chapter 1) down to the disk: to lay data out, or write access code, as
+if fetching a record from a random offset costs the same as streaming the next one. It does not — measured here, small random I/O ran at
+1/49&nbsp;of sequential throughput, and on a spinning disk the ratio would be far worse because each random access pays a mechanical seek. The
+trap surfaces as designs that scatter related data across the file and then chase it with a pointer per record, or that update rows in place at
+random offsets, and then are baffled that the system is slow despite &ldquo;not doing much I/O&rdquo; — it is doing the <em>worst kind</em> of
+I/O. Two secondary traps live here too. First, do not trust a single flag or number: this machine's <code>/sys/block/sdd/rotational</code> reads
+<strong>1</strong> though the backing store is an NVMe SSD (a WSL2 virtio artifact), so a design that branched on that flag would be wrong; and the
+221&nbsp;&micro;s random-read latency is a queue-depth-one virtualised figure, not a device ceiling. Second, do not assume an SSD's cheap random
+<em>reads</em> mean cheap random <em>writes</em> — the FTL makes small random writes amplify (&sect;46.3). The defense is the discipline this part
+builds: think in block-sized pages, prefer large sequential I/O, keep related data physically together, and turn unavoidable random work into
+sequential work (the log, the buffer pool, the B-tree's fanout) rather than pretending the disk is flat.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Let's store each record at whatever offset in the file, and keep a hash table from record
+ID to byte offset. To read a record we just <code>seek</code> there and read it. Disks are random-access anyway, so it'll be fast.&rdquo; Cover
+the paragraph and respond in four or five sentences, drawing on &sect;46.2 and &sect;46.4.</p>
+<p><em>Model answer.</em> &ldquo;The premise is the trap — a disk is not random-access like RAM. I measured small random 4&nbsp;KiB reads on our
+storage at about 19&nbsp;MB/s and ~221&nbsp;&micro;s each, against ~916&nbsp;MB/s streaming sequentially: roughly 49&times; slower for the same
+bytes, and on a spinning disk it would be far worse because every seek is mechanical, on the order of 10&nbsp;ms. A seek-per-record design turns
+every lookup and especially every scan into a storm of the most expensive I/O there is. The reason databases use fixed-size <strong>pages</strong>
+and pack related records together is exactly to fetch in large, block-aligned, mostly-sequential units and to keep hot pages in a buffer pool so
+most reads never touch the disk at all. So let's not scatter records at arbitrary offsets; let's lay them out in pages, and if we need lookup by
+ID, that's what an index is for — it's built to reach a record in a few page reads, not one seek per record.&rdquo; Naming the measured
+sequential-vs-random gap, the page as the I/O unit, and the buffer pool as the thing that avoids the cliff is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;46.3 quick check: a random read is cheap on an SSD because flash is addressed electronically — there is no head to move
+or platter to rotate, so reaching any page costs the same; on a hard disk a random read pays a mechanical seek plus rotational latency each time.
+A small random <strong>write</strong> is the SSD's weak spot because flash cannot be overwritten in place — the surrounding erase block must be erased
+first — so the controller must write elsewhere, remap, and later garbage-collect, causing <strong>write amplification</strong>; the layer that
+hides in-place overwrite and does the remapping, garbage collection, and wear leveling is the <strong>Flash Translation Layer</strong>,
+the&nbsp;FTL.)</em></p>
+
+<h2>46.5 What to carry forward</h2>
+
+<p>Storage sits one to five orders of magnitude below DRAM, and a database spends its life avoiding, batching, and amortizing the trip down the
+cliff (&sect;46.1). A spinning hard disk pays a mechanical <strong>seek</strong> plus rotational latency to reach data — on the order of
+10&nbsp;ms — so sequential access, which pays that once, beats random access, which pays it every time; this is the physical origin of every
+&ldquo;keep related data together&rdquo; rule in the volume (&sect;46.2). A flash <strong>SSD</strong> has no seek, so random reads are cheap, but
+it cannot overwrite in place, so a <strong>Flash Translation Layer</strong> remaps writes, garbage-collects, and levels wear, making small random
+writes amplify — the sequential-write preference survives for a new reason (&sect;46.3). Above the device the <strong>block layer</strong> presents
+fixed-size blocks (physical block 4096 on this machine), which is why a database thinks in <em>pages</em>; and measured here, large sequential
+streaming beat small random I/O by ~<strong>49&times;</strong> on the same device — the portable lesson being <em>read and write in large,
+sequential, block-aligned units</em> (&sect;46.4). Multiple disks can be combined for throughput and redundancy — the RAID idea (Patterson,
+Gibson &amp; Katz, 1988) — but even then the per-device physics above is what each disk contributes.</p>
+
+<p>That physics is the foundation the rest of this volume builds on, and the shape of what follows is already visible. The next chapter
+(Chapter 47) takes the block layer's fixed-size unit and makes it the database's currency: the <strong>page</strong>, laid out to hold
+variable-length records, and the file as a linear array of pages — the on-disk format a storage manager reads and writes, with the durability
+barrier (<code>fsync</code>) that Chapter 41 introduced now costed page by page. Chapter 48 then confronts the cliff head-on with the
+<strong>buffer pool</strong>: the database's own hand-managed cache of pages in DRAM, so that most accesses hit memory and only misses fall to
+the disk — the same demand-paging problem as Chapter 17, solved deliberately because the database knows its own access patterns. And beyond this
+part, the two great storage-engine families — B-trees and log-structured merge trees — are each an answer to this chapter's cost model: the
+B-tree minimizes the number of disk accesses per lookup, and the LSM tree turns random writes into sequential ones. The disk is the floor; know
+what it costs to touch it, and every structure above it stops being arbitrary and starts being <em>forced</em>.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Place storage on the memory hierarchy and give the published/typical latency of DRAM, an SSD read, and a hard-disk seek.</li>
+<li>Decompose a hard-disk read into seek, rotational latency, and transfer, and explain why sequential beats random.</li>
+<li>Explain why an SSD has no seek, what an erase block is, and why the FTL exists.</li>
+<li>Define write amplification and say why small random writes are an SSD's weak spot.</li>
+<li>State what the block layer presents, why a database thinks in pages, and the physical block size of this machine's disk.</li>
+<li>Quote the measured sequential-vs-random gap here (~49&times;) and separate the I/O-size effect from the access-pattern effect.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Roughly how much slower is a hard-disk seek than a DRAM access, and why does that ratio organize all of storage design? (&sect;46.1)</li>
+<li><strong>R2.</strong> What two mechanical delays must finish before a hard disk transfers data, and why does that make random access far costlier than sequential? (&sect;46.2)</li>
+<li><strong>R3.</strong> Why can't flash be overwritten in place, and what three jobs does the FTL do about it? (&sect;46.3)</li>
+<li><strong>R4.</strong> What does the block layer present, and why does a database choose a page size that is a multiple of the physical block size? (&sect;46.4)</li>
+<li><strong>R5.</strong> What was the measured sequential-vs-random throughput ratio here, and which part of it is I/O size versus access pattern? (&sect;46.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Remzi H. Arpaci-Dusseau &amp; Andrea C. Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em>, &ldquo;Hard Disk Drives&rdquo;
+(free online, pages.cs.wisc.edu/~remzi/OSTEP).</strong> The clearest short treatment of the source for &sect;46.2: platters, tracks, sectors, and
+the seek + rotation + transfer decomposition of a disk access. First authors the Arpaci-Dusseaus; chapter title verified against the online
+edition.</li>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>OSTEP</em>, &ldquo;Flash-based SSDs.&rdquo;</strong> The reference for &sect;46.3: NAND pages
+and erase blocks, the read/program/erase asymmetry, the Flash Translation Layer, garbage collection, and wear leveling — chapter title verified
+against the online edition.</li>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2016), ISBN
+978-0-13-409266-9, Chapter 6 (&ldquo;The Memory Hierarchy&rdquo;).</strong> The source for &sect;46.1's hierarchy and its published latency
+magnitudes, including disk geometry from a programmer's viewpoint. First author Randal E. Bryant; edition and ISBN verified via the publisher.</li>
+<li><strong>Nitin Agrawal, Vijayan Prabhakaran, Ted Wobber, John D. Davis, Mark Manasse &amp; Rina Panigrahy, &ldquo;Design Tradeoffs for SSD
+Performance,&rdquo; <em>USENIX Annual Technical Conference</em> (2008).</strong> The design-space study behind &sect;46.3: FTL policies, write
+amplification, and how workload shapes SSD performance and lifetime. First author Nitin Agrawal; venue and year verified via the USENIX
+proceedings.</li>
+<li><strong>David A. Patterson, Garth Gibson &amp; Randy H. Katz, &ldquo;A Case for Redundant Arrays of Inexpensive Disks (RAID),&rdquo; <em>Proc.
+ACM SIGMOD</em> (1988), DOI 10.1145/50202.50214.</strong> The origin of combining many disks for throughput and redundancy, referenced in
+&sect;46.5. First author David A. Patterson; venue, year, and DOI verified via the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex46.1"><span class="ex-label">46.1</span> <span class="ex-tag warm">warm-up</span>
+Give the published/typical latency magnitude of each and order them: an L1 cache hit, a DRAM access, a flash-SSD read, a hard-disk seek.</div>
+
+<div class="exercise" id="ex46.2"><span class="ex-label">46.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two mechanical delays a spinning hard disk pays before it can transfer a sector, and say in one sentence why they make random reads far
+costlier than sequential ones.</div>
+
+<div class="exercise" id="ex46.3"><span class="ex-label">46.3</span> <span class="ex-tag warm">warm-up</span>
+Why can a flash SSD not overwrite a page in place, and what is the unit it must erase before rewriting?</div>
+
+<div class="exercise" id="ex46.4"><span class="ex-label">46.4</span> <span class="ex-tag core">core</span>
+The hard-disk cost model. (a) Write the total time to read one sector as the sum of three terms and name each. (b) A drive has a 9&nbsp;ms average
+seek, spins at 7200&nbsp;RPM, and transfers at 150&nbsp;MB/s. Estimate the time to read one 4&nbsp;KiB sector at a random location, and identify
+which term dominates. (c) Estimate the time to read 1&nbsp;MiB laid out sequentially, and explain why the per-byte cost is now completely
+different.</div>
+
+<div class="exercise" id="ex46.5"><span class="ex-label">46.5</span> <span class="ex-tag core">core</span>
+Flash asymmetry. (a) Explain why a random <em>read</em> on an SSD is nearly as fast as a sequential one, but a random small <em>write</em> can be
+much more expensive. (b) Define write amplification and give the sequence of physical operations a single small overwrite can trigger. (c) State
+the sequential-write preference that both a hard disk and an SSD share, and why the <em>reason</em> differs between them.</div>
+
+<div class="exercise" id="ex46.6"><span class="ex-label">46.6</span> <span class="ex-tag core">core</span>
+The measurement. (a) On this machine sequential streaming reached ~916&nbsp;MB/s and random 4&nbsp;KiB reads ~19&nbsp;MB/s; name the two distinct
+effects that together produce the ~49&times; gap. (b) The <em>single</em>-4&nbsp;KiB comparison was only ~1.24&times; — what does that tell you
+about which of the two effects dominates on this flash-backed device? (c) Why would the same experiment on a spinning disk shift the balance
+between the two effects?</div>
+
+<div class="exercise" id="ex46.7"><span class="ex-label">46.7</span> <span class="ex-tag complexity">cost</span>
+A workload issues <var>N</var> record reads. Under design A each record is at a random offset (one random I/O per read); under design B records
+are packed 100 to a page and reads have good locality, so on average one page read serves 100 records. Let a random page read cost
+<var>t</var><sub>r</sub>. (a) Write the total I/O time for each design. (b) On a hard disk with <var>t</var><sub>r</sub>&nbsp;&asymp;&nbsp;10&nbsp;ms
+and <var>N</var>&nbsp;=&nbsp;10<sup>6</sup>, compute both. (c) Explain what the 100&times; factor physically represents and why it is the whole
+argument for pages.</div>
+
+<div class="exercise" id="ex46.8"><span class="ex-label">46.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team benchmarks their storage by reading a 1&nbsp;GiB file with a plain buffered <code>read</code>
+loop, sees 6&nbsp;GB/s, and concludes &ldquo;random and sequential are the same on our disk, so we don't need to worry about layout.&rdquo;
+<br><strong>Step 1 (given):</strong> a plain <code>read</code> loop hits the OS page cache, so a warm file is served from DRAM, not the device.
+<br><strong>Step 2 (given):</strong> to measure the device you must bypass the cache (<code>O_DIRECT</code> or an uncached file) and vary the
+access pattern and I/O size.
+<br><strong>Step 3 (given):</strong> doing so on this machine gave ~916&nbsp;MB/s sequential vs ~19&nbsp;MB/s random 4&nbsp;KiB.
+<br><strong>Step 4 (you):</strong> Explain why the team's 6&nbsp;GB/s measured DRAM rather than the disk, why their conclusion is exactly
+backwards, and what they should measure instead.</div>
+
+<div class="exercise" id="ex46.9"><span class="ex-label">46.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether it is limited mainly by <em>seek/positioning</em>, by <em>I/O size</em>, by <em>flash write amplification</em>, or by
+<em>the DRAM ceiling</em>, and why: (a) 10,000 random 4&nbsp;KiB reads from a cold spinning disk; (b) streaming a 10&nbsp;GiB file sequentially
+from an SSD; (c) 10,000 random 4&nbsp;KiB reads from a warm page cache; (d) a benchmark doing millions of tiny random overwrites on an SSD; (e)
+reading 4&nbsp;KiB pages one at a time versus 1&nbsp;MiB blocks from the same SSD.</div>
+
+<div class="exercise" id="ex46.10"><span class="ex-label">46.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;An SSD read is about as fast as a DRAM read.&rdquo; (b)
+&ldquo;On a hard disk, reading data sequentially is faster than reading it at random because the transfer rate is higher for sequential
+data.&rdquo; (c) &ldquo;Because an SSD has no seek, random writes are as cheap as random reads.&rdquo; (d) &ldquo;A database reads and writes in
+fixed-size pages because the block layer's smallest unit is a block.&rdquo; (e) &ldquo;<code>/sys/block/sdd/rotational</code> is 1, so this machine
+has a spinning disk.&rdquo;</div>
+
+<div class="exercise" id="ex46.11"><span class="ex-label">46.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the cost model. (a) State the one sentence about disks that forces the shape of B-trees, logs, and buffer pools, and explain in one
+line each how those three structures answer it. (b) The chapter measured a ~49&times; sequential-vs-random gap yet a ~1.24&times; single-read gap
+on the <em>same</em> device; explain why both numbers are true and what each one is actually measuring. (c) Argue why &ldquo;know where the bytes
+physically are and what it costs to reach them&rdquo; is the same discipline that unified Volume 1's I/O part, now applied one level down at the
+device.</div>
+
+<div class="exercise" id="ex46.12"><span class="ex-label">46.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Read <code>/sys/block/&lt;dev&gt;/queue/rotational</code>, <code>logical_block_size</code>, and
+<code>physical_block_size</code> for the disk your files live on, and report them. (b) Read a large file two ways with <code>O_DIRECT</code> —
+streaming in large blocks and fetching small pages at random offsets — and report throughput, per-read latency, and IOPS for each. (c) State your
+toolchain and CPU, note the times are wall-clock (no hardware counters), say whether your machine is virtualised, and explain which part of your
+sequential-vs-random gap is I/O size and which is access pattern — and how you could tell them apart with a third measurement.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch47">
+<h1>Chapter 47 — Files and Pages: The Database on Disk</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (the block layer and why sequential, block-aligned I/O
+wins), <a href="#ch41">Chapter 41</a> (durability, <code>fsync</code>, and what &ldquo;written&rdquo; really means),
+<a href="#ch40">Chapter 40</a> (the page cache the OS keeps under your <code>write</code>), <a href="#ch07">Chapter 7</a> (memory layout and
+alignment — we lay records out in bytes the same way), <a href="#ch11">Chapter 11</a> (buffer bounds — an on-disk page is a fixed-size buffer you
+must not overrun). &nbsp;·&nbsp; The last chapter established what the device costs. This one gives the database its on-disk shape: a file treated
+as an array of fixed-size <em>pages</em>, each page a little heap of records, each page write made durable at a price we now measure.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch46">Chapter 46</a> — the block layer hands you fixed-size blocks and rewards large, block-aligned, sequential I/O;
+what unit should a database therefore read and write in? (2) <a href="#ch41">Chapter 41</a> — after <code>write</code> returns, is your data on
+the disk platter yet, and what call forces it there? (3) <em>Predict:</em> a program appends 2,000 small pages to a file two ways — calling
+<code>fsync</code> once at the end, and calling <code>fsync</code> after <em>every</em> page (as a paranoid &ldquo;make each record durable
+immediately&rdquo; loop might). Two questions: how many durable writes per second do you think the per-page version can sustain, and how many times
+slower is it than the batched version — 3&times;, 10&times;, 100&times;? Write your guesses; &sect;47.4 answers them.</p>
+</aside>
+
+<p>A database has to turn the block layer's flat array of numbered blocks into something it can store rows in, look rows up in, and update
+without rewriting the world. The abstraction it chooses, almost universally, is the <strong>page</strong>: a fixed-size chunk — 4, 8, or
+16&nbsp;KiB, a multiple of the device's physical block (Chapter 46) — that is the unit of everything. The database file is one large array of
+pages; the storage manager reads and writes a whole page at a time; the buffer pool (Chapter 48) caches whole pages; the B-tree and the log are
+built out of pages. Inside a page lives a small, self-contained data structure that packs variable-length records and lets you add, find, and
+delete them without disturbing their neighbors. And because a page only becomes durable when you pay the barrier of Chapter 41, the cost of
+<em>persisting</em> a page — not just computing it — becomes a first-class number the design must respect. This chapter builds the on-disk
+database in five steps: the file as a linear space of pages, and page-number-to-offset arithmetic (&sect;47.1); the slotted-page layout that holds
+variable-length records (&sect;47.2); how a single record is laid out in bytes, with fixed and variable fields and a null bitmap (&sect;47.3); the
+cost of making a page durable, measured, and the torn-write hazard (&sect;47.4); and what the storage manager carries into the buffer pool and
+beyond (&sect;47.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The program is C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code>; times are wall-clock and a hardware-counter profiler
+(<code>perf</code>) is <em>not</em> installed. The durability measurement writes 4&nbsp;KiB pages to an <code>ext4</code> file on this machine's
+WSL2 virtual disk (<code>/dev/sdd</code>, <code>physical_block_size</code>&nbsp;4096) and calls <code>fsync</code>/<code>fdatasync</code>; because
+this is a <strong>virtualised</strong> disk behind a hypervisor, the per-<code>fsync</code> cost reflects that stack, not a bare NVMe SSD with
+power-loss-protected cache — the <em>ratio</em> between per-page and batched syncing is the portable lesson, and the run-to-run variance (noted
+below) is real. The slotted-page and record layouts are described in structural terms and cross-checked against the standard references
+(Hellerstein et al.; Ramakrishnan &amp; Gehrke, Chapter 9).</p>
+
+<h2>47.1 The database file: a linear space of pages</h2>
+
+<p>The storage manager takes one (or a few) ordinary OS files and treats each as a contiguous array of fixed-size <strong>pages</strong>, numbered
+0, 1, 2, and so on. That is the entire on-disk model, and its power is in the arithmetic: page number <var>p</var> lives at byte offset
+<var>p</var>&nbsp;&times;&nbsp;<var>pagesize</var>, so to read page <var>p</var> the manager issues <code>pread(fd, buf, pagesize, p*pagesize)</code>
+and to write it, <code>pwrite</code> at the same offset — a whole page, always, never a partial byte range. Choosing <var>pagesize</var> a multiple
+of the device's physical block (4096 on this machine) means one page is a clean unit of device I/O, so a page read is a single well-aligned
+block transfer and a page write does not force the device to read-modify-write a block it only partly touched. This is the direct payoff of
+Chapter 46: the page is the granularity at which the database pays the disk, chosen to match the granularity at which the disk charges. A page
+identifier — the pair (file, page number) — is the database's fundamental address, the equivalent of a pointer but for data that lives on disk
+and outlives the process; everything higher up, from a row's location to a B-tree node's children, is ultimately expressed as page numbers.
+Growing the file is just appending pages at the end (a sequential write, the pattern the disk likes); the manager keeps track of which pages are
+in use, often with a small allocation structure or a free-space map, but the essential picture stays simple: <strong>the database on disk is an
+array of pages, addressed by number, read and written whole.</strong></p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Given a page size of 8&nbsp;KiB, at what byte offset does page number 5 begin, and how many bytes does the storage manager read to fetch it?
+Why is choosing the page size to be a multiple of the device's physical block size (4096 here) worth doing? (Answer after the next section.)</p>
+</aside>
+
+<h2>47.2 Inside a page: the slotted-page layout</h2>
+
+<p>A page has to hold records that are <em>variable-length</em> — a row with a short name and a row with a long one — and it has to let you
+insert, delete, and occasionally grow them without shifting every other record or leaving unusable gaps. The structure that solves this, used by
+essentially every row-store, is the <strong>slotted page</strong> (Ramakrishnan &amp; Gehrke, Chapter 9; Hellerstein et al., the storage-manager
+section). The page is a fixed-size buffer with two regions that grow toward each other from opposite ends. At the top is a small
+<strong>header</strong> (how many slots, where the free space begins) followed by a <strong>slot directory</strong> — an array of slots that grows
+<em>downward</em>; at the bottom is the record data, which grows <em>upward</em>. Each <strong>slot</strong> is a tiny fixed-size entry holding the
+(offset, length) of one record within the page. To find a record you index into the slot directory and follow its offset; to insert one you place
+its bytes just above the current record data, add a slot pointing at them, and advance both boundaries; to delete one you mark its slot free (and
+can later compact the page to reclaim the hole). This indirection — you address a record by <em>slot number</em>, and the slot holds the real
+offset — is what makes the layout flexible: a record can be moved within the page (during compaction) and only its slot's offset changes, so
+every external reference, which names the slot, stays valid. That external reference is the <strong>record identifier</strong>, the pair (page
+number, slot number), and it is how an index or a scan names a specific row: the page number gets you the page from disk (or the buffer pool), and
+the slot number gets you the record within it. Two design points fall out. First, the slot directory means records need not be stored in any
+particular order, yet can be scanned in slot order and addressed stably — order on disk and order of reference are decoupled. Second, when a
+record must grow beyond the free space of its page, the layout offers an escape: leave a <strong>forwarding</strong> pointer in the original slot
+to the record's new home on another page, so its record identifier still resolves — at the cost of one extra page access, a small echo of Chapter
+46's &ldquo;one more disk trip&rdquo; being the unit of expense.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: address records by slot, not by raw offset, so they can move within a page</span>
+<p><strong>1. In words.</strong> A slotted page keeps a directory of (offset, length) slots at one end and the record bytes at the other. You name a
+record by its slot number; the slot holds where the bytes actually are. So the page can compact or rearrange records and only slots change — every
+outside reference, which uses the slot number, keeps working.</p>
+<p><strong>2. As a picture.</strong> Figure 47.1: a page with a header and a slot directory growing down from the top, record data growing up from
+the bottom, free space in the middle; arrows from two slots to their records, and a third slot marked free (a deleted record's hole awaiting
+compaction).</p>
+<p><strong>3. As numbers/contrast.</strong> A record identifier is (page number, slot number): the page number costs one page fetch — a buffer-pool
+hit (~tens of ns) or a disk miss (~hundreds of &micro;s, Chapter 48) — and the slot number costs an array index. Storing a raw byte offset instead
+would save the indirection but freeze every record in place; the slot's one extra lookup buys the freedom to compact and reclaim space.</p>
+</aside>
+
+<p><em>(Answer to the &sect;47.1 quick check: page 5 begins at byte offset 5&nbsp;&times;&nbsp;8192&nbsp;=&nbsp;40,960, and the manager reads the
+whole page — 8,192 bytes — to fetch it. Making the page size a multiple of the physical block (4096) means each page read is one aligned block
+transfer and each page write covers whole device blocks, so the device never has to read-modify-write a block the page only partly filled — the
+page is charged as one clean unit of I/O.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 260" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A slotted page: directory grows down, records grow up, free space between; a record ID is (page, slot).</text>
+<rect x="60" y="30" width="520" height="200" fill="#f7f9fb" stroke="#333"/>
+<rect x="60" y="30" width="520" height="22" fill="#dfe8f4" stroke="#14406b"/><text x="66" y="45" font-size="9" fill="#14406b">header: #slots=3, free-space pointer</text>
+<rect x="60" y="52" width="120" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="66" y="66" font-size="8">slot 0 -&gt; off,len</text>
+<rect x="180" y="52" width="120" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="186" y="66" font-size="8">slot 1 -&gt; off,len</text>
+<rect x="300" y="52" width="120" height="20" fill="#eef1f4" stroke="#999"/><text x="306" y="66" font-size="8">slot 2 (free)</text>
+<text x="66" y="90" font-size="8" fill="#8c3a1d">slot directory grows downward &darr;</text>
+<rect x="60" y="150" width="520" height="80" fill="#faf0ea" stroke="#8c3a1d"/>
+<rect x="360" y="150" width="220" height="80" fill="#f6dcd2" stroke="#8c3a1d"/><text x="366" y="165" font-size="8" fill="#8c3a1d">record for slot 0</text>
+<rect x="180" y="150" width="180" height="80" fill="#fbe9e0" stroke="#8c3a1d"/><text x="186" y="165" font-size="8" fill="#8c3a1d">record for slot 1</text>
+<text x="66" y="200" font-size="8" fill="#8c3a1d">record data grows upward &uarr;</text>
+<text x="200" y="120" font-size="9" fill="#2f7d32">&larr; free space &rarr;</text>
+<path d="M120 72 L470 150" stroke="#14406b" stroke-width="1" fill="none"/>
+<path d="M240 72 L270 150" stroke="#14406b" stroke-width="1" fill="none"/>
+<text x="12" y="250" font-size="8" fill="#14406b">Delete = mark slot free (leaves a hole); compaction slides records and updates only their slots; outside refs use the slot number.</text>
+</svg>
+<figcaption>Figure 47.1: A slotted page. The header and slot directory grow down from the top; record bytes grow up from the bottom; free space
+sits between. A record is addressed by its slot number, so compaction can move the bytes and only the slot's offset changes — every reference by
+(page, slot) stays valid.</figcaption>
+</figure>
+
+<h2>47.3 A record in bytes: fixed fields, variable fields, and nulls</h2>
+
+<p>Inside a slot's bytes is one <strong>record</strong> — a row — and laying it out is the same discipline as laying out a C struct (Chapter 7),
+with two complications the struct did not have: fields can be variable-length, and fields can be null. The standard layout splits the record into
+a fixed-length part and a variable-length part. Fixed-width columns (an <code>int</code>, a <code>double</code>, a timestamp) are stored inline at
+known offsets, so reading column three is a constant-offset load, exactly like a struct member — and alignment matters here for the same reason it
+did in Chapter 7, though on disk the tradeoff is space versus access convenience rather than a hardware fault. Variable-width columns (a
+<code>varchar</code>) cannot sit at a fixed offset because their length is not known at schema time, so the record stores, in the fixed part, an
+<strong>offset</strong> (or length) pointing into a variable-length area at the end of the record where the actual bytes live; reading such a
+column is a two-step indirection within the record, the same pattern as the slot directory one level up. Nullability is handled with a
+<strong>null bitmap</strong>: a small run of bits in the record header, one per nullable column, marking which columns are null so their storage
+can be omitted or ignored — checking a bit is cheaper and denser than storing a sentinel value in the field itself. Turning a record into these
+bytes is <strong>serialization</strong>; turning the bytes back into typed columns on read is <strong>deserialization</strong>; and the format is
+a contract the storage manager and everything above it must agree on, versioned carefully because a page written under one layout may be read
+years later. The through-line from Chapter 7 is exact: a record on disk is a struct whose layout you control byte for byte, extended to carry its
+own variability (offsets for variable fields) and its own optionality (the null bitmap) because, unlike an in-memory struct, it must be
+self-describing enough to survive the round trip to storage and back.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In a record with both fixed-width and variable-width columns, why can a fixed-width column be read at a constant offset while a variable-width
+column needs an offset stored in the record? What does the null bitmap buy over storing a special &ldquo;null&rdquo; value in each field?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>47.4 Making a page durable: the cost of the barrier, measured</h2>
+
+<p>Writing a page and <em>persisting</em> a page are different acts, and the gap between them is where Chapter 41's lesson becomes a number a
+storage engine must design around. When the manager calls <code>pwrite</code> to store a page, the data lands in the OS page cache and the call
+returns almost immediately — but the bytes are not yet on the device, and a crash now loses them (Chapter 40, Chapter 41). Durability requires the
+barrier: <code>fsync</code> (or <code>fdatasync</code>), which does not return until the device reports the data persisted. That barrier is
+expensive because it forces the one thing the whole stack is built to defer — an actual, acknowledged trip to the device — and worse, it cannot be
+pipelined away, so calling it per record serializes the workload behind the disk. To put a number on it, the program appends 2,000 4&nbsp;KiB
+pages two ways: one <code>fsync</code> at the very end, versus an <code>fsync</code> after <em>every</em> page. On this machine:</p>
+
+<pre><code>append 2,000 x 4 KiB pages to an ext4 file (WSL2 virtual disk), representative run:
+  fsync once at the end   :  ~0.06-0.07 s total   (~30-35 &micro;s/page amortized)
+  fsync after every page  :  ~6-8 s total         (~3-4 ms/page, ~250-310 durable writes/s)
+  -> per-page fsync is on the order of 100x slower than batching one sync at the end
+  (fdatasync per page is in the same 3-4 ms range; run-to-run variance is significant)
+</code></pre>
+
+<p>The batched version amortizes a single barrier over all 2,000 pages and finishes in tens of milliseconds; the per-page version pays a full
+device round trip 2,000 times and takes <em>seconds</em>, sustaining only a few hundred durable writes per second. The ratio — on the order of
+<strong>100&times;</strong> here — is the measured cost of confusing &ldquo;<code>write</code> returned&rdquo; with &ldquo;data is safe,&rdquo;
+and it is exactly why a database does not <code>fsync</code> after every row. Instead it <em>batches</em> durability: many changes are made in
+memory and to a sequential log, and one <code>fsync</code> makes a whole batch durable at once — group commit and the write-ahead log, which the
+durability part of this volume builds, are the disciplined answer to this measurement. There is a second, subtler hazard lurking in a page write:
+<strong>atomicity</strong>. A database page (say 8 or 16&nbsp;KiB) may be larger than the unit the device writes atomically, so a crash in the
+middle of persisting a page can leave it <strong>torn</strong> — half old bytes, half new — which corrupts the page rather than merely losing the
+update. Matching the page size to the device's physical block (4096 here) reduces the exposure, but the general defense, again, is the log: a
+technique like full-page logging or double-write records the page's intended contents somewhere durable first, so a torn page can be reconstructed
+after a crash. Both facts — the barrier's cost and the torn-write risk — point the same direction: durability is not free and not automatic, it is
+a specific expensive operation you batch and protect with a log, and pretending otherwise is how a &ldquo;safe&rdquo; storage layer becomes either
+unusably slow or quietly corrupt.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: fsync per record &mdash; paying the full durability barrier on every write</span>
+<p>The intuitive way to make data safe is to force it to disk immediately after each change: <code>write</code> the record, <code>fsync</code>,
+move on. It is correct, and it is catastrophically slow — measured here, an <code>fsync</code> per 4&nbsp;KiB page cost ~3&ndash;4&nbsp;ms and
+capped the system at a few hundred durable writes per second, roughly <strong>100&times;</strong> slower than syncing once at the end, because each
+sync is a full device round trip that cannot be pipelined. The trap is seductive because it passes every correctness test — the data really is
+durable after each call — so the bug is not wrongness but a throughput ceiling that only appears under load, when the system that benchmarked fine
+on one insert falls over at a few hundred inserts a second. Two related mistakes travel with it. First, believing <code>write</code> alone is
+durable (Chapter 41): it is not, the data sits in the page cache, so a crash loses it — under-syncing corrupts, over-syncing crawls, and both are
+failures to think about the barrier. Second, assuming a page write is <em>atomic</em>: a page larger than the device's atomic unit can be
+<strong>torn</strong> by a crash, leaving corruption, not just a lost update. The defense is the discipline the durability part formalizes: do not
+<code>fsync</code> per record — batch many changes behind one barrier, make durability a sequential-log write that one <code>fsync</code> commits
+in a group, and protect page atomicity by logging a page's contents before overwriting it in place. &ldquo;It's safe because we fsync every
+write&rdquo; and &ldquo;it sustains real write throughput&rdquo; are, without batching, not both true.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;To guarantee we never lose data, I made the storage layer <code>fsync</code> after every single
+row insert. It's rock-solid — I tested a crash and nothing was lost.&rdquo; Cover the paragraph and respond in four or five sentences, drawing on
+&sect;47.4.</p>
+<p><em>Model answer.</em> &ldquo;The correctness is right, but that design has a hard throughput ceiling we'll hit fast. An <code>fsync</code> is a
+full device round trip that can't be pipelined — I measured about 3&ndash;4&nbsp;ms per sync on our storage, which caps us at only a few hundred
+durable inserts per second, roughly 100&times; slower than syncing once for a batch. The fix isn't to sync less safely; it's to batch durability:
+make the changes in memory and to a sequential write-ahead log, then one <code>fsync</code> commits a whole group of inserts at once — that's what
+group commit is, and it keeps the same crash guarantee. We should also make sure a page write can't be torn across a crash — if our page is bigger
+than the device's atomic unit, we log the page before overwriting it. So let's keep the durability guarantee but move it to a batched log-and-sync
+instead of a sync per row; same safety, orders of magnitude more throughput.&rdquo; Naming the per-sync cost, the group-commit fix, and the
+torn-page risk is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;47.3 quick check: a fixed-width column has a known size, so its position within the record is a compile-time constant
+and reading it is a constant-offset load; a variable-width column's length is not known in advance, so it cannot occupy a fixed position — the
+record stores an offset/length in its fixed part pointing to the bytes in a variable-length area, and reading it takes that extra indirection. The
+null bitmap packs one bit per nullable column, so testing or marking null is a dense bit check and the column's storage can be omitted entirely,
+rather than reserving space in every row for a special sentinel value.)</em></p>
+
+<h2>47.5 What to carry forward</h2>
+
+<p>A database turns the block layer into an array of fixed-size <strong>pages</strong> addressed by number, where page <var>p</var> lives at offset
+<var>p</var>&nbsp;&times;&nbsp;<var>pagesize</var> and is read and written whole, the page size a multiple of the device's physical block so each
+page is a clean unit of I/O (&sect;47.1). Inside a page, the <strong>slotted-page</strong> layout keeps a directory of (offset, length) slots at
+one end and record bytes at the other, so records are addressed by slot number and can be compacted or moved while every (page, slot) record
+identifier stays valid (&sect;47.2). A <strong>record</strong> is laid out like a struct that must describe itself — fixed-width fields inline,
+variable-width fields via stored offsets into a trailing area, optionality via a null bitmap — serialized on write and deserialized on read
+(&sect;47.3). And persisting a page is a distinct, expensive act: measured here, an <code>fsync</code> per page cost ~3&ndash;4&nbsp;ms and
+~250&ndash;310 durable writes/s, on the order of <strong>100&times;</strong> slower than one batched barrier, while a page larger than the device's
+atomic unit risks a <strong>torn write</strong> — so durability must be batched and protected with a log (&sect;47.4).</p>
+
+<p>This is the storage manager's on-disk world, and it hands two things forward. The immediate one is the subject of the next chapter: pages are
+the unit of caching, and because a disk miss is hundreds of microseconds while a memory hit is tens of nanoseconds (Chapter 46), the database
+keeps hot pages in DRAM in its own hand-managed cache — the <strong>buffer pool</strong> of Chapter 48 — pinning pages in use, tracking which are
+dirty, and choosing which to evict when memory fills. The deferred one is the answer to this chapter's durability measurement: the batching-and-log
+discipline sketched in &sect;47.4 becomes, in the durability part of this volume, the write-ahead log and group commit that turn the expensive
+<code>fsync</code> barrier into a throughput a real system can sustain, and the torn-write defense into crash-consistent recovery. The page is the
+currency; the slot makes it flexible; the barrier makes durability real but costly. Everything the storage engines build next — B-tree nodes and
+LSM runs alike — is made of these pages, laid on this file, persisted through this barrier.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Give the offset of page <var>p</var> and explain why the page size is a multiple of the physical block size.</li>
+<li>Draw a slotted page and explain why records are addressed by slot number rather than raw offset.</li>
+<li>Define a record identifier and say what each of its two parts costs to resolve.</li>
+<li>Lay out a record with fixed and variable fields and a null bitmap, and say why variable fields need stored offsets.</li>
+<li>Quote the measured per-page vs batched <code>fsync</code> cost here and explain why per-record syncing is a throughput trap.</li>
+<li>Explain what a torn write is and why matching page size to the physical block, plus logging, defends against it.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> How does the storage manager turn a file into pages, and how does it compute where page <var>p</var> lives? (&sect;47.1)</li>
+<li><strong>R2.</strong> What are the parts of a slotted page, and why does addressing records by slot number allow compaction? (&sect;47.2)</li>
+<li><strong>R3.</strong> How are fixed-width, variable-width, and nullable columns stored in a record? (&sect;47.3)</li>
+<li><strong>R4.</strong> What were the measured per-page and batched <code>fsync</code> costs, and what does the ratio tell you to do? (&sect;47.4)</li>
+<li><strong>R5.</strong> What is a torn write, and what two defenses reduce or repair it? (&sect;47.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed. (McGraw-Hill, 2003), ISBN 978-0-07-246563-1,
+Chapter 9 (&ldquo;Storing Data: Disks and Files&rdquo;).</strong> The standard textbook treatment behind &sect;47.1&ndash;&sect;47.3: pages, the
+slotted-page layout, record formats, and record identifiers. First author Raghu Ramakrishnan; edition and ISBN verified via the publisher.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, DOI 10.1561/1900000002.</strong> The storage-manager sections frame &sect;47.1&ndash;&sect;47.4: the file and
+page abstraction, the buffer manager it feeds, and where durability sits. First author Joseph M. Hellerstein; venue, year, and DOI verified via
+the ACM Digital Library.</li>
+<li><strong>Marshall K. McKusick, William N. Joy, Samuel J. Leffler &amp; Robert S. Fabry, &ldquo;A Fast File System for UNIX,&rdquo; <em>ACM
+Transactions on Computer Systems</em> 2(3), 1984, pp. 181&ndash;197, DOI 10.1145/989.990.</strong> The classic on-disk-layout paper behind
+&sect;47.1: block sizes, allocation for locality, and turning random file access into sequential I/O — the file-system ancestor of a database's
+page file. First author Marshall K. McKusick; venue, year, and DOI verified via the ACM Digital Library.</li>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em>, &ldquo;File System Implementation&rdquo; (free
+online).</strong> The OS-level counterpart to &sect;47.1: how a file becomes blocks on a device, inodes, and allocation — the abstraction the
+database file sits on. First authors the Arpaci-Dusseaus; chapter title verified against the online edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex47.1"><span class="ex-label">47.1</span> <span class="ex-tag warm">warm-up</span>
+With a 4&nbsp;KiB page size, at what byte offset does page number 10 begin, and how many bytes does one page read transfer?</div>
+
+<div class="exercise" id="ex47.2"><span class="ex-label">47.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two regions of a slotted page and the direction each grows, and say what one slot contains.</div>
+
+<div class="exercise" id="ex47.3"><span class="ex-label">47.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: why does <code>write</code> returning not mean the data is durable, and what does <code>fsync</code> do about it?</div>
+
+<div class="exercise" id="ex47.4"><span class="ex-label">47.4</span> <span class="ex-tag core">core</span>
+Record identifiers. (a) What are the two components of a record identifier, and what does each cost to resolve? (b) Explain why addressing a record
+by slot number (not raw byte offset) lets the page compact away deletion holes without breaking outside references. (c) What is a forwarding
+pointer, when is it needed, and what does it cost on read?</div>
+
+<div class="exercise" id="ex47.5"><span class="ex-label">47.5</span> <span class="ex-tag core">core</span>
+Record layout. (a) For a row with an <code>int</code>, a <code>double</code>, and two <code>varchar</code> columns (one nullable), sketch the
+byte layout: fixed part, variable-length area, and null bitmap. (b) Explain why the two <code>varchar</code>s need stored offsets while the
+<code>int</code> and <code>double</code> do not. (c) Why is a null bitmap denser and cheaper than a sentinel value per field?</div>
+
+<div class="exercise" id="ex47.6"><span class="ex-label">47.6</span> <span class="ex-tag core">core</span>
+The durability measurement. (a) Per-page <code>fsync</code> ran ~100&times; slower than one <code>fsync</code> at the end here; explain physically
+why, in terms of what a sync forces and why it can't be pipelined. (b) What is the batched alternative a database actually uses, and how does it
+keep the same crash guarantee? (c) Why does the per-record-<code>fsync</code> design pass a correctness test yet fail under load?</div>
+
+<div class="exercise" id="ex47.7"><span class="ex-label">47.7</span> <span class="ex-tag complexity">cost</span>
+A workload commits <var>N</var> records. Let one <code>fsync</code> cost <var>s</var> seconds and let non-sync per-record work be negligible. (a)
+Write the total durability time if you <code>fsync</code> per record, and if you <code>fsync</code> once per batch of <var>k</var> records. (b) With
+<var>s</var>&nbsp;=&nbsp;3&nbsp;ms, <var>N</var>&nbsp;=&nbsp;100,000, compute both for <var>k</var>&nbsp;=&nbsp;1 and <var>k</var>&nbsp;=&nbsp;1000.
+(c) What is the sustainable durable-commit rate in each case, and what does this say about why group commit exists?</div>
+
+<div class="exercise" id="ex47.8"><span class="ex-label">47.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A storage layer uses 16&nbsp;KiB pages on a device whose atomic write unit is 4&nbsp;KiB. It overwrites
+pages in place and does no logging. After a crash during a page overwrite, a page is found half-updated and the database won't open.
+<br><strong>Step 1 (given):</strong> a 16&nbsp;KiB page spans four 4&nbsp;KiB atomic units, written non-atomically.
+<br><strong>Step 2 (given):</strong> a crash between the units leaves the page torn — part old, part new — which is corruption, not a lost update.
+<br><strong>Step 3 (given):</strong> in-place overwrite with no prior durable copy means the old contents are gone too.
+<br><strong>Step 4 (you):</strong> Explain why this is worse than merely losing the last write, and describe a logging scheme that would let
+recovery reconstruct the correct page.</div>
+
+<div class="exercise" id="ex47.9"><span class="ex-label">47.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether it belongs in the <em>fixed part</em>, the <em>variable-length area</em>, or the <em>null bitmap</em> of a record, and why:
+(a) a 4-byte integer key; (b) a 200-character product description; (c) the fact that the description column is absent for this row; (d) an
+8-byte timestamp; (e) the offset that locates the description within the record.</div>
+
+<div class="exercise" id="ex47.10"><span class="ex-label">47.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A slotted page stores records in sorted order so scans are
+fast.&rdquo; (b) &ldquo;A record identifier is a raw byte offset into the file.&rdquo; (c) &ldquo;After <code>pwrite</code> returns, the page is
+safely on the device.&rdquo; (d) &ldquo;Calling <code>fsync</code> once per batch gives weaker durability than calling it per record.&rdquo; (e)
+&ldquo;A torn write means the last update was lost.&rdquo;</div>
+
+<div class="exercise" id="ex47.11"><span class="ex-label">47.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the on-disk design. (a) Trace the two levels of indirection between &ldquo;I want row R&rdquo; and its bytes on disk: record identifier
+&rarr; page &rarr; slot &rarr; record, and say what each level buys. (b) The chapter measured a ~100&times; penalty for per-page <code>fsync</code>;
+connect that number to why the write-ahead log (built later) is the shape durability must take, not an optional optimization. (c) Argue that a
+record on disk is &ldquo;a struct that must describe itself,&rdquo; using the variable-field offsets and null bitmap of &sect;47.3 as evidence, and
+say what the round trip to storage adds that an in-memory struct never needs.</div>
+
+<div class="exercise" id="ex47.12"><span class="ex-label">47.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Append many 4&nbsp;KiB pages to a file two ways — one <code>fsync</code> at the end, and one
+<code>fsync</code> per page — and report total time, per-page time, and sustainable durable writes per second for each. (b) Repeat with
+<code>fdatasync</code> and note any difference. (c) State your toolchain and CPU, note the times are wall-clock and whether your disk is
+virtualised, and explain why the <em>ratio</em> between the two is the portable result while the absolute per-sync time is your machine's.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch48">
+<h1>Chapter 48 — The Buffer Pool</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch40">Chapter 40</a> (the OS page cache — the buffer pool is the database doing
+this itself), <a href="#ch17">Chapter 17</a> (demand paging and page replacement — the same problem, LRU and clock), <a href="#ch46">Chapter 46</a>
+(a disk miss is hundreds of microseconds; a memory hit is tens of nanoseconds), <a href="#ch47">Chapter 47</a> (the page is the unit that gets
+cached, pinned, and evicted), <a href="#ch03">Chapter 3</a> (the memory hierarchy — a hit is DRAM, a miss falls off the cliff). &nbsp;·&nbsp;
+Chapters 46 and 47 gave the device and the page. This chapter puts a layer of DRAM between them and the rest of the database — the pool of pages
+that turns most accesses into memory hits, and confronts the cliff head-on.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch46">Chapter 46</a> — a random page read from this machine's disk cost on the order of hundreds of microseconds;
+how does that compare to reading a page already sitting in DRAM? (2) <a href="#ch17">Chapter 17</a> — when physical memory fills and a new page is
+needed, the OS must choose a victim to evict; what were the policies it used, and which one did the clock algorithm approximate? (3)
+<em>Predict:</em> a database keeps a pool of pages in memory. Accessing a page that is <em>in</em> the pool (a hit) is a memory operation;
+accessing one that is not (a miss) is a disk read. Two questions: by roughly what factor do you think a miss is slower than a hit here —
+10&times;, 100&times;, 10,000&times;? And if a full-table scan reads more distinct pages than the pool holds, what happens to the pages that were
+hot before the scan? Write your guesses; &sect;48.3&ndash;&sect;48.4 answer them.</p>
+</aside>
+
+<p>The disk is the floor and it is a cliff (Chapter 46); the page is the currency (Chapter 47); and no database can afford to touch the disk for
+most of what it does. The escape is a cache — a region of DRAM holding pages so that repeated accesses hit memory instead of the device — and a
+database builds its own, called the <strong>buffer pool</strong>, rather than leaning solely on the OS page cache of Chapter 40. It does so
+deliberately: the database knows things the OS cannot, and a hand-managed cache lets it act on that knowledge — pin a page so a query using it
+cannot have it yanked away, control the order dirty pages are written so the write-ahead log's rules are honored, prefetch along an access pattern
+it can predict, and choose its own eviction policy. The buffer pool is, structurally, the same demand-paging problem the OS solved in Chapter 17 —
+a set of frames, a map from what-you-want to where-it-is, and a replacement policy for when memory fills — solved again on purpose, at the
+database's level, where the database's knowledge can be applied. This chapter builds it in five steps: why the database manages its own cache
+instead of trusting the OS (&sect;48.1); the anatomy — frames, the page table, pin counts, and dirty bits (&sect;48.2); the hit-versus-miss gap,
+measured here at four orders of magnitude, and why hit rate is everything (&sect;48.3); replacement — LRU, the clock approximation, and the
+sequential scan that defeats them, simulated (&sect;48.4); and what the buffer pool carries into the storage engines and the log (&sect;48.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code>; times are wall-clock and a hardware-counter profiler
+(<code>perf</code>) is <em>not</em> installed. The hit measurement is a <code>memcpy</code> from a resident 4&nbsp;KiB frame; the miss measurement
+is an <code>O_DIRECT</code> <code>pread</code> of a 4&nbsp;KiB page at random offsets from a 1&nbsp;GiB file on this machine's WSL2 virtual disk
+(<code>/dev/sdd</code>) — so the miss cost is the virtualised-disk figure of Chapter 46, not a bare device, and its run-to-run variance is real
+(it landed near ~350&nbsp;&micro;s here, within the same hundreds-of-microseconds band as Chapter 46's ~221&nbsp;&micro;s). The replacement results
+are from a <strong>deterministic simulation</strong> (a fixed pseudo-random reference string, seeded), reported as hit rates, not timings —
+they compare policies, and are exactly reproducible rather than measured against a clock.</p>
+
+<h2>48.1 Why a database manages its own cache</h2>
+
+<p>The operating system already caches disk blocks in memory — the page cache of Chapter 40 — so it is fair to ask why a database bothers to
+build a second cache of its own on top of it. The answer is that the OS page cache is generic by necessity: it serves every process, it does not
+know what a database page <em>means</em>, and it makes eviction and writeback decisions on information the database could improve on. A database,
+managing its own <strong>buffer pool</strong>, can do four things the OS cache cannot. First, it can <strong>pin</strong> a page: while a query is
+reading or modifying a page, the database marks it un-evictable, guaranteeing the page stays in memory and at a stable address for the duration —
+something the OS gives no direct control over. Second, it can <strong>control writeback order</strong>: the write-ahead log (built later in this
+volume) demands that a page's log records reach disk <em>before</em> the page itself, and only a cache the database controls can enforce
+&ldquo;do not write this dirty page until its log is durable.&rdquo; Third, it can <strong>prefetch</strong> along access patterns it understands —
+the next leaf of a B-tree, the next run of a scan — because it knows the structure of its own data. Fourth, it can choose a <strong>replacement
+policy</strong> suited to database workloads, which as &sect;48.4 shows differ from the generic case (a large scan should not be allowed to evict
+everything). The cost of this control is a known awkwardness: the same page can now sit in both the OS page cache and the database's buffer pool,
+wasting memory and copying twice — <strong>double buffering</strong> — which is exactly why databases often open their files with
+<code>O_DIRECT</code> (Chapter 41) to bypass the OS cache and let the buffer pool be the single authority on which pages are in memory. The
+principle is the recurring one of this volume: the layer that has the most specific knowledge should make the decision, and a database knows more
+about its own pages than the OS ever can.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name two things a database's own buffer pool can do that it cannot ask the OS page cache to do for it. What is double buffering, and why do
+databases sometimes use <code>O_DIRECT</code> to avoid it? (Answer after the next section.)</p>
+</aside>
+
+<h2>48.2 Anatomy: frames, the page table, pins, and dirty bits</h2>
+
+<p>A buffer pool is a fixed-size array of <strong>frames</strong> — each frame a slot of exactly one page's size (Chapter 47) — plus the
+bookkeeping to find, protect, and reclaim them. Finding a page uses a <strong>page table</strong> (a hash table) mapping page identifier &rarr;
+frame index: given a page number, a lookup says either &ldquo;it is in frame 7&rdquo; (a hit) or &ldquo;it is not resident&rdquo; (a miss). On a
+miss the pool picks a free or evictable frame, reads the page into it from disk (Chapter 47's <code>pread</code>), and records the mapping. Two
+per-frame flags govern the frame's life. The <strong>pin count</strong> (or reference count) tracks how many callers are currently using the page:
+<code>fetchPage</code> looks the page up, brings it in if absent, increments the pin count, and returns a pointer into the frame; the caller works
+on it and then calls <code>unpin</code> to decrement. A frame with a nonzero pin count is <strong>in use and cannot be evicted</strong> — this is
+the mechanism promised in &sect;48.1, and it is essential for correctness: evicting a page a query is mid-read on would pull memory out from under
+it. The <strong>dirty bit</strong> records whether the page has been modified since it was read in; when a dirty page is chosen for eviction, it
+<em>must be written back</em> to disk first (respecting, later, the log-before-page rule), whereas a clean page can simply be dropped because the
+on-disk copy is already current. So the lifecycle of a page in the pool is: fetched (pinned, mapped into a frame) &rarr; used (read or written,
+setting the dirty bit) &rarr; unpinned &rarr; eventually chosen as a victim &rarr; written back if dirty &rarr; frame reused for another page
+(Effelsberg &amp; H&auml;rder, &ldquo;Principles of Database Buffer Management,&rdquo; formalize exactly this — the fixing of pages, the frame
+allocation, and the replacement search as the buffer manager's three tasks). This anatomy is small, but every field earns its place: without the
+page table you cannot find a resident page; without the pin count you can corrupt an in-flight read; without the dirty bit you either lose updates
+or waste writes.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a buffer-pool hit is a memory access; a miss is a fall off the disk cliff</span>
+<p><strong>1. In words.</strong> The page table turns a page number into either &ldquo;in frame N&rdquo; (a hit — read it from DRAM) or &ldquo;not
+resident&rdquo; (a miss — read it from disk into a frame first). A hit is a memory operation; a miss pays the device latency of Chapter 46. So the
+fraction of accesses that hit — the <em>hit rate</em> — governs the effective speed of the whole database.</p>
+<p><strong>2. As a picture.</strong> Figure 48.1: a page-number request entering a hash table; a hit arrow going straight to a frame in DRAM
+(~tens of ns); a miss arrow going out to the disk, back into an evicted frame (~hundreds of &micro;s), then to the caller — the two paths drawn to
+scale on a log axis so the miss path dwarfs the hit.</p>
+<p><strong>3. As numbers/contrast.</strong> Measured here: a hit (memcpy from a resident 4&nbsp;KiB frame) ~<strong>36&nbsp;ns</strong>; a miss
+(<code>O_DIRECT</code> <code>pread</code>) ~<strong>350&nbsp;&micro;s</strong> — about <strong>10,000&times;</strong>. So effective access time is
+<var>h</var>&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;(1&minus;<var>h</var>)&nbsp;&times;&nbsp;350&nbsp;&micro;s: at
+<var>h</var>&nbsp;=&nbsp;0.99 the misses still dominate the average, which is why databases chase the last few percent of hit rate (&sect;48.3).</p>
+</aside>
+
+<p><em>(Answer to the &sect;48.1 quick check: a database buffer pool can, among other things, <strong>pin</strong> a page so an in-use page is never
+evicted, <strong>order writeback</strong> so a dirty page is not flushed before its log records are durable, <strong>prefetch</strong> along access
+patterns it predicts, and pick a database-suitable <strong>replacement policy</strong> — none of which the generic OS page cache exposes. Double
+buffering is the same page being held in both the OS page cache and the buffer pool, wasting memory and an extra copy; opening files with
+<code>O_DIRECT</code> bypasses the OS cache so the buffer pool is the single authority, avoiding the duplication.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 260" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">fetchPage(p): the page table gives a hit (DRAM) or a miss (disk read into an evicted frame).</text>
+<rect x="20" y="40" width="110" height="26" fill="#eef1f4" stroke="#333"/><text x="26" y="57" font-size="9">fetchPage(p)</text>
+<rect x="170" y="34" width="120" height="38" fill="#dfe8f4" stroke="#14406b"/><text x="176" y="50" font-size="8">page table</text><text x="176" y="63" font-size="8">p -&gt; frame?</text>
+<path d="M130 53 L170 53" stroke="#333" stroke-width="1.5"/>
+<rect x="360" y="34" width="120" height="38" fill="#dfe8f4" stroke="#14406b"/><text x="366" y="50" font-size="8">HIT: frame in DRAM</text><text x="366" y="63" font-size="8">~36 ns</text>
+<path d="M290 46 L360 46" stroke="#2f7d32" stroke-width="2"/><text x="300" y="40" font-size="8" fill="#2f7d32">resident</text>
+<rect x="360" y="120" width="120" height="38" fill="#f6dcd2" stroke="#8c3a1d"/><text x="366" y="136" font-size="8">MISS: read from disk</text><text x="366" y="149" font-size="8">~350 &micro;s</text>
+<path d="M230 72 L400 120" stroke="#8c3a1d" stroke-width="2"/><text x="250" y="110" font-size="8" fill="#8c3a1d">not resident</text>
+<rect x="360" y="190" width="230" height="30" fill="#eef1f4" stroke="#333"/><text x="366" y="209" font-size="8">evict a victim (write back if dirty), read page into frame, pin</text>
+<path d="M420 158 L420 190" stroke="#8c3a1d" stroke-width="1.5"/>
+<rect x="510" y="34" width="80" height="38" fill="#eef1f4" stroke="#333"/><text x="516" y="57" font-size="8">caller</text>
+<path d="M480 53 L510 53" stroke="#2f7d32" stroke-width="1.5"/>
+<path d="M480 139 C540 139 560 90 560 72" stroke="#8c3a1d" stroke-width="1.5" fill="none"/>
+<text x="12" y="245" font-size="8" fill="#14406b">Hit ~36 ns vs miss ~350 &micro;s here: ~10,000x. Effective time = h&middot;hit + (1-h)&middot;miss; misses dominate until h is very near 1.</text>
+</svg>
+<figcaption>Figure 48.1: <code>fetchPage</code> resolves a page number through the page table. A hit reads a resident frame from DRAM (~36&nbsp;ns
+here); a miss evicts a victim (writing it back if dirty), reads the page from disk into the frame (~350&nbsp;&micro;s here), pins it, and returns —
+about 10,000&times; the cost of a hit.</figcaption>
+</figure>
+
+<h2>48.3 The hit that saves the cliff, measured</h2>
+
+<p>The whole justification for a buffer pool is the size of the gap between a hit and a miss, so it is worth measuring rather than asserting. A
+<strong>hit</strong> — the page is already in a frame — costs a memory access: here, copying a resident 4&nbsp;KiB page out of its frame took about
+<strong>36&nbsp;nanoseconds</strong>. A <strong>miss</strong> — the page is not resident and must be read from disk — costs a device I/O: here, an
+<code>O_DIRECT</code> read of a 4&nbsp;KiB page landed around <strong>350&nbsp;microseconds</strong> (the Chapter 46 virtualised-disk figure, in
+the same hundreds-of-microseconds band as the ~221&nbsp;&micro;s measured there; the exact value wanders with the virtual disk). The ratio is
+about <strong>10,000&times;</strong>:</p>
+
+<pre><code>4 KiB page access on this machine:
+  HIT  (memcpy from a resident frame)      : ~36 ns
+  MISS (O_DIRECT pread from virtual disk)  : ~350 &micro;s   (~hundreds of &micro;s, cf. Ch.46)
+  miss / hit  ~ 10,000x
+</code></pre>
+
+<p>Four orders of magnitude is a different kind of number from the 49&times; of Chapter 46, and it changes how you must think about the average.
+The <strong>effective access time</strong> of a page request is a weighted average of the two outcomes: if a fraction <var>h</var> of accesses hit,
+the mean cost is <var>h</var>&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;(1&minus;<var>h</var>)&nbsp;&times;&nbsp;350&nbsp;&micro;s. The startling
+consequence of the 10,000&times; gap is that the misses dominate the average until the hit rate is <em>extremely</em> close to one. At a
+90% hit rate the average is about 35&nbsp;&micro;s — essentially all misses, the hits contributing nothing; even at 99% it is about 3.5&nbsp;&micro;s,
+still a hundred times the hit cost. Only as <var>h</var> approaches 99.9% and beyond do the hits begin to set the pace. This is why a database
+treats its hit rate as a first-class health metric and why the last fractions of a percent are worth fighting for: raising the hit rate from 99%
+to 99.9% cuts the average access time roughly tenfold, because it removes nine-tenths of the remaining ruinously expensive misses. It is also why
+buffer-pool <em>sizing</em> — how much DRAM you devote to frames — is among the highest-leverage tuning decisions in operating a database: more
+frames means more of the working set stays resident, which means a higher hit rate, which, on this curve, means a disproportionate drop in
+effective latency. The buffer pool does not make the disk faster; it makes you visit the disk rarely, and the arithmetic of the hit/miss gap is
+what turns &ldquo;rarely&rdquo; into &ldquo;fast.&rdquo;</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>With a hit at ~36&nbsp;ns and a miss at ~350&nbsp;&micro;s, why does a 90% hit rate still give an average access time almost entirely made of
+miss cost? Roughly what does raising the hit rate from 99% to 99.9% do to the average, and why is that the reason to fight for the last fractions
+of a percent? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>48.4 Replacement: LRU, the clock approximation, and the scan that breaks them</h2>
+
+<p>When every frame is full and a miss needs one, the buffer pool must evict a resident, unpinned page — and which one it picks determines the hit
+rate the previous section showed to be everything. The ideal is to evict the page that will be needed furthest in the future, which is
+unknowable, so the standard proxy is <strong>least-recently-used</strong> (LRU): evict the page unused for the longest time, betting that the
+recent past predicts the near future (Chapter 17 met exactly this bet for OS pages). True LRU means updating a page's position on <em>every</em>
+access, which is bookkeeping the pool would rather not do on a hot path, so real systems approximate it with the <strong>clock</strong>
+(second-chance) algorithm: frames sit in a circle, each with a reference bit set on access; a hand sweeps the circle, and when it needs a victim
+it clears the reference bit of a page it finds set (giving it a &ldquo;second chance&rdquo;) and evicts the first page it finds already clear —
+approximating LRU at a fraction of the cost (OSTEP, &ldquo;Beyond Physical Memory: Policies&rdquo;). A deterministic simulation on a skewed access
+pattern (1,000 pages, a 100-frame pool, 200,000 references) shows clock tracking LRU closely and both beating FIFO:</p>
+
+<pre><code>replacement simulation (skewed access; 1000 pages, pool=100, 200000 refs):
+  FIFO  hit rate : 17.2 %
+  CLOCK hit rate : 18.1 %     (approximates LRU cheaply)
+  LRU   hit rate : 18.6 %
+
+looping sequential scan of 110 pages through a 100-frame pool:
+  FIFO  hit rate : 0.0 %
+  CLOCK hit rate : 0.0 %
+  LRU   hit rate : 0.0 %
+</code></pre>
+
+<p>The first block is the reassuring result: clock (18.1%) sits between FIFO (17.2%) and true LRU (18.6%), confirming it is a cheap, faithful LRU
+approximation — the reason it is the workhorse of real buffer pools. The second block is the warning, and it is the named trap of this chapter. A
+<strong>looping sequential scan</strong> over slightly more pages than the pool holds — 110 pages cycling through 100 frames — produces a
+<strong>0% hit rate under every policy</strong>, because by the time the scan comes back around to a page, LRU (and clock, and FIFO) has just
+evicted it as the least-recently-used to make room for the pages in between: each page is thrown out moments before it is needed again. This is
+<strong>sequential flooding</strong>, and it is worse than its own zero hit rate suggests, because a single large scan does not just fail to
+benefit from the cache — it <em>evicts everyone else's hot pages</em> to fill the pool with scan pages it will never reuse, collapsing the hit
+rate for the whole system while it runs. It is exactly why databases do not use naive LRU for the buffer pool: they use scan-resistant policies —
+LRU-K, which tracks the last <var>K</var> references so a page touched once by a scan is not treated as &ldquo;recently used,&rdquo; or the
+query-locality approach of DBMIN (Chou &amp; DeWitt, &ldquo;An Evaluation of Buffer Management Strategies for Relational Database Systems&rdquo;),
+which gives each query its own locality set — or they simply refuse to cache scan pages, reading them through a small dedicated ring buffer so a
+big scan cannot flood the pool. The lesson generalizes the whole chapter: the replacement policy is not a detail but a defense, because the access
+patterns that break the simplest good-enough policy (the sequential scan) are common in exactly the systems that most need the cache to hold.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: letting a big sequential scan flood the buffer pool and evict the working set</span>
+<p>Naive LRU (or clock) has a specific, common failure mode: a sequential scan that touches more distinct pages than the pool holds gets a
+<strong>0% hit rate</strong> on its own pages — measured here, a 110-page loop through a 100-frame pool hit nothing under FIFO, clock, and LRU
+alike — because each page is evicted just before the scan wraps back to it. The trap is not merely that the scan is uncached; it is that the scan
+<em>pulls every other query's hot pages out of the pool</em> to make room for pages it will use exactly once, so a single analytics scan can
+tank the hit rate — and therefore the latency (&sect;48.3) — of the entire system while it runs. This surfaces as the classic operational mystery:
+the transactional workload was fast, someone runs a nightly full-table report, and suddenly unrelated queries slow to a crawl and blame lands on
+&ldquo;the cache being broken&rdquo; when the cache is working exactly as a naive policy dictates. The defenses are to make the policy
+scan-resistant rather than to make the pool bigger (a scan larger than <em>any</em> pool still floods): track multiple references so a
+once-touched page is not deemed hot (LRU-K), give each query its own locality budget (DBMIN), or read large scans through a small ring buffer that
+never displaces the general pool. &ldquo;We use LRU, so the hot pages stay hot&rdquo; and &ldquo;a full scan runs concurrently&rdquo; are, without
+a scan-resistant policy, not both safe to assume.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate reports: &ldquo;Every night our reporting job does a full scan of the orders table, and while it runs, the
+normal customer queries — which were fast all day — get slow. The buffer pool must be too small or broken.&rdquo; Cover the paragraph and respond
+in four or five sentences, drawing on &sect;48.3 and &sect;48.4.</p>
+<p><em>Model answer.</em> &ldquo;The pool isn't broken — this is sequential flooding, and a bigger pool won't fix it. A full scan reads more
+distinct pages than any reasonable pool holds, and with plain LRU each scan page evicts one of the customer queries' hot pages to make room, so the
+scan fills the pool with pages it uses exactly once and pushes out the working set everyone else depends on. Because a miss here is about
+10,000&times; a hit, dropping the hit rate even a little sends effective latency up sharply — that's the daytime slowdown. The fix is a
+scan-resistant policy, not more memory: don't let a single-touch scan page count as 'hot' (LRU-K), or give the reporting query its own small
+locality budget, or run big scans through a dedicated ring buffer so they can't displace the shared pool. So let's make the scan not poison the
+cache rather than chase pool size.&rdquo; Naming sequential flooding, the miss/hit ratio's leverage on latency, and a scan-resistant fix is the
+senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;48.3 quick check: at a 90% hit rate the average is 0.9&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;0.1&nbsp;&times;&nbsp;350&nbsp;&micro;s
+&asymp;&nbsp;35&nbsp;&micro;s — the 10% of misses, each ~10,000&times; a hit, contribute essentially the entire average while the hits are
+rounding error. Raising the hit rate from 99% to 99.9% removes nine-tenths of the remaining misses, cutting the average from ~3.5&nbsp;&micro;s to
+~0.4&nbsp;&micro;s — roughly tenfold — which is why the last fractions of a percent, not the first, are where the effective latency is won.)</em></p>
+
+<h2>48.5 What to carry forward</h2>
+
+<p>A database builds its own <strong>buffer pool</strong> rather than trusting the OS page cache because it can pin pages, order writeback for the
+log, prefetch on patterns it predicts, and choose a database-suitable replacement policy — often bypassing the OS cache with <code>O_DIRECT</code>
+to avoid double buffering (&sect;48.1). The pool is an array of <strong>frames</strong> plus a <strong>page table</strong> (page number &rarr;
+frame), a per-frame <strong>pin count</strong> (a pinned page cannot be evicted), and a <strong>dirty bit</strong> (a dirty victim must be written
+back before reuse) (&sect;48.2). A hit is a memory access and a miss a disk read — measured here ~36&nbsp;ns against ~350&nbsp;&micro;s, about
+<strong>10,000&times;</strong> — so effective access time is a hit/miss weighted average in which misses dominate until the hit rate is very near
+one, making hit rate and pool sizing the highest-leverage knobs (&sect;48.3). Replacement approximates the unknowable optimum with
+<strong>LRU</strong>, cheaply realized by the <strong>clock</strong> algorithm (simulated at 18.1% against LRU's 18.6% and FIFO's 17.2%), but a
+<strong>sequential scan</strong> larger than the pool defeats them all — 0% hit rate and, worse, it floods out everyone's working set — so real
+pools use scan-resistant policies like LRU-K or DBMIN (&sect;48.4).</p>
+
+<p>With this, the storage foundation of the volume is complete: the device and its cost model (Chapter 46), the page and its on-disk file
+(Chapter 47), and the buffer pool that keeps hot pages in DRAM (here). Everything the rest of the volume builds sits on these three. The buffer
+pool's two loose threads point straight ahead. Its <strong>writeback ordering</strong> — the rule that a dirty page must not reach disk before its
+log is durable — is precisely the hook the write-ahead log needs, so the durability part of this volume will formalize the buffer pool's dirty-bit
+lifecycle into the log-before-page protocol and group commit that make Chapter 47's expensive <code>fsync</code> a throughput a real system can
+sustain. And the pool's role as the layer that turns disk pages into memory the query can touch is what lets the storage engines built next — the
+B-tree, whose nodes are pages fetched through this pool, and the log-structured merge tree, whose runs are read and merged through it — assume that
+&ldquo;fetch a page&rdquo; is usually cheap. The disk is the floor; the page is the currency; the buffer pool is the layer of DRAM that means you
+rarely have to spend it. On that foundation, the database becomes something you can build.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Give two things a database buffer pool can do that the OS page cache cannot, and explain double buffering.</li>
+<li>Name the parts of a buffer pool — frames, page table, pin count, dirty bit — and what each is for.</li>
+<li>Quote the measured hit vs miss cost here and the ratio, and write the effective-access-time formula.</li>
+<li>Explain why a 90% hit rate is still miss-dominated, and why the last fractions of a percent matter most.</li>
+<li>Describe the clock algorithm and why it is used instead of true LRU.</li>
+<li>Explain sequential flooding, why it defeats LRU, and name one scan-resistant defense.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why does a database keep its own buffer pool instead of relying on the OS page cache? (&sect;48.1)</li>
+<li><strong>R2.</strong> What does the pin count protect against, and what must happen to a dirty page before its frame is reused? (&sect;48.2)</li>
+<li><strong>R3.</strong> What were the measured hit and miss costs, and why do misses dominate the average until the hit rate is near one? (&sect;48.3)</li>
+<li><strong>R4.</strong> How does the clock algorithm approximate LRU, and how did it compare to LRU and FIFO in the simulation? (&sect;48.4)</li>
+<li><strong>R5.</strong> What is sequential flooding, why does it give a 0% hit rate, and how is it defended against? (&sect;48.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Wolfgang Effelsberg &amp; Theo H&auml;rder, &ldquo;Principles of Database Buffer Management,&rdquo; <em>ACM Transactions on Database
+Systems</em> 9(4), 1984, pp. 560&ndash;595, DOI 10.1145/1994.2022.</strong> The foundational treatment behind &sect;48.1&ndash;&sect;48.2: how a
+database buffer manager differs from OS paging, the fixing (pinning) of pages, frame allocation, and the replacement search. First author Wolfgang
+Effelsberg; venue, year, and DOI verified via the ACM Digital Library.</li>
+<li><strong>Hong-Tai Chou &amp; David J. DeWitt, &ldquo;An Evaluation of Buffer Management Strategies for Relational Database Systems,&rdquo;
+<em>Proc. 11th VLDB</em> (1985), pp. 127&ndash;141.</strong> The source for &sect;48.4's scan problem and its fix: the query-locality-set model
+and the DBMIN algorithm, which allocate buffers per query rather than by a single global LRU. First author Hong-Tai Chou; venue and year verified
+via the VLDB proceedings.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, DOI 10.1561/1900000002.</strong> Its buffer-manager section situates &sect;48.1&ndash;&sect;48.3 in the whole
+storage stack, including the writeback ordering the log depends on. First author Joseph M. Hellerstein; venue, year, and DOI verified via the ACM
+Digital Library.</li>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em>, &ldquo;Beyond Physical Memory: Policies&rdquo; (free
+online).</strong> The OS-level companion to &sect;48.4: optimal replacement, LRU, and the clock (second-chance) approximation — the same
+algorithms the buffer pool reuses. First authors the Arpaci-Dusseaus; chapter title verified against the online edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex48.1"><span class="ex-label">48.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does the page table in a buffer pool map, and what are the two possible outcomes of a lookup?</div>
+
+<div class="exercise" id="ex48.2"><span class="ex-label">48.2</span> <span class="ex-tag warm">warm-up</span>
+What does a nonzero pin count on a frame mean, and why must a dirty victim page be written back before its frame is reused?</div>
+
+<div class="exercise" id="ex48.3"><span class="ex-label">48.3</span> <span class="ex-tag warm">warm-up</span>
+Roughly what were the measured hit and miss costs for a 4&nbsp;KiB page on this machine, and what is their approximate ratio?</div>
+
+<div class="exercise" id="ex48.4"><span class="ex-label">48.4</span> <span class="ex-tag core">core</span>
+Effective access time. (a) Write the effective access time as a function of hit rate <var>h</var> using this chapter's ~36&nbsp;ns hit and
+~350&nbsp;&micro;s miss. (b) Evaluate it at <var>h</var>&nbsp;=&nbsp;0.90, 0.99, and 0.999. (c) Explain why the improvement from 0.99 to 0.999 is
+so much more valuable than from 0.90 to 0.99, and what that implies about buffer-pool sizing.</div>
+
+<div class="exercise" id="ex48.5"><span class="ex-label">48.5</span> <span class="ex-tag core">core</span>
+The clock algorithm. (a) Describe the reference bit and the hand's sweep, including what happens when the hand finds a set bit versus a clear one.
+(b) Why is clock preferred over true LRU in a buffer pool? (c) In the simulation clock scored 18.1% against LRU's 18.6% and FIFO's 17.2% —
+interpret what that ordering confirms about clock.</div>
+
+<div class="exercise" id="ex48.6"><span class="ex-label">48.6</span> <span class="ex-tag core">core</span>
+Sequential flooding. (a) Explain why a loop over 110 pages through a 100-frame pool gave a 0% hit rate under LRU. (b) Why is this worse than the
+scan simply being uncached — what does it do to other queries? (c) Name two defenses and say how each prevents the flood.</div>
+
+<div class="exercise" id="ex48.7"><span class="ex-label">48.7</span> <span class="ex-tag complexity">cost</span>
+A query repeatedly scans a working set of <var>W</var> distinct pages, uniformly, through a pool of <var>F</var> frames under LRU. (a) Give the
+steady-state hit rate when <var>W</var>&nbsp;&le;&nbsp;<var>F</var> and when <var>W</var>&nbsp;&gt;&nbsp;<var>F</var> in the looping-scan case, and
+explain the cliff between them. (b) Using this chapter's hit/miss costs, write the effective access time on each side of the cliff. (c) Explain why
+this cliff is the quantitative core of the sequential-flooding trap.</div>
+
+<div class="exercise" id="ex48.8"><span class="ex-label">48.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team adds a large analytics scan to a database that serves fast point queries. The point queries
+were at ~99.5% hit rate; while the scan runs, they drop to ~85% and latency spikes.
+<br><strong>Step 1 (given):</strong> the scan reads far more distinct pages than the pool holds, each used once.
+<br><strong>Step 2 (given):</strong> under LRU each scan page evicts a hot point-query page to make room.
+<br><strong>Step 3 (given):</strong> a miss here is ~10,000&times; a hit, so a hit-rate drop from 99.5% to 85% raises effective latency sharply.
+<br><strong>Step 4 (you):</strong> Explain why the scan causes the point queries' hit rate to fall, estimate the effect on their average access
+time using the chapter's numbers, and give a fix that does not require enlarging the pool.</div>
+
+<div class="exercise" id="ex48.9"><span class="ex-label">48.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say which buffer-pool mechanism is responsible — <em>pin count</em>, <em>dirty bit</em>, <em>page table</em>, <em>replacement
+policy</em>, or <em>writeback ordering</em> — and why: (a) a page a query is mid-read on is never evicted; (b) a modified page is written to disk
+before its frame is reused; (c) a page number is resolved to a frame index; (d) a full scan is prevented from evicting the working set; (e) a
+dirty page is not flushed until its log records are durable.</div>
+
+<div class="exercise" id="ex48.10"><span class="ex-label">48.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A buffer-pool hit and a miss cost about the same order of
+magnitude.&rdquo; (b) &ldquo;The clock algorithm gives exactly the same evictions as true LRU.&rdquo; (c) &ldquo;A clean victim page must be
+written to disk before its frame is reused.&rdquo; (d) &ldquo;Enlarging the buffer pool fixes sequential flooding.&rdquo; (e) &ldquo;At a 90% hit
+rate, hits contribute most of the average access time.&rdquo;</div>
+
+<div class="exercise" id="ex48.11"><span class="ex-label">48.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the storage foundation. (a) Trace a single record read from &ldquo;query wants row R&rdquo; down through record identifier (Chapter 47),
+buffer-pool lookup (here), and possibly disk (Chapter 46), naming the cost at each step and where the cliff is. (b) The buffer pool reuses Chapter
+17's demand-paging machinery; state one thing the database knows that the OS does not, and how it changes the design. (c) Argue that hit rate,
+not raw disk speed, is the number that governs a database's storage performance, using the ~10,000&times; gap and the effective-access-time curve
+to make the case.</div>
+
+<div class="exercise" id="ex48.12"><span class="ex-label">48.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Measure the cost of a 4&nbsp;KiB page &ldquo;hit&rdquo; (a <code>memcpy</code> from a resident buffer)
+against a &ldquo;miss&rdquo; (an <code>O_DIRECT</code> <code>pread</code> from a large file), and report both and their ratio. (b) Write a small
+deterministic replacement simulation over a fixed reference string and report FIFO, clock, and LRU hit rates, including a looping scan larger than
+your pool. (c) State your toolchain and CPU, note the hit/miss times are wall-clock and whether your disk is virtualised, and explain which of your
+results are measurements and which are a reproducible simulation — and why that distinction matters for what you can claim.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part IX</div><h1>Storage Engines</h1><p class='part-blurb'>B-trees and LSM-trees implemented and analyzed — the two families and when each wins.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part X</div><h1>Durability & Recovery</h1><p class='part-blurb'>Write-ahead logging, ARIES, checkpoints, and crash recovery — how a database keeps its promises across failures.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XI</div><h1>Transactions & Concurrency Control</h1><p class='part-blurb'>ACID, isolation levels and their anomalies, 2PL, MVCC, and OCC — correctness under concurrency, implemented.</p></div>
@@ -23520,6 +24611,286 @@ copies and removed boundary crossings, using the syscall counts to separate them
 hardware counters, and explains that loopback understates the win because there is no NIC to use scatter-gather DMA — the feature that removes
 the final in-kernel copy on a real network path. <em>Tempting wrong answer:</em> &ldquo;conclude the loopback number is the real-world
 ceiling&rdquo; — a scatter-gather NIC removes a copy loopback still pays. <strong>Feed-forward:</strong> &sect;45.2&ndash;&sect;45.3.</div>
+
+</section>
+
+<section class="solutions" id="sol46">
+<h1>Chapter 46 — Solutions</h1>
+
+<div class="solution" id="sol46.1"><span class="sol-label">46.1</span>
+Fastest to slowest: L1 hit ~1&nbsp;ns, DRAM ~100&nbsp;ns, flash-SSD read ~tens&ndash;100&nbsp;&micro;s, hard-disk seek ~10&nbsp;ms (all
+published/typical). Each step down is roughly three orders of magnitude. <em>Tempting wrong answer:</em> putting SSD and DRAM in the same
+ballpark — an SSD read is about a thousand times slower than DRAM, not comparable. <strong>Feed-forward:</strong> &sect;46.1.</div>
+
+<div class="solution" id="sol46.2"><span class="sol-label">46.2</span>
+A <strong>seek</strong> (moving the head to the right track) and <strong>rotational latency</strong> (waiting for the target sector to rotate
+under the head). Random reads pay both delays every time, while sequential reads pay them once and then stream adjacent sectors. <em>Tempting
+wrong answer:</em> naming only the seek — rotational latency (~4&nbsp;ms at 7200&nbsp;RPM) is a comparable second cost. <strong>Feed-forward:</strong>
+&sect;46.2.</div>
+
+<div class="solution" id="sol46.3"><span class="sol-label">46.3</span>
+Because flash cannot be reprogrammed in place: to rewrite a page you must first <em>erase</em> its surrounding block, and erase operates on a whole
+<strong>erase block</strong> (hundreds of pages), not one page. <em>Tempting wrong answer:</em> &ldquo;you erase a single page&rdquo; — erase is
+per block; the read/program unit (the page) is much smaller than the erase unit. <strong>Feed-forward:</strong> &sect;46.3.</div>
+
+<div class="solution" id="sol46.4"><span class="sol-label">46.4</span>
+(a) time = seek + rotational latency + transfer, naming the head move, the wait for the sector, and the data read. (b) Random 4&nbsp;KiB:
+~9&nbsp;ms seek + ~4.2&nbsp;ms half-rotation + ~0.03&nbsp;ms transfer &asymp; ~13&nbsp;ms, dominated by seek and rotation; the transfer is
+negligible. (c) 1&nbsp;MiB sequential: one seek + rotation up front, then ~7&nbsp;ms of transfer at 150&nbsp;MB/s — so per byte the positioning is
+amortized to near zero and the transfer rate governs. <em>Tempting wrong answer:</em> assuming the transfer term dominates a random read — for
+small reads it is the smallest term. <strong>Feed-forward:</strong> &sect;46.2.</div>
+
+<div class="solution" id="sol46.5"><span class="sol-label">46.5</span>
+(a) A random read is electronic (no head or platter to move), so reaching any page costs the same; a small random write can't overwrite in place,
+so the controller writes elsewhere, remaps, and later erases/garbage-collects. (b) Write amplification: one logical small overwrite triggers
+read-erase-reprogram of a block plus garbage collection, so physical writes exceed logical ones. (c) Both prefer sequential writes — the hard disk
+because it avoids seeks, the SSD because large sequential writes align with erase blocks and cause less amplification. <em>Tempting wrong
+answer:</em> &ldquo;an SSD's cheap random reads mean cheap random writes&rdquo; — writes are the asymmetric, expensive direction.
+<strong>Feed-forward:</strong> &sect;46.3.</div>
+
+<div class="solution" id="sol46.6"><span class="sol-label">46.6</span>
+(a) <strong>I/O size</strong> (1&nbsp;MiB requests amortize per-request overhead over 256&times; more data than 4&nbsp;KiB) and <strong>access
+pattern</strong> (random reads forfeit readahead and locality). (b) The single-4&nbsp;KiB comparison being only ~1.24&times; means the
+pattern penalty is small on this flash-backed device (no seek), so most of the 49&times; is the I/O-size effect. (c) On a spinning disk each random
+read would pay a mechanical seek, so the access-pattern term would explode and come to dominate. <em>Tempting wrong answer:</em> attributing the
+whole 49&times; to &ldquo;random is slow&rdquo; — on this SSD the bigger factor is fetching in bulk. <strong>Feed-forward:</strong> &sect;46.4.</div>
+
+<div class="solution" id="sol46.7"><span class="sol-label">46.7</span>
+(a) Design A: <var>N</var>&nbsp;&times;&nbsp;<var>t</var><sub>r</sub>. Design B: (<var>N</var>/100)&nbsp;&times;&nbsp;<var>t</var><sub>r</sub>. (b)
+With <var>t</var><sub>r</sub>&nbsp;&asymp;&nbsp;10&nbsp;ms and <var>N</var>&nbsp;=&nbsp;10<sup>6</sup>: A &asymp; 10,000&nbsp;s (~2.8 hours); B
+&asymp; 100&nbsp;s. (c) The 100&times; is the number of records that share one page read: packing related records into a page means one disk trip
+serves 100 of them, turning 100 random accesses into one — the entire argument for the page as the unit of I/O. <em>Tempting wrong answer:</em>
+ignoring that B still pays for locality — if the 100 records were scattered across 100 pages, B collapses back to A. <strong>Feed-forward:</strong>
+&sect;46.2, &sect;46.4.</div>
+
+<div class="solution" id="sol46.8"><span class="sol-label">46.8</span>
+<strong>Step 4:</strong> The 6&nbsp;GB/s measured the page cache in DRAM, not the disk — a plain buffered <code>read</code> loop over a warm file
+never reaches the device, so the number is a memory-bandwidth figure. The conclusion is backwards: because they measured DRAM, they saw no
+difference between patterns and inferred layout doesn't matter, when the device (which they never touched) shows a ~49&times; gap that makes layout
+decisive. They should bypass the cache (<code>O_DIRECT</code> or drop caches) and vary both access pattern and I/O size, as in &sect;46.4.
+<em>Tempting wrong answer:</em> &ldquo;6&nbsp;GB/s is the disk, their disk is just fast&rdquo; — no disk here does 6&nbsp;GB/s at 4&nbsp;KiB random;
+that is DRAM. <strong>Feed-forward:</strong> &sect;46.4.</div>
+
+<div class="solution" id="sol46.9"><span class="sol-label">46.9</span>
+(a) <strong>Seek/positioning</strong> — random reads on a spinning disk pay a mechanical seek each. (b) <strong>I/O size</strong> (and raw transfer
+rate) — large sequential SSD reads are bandwidth-bound, not seek-bound. (c) <strong>DRAM ceiling</strong> — a warm cache serves from memory, so
+&ldquo;random&rdquo; costs a memory access, not a disk one. (d) <strong>Flash write amplification</strong> — tiny random overwrites trigger
+erase/garbage-collection work. (e) <strong>I/O size</strong> — same device and pattern, only the request size differs, so 1&nbsp;MiB amortizes
+overhead that 4&nbsp;KiB cannot. <em>Tempting wrong answer:</em> calling (c) seek-bound &ldquo;because it's random&rdquo; — a cache hit never
+reaches the disk. <strong>Feed-forward:</strong> &sect;46.1&ndash;&sect;46.4.</div>
+
+<div class="solution" id="sol46.10"><span class="sol-label">46.10</span>
+(a) <strong>False</strong> — an SSD read (~tens&ndash;100&nbsp;&micro;s) is ~1000&times; slower than DRAM (~100&nbsp;ns). (b) <strong>False</strong>
+(as stated) — the transfer rate is the same; sequential is faster because it pays seek and rotation once instead of per access. (c)
+<strong>False</strong> — random writes suffer the erase-in-place limitation and amplification; only random reads are cheap. (d) <strong>True</strong>
+— the block layer's smallest unit is a block, so a database reads/writes in block-multiple pages. (e) <strong>False</strong> — on this machine the
+<code>rotational</code> flag is a WSL2 virtio artifact; the backing store is an NVMe SSD. <em>Tempting wrong answer:</em> marking (b) true by
+crediting a higher transfer rate rather than amortized positioning. <strong>Feed-forward:</strong> &sect;46.1&ndash;&sect;46.4.</div>
+
+<div class="solution" id="sol46.11"><span class="sol-label">46.11</span>
+(a) &ldquo;An access to disk is enormously more expensive than computation, and random access far more than sequential.&rdquo; The B-tree minimizes
+the <em>number</em> of disk accesses per lookup (high fanout, a few levels); the log turns writes into <em>sequential</em> I/O; the buffer pool
+keeps hot pages in DRAM so most accesses never reach the disk. (b) Both are true because they measure different things: ~49&times; is large
+sequential streaming versus small random I/O (dominated by I/O size on this flash device), while ~1.24&times; is sequential versus random at the
+<em>same</em> small 4&nbsp;KiB size (isolating the pure pattern penalty, tiny without a seek). (c) The unifying discipline is knowing where bytes
+physically are and what reaching them costs — Volume 1's I/O part asked it of the page cache and the wire; here it is asked of the device, and the
+same answer (touch it rarely, in bulk, in the pattern it prefers) falls out. <em>Tempting wrong answer:</em> claiming the two ratios contradict —
+they measure different comparisons. <strong>Feed-forward:</strong> &sect;46.1&ndash;&sect;46.5.</div>
+
+<div class="solution" id="sol46.12"><span class="sol-label">46.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports the three <code>/sys/block</code> values for the right device; (b) gives
+sequential-large-block and random-small-page throughput, per-read latency, and IOPS under <code>O_DIRECT</code>; (c) states toolchain and CPU,
+flags wall-clock timing without hardware counters, notes whether the machine is virtualised (so absolute numbers reflect the stack, not a bare
+device), and separates the I/O-size effect from the access-pattern effect — for instance by also measuring single 4&nbsp;KiB reads sequential vs
+random, which isolates the pattern penalty. <em>Tempting wrong answer:</em> reporting a buffered-<code>read</code> number as the device speed —
+that measures the page cache. <strong>Feed-forward:</strong> &sect;46.4.</div>
+
+</section>
+
+<section class="solutions" id="sol47">
+<h1>Chapter 47 — Solutions</h1>
+
+<div class="solution" id="sol47.1"><span class="sol-label">47.1</span>
+Page 10 begins at offset 10&nbsp;&times;&nbsp;4096&nbsp;=&nbsp;40,960, and one page read transfers the whole page — 4,096 bytes. <em>Tempting wrong
+answer:</em> reading &ldquo;just the record&rdquo; — the storage manager always transfers a full page, not a byte range. <strong>Feed-forward:</strong>
+&sect;47.1.</div>
+
+<div class="solution" id="sol47.2"><span class="sol-label">47.2</span>
+The <strong>slot directory</strong> (with a header) grows downward from the top; the <strong>record data</strong> grows upward from the bottom;
+free space sits between. One slot holds the (offset, length) of a record within the page. <em>Tempting wrong answer:</em> &ldquo;a slot holds the
+record itself&rdquo; — it holds a pointer to the record, not the bytes. <strong>Feed-forward:</strong> &sect;47.2.</div>
+
+<div class="solution" id="sol47.3"><span class="sol-label">47.3</span>
+<code>write</code> only puts data in the OS page cache and returns, so a crash before flush loses it; <code>fsync</code> blocks until the device
+reports the data persisted, making it durable. <em>Tempting wrong answer:</em> &ldquo;<code>write</code> writes to disk&rdquo; — it writes to the
+cache; durability needs the barrier. <strong>Feed-forward:</strong> &sect;47.4.</div>
+
+<div class="solution" id="sol47.4"><span class="sol-label">47.4</span>
+(a) A record identifier is (page number, slot number): the page number costs one page fetch (a buffer-pool hit, ~tens of ns, or a disk miss,
+~hundreds of &micro;s), the slot number an array index within the page. (b) Because outside references name the <em>slot</em>, not a byte offset,
+compaction can slide records to reclaim deletion holes and only update each slot's stored offset — every (page, slot) reference still resolves. (c)
+A forwarding pointer is left in a record's original slot when the record grows beyond its page's free space and must move to another page; it costs
+one extra page access to follow on read. <em>Tempting wrong answer:</em> &ldquo;the record ID is the byte offset&rdquo; — that would freeze
+records in place and break under compaction. <strong>Feed-forward:</strong> &sect;47.2.</div>
+
+<div class="solution" id="sol47.5"><span class="sol-label">47.5</span>
+(a) Fixed part: null bitmap, then the <code>int</code> and <code>double</code> inline, then offsets/lengths for the two <code>varchar</code>s;
+variable-length area at the end holds the two strings' bytes. (b) The <code>int</code> and <code>double</code> have known sizes, so their
+positions are constant offsets; the <code>varchar</code>s have data-dependent lengths, so a stored offset must locate them. (c) A null bitmap uses
+one bit per nullable column — dense and cheap to test — and lets the column's storage be omitted, rather than reserving a whole sentinel value in
+every row. <em>Tempting wrong answer:</em> putting <code>varchar</code> bytes inline at a fixed position — their length isn't known at schema time.
+<strong>Feed-forward:</strong> &sect;47.3.</div>
+
+<div class="solution" id="sol47.6"><span class="sol-label">47.6</span>
+(a) An <code>fsync</code> forces an actual, acknowledged trip to the device and cannot be pipelined, so per page it serializes the workload behind
+a full device round trip — ~3&ndash;4&nbsp;ms each here versus ~30&nbsp;&micro;s amortized when one sync covers 2,000 pages. (b) The batched
+alternative writes changes to a sequential write-ahead log and issues one <code>fsync</code> per group of commits (group commit), keeping the same
+crash guarantee because the log is durable before the commit is acknowledged. (c) It passes correctness tests because each record really is durable
+after its sync, but it caps throughput at a few hundred durable writes per second, which only fails under load. <em>Tempting wrong answer:</em>
+&ldquo;batching weakens durability&rdquo; — group commit is equally durable, just amortized. <strong>Feed-forward:</strong> &sect;47.4.</div>
+
+<div class="solution" id="sol47.7"><span class="sol-label">47.7</span>
+(a) Per record: <var>N</var>&nbsp;&times;&nbsp;<var>s</var>. Per batch of <var>k</var>: (<var>N</var>/<var>k</var>)&nbsp;&times;&nbsp;<var>s</var>. (b)
+With <var>s</var>&nbsp;=&nbsp;3&nbsp;ms, <var>N</var>&nbsp;=&nbsp;100,000: <var>k</var>&nbsp;=&nbsp;1 gives 300&nbsp;s;
+<var>k</var>&nbsp;=&nbsp;1000 gives 0.3&nbsp;s. (c) Sustainable durable-commit rate is ~333/s for <var>k</var>&nbsp;=&nbsp;1 and ~333,000/s for
+<var>k</var>&nbsp;=&nbsp;1000 — a 1000&times; gain from amortizing one barrier over 1000 commits, which is exactly why group commit exists.
+<em>Tempting wrong answer:</em> assuming throughput scales with CPU, not with the sync barrier — the barrier is the bottleneck.
+<strong>Feed-forward:</strong> &sect;47.4.</div>
+
+<div class="solution" id="sol47.8"><span class="sol-label">47.8</span>
+<strong>Step 4:</strong> Losing the last write leaves a consistent older page; a torn write leaves a page that is <em>neither</em> the old nor the
+new version — part of each — so it is corrupt and cannot be read as either, which is why the database won't open. A logging scheme fixes it by
+recording the page's intended contents durably <em>before</em> overwriting it in place: e.g. full-page logging or a double-write buffer writes the
+whole new page to a separate durable location first, so after a crash recovery detects the torn page and reconstructs it from the logged copy.
+<em>Tempting wrong answer:</em> &ldquo;just retry the write&rdquo; — the old contents are already gone, so without a logged copy there is nothing
+to recover to. <strong>Feed-forward:</strong> &sect;47.4.</div>
+
+<div class="solution" id="sol47.9"><span class="sol-label">47.9</span>
+(a) <strong>Fixed part</strong> — a known-size 4-byte value read at a constant offset. (b) <strong>Variable-length area</strong> — a variable-size
+string stored at the record's end. (c) <strong>Null bitmap</strong> — one bit recording the column's absence. (d) <strong>Fixed part</strong> — a
+known-size 8-byte value. (e) <strong>Fixed part</strong> — the offset that locates (b) is itself fixed-size and lives inline. <em>Tempting wrong
+answer:</em> putting the description's <em>offset</em> in the variable area — the offset is fixed-size and must be at a known position to be found.
+<strong>Feed-forward:</strong> &sect;47.3.</div>
+
+<div class="solution" id="sol47.10"><span class="sol-label">47.10</span>
+(a) <strong>False</strong> — a slotted page need not store records in sorted order; the slot directory decouples reference order from physical
+order. (b) <strong>False</strong> — a record identifier is (page number, slot number), not a raw byte offset. (c) <strong>False</strong> — after
+<code>pwrite</code> the data is in the page cache, not on the device; <code>fsync</code> is required. (d) <strong>False</strong> — one
+<code>fsync</code> per batch is equally durable, just amortized. (e) <strong>False</strong> — a torn write is corruption (part old, part new), not
+merely a lost update. <em>Tempting wrong answer:</em> marking (d) true, conflating &ldquo;less frequent&rdquo; with &ldquo;less safe.&rdquo;
+<strong>Feed-forward:</strong> &sect;47.2&ndash;&sect;47.4.</div>
+
+<div class="solution" id="sol47.11"><span class="sol-label">47.11</span>
+(a) Record identifier (page, slot) &rarr; fetch the <em>page</em> (buffer-pool hit or disk read — the cliff is here) &rarr; index the <em>slot</em>
+to get an (offset, length) &rarr; read the <em>record</em> bytes at that offset. The page level buys the unit of I/O and caching; the slot level
+buys stable addressing under compaction. (b) The ~100&times; per-page <code>fsync</code> penalty means durability cannot be paid per record and
+survive real load, so it must be batched behind a sequential log with one grouped barrier — the write-ahead log is the shape durability is
+<em>forced</em> into, not an optional tuning. (c) A record on disk carries its own variability (stored offsets for variable fields) and optionality
+(null bitmap) because it must be self-describing to survive serialization and be read back later, possibly under a newer code version — things an
+in-memory struct, tied to one program's live layout, never needs. <em>Tempting wrong answer:</em> treating the log as a mere speed optimization —
+the measurement shows it is a structural necessity. <strong>Feed-forward:</strong> &sect;47.1&ndash;&sect;47.5.</div>
+
+<div class="solution" id="sol47.12"><span class="sol-label">47.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports total time, per-page time, and durable writes/s for one-<code>fsync</code>-at-end
+versus per-page <code>fsync</code>; (b) repeats with <code>fdatasync</code> and notes it syncs data without necessarily all metadata, often
+similar here; (c) states toolchain and CPU, flags wall-clock timing and whether the disk is virtualised, and argues that the <em>ratio</em>
+(per-page vs batched) is the portable lesson while the absolute per-sync time depends on the device and stack. <em>Tempting wrong answer:</em>
+reporting the absolute per-sync time as a universal constant — it varies by device and virtualization. <strong>Feed-forward:</strong> &sect;47.4.</div>
+
+</section>
+
+<section class="solutions" id="sol48">
+<h1>Chapter 48 — Solutions</h1>
+
+<div class="solution" id="sol48.1"><span class="sol-label">48.1</span>
+It maps a page identifier (page number) to a frame index. A lookup returns either &ldquo;resident in frame N&rdquo; (a hit) or &ldquo;not
+resident&rdquo; (a miss). <em>Tempting wrong answer:</em> &ldquo;it maps offsets to bytes&rdquo; — it maps page numbers to frames, the unit is a
+whole page. <strong>Feed-forward:</strong> &sect;48.2.</div>
+
+<div class="solution" id="sol48.2"><span class="sol-label">48.2</span>
+A nonzero pin count means the page is in use by at least one caller and must not be evicted (evicting it would pull memory out from under an
+in-flight read). A dirty victim must be written back first because it has been modified since load, so the on-disk copy is stale and dropping it
+would lose the update. <em>Tempting wrong answer:</em> &ldquo;write back every victim&rdquo; — a clean victim's on-disk copy is already current, so
+it can just be dropped. <strong>Feed-forward:</strong> &sect;48.2.</div>
+
+<div class="solution" id="sol48.3"><span class="sol-label">48.3</span>
+A hit (memcpy from a resident 4&nbsp;KiB frame) was ~36&nbsp;ns; a miss (<code>O_DIRECT</code> <code>pread</code>) was ~350&nbsp;&micro;s — a ratio
+of about 10,000&times;. <em>Tempting wrong answer:</em> guessing ~100&times; by analogy to a cache/DRAM gap — the disk cliff is four orders of
+magnitude, not two. <strong>Feed-forward:</strong> &sect;48.3.</div>
+
+<div class="solution" id="sol48.4"><span class="sol-label">48.4</span>
+(a) EAT(<var>h</var>)&nbsp;=&nbsp;<var>h</var>&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;(1&minus;<var>h</var>)&nbsp;&times;&nbsp;350&nbsp;&micro;s. (b)
+<var>h</var>&nbsp;=&nbsp;0.90 &rarr; ~35&nbsp;&micro;s; 0.99 &rarr; ~3.5&nbsp;&micro;s; 0.999 &rarr; ~0.4&nbsp;&micro;s. (c) Because misses cost
+~10,000&times; a hit, they dominate the average until the hit rate is very near one; going 0.99&rarr;0.999 removes nine-tenths of the
+<em>remaining</em> misses (a ~10&times; cut) while 0.90&rarr;0.99 also removes nine-tenths but from a larger base — the marginal value keeps rising
+as you approach one, so sizing the pool to hold the working set is the high-leverage move. <em>Tempting wrong answer:</em> treating each 9%
+hit-rate gain as equally valuable — the value is in eliminating the last misses. <strong>Feed-forward:</strong> &sect;48.3.</div>
+
+<div class="solution" id="sol48.5"><span class="sol-label">48.5</span>
+(a) Each frame has a reference bit set on access; a hand sweeps the circular frames — on a frame whose bit is <em>set</em>, it clears the bit and
+moves on (a second chance); on a frame whose bit is <em>clear</em>, it evicts that page. (b) True LRU would reorder a list on every access — costly
+on the hot path; clock approximates LRU with a single bit and no per-access reordering. (c) Clock's 18.1% sitting between FIFO's 17.2% and LRU's
+18.6% confirms it captures most of LRU's benefit at far lower cost. <em>Tempting wrong answer:</em> &ldquo;clock equals LRU&rdquo; — it
+approximates LRU; the small gap (18.1 vs 18.6) is the approximation. <strong>Feed-forward:</strong> &sect;48.4.</div>
+
+<div class="solution" id="sol48.6"><span class="sol-label">48.6</span>
+(a) With 110 pages cycling through 100 frames, by the time the scan wraps back to a page LRU has evicted it as least-recently-used to fit the 10
+pages seen since — so every access is a miss, 0%. (b) It is worse than being uncached because the scan fills the pool with single-use pages,
+evicting other queries' hot pages and collapsing the whole system's hit rate while it runs. (c) Defenses: LRU-K (a once-touched scan page isn't
+counted as recently used, so it isn't kept), and a dedicated ring buffer for scans (so scan pages never displace the shared pool); DBMIN's
+per-query locality sets do the same by budgeting buffers per query. <em>Tempting wrong answer:</em> &ldquo;make the pool bigger&rdquo; — a scan
+larger than any pool still floods. <strong>Feed-forward:</strong> &sect;48.4.</div>
+
+<div class="solution" id="sol48.7"><span class="sol-label">48.7</span>
+(a) When <var>W</var>&nbsp;&le;&nbsp;<var>F</var> the whole working set stays resident, so after warm-up the hit rate approaches 100%; in the
+looping-scan case with <var>W</var>&nbsp;&gt;&nbsp;<var>F</var> under LRU each page is evicted just before reuse, so the hit rate collapses toward
+0% — a cliff at <var>W</var>&nbsp;=&nbsp;<var>F</var>. (b) Below the cliff EAT &asymp; hit &asymp; ~36&nbsp;ns; above it EAT &asymp; miss &asymp;
+~350&nbsp;&micro;s — about four orders of magnitude apart. (c) The trap is quantitatively this cliff: crossing <var>W</var>&nbsp;=&nbsp;<var>F</var>
+flips nearly every access from a ~36&nbsp;ns hit to a ~350&nbsp;&micro;s miss, so a scan that nudges the working set past the pool size is
+catastrophic, not gradual. <em>Tempting wrong answer:</em> assuming the hit rate degrades smoothly with <var>W</var> — under looping LRU it falls
+off a cliff at <var>F</var>. <strong>Feed-forward:</strong> &sect;48.3&ndash;&sect;48.4.</div>
+
+<div class="solution" id="sol48.8"><span class="sol-label">48.8</span>
+<strong>Step 4:</strong> Each scan page, used once, evicts a hot point-query page under LRU, so the point queries' resident working set shrinks and
+their hit rate falls (99.5% &rarr; 85%). Effect on their average access time (hit ~36&nbsp;ns, miss ~350&nbsp;&micro;s): at 99.5% EAT &asymp;
+0.005&nbsp;&times;&nbsp;350&nbsp;&micro;s &asymp; 1.75&nbsp;&micro;s; at 85% EAT &asymp; 0.15&nbsp;&times;&nbsp;350&nbsp;&micro;s &asymp; 52&nbsp;&micro;s
+— roughly a 30&times; jump, matching the observed latency spike. Fix without enlarging the pool: make the scan scan-resistant — read it through a
+small ring buffer or use LRU-K/DBMIN so its single-use pages don't evict the point queries' working set. <em>Tempting wrong answer:</em> &ldquo;add
+RAM&rdquo; — the scan exceeds any pool, so it will still flood without a scan-resistant policy. <strong>Feed-forward:</strong> &sect;48.4.</div>
+
+<div class="solution" id="sol48.9"><span class="sol-label">48.9</span>
+(a) <strong>Pin count</strong> — a pinned (in-use) page is un-evictable. (b) <strong>Dirty bit</strong> — a modified victim is written back before
+reuse. (c) <strong>Page table</strong> — resolves a page number to a frame index. (d) <strong>Replacement policy</strong> — a scan-resistant policy
+keeps a scan from evicting the working set. (e) <strong>Writeback ordering</strong> — the log-before-page rule holds a dirty page until its log is
+durable. <em>Tempting wrong answer:</em> attributing (e) to the dirty bit alone — the dirty bit marks the page, but ordering the flush against the
+log is a separate mechanism. <strong>Feed-forward:</strong> &sect;48.1&ndash;&sect;48.2.</div>
+
+<div class="solution" id="sol48.10"><span class="sol-label">48.10</span>
+(a) <strong>False</strong> — a hit (~36&nbsp;ns) and a miss (~350&nbsp;&micro;s) differ by ~10,000&times;. (b) <strong>False</strong> — clock only
+approximates LRU (18.1% vs 18.6% here). (c) <strong>False</strong> — a clean victim's on-disk copy is current, so it is dropped without a write.
+(d) <strong>False</strong> — a scan larger than any pool still floods; the fix is a scan-resistant policy. (e) <strong>False</strong> — at 90% the
+misses (each ~10,000&times; a hit) make up essentially the entire average. <em>Tempting wrong answer:</em> marking (e) true by intuition that
+&ldquo;90% of accesses are hits, so hits dominate&rdquo; — cost, not count, sets the average. <strong>Feed-forward:</strong>
+&sect;48.2&ndash;&sect;48.4.</div>
+
+<div class="solution" id="sol48.11"><span class="sol-label">48.11</span>
+(a) Query wants row R &rarr; resolve its record identifier (page, slot) &rarr; buffer-pool lookup on the page number: a hit reads the frame from
+DRAM (~36&nbsp;ns — cheap), a miss reads the page from disk (~350&nbsp;&micro;s — the cliff) into a frame; then index the slot and read the record.
+The cliff is the buffer-pool miss. (b) The database knows its own access patterns and data structure — e.g. it can pin a page in use, order dirty
+writes against the log, or refuse to cache a scan — none of which the OS page cache exposes, and each changes the design toward correctness and
+scan-resistance. (c) Because a miss is ~10,000&times; a hit and the effective-access-time curve stays miss-dominated until the hit rate is very
+near one, the number that governs storage performance is the hit rate (how often you avoid the disk), not the disk's raw speed — you cannot make
+the disk fast, only visit it rarely. <em>Tempting wrong answer:</em> &ldquo;faster disks are the main lever&rdquo; — hit rate dominates until it is
+extremely high. <strong>Feed-forward:</strong> &sect;48.1&ndash;&sect;48.5.</div>
+
+<div class="solution" id="sol48.12"><span class="sol-label">48.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports a hit (memcpy from a resident buffer) and a miss (<code>O_DIRECT</code>
+<code>pread</code>) with their ratio; (b) reports FIFO, clock, and LRU hit rates from a fixed, seeded reference string including a looping scan
+larger than the pool (expect ~0% there); (c) states toolchain and CPU, flags the hit/miss times as wall-clock and whether the disk is virtualised,
+and distinguishes the <em>measured</em> latencies (device- and machine-dependent) from the <em>simulated</em> hit rates (exactly reproducible, a
+comparison of policies) — the distinction matters because only the simulation is a claim independent of hardware. <em>Tempting wrong answer:</em>
+presenting simulated hit rates as timed measurements — they are a deterministic policy comparison, not a clock reading. <strong>Feed-forward:</strong>
+&sect;48.3&ndash;&sect;48.4.</div>
 
 </section>
 </body></html>

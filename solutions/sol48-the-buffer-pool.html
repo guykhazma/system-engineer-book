@@ -1,0 +1,94 @@
+<section class="solutions" id="sol48">
+<h1>Chapter 48 — Solutions</h1>
+
+<div class="solution" id="sol48.1"><span class="sol-label">48.1</span>
+It maps a page identifier (page number) to a frame index. A lookup returns either &ldquo;resident in frame N&rdquo; (a hit) or &ldquo;not
+resident&rdquo; (a miss). <em>Tempting wrong answer:</em> &ldquo;it maps offsets to bytes&rdquo; — it maps page numbers to frames, the unit is a
+whole page. <strong>Feed-forward:</strong> &sect;48.2.</div>
+
+<div class="solution" id="sol48.2"><span class="sol-label">48.2</span>
+A nonzero pin count means the page is in use by at least one caller and must not be evicted (evicting it would pull memory out from under an
+in-flight read). A dirty victim must be written back first because it has been modified since load, so the on-disk copy is stale and dropping it
+would lose the update. <em>Tempting wrong answer:</em> &ldquo;write back every victim&rdquo; — a clean victim's on-disk copy is already current, so
+it can just be dropped. <strong>Feed-forward:</strong> &sect;48.2.</div>
+
+<div class="solution" id="sol48.3"><span class="sol-label">48.3</span>
+A hit (memcpy from a resident 4&nbsp;KiB frame) was ~36&nbsp;ns; a miss (<code>O_DIRECT</code> <code>pread</code>) was ~350&nbsp;&micro;s — a ratio
+of about 10,000&times;. <em>Tempting wrong answer:</em> guessing ~100&times; by analogy to a cache/DRAM gap — the disk cliff is four orders of
+magnitude, not two. <strong>Feed-forward:</strong> &sect;48.3.</div>
+
+<div class="solution" id="sol48.4"><span class="sol-label">48.4</span>
+(a) EAT(<var>h</var>)&nbsp;=&nbsp;<var>h</var>&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;(1&minus;<var>h</var>)&nbsp;&times;&nbsp;350&nbsp;&micro;s. (b)
+<var>h</var>&nbsp;=&nbsp;0.90 &rarr; ~35&nbsp;&micro;s; 0.99 &rarr; ~3.5&nbsp;&micro;s; 0.999 &rarr; ~0.4&nbsp;&micro;s. (c) Because misses cost
+~10,000&times; a hit, they dominate the average until the hit rate is very near one; going 0.99&rarr;0.999 removes nine-tenths of the
+<em>remaining</em> misses (a ~10&times; cut) while 0.90&rarr;0.99 also removes nine-tenths but from a larger base — the marginal value keeps rising
+as you approach one, so sizing the pool to hold the working set is the high-leverage move. <em>Tempting wrong answer:</em> treating each 9%
+hit-rate gain as equally valuable — the value is in eliminating the last misses. <strong>Feed-forward:</strong> &sect;48.3.</div>
+
+<div class="solution" id="sol48.5"><span class="sol-label">48.5</span>
+(a) Each frame has a reference bit set on access; a hand sweeps the circular frames — on a frame whose bit is <em>set</em>, it clears the bit and
+moves on (a second chance); on a frame whose bit is <em>clear</em>, it evicts that page. (b) True LRU would reorder a list on every access — costly
+on the hot path; clock approximates LRU with a single bit and no per-access reordering. (c) Clock's 18.1% sitting between FIFO's 17.2% and LRU's
+18.6% confirms it captures most of LRU's benefit at far lower cost. <em>Tempting wrong answer:</em> &ldquo;clock equals LRU&rdquo; — it
+approximates LRU; the small gap (18.1 vs 18.6) is the approximation. <strong>Feed-forward:</strong> &sect;48.4.</div>
+
+<div class="solution" id="sol48.6"><span class="sol-label">48.6</span>
+(a) With 110 pages cycling through 100 frames, by the time the scan wraps back to a page LRU has evicted it as least-recently-used to fit the 10
+pages seen since — so every access is a miss, 0%. (b) It is worse than being uncached because the scan fills the pool with single-use pages,
+evicting other queries' hot pages and collapsing the whole system's hit rate while it runs. (c) Defenses: LRU-K (a once-touched scan page isn't
+counted as recently used, so it isn't kept), and a dedicated ring buffer for scans (so scan pages never displace the shared pool); DBMIN's
+per-query locality sets do the same by budgeting buffers per query. <em>Tempting wrong answer:</em> &ldquo;make the pool bigger&rdquo; — a scan
+larger than any pool still floods. <strong>Feed-forward:</strong> &sect;48.4.</div>
+
+<div class="solution" id="sol48.7"><span class="sol-label">48.7</span>
+(a) When <var>W</var>&nbsp;&le;&nbsp;<var>F</var> the whole working set stays resident, so after warm-up the hit rate approaches 100%; in the
+looping-scan case with <var>W</var>&nbsp;&gt;&nbsp;<var>F</var> under LRU each page is evicted just before reuse, so the hit rate collapses toward
+0% — a cliff at <var>W</var>&nbsp;=&nbsp;<var>F</var>. (b) Below the cliff EAT &asymp; hit &asymp; ~36&nbsp;ns; above it EAT &asymp; miss &asymp;
+~350&nbsp;&micro;s — about four orders of magnitude apart. (c) The trap is quantitatively this cliff: crossing <var>W</var>&nbsp;=&nbsp;<var>F</var>
+flips nearly every access from a ~36&nbsp;ns hit to a ~350&nbsp;&micro;s miss, so a scan that nudges the working set past the pool size is
+catastrophic, not gradual. <em>Tempting wrong answer:</em> assuming the hit rate degrades smoothly with <var>W</var> — under looping LRU it falls
+off a cliff at <var>F</var>. <strong>Feed-forward:</strong> &sect;48.3&ndash;&sect;48.4.</div>
+
+<div class="solution" id="sol48.8"><span class="sol-label">48.8</span>
+<strong>Step 4:</strong> Each scan page, used once, evicts a hot point-query page under LRU, so the point queries' resident working set shrinks and
+their hit rate falls (99.5% &rarr; 85%). Effect on their average access time (hit ~36&nbsp;ns, miss ~350&nbsp;&micro;s): at 99.5% EAT &asymp;
+0.005&nbsp;&times;&nbsp;350&nbsp;&micro;s &asymp; 1.75&nbsp;&micro;s; at 85% EAT &asymp; 0.15&nbsp;&times;&nbsp;350&nbsp;&micro;s &asymp; 52&nbsp;&micro;s
+— roughly a 30&times; jump, matching the observed latency spike. Fix without enlarging the pool: make the scan scan-resistant — read it through a
+small ring buffer or use LRU-K/DBMIN so its single-use pages don't evict the point queries' working set. <em>Tempting wrong answer:</em> &ldquo;add
+RAM&rdquo; — the scan exceeds any pool, so it will still flood without a scan-resistant policy. <strong>Feed-forward:</strong> &sect;48.4.</div>
+
+<div class="solution" id="sol48.9"><span class="sol-label">48.9</span>
+(a) <strong>Pin count</strong> — a pinned (in-use) page is un-evictable. (b) <strong>Dirty bit</strong> — a modified victim is written back before
+reuse. (c) <strong>Page table</strong> — resolves a page number to a frame index. (d) <strong>Replacement policy</strong> — a scan-resistant policy
+keeps a scan from evicting the working set. (e) <strong>Writeback ordering</strong> — the log-before-page rule holds a dirty page until its log is
+durable. <em>Tempting wrong answer:</em> attributing (e) to the dirty bit alone — the dirty bit marks the page, but ordering the flush against the
+log is a separate mechanism. <strong>Feed-forward:</strong> &sect;48.1&ndash;&sect;48.2.</div>
+
+<div class="solution" id="sol48.10"><span class="sol-label">48.10</span>
+(a) <strong>False</strong> — a hit (~36&nbsp;ns) and a miss (~350&nbsp;&micro;s) differ by ~10,000&times;. (b) <strong>False</strong> — clock only
+approximates LRU (18.1% vs 18.6% here). (c) <strong>False</strong> — a clean victim's on-disk copy is current, so it is dropped without a write.
+(d) <strong>False</strong> — a scan larger than any pool still floods; the fix is a scan-resistant policy. (e) <strong>False</strong> — at 90% the
+misses (each ~10,000&times; a hit) make up essentially the entire average. <em>Tempting wrong answer:</em> marking (e) true by intuition that
+&ldquo;90% of accesses are hits, so hits dominate&rdquo; — cost, not count, sets the average. <strong>Feed-forward:</strong>
+&sect;48.2&ndash;&sect;48.4.</div>
+
+<div class="solution" id="sol48.11"><span class="sol-label">48.11</span>
+(a) Query wants row R &rarr; resolve its record identifier (page, slot) &rarr; buffer-pool lookup on the page number: a hit reads the frame from
+DRAM (~36&nbsp;ns — cheap), a miss reads the page from disk (~350&nbsp;&micro;s — the cliff) into a frame; then index the slot and read the record.
+The cliff is the buffer-pool miss. (b) The database knows its own access patterns and data structure — e.g. it can pin a page in use, order dirty
+writes against the log, or refuse to cache a scan — none of which the OS page cache exposes, and each changes the design toward correctness and
+scan-resistance. (c) Because a miss is ~10,000&times; a hit and the effective-access-time curve stays miss-dominated until the hit rate is very
+near one, the number that governs storage performance is the hit rate (how often you avoid the disk), not the disk's raw speed — you cannot make
+the disk fast, only visit it rarely. <em>Tempting wrong answer:</em> &ldquo;faster disks are the main lever&rdquo; — hit rate dominates until it is
+extremely high. <strong>Feed-forward:</strong> &sect;48.1&ndash;&sect;48.5.</div>
+
+<div class="solution" id="sol48.12"><span class="sol-label">48.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports a hit (memcpy from a resident buffer) and a miss (<code>O_DIRECT</code>
+<code>pread</code>) with their ratio; (b) reports FIFO, clock, and LRU hit rates from a fixed, seeded reference string including a looping scan
+larger than the pool (expect ~0% there); (c) states toolchain and CPU, flags the hit/miss times as wall-clock and whether the disk is virtualised,
+and distinguishes the <em>measured</em> latencies (device- and machine-dependent) from the <em>simulated</em> hit rates (exactly reproducible, a
+comparison of policies) — the distinction matters because only the simulation is a claim independent of hardware. <em>Tempting wrong answer:</em>
+presenting simulated hit rates as timed measurements — they are a deterministic policy comparison, not a clock reading. <strong>Feed-forward:</strong>
+&sect;48.3&ndash;&sect;48.4.</div>
+
+</section>

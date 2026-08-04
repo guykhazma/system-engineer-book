@@ -1,0 +1,91 @@
+<section class="solutions" id="sol47">
+<h1>Chapter 47 — Solutions</h1>
+
+<div class="solution" id="sol47.1"><span class="sol-label">47.1</span>
+Page 10 begins at offset 10&nbsp;&times;&nbsp;4096&nbsp;=&nbsp;40,960, and one page read transfers the whole page — 4,096 bytes. <em>Tempting wrong
+answer:</em> reading &ldquo;just the record&rdquo; — the storage manager always transfers a full page, not a byte range. <strong>Feed-forward:</strong>
+&sect;47.1.</div>
+
+<div class="solution" id="sol47.2"><span class="sol-label">47.2</span>
+The <strong>slot directory</strong> (with a header) grows downward from the top; the <strong>record data</strong> grows upward from the bottom;
+free space sits between. One slot holds the (offset, length) of a record within the page. <em>Tempting wrong answer:</em> &ldquo;a slot holds the
+record itself&rdquo; — it holds a pointer to the record, not the bytes. <strong>Feed-forward:</strong> &sect;47.2.</div>
+
+<div class="solution" id="sol47.3"><span class="sol-label">47.3</span>
+<code>write</code> only puts data in the OS page cache and returns, so a crash before flush loses it; <code>fsync</code> blocks until the device
+reports the data persisted, making it durable. <em>Tempting wrong answer:</em> &ldquo;<code>write</code> writes to disk&rdquo; — it writes to the
+cache; durability needs the barrier. <strong>Feed-forward:</strong> &sect;47.4.</div>
+
+<div class="solution" id="sol47.4"><span class="sol-label">47.4</span>
+(a) A record identifier is (page number, slot number): the page number costs one page fetch (a buffer-pool hit, ~tens of ns, or a disk miss,
+~hundreds of &micro;s), the slot number an array index within the page. (b) Because outside references name the <em>slot</em>, not a byte offset,
+compaction can slide records to reclaim deletion holes and only update each slot's stored offset — every (page, slot) reference still resolves. (c)
+A forwarding pointer is left in a record's original slot when the record grows beyond its page's free space and must move to another page; it costs
+one extra page access to follow on read. <em>Tempting wrong answer:</em> &ldquo;the record ID is the byte offset&rdquo; — that would freeze
+records in place and break under compaction. <strong>Feed-forward:</strong> &sect;47.2.</div>
+
+<div class="solution" id="sol47.5"><span class="sol-label">47.5</span>
+(a) Fixed part: null bitmap, then the <code>int</code> and <code>double</code> inline, then offsets/lengths for the two <code>varchar</code>s;
+variable-length area at the end holds the two strings' bytes. (b) The <code>int</code> and <code>double</code> have known sizes, so their
+positions are constant offsets; the <code>varchar</code>s have data-dependent lengths, so a stored offset must locate them. (c) A null bitmap uses
+one bit per nullable column — dense and cheap to test — and lets the column's storage be omitted, rather than reserving a whole sentinel value in
+every row. <em>Tempting wrong answer:</em> putting <code>varchar</code> bytes inline at a fixed position — their length isn't known at schema time.
+<strong>Feed-forward:</strong> &sect;47.3.</div>
+
+<div class="solution" id="sol47.6"><span class="sol-label">47.6</span>
+(a) An <code>fsync</code> forces an actual, acknowledged trip to the device and cannot be pipelined, so per page it serializes the workload behind
+a full device round trip — ~3&ndash;4&nbsp;ms each here versus ~30&nbsp;&micro;s amortized when one sync covers 2,000 pages. (b) The batched
+alternative writes changes to a sequential write-ahead log and issues one <code>fsync</code> per group of commits (group commit), keeping the same
+crash guarantee because the log is durable before the commit is acknowledged. (c) It passes correctness tests because each record really is durable
+after its sync, but it caps throughput at a few hundred durable writes per second, which only fails under load. <em>Tempting wrong answer:</em>
+&ldquo;batching weakens durability&rdquo; — group commit is equally durable, just amortized. <strong>Feed-forward:</strong> &sect;47.4.</div>
+
+<div class="solution" id="sol47.7"><span class="sol-label">47.7</span>
+(a) Per record: <var>N</var>&nbsp;&times;&nbsp;<var>s</var>. Per batch of <var>k</var>: (<var>N</var>/<var>k</var>)&nbsp;&times;&nbsp;<var>s</var>. (b)
+With <var>s</var>&nbsp;=&nbsp;3&nbsp;ms, <var>N</var>&nbsp;=&nbsp;100,000: <var>k</var>&nbsp;=&nbsp;1 gives 300&nbsp;s;
+<var>k</var>&nbsp;=&nbsp;1000 gives 0.3&nbsp;s. (c) Sustainable durable-commit rate is ~333/s for <var>k</var>&nbsp;=&nbsp;1 and ~333,000/s for
+<var>k</var>&nbsp;=&nbsp;1000 — a 1000&times; gain from amortizing one barrier over 1000 commits, which is exactly why group commit exists.
+<em>Tempting wrong answer:</em> assuming throughput scales with CPU, not with the sync barrier — the barrier is the bottleneck.
+<strong>Feed-forward:</strong> &sect;47.4.</div>
+
+<div class="solution" id="sol47.8"><span class="sol-label">47.8</span>
+<strong>Step 4:</strong> Losing the last write leaves a consistent older page; a torn write leaves a page that is <em>neither</em> the old nor the
+new version — part of each — so it is corrupt and cannot be read as either, which is why the database won't open. A logging scheme fixes it by
+recording the page's intended contents durably <em>before</em> overwriting it in place: e.g. full-page logging or a double-write buffer writes the
+whole new page to a separate durable location first, so after a crash recovery detects the torn page and reconstructs it from the logged copy.
+<em>Tempting wrong answer:</em> &ldquo;just retry the write&rdquo; — the old contents are already gone, so without a logged copy there is nothing
+to recover to. <strong>Feed-forward:</strong> &sect;47.4.</div>
+
+<div class="solution" id="sol47.9"><span class="sol-label">47.9</span>
+(a) <strong>Fixed part</strong> — a known-size 4-byte value read at a constant offset. (b) <strong>Variable-length area</strong> — a variable-size
+string stored at the record's end. (c) <strong>Null bitmap</strong> — one bit recording the column's absence. (d) <strong>Fixed part</strong> — a
+known-size 8-byte value. (e) <strong>Fixed part</strong> — the offset that locates (b) is itself fixed-size and lives inline. <em>Tempting wrong
+answer:</em> putting the description's <em>offset</em> in the variable area — the offset is fixed-size and must be at a known position to be found.
+<strong>Feed-forward:</strong> &sect;47.3.</div>
+
+<div class="solution" id="sol47.10"><span class="sol-label">47.10</span>
+(a) <strong>False</strong> — a slotted page need not store records in sorted order; the slot directory decouples reference order from physical
+order. (b) <strong>False</strong> — a record identifier is (page number, slot number), not a raw byte offset. (c) <strong>False</strong> — after
+<code>pwrite</code> the data is in the page cache, not on the device; <code>fsync</code> is required. (d) <strong>False</strong> — one
+<code>fsync</code> per batch is equally durable, just amortized. (e) <strong>False</strong> — a torn write is corruption (part old, part new), not
+merely a lost update. <em>Tempting wrong answer:</em> marking (d) true, conflating &ldquo;less frequent&rdquo; with &ldquo;less safe.&rdquo;
+<strong>Feed-forward:</strong> &sect;47.2&ndash;&sect;47.4.</div>
+
+<div class="solution" id="sol47.11"><span class="sol-label">47.11</span>
+(a) Record identifier (page, slot) &rarr; fetch the <em>page</em> (buffer-pool hit or disk read — the cliff is here) &rarr; index the <em>slot</em>
+to get an (offset, length) &rarr; read the <em>record</em> bytes at that offset. The page level buys the unit of I/O and caching; the slot level
+buys stable addressing under compaction. (b) The ~100&times; per-page <code>fsync</code> penalty means durability cannot be paid per record and
+survive real load, so it must be batched behind a sequential log with one grouped barrier — the write-ahead log is the shape durability is
+<em>forced</em> into, not an optional tuning. (c) A record on disk carries its own variability (stored offsets for variable fields) and optionality
+(null bitmap) because it must be self-describing to survive serialization and be read back later, possibly under a newer code version — things an
+in-memory struct, tied to one program's live layout, never needs. <em>Tempting wrong answer:</em> treating the log as a mere speed optimization —
+the measurement shows it is a structural necessity. <strong>Feed-forward:</strong> &sect;47.1&ndash;&sect;47.5.</div>
+
+<div class="solution" id="sol47.12"><span class="sol-label">47.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports total time, per-page time, and durable writes/s for one-<code>fsync</code>-at-end
+versus per-page <code>fsync</code>; (b) repeats with <code>fdatasync</code> and notes it syncs data without necessarily all metadata, often
+similar here; (c) states toolchain and CPU, flags wall-clock timing and whether the disk is virtualised, and argues that the <em>ratio</em>
+(per-page vs batched) is the portable lesson while the absolute per-sync time depends on the device and stack. <em>Tempting wrong answer:</em>
+reporting the absolute per-sync time as a universal constant — it varies by device and virtualization. <strong>Feed-forward:</strong> &sect;47.4.</div>
+
+</section>

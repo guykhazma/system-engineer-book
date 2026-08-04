@@ -1,0 +1,365 @@
+<section class="chapter" id="ch46">
+<h1>Chapter 46 — Storage &amp; the Disk: How Devices Really Work</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch03">Chapter 3</a> (the memory hierarchy and the cost cliff between a cache hit and
+DRAM), <a href="#ch40">Chapter 40</a> (the page cache — how the OS keeps disk blocks in memory), <a href="#ch41">Chapter 41</a> (durability and
+<code>fsync</code>), <a href="#ch17">Chapter 17</a> (demand paging and page replacement — the same problem a buffer pool will solve by hand),
+<a href="#ch05">Chapter 5</a> (mechanical sympathy — knowing the device you run on). &nbsp;·&nbsp; This chapter opens the second volume. The first
+built the machine and its I/O; the second builds a database on top, and a database is, before anything else, a program that is honest about where
+its data physically lives. That place is the disk, and the disk is nothing like RAM. This chapter is the floor the whole volume stands on.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch03">Chapter 3</a> — a cache miss to DRAM costs on the order of a hundred nanoseconds against a hit's fraction of
+one; storage sits one more cliff below DRAM. Roughly how much slower is a disk access than a DRAM access? (2) <a href="#ch40">Chapter 40</a> —
+when you <code>read</code> a file the OS may serve it from the page cache in memory; what has to happen the first time, when it is <em>not</em>
+cached? (3) <em>Predict:</em> a program reads a 1&nbsp;GiB file with the page cache bypassed, two ways — streaming it in large sequential blocks,
+and fetching 4&nbsp;KiB pages at random offsets. Two questions: which is faster, and by what factor — 2&times;, 10&times;, 50&times;? And would a
+spinning hard disk and a flash SSD give the <em>same</em> ratio? Write your guesses; &sect;46.2&ndash;&sect;46.4 answer them.</p>
+</aside>
+
+<p>Everything in Volume 1 could pretend the machine had one kind of memory. The RAM model of <a href="#ch01">Chapter 1</a> says any location costs
+the same to touch, and even after Chapter 3 punctured that with caches, the whole hierarchy — registers, L1, L2, L3, DRAM — was still
+<em>memory</em>: electrically addressed, uniform within a level, measured in nanoseconds. A database cannot live in that world, because its data
+outlives the process and outgrows the RAM, so it must live on <strong>persistent storage</strong> — a disk — and the disk breaks every
+assumption the memory hierarchy let you keep. It is slower than DRAM by three to five orders of magnitude; it is addressed not in bytes but in
+fixed <strong>blocks</strong>; and, most consequentially, its cost depends violently on <em>access pattern</em> — reading the same amount of data
+sequentially versus at random can differ by fifty times. Every structure a database builds — the page, the B-tree, the log, the buffer pool —
+is a specific, disciplined answer to those three facts. This chapter establishes them in five steps: the storage hierarchy and why the disk is
+the floor (&sect;46.1); the spinning hard disk, its geometry, and why a seek is the enemy (&sect;46.2); the flash SSD, its erase blocks, the
+translation layer, and why it has no seek but hates small writes (&sect;46.3); the block layer and the sequential-versus-random gap, measured on
+this machine (&sect;46.4); and the storage discipline the rest of the volume inherits (&sect;46.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The program is C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as the best of several trials; times are wall-clock and a
+hardware-counter profiler (<code>perf</code>) is <em>not</em> installed. Reads use <code>O_DIRECT</code> to bypass the page cache so the
+measurement reaches the storage stack rather than DRAM. This machine runs under <strong>WSL2</strong>: the working directory is an
+<code>ext4</code> filesystem on a virtual disk (<code>/dev/sdd</code>), whose <code>/sys/block/sdd/queue/physical_block_size</code> reads
+<strong>4096</strong> and whose <code>rotational</code> flag reads <strong>1</strong> — a virtio artifact, not a real platter; the host backing
+store is an NVMe SSD. So the absolute numbers below reflect a <em>virtualised SSD through a hypervisor at queue depth one</em>, not a bare device,
+and the published hard-disk and SSD latencies quoted in &sect;46.1&ndash;&sect;46.3 are labeled <strong>published/typical</strong>, not measured
+here. Device values were read from <code>/sys/block</code> on this machine.</p>
+
+<h2>46.1 The storage hierarchy and why the disk is the floor</h2>
+
+<p>Extend the memory hierarchy of Chapter 3 downward past DRAM and you reach a different kind of device. The numbers, as
+<em>published/typical</em> figures (Bryant &amp; O'Hallaron, CS:APP, Chapter 6; the orders of magnitude, not the exact digits, are the point):
+an L1 cache hit is about one nanosecond; a miss to DRAM is on the order of a hundred nanoseconds; a read from a flash <strong>SSD</strong> is on
+the order of tens to a hundred <strong>microseconds</strong> — a thousand times slower than DRAM; and a read from a spinning <strong>hard
+disk</strong> that must physically move its head is on the order of <strong>ten milliseconds</strong> — a hundred thousand times slower than DRAM,
+and roughly ten million times slower than the L1 hit. If a DRAM access were one second, a hard-disk seek would be about four months. That is not
+a slower level of the same hierarchy; it is a cliff, and a database spends its life on the wrong side of it. The consequence is the founding
+principle of storage engineering: <strong>an access to disk is so expensive relative to computation that the entire design is organized around
+avoiding, batching, and amortizing it.</strong> A B-tree is shaped to reach any record in three or four disk accesses instead of thousands; a log
+is written sequentially so that durability costs one kind of I/O instead of the worst kind; a buffer pool (Chapter 48) keeps hot pages in DRAM so
+that most accesses never reach the cliff at all. You cannot make the disk fast. You can only touch it rarely, in bulk, and in the pattern it
+prefers — and to do that you must know what pattern it prefers, which is the subject of the next three sections.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Order these by access latency and give the published/typical magnitude of each: an L1 cache hit, a DRAM access, a flash-SSD read, a hard-disk
+seek. Roughly how many DRAM accesses fit in the time of one hard-disk seek? (Answer after the next section.)</p>
+</aside>
+
+<h2>46.2 The spinning hard disk: geometry, seek, and rotation</h2>
+
+<p>A mechanical hard disk stores bits as magnetic patterns on the surfaces of rigid spinning <strong>platters</strong>. Each surface is divided
+into concentric <strong>tracks</strong>, and each track into fixed-size <strong>sectors</strong> (historically 512 bytes, now commonly 4096); a
+<strong>head</strong> on a moving arm reads and writes whichever sector passes beneath it. To read a given sector, two mechanical motions must
+finish: the arm must move the head to the right track — a <strong>seek</strong> — and the platter must rotate until the target sector arrives
+under the head — <strong>rotational latency</strong>. Both are governed by physics, not electronics, and both are slow. Published/typical figures
+(OSTEP, &ldquo;Hard Disk Drives&rdquo;): an average seek is on the order of several to ten milliseconds, and a 7200-RPM drive turns once every
+about 8.3&nbsp;ms, so the average rotational wait — half a turn — is roughly 4&nbsp;ms. Only after both finish does the actual data
+<strong>transfer</strong> begin, and the transfer itself is fast (100+&nbsp;MB/s). This decomposition is the whole story of the hard disk: the
+time to read a sector is dominated by <em>getting to it</em>, not by reading it. Now consider what that means for access pattern. A
+<strong>sequential</strong> read walks sectors that are already adjacent — same track, then the next — so after one initial seek the head barely
+moves and the platter simply feeds sector after sector; the per-sector cost collapses toward the raw transfer rate. A <strong>random</strong>
+read jumps to an unrelated sector each time, paying a fresh seek plus rotational latency — call it roughly 10&nbsp;ms — for every single access.
+The difference is not a constant factor; it is the difference between paying mechanical positioning <em>once</em> and paying it <em>every
+time</em>. This is why, on a hard disk, a few hundred random reads per second is a realistic ceiling while sequential throughput is hundreds of
+megabytes per second, and it is the physical reason databases were built, from the beginning, to turn random work into sequential work wherever
+they possibly can (McKusick's fast file system, Chapter 47's on-disk layout, and the log-structured designs of the next part all descend from
+this one fact).</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: the disk is not RAM — random access costs far more than sequential</span>
+<p><strong>1. In words.</strong> On storage, the cost of reaching data dominates the cost of reading it. On a spinning disk the reach is a
+mechanical seek plus rotation (~10&nbsp;ms); even on an SSD, small random I/O forfeits the streaming efficiency of large sequential I/O. So the
+same number of bytes costs far more fetched at random than fetched in order — the opposite of the uniform-cost RAM model.</p>
+<p><strong>2. As a picture.</strong> Figure 46.1: the latency cliff from L1 (~1&nbsp;ns) down to DRAM (~100&nbsp;ns), SSD (~100&nbsp;&micro;s), and
+hard disk (~10&nbsp;ms) on a log scale; beside it, two bars for the same 1&nbsp;GiB moved through this machine's storage stack — large sequential
+streaming versus small random 4&nbsp;KiB reads — the random bar a sliver of the sequential one.</p>
+<p><strong>3. As numbers/contrast.</strong> Measured here (1&nbsp;GiB, <code>O_DIRECT</code>, queue depth 1): sequential 1&nbsp;MiB-block streaming
+at <strong>~916&nbsp;MB/s</strong> against random 4&nbsp;KiB reads at <strong>~19&nbsp;MB/s</strong> and ~221&nbsp;&micro;s per read — about
+<strong>49&times;</strong> more throughput for the same device when the access is sequential (&sect;46.4).</p>
+</aside>
+
+<p><em>(Answer to the &sect;46.1 quick check: fastest to slowest — L1 hit ~1&nbsp;ns, DRAM ~100&nbsp;ns, flash-SSD read ~tens&ndash;100&nbsp;&micro;s,
+hard-disk seek ~10&nbsp;ms, all published/typical. A hard-disk seek is roughly <strong>100,000&times;</strong> a DRAM access, so on the order of a
+hundred thousand DRAM accesses fit in one seek — the cliff a database spends its life avoiding.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">The storage cliff (log scale), and the same 1 GiB moved sequentially vs at random on this machine.</text>
+<text x="12" y="38" font-size="9" fill="#8c3a1d">Latency, published/typical (log scale) &mdash; each step is ~1000x</text>
+<rect x="20" y="48" width="40" height="16" fill="#dfe8f4" stroke="#14406b"/><text x="66" y="60" font-size="8">L1 hit ~1 ns</text>
+<rect x="20" y="70" width="90" height="16" fill="#dfe8f4" stroke="#14406b"/><text x="116" y="82" font-size="8">DRAM ~100 ns</text>
+<rect x="20" y="92" width="150" height="16" fill="#e7dff4" stroke="#5a3a8c"/><text x="176" y="104" font-size="8">SSD read ~100 &micro;s (~1000x DRAM)</text>
+<rect x="20" y="114" width="230" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="256" y="126" font-size="8">hard-disk seek ~10 ms (~100,000x DRAM)</text>
+<text x="20" y="150" font-size="8" fill="#8c3a1d">A database lives below DRAM: every access it fails to avoid falls off this cliff.</text>
+<line x1="12" y1="162" x2="628" y2="162" stroke="#b9c2cc"/>
+<text x="12" y="182" font-size="9" fill="#2f7d32">Measured (1 GiB, O_DIRECT, queue depth 1): sequential streaming vs random 4 KiB</text>
+<rect x="20" y="192" width="500" height="22" fill="#dfe8f4" stroke="#14406b"/><text x="26" y="207" font-size="9" fill="#14406b">sequential 1 MiB blocks &mdash; ~916 MB/s</text>
+<rect x="20" y="220" width="10" height="22" fill="#f6dcd2" stroke="#8c3a1d"/><text x="36" y="235" font-size="9" fill="#8c3a1d">random 4 KiB &mdash; ~19 MB/s, ~221 &micro;s/read (~49x less)</text>
+<text x="12" y="266" font-size="8" fill="#14406b">Same device, same bytes: the access pattern &mdash; not the hardware &mdash; is the 49x.</text>
+<text x="12" y="286" font-size="8" fill="#5a3a8c">On flash there is no seek, so single 4 KiB random ~= sequential (~1.24x here); the gap above is streaming vs small I/O.</text>
+</svg>
+<figcaption>Figure 46.1: Storage sits one to five orders of magnitude below DRAM (top, log scale). For the same 1&nbsp;GiB on this machine
+(bottom), large sequential streaming reaches ~916&nbsp;MB/s while small random 4&nbsp;KiB reads reach ~19&nbsp;MB/s — a ~49&times; gap set by the
+<em>access pattern</em>, not by the device.</figcaption>
+</figure>
+
+<h2>46.3 The flash SSD: erase blocks, the FTL, and wear</h2>
+
+<p>A solid-state drive has no moving parts: it stores bits as trapped charge in <strong>NAND flash</strong> cells, and reads them electronically,
+so there is no seek and no rotation. That single fact changes the cost model — random reads on an SSD are cheap, close to sequential, because
+there is nothing mechanical to reposition. But flash has its own awkward physics, and a database that assumes an SSD is just &ldquo;a fast
+disk&rdquo; will be surprised by writes. Flash is organized into <strong>pages</strong> (typically a few kilobytes, the unit of read and
+<em>program</em>/write) grouped into <strong>erase blocks</strong> (typically hundreds of pages, the unit of <em>erase</em>). The awkward rule is
+this: you can read any page and you can program an <em>empty</em> page, but you <strong>cannot overwrite a page in place</strong> — to rewrite it
+you must first erase its entire surrounding block, and erase is slow and can only be done a limited number of times before the cells wear out. No
+sane system erases a whole block to change one page, so every SSD hides a <strong>Flash Translation Layer</strong> (FTL): a controller that maps
+logical block addresses (what the OS sees) to physical flash pages (where the data actually is), writes updated data to a fresh already-erased
+page and remaps the pointer, garbage-collects blocks whose pages are mostly stale, and spreads writes across all blocks so no cell wears out
+first — <strong>wear leveling</strong> (Agrawal et al., &ldquo;Design Tradeoffs for SSD Performance,&rdquo; USENIX ATC 2008; OSTEP,
+&ldquo;Flash-based SSDs&rdquo;). The consequences a database designer must keep in mind: reads are fast and pattern-insensitive; a random small
+<em>write</em> can trigger far more physical work than it seems (a read-erase-reprogram cycle plus garbage collection), an effect called
+<strong>write amplification</strong>; and the device has a finite write lifetime. So the sequential-write preference that the hard disk taught for
+mechanical reasons survives on the SSD for a completely different reason — large sequential writes are friendlier to the FTL's erase-block
+structure and cause less amplification. As a small confirmation that flash has no seek, the single-4&nbsp;KiB reads measured on this machine came
+out only about <strong>1.24&times;</strong> slower at random offsets than at sequential ones (&sect;46.4) — a hard disk would show that same
+comparison as a chasm, because each random read there would pay a fresh ~10&nbsp;ms seek.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>On an SSD, why is a random <em>read</em> nearly as cheap as a sequential one, when on a hard disk it is far more expensive? Why is a small
+random <em>write</em> the operation an SSD dislikes, and what is the layer that hides in-place-overwrite from the OS called? (Answer below the
+communicate box.)</p>
+</aside>
+
+<h2>46.4 The block layer and sequential vs random, measured</h2>
+
+<p>Above the device, the operating system presents storage as the <strong>block layer</strong>: a linear array of fixed-size blocks, addressed by
+number, that you read and write a whole block at a time. On this machine, <code>/sys/block/sdd/queue/logical_block_size</code> is
+<strong>512</strong> (the smallest addressable unit the device advertises) and <code>physical_block_size</code> is <strong>4096</strong> (the size
+the device actually operates on internally); a database will choose a page size that is a multiple of that physical block — 4, 8, or 16&nbsp;KiB
+— precisely so that one page is one natural unit of device I/O. The block abstraction is why a database thinks in <em>pages</em>, not bytes
+(Chapter 47): the smallest thing you can fetch or store is a block, so making the byte the unit of I/O would waste almost all of every transfer.
+To measure the sequential-versus-random gap directly, the program reads a 1&nbsp;GiB file with <code>O_DIRECT</code> — which bypasses the page
+cache so each read reaches the storage stack — two ways: streaming the whole file in 1&nbsp;MiB blocks, and fetching 4&nbsp;KiB pages at
+uniformly random offsets. Best of several trials on this machine:</p>
+
+<pre><code>read 1 GiB, O_DIRECT (page cache bypassed), single thread, queue depth 1:
+  sequential, 1 MiB blocks :  ~916 MB/s
+  random,     4 KiB pages   :  ~19 MB/s   (~221 &micro;s/read, ~4,500 IOPS)
+  sequential streaming is ~49x the throughput of small random I/O
+  (single 4 KiB reads: random only ~1.24x slower than sequential -> flash has no seek)
+</code></pre>
+
+<p>The sequential stream moved bytes at about <strong>49&times;</strong> the throughput of the small random reads — 916 against 19&nbsp;MB/s —
+on the exact same device, in the same run. Two distinct effects combine to produce that gap, and it is worth separating them because they teach
+different lessons. The first is <strong>I/O size</strong>: the sequential test asks for 1&nbsp;MiB at a time and the random test for 4&nbsp;KiB, so
+the sequential test amortizes each request's fixed overhead over 256&times; more data; big requests are efficient, tiny requests are not. The
+second is <strong>access pattern</strong>: the random test scatters its reads, forfeiting any readahead or locality the stack could exploit. That
+the <em>single</em>-4&nbsp;KiB comparison (sequential vs random at the same small size) came out only ~1.24&times; apart tells you that on this
+flash-backed device the pattern penalty alone is modest — there is no seek — and that most of the 49&times; is the I/O-<em>size</em> effect, the
+reward for fetching in bulk. On a real spinning disk the same experiment would show the pattern penalty exploding instead, because each random
+read would pay a mechanical seek. Either way the engineering conclusion is identical, and it is the reason a database is built the way it is:
+<strong>read and write in large, sequential, block-aligned units, and avoid a storm of tiny random accesses.</strong> Hold the WSL2 caveat
+firmly, though — 221&nbsp;&micro;s per random read and 4,500 IOPS are the numbers for <em>this virtualised disk at queue depth one</em>; a bare
+NVMe SSD driven with deep request queues does far more, and a spinning disk far less. The <em>shape</em> of the result — sequential vastly beats
+small random — is the portable lesson; the digits are this machine's.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: treating the disk as random-access memory &mdash; assuming any access costs the same</span>
+<p>The most expensive mistake in storage design is to carry the RAM model (Chapter 1) down to the disk: to lay data out, or write access code, as
+if fetching a record from a random offset costs the same as streaming the next one. It does not — measured here, small random I/O ran at
+1/49&nbsp;of sequential throughput, and on a spinning disk the ratio would be far worse because each random access pays a mechanical seek. The
+trap surfaces as designs that scatter related data across the file and then chase it with a pointer per record, or that update rows in place at
+random offsets, and then are baffled that the system is slow despite &ldquo;not doing much I/O&rdquo; — it is doing the <em>worst kind</em> of
+I/O. Two secondary traps live here too. First, do not trust a single flag or number: this machine's <code>/sys/block/sdd/rotational</code> reads
+<strong>1</strong> though the backing store is an NVMe SSD (a WSL2 virtio artifact), so a design that branched on that flag would be wrong; and the
+221&nbsp;&micro;s random-read latency is a queue-depth-one virtualised figure, not a device ceiling. Second, do not assume an SSD's cheap random
+<em>reads</em> mean cheap random <em>writes</em> — the FTL makes small random writes amplify (&sect;46.3). The defense is the discipline this part
+builds: think in block-sized pages, prefer large sequential I/O, keep related data physically together, and turn unavoidable random work into
+sequential work (the log, the buffer pool, the B-tree's fanout) rather than pretending the disk is flat.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Let's store each record at whatever offset in the file, and keep a hash table from record
+ID to byte offset. To read a record we just <code>seek</code> there and read it. Disks are random-access anyway, so it'll be fast.&rdquo; Cover
+the paragraph and respond in four or five sentences, drawing on &sect;46.2 and &sect;46.4.</p>
+<p><em>Model answer.</em> &ldquo;The premise is the trap — a disk is not random-access like RAM. I measured small random 4&nbsp;KiB reads on our
+storage at about 19&nbsp;MB/s and ~221&nbsp;&micro;s each, against ~916&nbsp;MB/s streaming sequentially: roughly 49&times; slower for the same
+bytes, and on a spinning disk it would be far worse because every seek is mechanical, on the order of 10&nbsp;ms. A seek-per-record design turns
+every lookup and especially every scan into a storm of the most expensive I/O there is. The reason databases use fixed-size <strong>pages</strong>
+and pack related records together is exactly to fetch in large, block-aligned, mostly-sequential units and to keep hot pages in a buffer pool so
+most reads never touch the disk at all. So let's not scatter records at arbitrary offsets; let's lay them out in pages, and if we need lookup by
+ID, that's what an index is for — it's built to reach a record in a few page reads, not one seek per record.&rdquo; Naming the measured
+sequential-vs-random gap, the page as the I/O unit, and the buffer pool as the thing that avoids the cliff is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;46.3 quick check: a random read is cheap on an SSD because flash is addressed electronically — there is no head to move
+or platter to rotate, so reaching any page costs the same; on a hard disk a random read pays a mechanical seek plus rotational latency each time.
+A small random <strong>write</strong> is the SSD's weak spot because flash cannot be overwritten in place — the surrounding erase block must be erased
+first — so the controller must write elsewhere, remap, and later garbage-collect, causing <strong>write amplification</strong>; the layer that
+hides in-place overwrite and does the remapping, garbage collection, and wear leveling is the <strong>Flash Translation Layer</strong>,
+the&nbsp;FTL.)</em></p>
+
+<h2>46.5 What to carry forward</h2>
+
+<p>Storage sits one to five orders of magnitude below DRAM, and a database spends its life avoiding, batching, and amortizing the trip down the
+cliff (&sect;46.1). A spinning hard disk pays a mechanical <strong>seek</strong> plus rotational latency to reach data — on the order of
+10&nbsp;ms — so sequential access, which pays that once, beats random access, which pays it every time; this is the physical origin of every
+&ldquo;keep related data together&rdquo; rule in the volume (&sect;46.2). A flash <strong>SSD</strong> has no seek, so random reads are cheap, but
+it cannot overwrite in place, so a <strong>Flash Translation Layer</strong> remaps writes, garbage-collects, and levels wear, making small random
+writes amplify — the sequential-write preference survives for a new reason (&sect;46.3). Above the device the <strong>block layer</strong> presents
+fixed-size blocks (physical block 4096 on this machine), which is why a database thinks in <em>pages</em>; and measured here, large sequential
+streaming beat small random I/O by ~<strong>49&times;</strong> on the same device — the portable lesson being <em>read and write in large,
+sequential, block-aligned units</em> (&sect;46.4). Multiple disks can be combined for throughput and redundancy — the RAID idea (Patterson,
+Gibson &amp; Katz, 1988) — but even then the per-device physics above is what each disk contributes.</p>
+
+<p>That physics is the foundation the rest of this volume builds on, and the shape of what follows is already visible. The next chapter
+(Chapter 47) takes the block layer's fixed-size unit and makes it the database's currency: the <strong>page</strong>, laid out to hold
+variable-length records, and the file as a linear array of pages — the on-disk format a storage manager reads and writes, with the durability
+barrier (<code>fsync</code>) that Chapter 41 introduced now costed page by page. Chapter 48 then confronts the cliff head-on with the
+<strong>buffer pool</strong>: the database's own hand-managed cache of pages in DRAM, so that most accesses hit memory and only misses fall to
+the disk — the same demand-paging problem as Chapter 17, solved deliberately because the database knows its own access patterns. And beyond this
+part, the two great storage-engine families — B-trees and log-structured merge trees — are each an answer to this chapter's cost model: the
+B-tree minimizes the number of disk accesses per lookup, and the LSM tree turns random writes into sequential ones. The disk is the floor; know
+what it costs to touch it, and every structure above it stops being arbitrary and starts being <em>forced</em>.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Place storage on the memory hierarchy and give the published/typical latency of DRAM, an SSD read, and a hard-disk seek.</li>
+<li>Decompose a hard-disk read into seek, rotational latency, and transfer, and explain why sequential beats random.</li>
+<li>Explain why an SSD has no seek, what an erase block is, and why the FTL exists.</li>
+<li>Define write amplification and say why small random writes are an SSD's weak spot.</li>
+<li>State what the block layer presents, why a database thinks in pages, and the physical block size of this machine's disk.</li>
+<li>Quote the measured sequential-vs-random gap here (~49&times;) and separate the I/O-size effect from the access-pattern effect.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Roughly how much slower is a hard-disk seek than a DRAM access, and why does that ratio organize all of storage design? (&sect;46.1)</li>
+<li><strong>R2.</strong> What two mechanical delays must finish before a hard disk transfers data, and why does that make random access far costlier than sequential? (&sect;46.2)</li>
+<li><strong>R3.</strong> Why can't flash be overwritten in place, and what three jobs does the FTL do about it? (&sect;46.3)</li>
+<li><strong>R4.</strong> What does the block layer present, and why does a database choose a page size that is a multiple of the physical block size? (&sect;46.4)</li>
+<li><strong>R5.</strong> What was the measured sequential-vs-random throughput ratio here, and which part of it is I/O size versus access pattern? (&sect;46.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Remzi H. Arpaci-Dusseau &amp; Andrea C. Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em>, &ldquo;Hard Disk Drives&rdquo;
+(free online, pages.cs.wisc.edu/~remzi/OSTEP).</strong> The clearest short treatment of the source for &sect;46.2: platters, tracks, sectors, and
+the seek + rotation + transfer decomposition of a disk access. First authors the Arpaci-Dusseaus; chapter title verified against the online
+edition.</li>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>OSTEP</em>, &ldquo;Flash-based SSDs.&rdquo;</strong> The reference for &sect;46.3: NAND pages
+and erase blocks, the read/program/erase asymmetry, the Flash Translation Layer, garbage collection, and wear leveling — chapter title verified
+against the online edition.</li>
+<li><strong>Randal E. Bryant &amp; David R. O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed. (Pearson, 2016), ISBN
+978-0-13-409266-9, Chapter 6 (&ldquo;The Memory Hierarchy&rdquo;).</strong> The source for &sect;46.1's hierarchy and its published latency
+magnitudes, including disk geometry from a programmer's viewpoint. First author Randal E. Bryant; edition and ISBN verified via the publisher.</li>
+<li><strong>Nitin Agrawal, Vijayan Prabhakaran, Ted Wobber, John D. Davis, Mark Manasse &amp; Rina Panigrahy, &ldquo;Design Tradeoffs for SSD
+Performance,&rdquo; <em>USENIX Annual Technical Conference</em> (2008).</strong> The design-space study behind &sect;46.3: FTL policies, write
+amplification, and how workload shapes SSD performance and lifetime. First author Nitin Agrawal; venue and year verified via the USENIX
+proceedings.</li>
+<li><strong>David A. Patterson, Garth Gibson &amp; Randy H. Katz, &ldquo;A Case for Redundant Arrays of Inexpensive Disks (RAID),&rdquo; <em>Proc.
+ACM SIGMOD</em> (1988), DOI 10.1145/50202.50214.</strong> The origin of combining many disks for throughput and redundancy, referenced in
+&sect;46.5. First author David A. Patterson; venue, year, and DOI verified via the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex46.1"><span class="ex-label">46.1</span> <span class="ex-tag warm">warm-up</span>
+Give the published/typical latency magnitude of each and order them: an L1 cache hit, a DRAM access, a flash-SSD read, a hard-disk seek.</div>
+
+<div class="exercise" id="ex46.2"><span class="ex-label">46.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two mechanical delays a spinning hard disk pays before it can transfer a sector, and say in one sentence why they make random reads far
+costlier than sequential ones.</div>
+
+<div class="exercise" id="ex46.3"><span class="ex-label">46.3</span> <span class="ex-tag warm">warm-up</span>
+Why can a flash SSD not overwrite a page in place, and what is the unit it must erase before rewriting?</div>
+
+<div class="exercise" id="ex46.4"><span class="ex-label">46.4</span> <span class="ex-tag core">core</span>
+The hard-disk cost model. (a) Write the total time to read one sector as the sum of three terms and name each. (b) A drive has a 9&nbsp;ms average
+seek, spins at 7200&nbsp;RPM, and transfers at 150&nbsp;MB/s. Estimate the time to read one 4&nbsp;KiB sector at a random location, and identify
+which term dominates. (c) Estimate the time to read 1&nbsp;MiB laid out sequentially, and explain why the per-byte cost is now completely
+different.</div>
+
+<div class="exercise" id="ex46.5"><span class="ex-label">46.5</span> <span class="ex-tag core">core</span>
+Flash asymmetry. (a) Explain why a random <em>read</em> on an SSD is nearly as fast as a sequential one, but a random small <em>write</em> can be
+much more expensive. (b) Define write amplification and give the sequence of physical operations a single small overwrite can trigger. (c) State
+the sequential-write preference that both a hard disk and an SSD share, and why the <em>reason</em> differs between them.</div>
+
+<div class="exercise" id="ex46.6"><span class="ex-label">46.6</span> <span class="ex-tag core">core</span>
+The measurement. (a) On this machine sequential streaming reached ~916&nbsp;MB/s and random 4&nbsp;KiB reads ~19&nbsp;MB/s; name the two distinct
+effects that together produce the ~49&times; gap. (b) The <em>single</em>-4&nbsp;KiB comparison was only ~1.24&times; — what does that tell you
+about which of the two effects dominates on this flash-backed device? (c) Why would the same experiment on a spinning disk shift the balance
+between the two effects?</div>
+
+<div class="exercise" id="ex46.7"><span class="ex-label">46.7</span> <span class="ex-tag complexity">cost</span>
+A workload issues <var>N</var> record reads. Under design A each record is at a random offset (one random I/O per read); under design B records
+are packed 100 to a page and reads have good locality, so on average one page read serves 100 records. Let a random page read cost
+<var>t</var><sub>r</sub>. (a) Write the total I/O time for each design. (b) On a hard disk with <var>t</var><sub>r</sub>&nbsp;&asymp;&nbsp;10&nbsp;ms
+and <var>N</var>&nbsp;=&nbsp;10<sup>6</sup>, compute both. (c) Explain what the 100&times; factor physically represents and why it is the whole
+argument for pages.</div>
+
+<div class="exercise" id="ex46.8"><span class="ex-label">46.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team benchmarks their storage by reading a 1&nbsp;GiB file with a plain buffered <code>read</code>
+loop, sees 6&nbsp;GB/s, and concludes &ldquo;random and sequential are the same on our disk, so we don't need to worry about layout.&rdquo;
+<br><strong>Step 1 (given):</strong> a plain <code>read</code> loop hits the OS page cache, so a warm file is served from DRAM, not the device.
+<br><strong>Step 2 (given):</strong> to measure the device you must bypass the cache (<code>O_DIRECT</code> or an uncached file) and vary the
+access pattern and I/O size.
+<br><strong>Step 3 (given):</strong> doing so on this machine gave ~916&nbsp;MB/s sequential vs ~19&nbsp;MB/s random 4&nbsp;KiB.
+<br><strong>Step 4 (you):</strong> Explain why the team's 6&nbsp;GB/s measured DRAM rather than the disk, why their conclusion is exactly
+backwards, and what they should measure instead.</div>
+
+<div class="exercise" id="ex46.9"><span class="ex-label">46.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether it is limited mainly by <em>seek/positioning</em>, by <em>I/O size</em>, by <em>flash write amplification</em>, or by
+<em>the DRAM ceiling</em>, and why: (a) 10,000 random 4&nbsp;KiB reads from a cold spinning disk; (b) streaming a 10&nbsp;GiB file sequentially
+from an SSD; (c) 10,000 random 4&nbsp;KiB reads from a warm page cache; (d) a benchmark doing millions of tiny random overwrites on an SSD; (e)
+reading 4&nbsp;KiB pages one at a time versus 1&nbsp;MiB blocks from the same SSD.</div>
+
+<div class="exercise" id="ex46.10"><span class="ex-label">46.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;An SSD read is about as fast as a DRAM read.&rdquo; (b)
+&ldquo;On a hard disk, reading data sequentially is faster than reading it at random because the transfer rate is higher for sequential
+data.&rdquo; (c) &ldquo;Because an SSD has no seek, random writes are as cheap as random reads.&rdquo; (d) &ldquo;A database reads and writes in
+fixed-size pages because the block layer's smallest unit is a block.&rdquo; (e) &ldquo;<code>/sys/block/sdd/rotational</code> is 1, so this machine
+has a spinning disk.&rdquo;</div>
+
+<div class="exercise" id="ex46.11"><span class="ex-label">46.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the cost model. (a) State the one sentence about disks that forces the shape of B-trees, logs, and buffer pools, and explain in one
+line each how those three structures answer it. (b) The chapter measured a ~49&times; sequential-vs-random gap yet a ~1.24&times; single-read gap
+on the <em>same</em> device; explain why both numbers are true and what each one is actually measuring. (c) Argue why &ldquo;know where the bytes
+physically are and what it costs to reach them&rdquo; is the same discipline that unified Volume 1's I/O part, now applied one level down at the
+device.</div>
+
+<div class="exercise" id="ex46.12"><span class="ex-label">46.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Read <code>/sys/block/&lt;dev&gt;/queue/rotational</code>, <code>logical_block_size</code>, and
+<code>physical_block_size</code> for the disk your files live on, and report them. (b) Read a large file two ways with <code>O_DIRECT</code> —
+streaming in large blocks and fetching small pages at random offsets — and report throughput, per-read latency, and IOPS for each. (c) State your
+toolchain and CPU, note the times are wall-clock (no hardware counters), say whether your machine is virtualised, and explain which part of your
+sequential-vs-random gap is I/O size and which is access pattern — and how you could tell them apart with a third measurement.</div>
+
+</section>
+</section>

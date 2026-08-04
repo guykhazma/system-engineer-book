@@ -1,0 +1,371 @@
+<section class="chapter" id="ch48">
+<h1>Chapter 48 — The Buffer Pool</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch40">Chapter 40</a> (the OS page cache — the buffer pool is the database doing
+this itself), <a href="#ch17">Chapter 17</a> (demand paging and page replacement — the same problem, LRU and clock), <a href="#ch46">Chapter 46</a>
+(a disk miss is hundreds of microseconds; a memory hit is tens of nanoseconds), <a href="#ch47">Chapter 47</a> (the page is the unit that gets
+cached, pinned, and evicted), <a href="#ch03">Chapter 3</a> (the memory hierarchy — a hit is DRAM, a miss falls off the cliff). &nbsp;·&nbsp;
+Chapters 46 and 47 gave the device and the page. This chapter puts a layer of DRAM between them and the rest of the database — the pool of pages
+that turns most accesses into memory hits, and confronts the cliff head-on.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch46">Chapter 46</a> — a random page read from this machine's disk cost on the order of hundreds of microseconds;
+how does that compare to reading a page already sitting in DRAM? (2) <a href="#ch17">Chapter 17</a> — when physical memory fills and a new page is
+needed, the OS must choose a victim to evict; what were the policies it used, and which one did the clock algorithm approximate? (3)
+<em>Predict:</em> a database keeps a pool of pages in memory. Accessing a page that is <em>in</em> the pool (a hit) is a memory operation;
+accessing one that is not (a miss) is a disk read. Two questions: by roughly what factor do you think a miss is slower than a hit here —
+10&times;, 100&times;, 10,000&times;? And if a full-table scan reads more distinct pages than the pool holds, what happens to the pages that were
+hot before the scan? Write your guesses; &sect;48.3&ndash;&sect;48.4 answer them.</p>
+</aside>
+
+<p>The disk is the floor and it is a cliff (Chapter 46); the page is the currency (Chapter 47); and no database can afford to touch the disk for
+most of what it does. The escape is a cache — a region of DRAM holding pages so that repeated accesses hit memory instead of the device — and a
+database builds its own, called the <strong>buffer pool</strong>, rather than leaning solely on the OS page cache of Chapter 40. It does so
+deliberately: the database knows things the OS cannot, and a hand-managed cache lets it act on that knowledge — pin a page so a query using it
+cannot have it yanked away, control the order dirty pages are written so the write-ahead log's rules are honored, prefetch along an access pattern
+it can predict, and choose its own eviction policy. The buffer pool is, structurally, the same demand-paging problem the OS solved in Chapter 17 —
+a set of frames, a map from what-you-want to where-it-is, and a replacement policy for when memory fills — solved again on purpose, at the
+database's level, where the database's knowledge can be applied. This chapter builds it in five steps: why the database manages its own cache
+instead of trusting the OS (&sect;48.1); the anatomy — frames, the page table, pin counts, and dirty bits (&sect;48.2); the hit-versus-miss gap,
+measured here at four orders of magnitude, and why hit rate is everything (&sect;48.3); replacement — LRU, the clock approximation, and the
+sequential scan that defeats them, simulated (&sect;48.4); and what the buffer pool carries into the storage engines and the log (&sect;48.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code>; times are wall-clock and a hardware-counter profiler
+(<code>perf</code>) is <em>not</em> installed. The hit measurement is a <code>memcpy</code> from a resident 4&nbsp;KiB frame; the miss measurement
+is an <code>O_DIRECT</code> <code>pread</code> of a 4&nbsp;KiB page at random offsets from a 1&nbsp;GiB file on this machine's WSL2 virtual disk
+(<code>/dev/sdd</code>) — so the miss cost is the virtualised-disk figure of Chapter 46, not a bare device, and its run-to-run variance is real
+(it landed near ~350&nbsp;&micro;s here, within the same hundreds-of-microseconds band as Chapter 46's ~221&nbsp;&micro;s). The replacement results
+are from a <strong>deterministic simulation</strong> (a fixed pseudo-random reference string, seeded), reported as hit rates, not timings —
+they compare policies, and are exactly reproducible rather than measured against a clock.</p>
+
+<h2>48.1 Why a database manages its own cache</h2>
+
+<p>The operating system already caches disk blocks in memory — the page cache of Chapter 40 — so it is fair to ask why a database bothers to
+build a second cache of its own on top of it. The answer is that the OS page cache is generic by necessity: it serves every process, it does not
+know what a database page <em>means</em>, and it makes eviction and writeback decisions on information the database could improve on. A database,
+managing its own <strong>buffer pool</strong>, can do four things the OS cache cannot. First, it can <strong>pin</strong> a page: while a query is
+reading or modifying a page, the database marks it un-evictable, guaranteeing the page stays in memory and at a stable address for the duration —
+something the OS gives no direct control over. Second, it can <strong>control writeback order</strong>: the write-ahead log (built later in this
+volume) demands that a page's log records reach disk <em>before</em> the page itself, and only a cache the database controls can enforce
+&ldquo;do not write this dirty page until its log is durable.&rdquo; Third, it can <strong>prefetch</strong> along access patterns it understands —
+the next leaf of a B-tree, the next run of a scan — because it knows the structure of its own data. Fourth, it can choose a <strong>replacement
+policy</strong> suited to database workloads, which as &sect;48.4 shows differ from the generic case (a large scan should not be allowed to evict
+everything). The cost of this control is a known awkwardness: the same page can now sit in both the OS page cache and the database's buffer pool,
+wasting memory and copying twice — <strong>double buffering</strong> — which is exactly why databases often open their files with
+<code>O_DIRECT</code> (Chapter 41) to bypass the OS cache and let the buffer pool be the single authority on which pages are in memory. The
+principle is the recurring one of this volume: the layer that has the most specific knowledge should make the decision, and a database knows more
+about its own pages than the OS ever can.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name two things a database's own buffer pool can do that it cannot ask the OS page cache to do for it. What is double buffering, and why do
+databases sometimes use <code>O_DIRECT</code> to avoid it? (Answer after the next section.)</p>
+</aside>
+
+<h2>48.2 Anatomy: frames, the page table, pins, and dirty bits</h2>
+
+<p>A buffer pool is a fixed-size array of <strong>frames</strong> — each frame a slot of exactly one page's size (Chapter 47) — plus the
+bookkeeping to find, protect, and reclaim them. Finding a page uses a <strong>page table</strong> (a hash table) mapping page identifier &rarr;
+frame index: given a page number, a lookup says either &ldquo;it is in frame 7&rdquo; (a hit) or &ldquo;it is not resident&rdquo; (a miss). On a
+miss the pool picks a free or evictable frame, reads the page into it from disk (Chapter 47's <code>pread</code>), and records the mapping. Two
+per-frame flags govern the frame's life. The <strong>pin count</strong> (or reference count) tracks how many callers are currently using the page:
+<code>fetchPage</code> looks the page up, brings it in if absent, increments the pin count, and returns a pointer into the frame; the caller works
+on it and then calls <code>unpin</code> to decrement. A frame with a nonzero pin count is <strong>in use and cannot be evicted</strong> — this is
+the mechanism promised in &sect;48.1, and it is essential for correctness: evicting a page a query is mid-read on would pull memory out from under
+it. The <strong>dirty bit</strong> records whether the page has been modified since it was read in; when a dirty page is chosen for eviction, it
+<em>must be written back</em> to disk first (respecting, later, the log-before-page rule), whereas a clean page can simply be dropped because the
+on-disk copy is already current. So the lifecycle of a page in the pool is: fetched (pinned, mapped into a frame) &rarr; used (read or written,
+setting the dirty bit) &rarr; unpinned &rarr; eventually chosen as a victim &rarr; written back if dirty &rarr; frame reused for another page
+(Effelsberg &amp; H&auml;rder, &ldquo;Principles of Database Buffer Management,&rdquo; formalize exactly this — the fixing of pages, the frame
+allocation, and the replacement search as the buffer manager's three tasks). This anatomy is small, but every field earns its place: without the
+page table you cannot find a resident page; without the pin count you can corrupt an in-flight read; without the dirty bit you either lose updates
+or waste writes.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a buffer-pool hit is a memory access; a miss is a fall off the disk cliff</span>
+<p><strong>1. In words.</strong> The page table turns a page number into either &ldquo;in frame N&rdquo; (a hit — read it from DRAM) or &ldquo;not
+resident&rdquo; (a miss — read it from disk into a frame first). A hit is a memory operation; a miss pays the device latency of Chapter 46. So the
+fraction of accesses that hit — the <em>hit rate</em> — governs the effective speed of the whole database.</p>
+<p><strong>2. As a picture.</strong> Figure 48.1: a page-number request entering a hash table; a hit arrow going straight to a frame in DRAM
+(~tens of ns); a miss arrow going out to the disk, back into an evicted frame (~hundreds of &micro;s), then to the caller — the two paths drawn to
+scale on a log axis so the miss path dwarfs the hit.</p>
+<p><strong>3. As numbers/contrast.</strong> Measured here: a hit (memcpy from a resident 4&nbsp;KiB frame) ~<strong>36&nbsp;ns</strong>; a miss
+(<code>O_DIRECT</code> <code>pread</code>) ~<strong>350&nbsp;&micro;s</strong> — about <strong>10,000&times;</strong>. So effective access time is
+<var>h</var>&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;(1&minus;<var>h</var>)&nbsp;&times;&nbsp;350&nbsp;&micro;s: at
+<var>h</var>&nbsp;=&nbsp;0.99 the misses still dominate the average, which is why databases chase the last few percent of hit rate (&sect;48.3).</p>
+</aside>
+
+<p><em>(Answer to the &sect;48.1 quick check: a database buffer pool can, among other things, <strong>pin</strong> a page so an in-use page is never
+evicted, <strong>order writeback</strong> so a dirty page is not flushed before its log records are durable, <strong>prefetch</strong> along access
+patterns it predicts, and pick a database-suitable <strong>replacement policy</strong> — none of which the generic OS page cache exposes. Double
+buffering is the same page being held in both the OS page cache and the buffer pool, wasting memory and an extra copy; opening files with
+<code>O_DIRECT</code> bypasses the OS cache so the buffer pool is the single authority, avoiding the duplication.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 260" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">fetchPage(p): the page table gives a hit (DRAM) or a miss (disk read into an evicted frame).</text>
+<rect x="20" y="40" width="110" height="26" fill="#eef1f4" stroke="#333"/><text x="26" y="57" font-size="9">fetchPage(p)</text>
+<rect x="170" y="34" width="120" height="38" fill="#dfe8f4" stroke="#14406b"/><text x="176" y="50" font-size="8">page table</text><text x="176" y="63" font-size="8">p -&gt; frame?</text>
+<path d="M130 53 L170 53" stroke="#333" stroke-width="1.5"/>
+<rect x="360" y="34" width="120" height="38" fill="#dfe8f4" stroke="#14406b"/><text x="366" y="50" font-size="8">HIT: frame in DRAM</text><text x="366" y="63" font-size="8">~36 ns</text>
+<path d="M290 46 L360 46" stroke="#2f7d32" stroke-width="2"/><text x="300" y="40" font-size="8" fill="#2f7d32">resident</text>
+<rect x="360" y="120" width="120" height="38" fill="#f6dcd2" stroke="#8c3a1d"/><text x="366" y="136" font-size="8">MISS: read from disk</text><text x="366" y="149" font-size="8">~350 &micro;s</text>
+<path d="M230 72 L400 120" stroke="#8c3a1d" stroke-width="2"/><text x="250" y="110" font-size="8" fill="#8c3a1d">not resident</text>
+<rect x="360" y="190" width="230" height="30" fill="#eef1f4" stroke="#333"/><text x="366" y="209" font-size="8">evict a victim (write back if dirty), read page into frame, pin</text>
+<path d="M420 158 L420 190" stroke="#8c3a1d" stroke-width="1.5"/>
+<rect x="510" y="34" width="80" height="38" fill="#eef1f4" stroke="#333"/><text x="516" y="57" font-size="8">caller</text>
+<path d="M480 53 L510 53" stroke="#2f7d32" stroke-width="1.5"/>
+<path d="M480 139 C540 139 560 90 560 72" stroke="#8c3a1d" stroke-width="1.5" fill="none"/>
+<text x="12" y="245" font-size="8" fill="#14406b">Hit ~36 ns vs miss ~350 &micro;s here: ~10,000x. Effective time = h&middot;hit + (1-h)&middot;miss; misses dominate until h is very near 1.</text>
+</svg>
+<figcaption>Figure 48.1: <code>fetchPage</code> resolves a page number through the page table. A hit reads a resident frame from DRAM (~36&nbsp;ns
+here); a miss evicts a victim (writing it back if dirty), reads the page from disk into the frame (~350&nbsp;&micro;s here), pins it, and returns —
+about 10,000&times; the cost of a hit.</figcaption>
+</figure>
+
+<h2>48.3 The hit that saves the cliff, measured</h2>
+
+<p>The whole justification for a buffer pool is the size of the gap between a hit and a miss, so it is worth measuring rather than asserting. A
+<strong>hit</strong> — the page is already in a frame — costs a memory access: here, copying a resident 4&nbsp;KiB page out of its frame took about
+<strong>36&nbsp;nanoseconds</strong>. A <strong>miss</strong> — the page is not resident and must be read from disk — costs a device I/O: here, an
+<code>O_DIRECT</code> read of a 4&nbsp;KiB page landed around <strong>350&nbsp;microseconds</strong> (the Chapter 46 virtualised-disk figure, in
+the same hundreds-of-microseconds band as the ~221&nbsp;&micro;s measured there; the exact value wanders with the virtual disk). The ratio is
+about <strong>10,000&times;</strong>:</p>
+
+<pre><code>4 KiB page access on this machine:
+  HIT  (memcpy from a resident frame)      : ~36 ns
+  MISS (O_DIRECT pread from virtual disk)  : ~350 &micro;s   (~hundreds of &micro;s, cf. Ch.46)
+  miss / hit  ~ 10,000x
+</code></pre>
+
+<p>Four orders of magnitude is a different kind of number from the 49&times; of Chapter 46, and it changes how you must think about the average.
+The <strong>effective access time</strong> of a page request is a weighted average of the two outcomes: if a fraction <var>h</var> of accesses hit,
+the mean cost is <var>h</var>&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;(1&minus;<var>h</var>)&nbsp;&times;&nbsp;350&nbsp;&micro;s. The startling
+consequence of the 10,000&times; gap is that the misses dominate the average until the hit rate is <em>extremely</em> close to one. At a
+90% hit rate the average is about 35&nbsp;&micro;s — essentially all misses, the hits contributing nothing; even at 99% it is about 3.5&nbsp;&micro;s,
+still a hundred times the hit cost. Only as <var>h</var> approaches 99.9% and beyond do the hits begin to set the pace. This is why a database
+treats its hit rate as a first-class health metric and why the last fractions of a percent are worth fighting for: raising the hit rate from 99%
+to 99.9% cuts the average access time roughly tenfold, because it removes nine-tenths of the remaining ruinously expensive misses. It is also why
+buffer-pool <em>sizing</em> — how much DRAM you devote to frames — is among the highest-leverage tuning decisions in operating a database: more
+frames means more of the working set stays resident, which means a higher hit rate, which, on this curve, means a disproportionate drop in
+effective latency. The buffer pool does not make the disk faster; it makes you visit the disk rarely, and the arithmetic of the hit/miss gap is
+what turns &ldquo;rarely&rdquo; into &ldquo;fast.&rdquo;</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>With a hit at ~36&nbsp;ns and a miss at ~350&nbsp;&micro;s, why does a 90% hit rate still give an average access time almost entirely made of
+miss cost? Roughly what does raising the hit rate from 99% to 99.9% do to the average, and why is that the reason to fight for the last fractions
+of a percent? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>48.4 Replacement: LRU, the clock approximation, and the scan that breaks them</h2>
+
+<p>When every frame is full and a miss needs one, the buffer pool must evict a resident, unpinned page — and which one it picks determines the hit
+rate the previous section showed to be everything. The ideal is to evict the page that will be needed furthest in the future, which is
+unknowable, so the standard proxy is <strong>least-recently-used</strong> (LRU): evict the page unused for the longest time, betting that the
+recent past predicts the near future (Chapter 17 met exactly this bet for OS pages). True LRU means updating a page's position on <em>every</em>
+access, which is bookkeeping the pool would rather not do on a hot path, so real systems approximate it with the <strong>clock</strong>
+(second-chance) algorithm: frames sit in a circle, each with a reference bit set on access; a hand sweeps the circle, and when it needs a victim
+it clears the reference bit of a page it finds set (giving it a &ldquo;second chance&rdquo;) and evicts the first page it finds already clear —
+approximating LRU at a fraction of the cost (OSTEP, &ldquo;Beyond Physical Memory: Policies&rdquo;). A deterministic simulation on a skewed access
+pattern (1,000 pages, a 100-frame pool, 200,000 references) shows clock tracking LRU closely and both beating FIFO:</p>
+
+<pre><code>replacement simulation (skewed access; 1000 pages, pool=100, 200000 refs):
+  FIFO  hit rate : 17.2 %
+  CLOCK hit rate : 18.1 %     (approximates LRU cheaply)
+  LRU   hit rate : 18.6 %
+
+looping sequential scan of 110 pages through a 100-frame pool:
+  FIFO  hit rate : 0.0 %
+  CLOCK hit rate : 0.0 %
+  LRU   hit rate : 0.0 %
+</code></pre>
+
+<p>The first block is the reassuring result: clock (18.1%) sits between FIFO (17.2%) and true LRU (18.6%), confirming it is a cheap, faithful LRU
+approximation — the reason it is the workhorse of real buffer pools. The second block is the warning, and it is the named trap of this chapter. A
+<strong>looping sequential scan</strong> over slightly more pages than the pool holds — 110 pages cycling through 100 frames — produces a
+<strong>0% hit rate under every policy</strong>, because by the time the scan comes back around to a page, LRU (and clock, and FIFO) has just
+evicted it as the least-recently-used to make room for the pages in between: each page is thrown out moments before it is needed again. This is
+<strong>sequential flooding</strong>, and it is worse than its own zero hit rate suggests, because a single large scan does not just fail to
+benefit from the cache — it <em>evicts everyone else's hot pages</em> to fill the pool with scan pages it will never reuse, collapsing the hit
+rate for the whole system while it runs. It is exactly why databases do not use naive LRU for the buffer pool: they use scan-resistant policies —
+LRU-K, which tracks the last <var>K</var> references so a page touched once by a scan is not treated as &ldquo;recently used,&rdquo; or the
+query-locality approach of DBMIN (Chou &amp; DeWitt, &ldquo;An Evaluation of Buffer Management Strategies for Relational Database Systems&rdquo;),
+which gives each query its own locality set — or they simply refuse to cache scan pages, reading them through a small dedicated ring buffer so a
+big scan cannot flood the pool. The lesson generalizes the whole chapter: the replacement policy is not a detail but a defense, because the access
+patterns that break the simplest good-enough policy (the sequential scan) are common in exactly the systems that most need the cache to hold.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: letting a big sequential scan flood the buffer pool and evict the working set</span>
+<p>Naive LRU (or clock) has a specific, common failure mode: a sequential scan that touches more distinct pages than the pool holds gets a
+<strong>0% hit rate</strong> on its own pages — measured here, a 110-page loop through a 100-frame pool hit nothing under FIFO, clock, and LRU
+alike — because each page is evicted just before the scan wraps back to it. The trap is not merely that the scan is uncached; it is that the scan
+<em>pulls every other query's hot pages out of the pool</em> to make room for pages it will use exactly once, so a single analytics scan can
+tank the hit rate — and therefore the latency (&sect;48.3) — of the entire system while it runs. This surfaces as the classic operational mystery:
+the transactional workload was fast, someone runs a nightly full-table report, and suddenly unrelated queries slow to a crawl and blame lands on
+&ldquo;the cache being broken&rdquo; when the cache is working exactly as a naive policy dictates. The defenses are to make the policy
+scan-resistant rather than to make the pool bigger (a scan larger than <em>any</em> pool still floods): track multiple references so a
+once-touched page is not deemed hot (LRU-K), give each query its own locality budget (DBMIN), or read large scans through a small ring buffer that
+never displaces the general pool. &ldquo;We use LRU, so the hot pages stay hot&rdquo; and &ldquo;a full scan runs concurrently&rdquo; are, without
+a scan-resistant policy, not both safe to assume.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate reports: &ldquo;Every night our reporting job does a full scan of the orders table, and while it runs, the
+normal customer queries — which were fast all day — get slow. The buffer pool must be too small or broken.&rdquo; Cover the paragraph and respond
+in four or five sentences, drawing on &sect;48.3 and &sect;48.4.</p>
+<p><em>Model answer.</em> &ldquo;The pool isn't broken — this is sequential flooding, and a bigger pool won't fix it. A full scan reads more
+distinct pages than any reasonable pool holds, and with plain LRU each scan page evicts one of the customer queries' hot pages to make room, so the
+scan fills the pool with pages it uses exactly once and pushes out the working set everyone else depends on. Because a miss here is about
+10,000&times; a hit, dropping the hit rate even a little sends effective latency up sharply — that's the daytime slowdown. The fix is a
+scan-resistant policy, not more memory: don't let a single-touch scan page count as 'hot' (LRU-K), or give the reporting query its own small
+locality budget, or run big scans through a dedicated ring buffer so they can't displace the shared pool. So let's make the scan not poison the
+cache rather than chase pool size.&rdquo; Naming sequential flooding, the miss/hit ratio's leverage on latency, and a scan-resistant fix is the
+senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;48.3 quick check: at a 90% hit rate the average is 0.9&nbsp;&times;&nbsp;36&nbsp;ns&nbsp;+&nbsp;0.1&nbsp;&times;&nbsp;350&nbsp;&micro;s
+&asymp;&nbsp;35&nbsp;&micro;s — the 10% of misses, each ~10,000&times; a hit, contribute essentially the entire average while the hits are
+rounding error. Raising the hit rate from 99% to 99.9% removes nine-tenths of the remaining misses, cutting the average from ~3.5&nbsp;&micro;s to
+~0.4&nbsp;&micro;s — roughly tenfold — which is why the last fractions of a percent, not the first, are where the effective latency is won.)</em></p>
+
+<h2>48.5 What to carry forward</h2>
+
+<p>A database builds its own <strong>buffer pool</strong> rather than trusting the OS page cache because it can pin pages, order writeback for the
+log, prefetch on patterns it predicts, and choose a database-suitable replacement policy — often bypassing the OS cache with <code>O_DIRECT</code>
+to avoid double buffering (&sect;48.1). The pool is an array of <strong>frames</strong> plus a <strong>page table</strong> (page number &rarr;
+frame), a per-frame <strong>pin count</strong> (a pinned page cannot be evicted), and a <strong>dirty bit</strong> (a dirty victim must be written
+back before reuse) (&sect;48.2). A hit is a memory access and a miss a disk read — measured here ~36&nbsp;ns against ~350&nbsp;&micro;s, about
+<strong>10,000&times;</strong> — so effective access time is a hit/miss weighted average in which misses dominate until the hit rate is very near
+one, making hit rate and pool sizing the highest-leverage knobs (&sect;48.3). Replacement approximates the unknowable optimum with
+<strong>LRU</strong>, cheaply realized by the <strong>clock</strong> algorithm (simulated at 18.1% against LRU's 18.6% and FIFO's 17.2%), but a
+<strong>sequential scan</strong> larger than the pool defeats them all — 0% hit rate and, worse, it floods out everyone's working set — so real
+pools use scan-resistant policies like LRU-K or DBMIN (&sect;48.4).</p>
+
+<p>With this, the storage foundation of the volume is complete: the device and its cost model (Chapter 46), the page and its on-disk file
+(Chapter 47), and the buffer pool that keeps hot pages in DRAM (here). Everything the rest of the volume builds sits on these three. The buffer
+pool's two loose threads point straight ahead. Its <strong>writeback ordering</strong> — the rule that a dirty page must not reach disk before its
+log is durable — is precisely the hook the write-ahead log needs, so the durability part of this volume will formalize the buffer pool's dirty-bit
+lifecycle into the log-before-page protocol and group commit that make Chapter 47's expensive <code>fsync</code> a throughput a real system can
+sustain. And the pool's role as the layer that turns disk pages into memory the query can touch is what lets the storage engines built next — the
+B-tree, whose nodes are pages fetched through this pool, and the log-structured merge tree, whose runs are read and merged through it — assume that
+&ldquo;fetch a page&rdquo; is usually cheap. The disk is the floor; the page is the currency; the buffer pool is the layer of DRAM that means you
+rarely have to spend it. On that foundation, the database becomes something you can build.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Give two things a database buffer pool can do that the OS page cache cannot, and explain double buffering.</li>
+<li>Name the parts of a buffer pool — frames, page table, pin count, dirty bit — and what each is for.</li>
+<li>Quote the measured hit vs miss cost here and the ratio, and write the effective-access-time formula.</li>
+<li>Explain why a 90% hit rate is still miss-dominated, and why the last fractions of a percent matter most.</li>
+<li>Describe the clock algorithm and why it is used instead of true LRU.</li>
+<li>Explain sequential flooding, why it defeats LRU, and name one scan-resistant defense.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why does a database keep its own buffer pool instead of relying on the OS page cache? (&sect;48.1)</li>
+<li><strong>R2.</strong> What does the pin count protect against, and what must happen to a dirty page before its frame is reused? (&sect;48.2)</li>
+<li><strong>R3.</strong> What were the measured hit and miss costs, and why do misses dominate the average until the hit rate is near one? (&sect;48.3)</li>
+<li><strong>R4.</strong> How does the clock algorithm approximate LRU, and how did it compare to LRU and FIFO in the simulation? (&sect;48.4)</li>
+<li><strong>R5.</strong> What is sequential flooding, why does it give a 0% hit rate, and how is it defended against? (&sect;48.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Wolfgang Effelsberg &amp; Theo H&auml;rder, &ldquo;Principles of Database Buffer Management,&rdquo; <em>ACM Transactions on Database
+Systems</em> 9(4), 1984, pp. 560&ndash;595, DOI 10.1145/1994.2022.</strong> The foundational treatment behind &sect;48.1&ndash;&sect;48.2: how a
+database buffer manager differs from OS paging, the fixing (pinning) of pages, frame allocation, and the replacement search. First author Wolfgang
+Effelsberg; venue, year, and DOI verified via the ACM Digital Library.</li>
+<li><strong>Hong-Tai Chou &amp; David J. DeWitt, &ldquo;An Evaluation of Buffer Management Strategies for Relational Database Systems,&rdquo;
+<em>Proc. 11th VLDB</em> (1985), pp. 127&ndash;141.</strong> The source for &sect;48.4's scan problem and its fix: the query-locality-set model
+and the DBMIN algorithm, which allocate buffers per query rather than by a single global LRU. First author Hong-Tai Chou; venue and year verified
+via the VLDB proceedings.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, DOI 10.1561/1900000002.</strong> Its buffer-manager section situates &sect;48.1&ndash;&sect;48.3 in the whole
+storage stack, including the writeback ordering the log depends on. First author Joseph M. Hellerstein; venue, year, and DOI verified via the ACM
+Digital Library.</li>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em>, &ldquo;Beyond Physical Memory: Policies&rdquo; (free
+online).</strong> The OS-level companion to &sect;48.4: optimal replacement, LRU, and the clock (second-chance) approximation — the same
+algorithms the buffer pool reuses. First authors the Arpaci-Dusseaus; chapter title verified against the online edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex48.1"><span class="ex-label">48.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does the page table in a buffer pool map, and what are the two possible outcomes of a lookup?</div>
+
+<div class="exercise" id="ex48.2"><span class="ex-label">48.2</span> <span class="ex-tag warm">warm-up</span>
+What does a nonzero pin count on a frame mean, and why must a dirty victim page be written back before its frame is reused?</div>
+
+<div class="exercise" id="ex48.3"><span class="ex-label">48.3</span> <span class="ex-tag warm">warm-up</span>
+Roughly what were the measured hit and miss costs for a 4&nbsp;KiB page on this machine, and what is their approximate ratio?</div>
+
+<div class="exercise" id="ex48.4"><span class="ex-label">48.4</span> <span class="ex-tag core">core</span>
+Effective access time. (a) Write the effective access time as a function of hit rate <var>h</var> using this chapter's ~36&nbsp;ns hit and
+~350&nbsp;&micro;s miss. (b) Evaluate it at <var>h</var>&nbsp;=&nbsp;0.90, 0.99, and 0.999. (c) Explain why the improvement from 0.99 to 0.999 is
+so much more valuable than from 0.90 to 0.99, and what that implies about buffer-pool sizing.</div>
+
+<div class="exercise" id="ex48.5"><span class="ex-label">48.5</span> <span class="ex-tag core">core</span>
+The clock algorithm. (a) Describe the reference bit and the hand's sweep, including what happens when the hand finds a set bit versus a clear one.
+(b) Why is clock preferred over true LRU in a buffer pool? (c) In the simulation clock scored 18.1% against LRU's 18.6% and FIFO's 17.2% —
+interpret what that ordering confirms about clock.</div>
+
+<div class="exercise" id="ex48.6"><span class="ex-label">48.6</span> <span class="ex-tag core">core</span>
+Sequential flooding. (a) Explain why a loop over 110 pages through a 100-frame pool gave a 0% hit rate under LRU. (b) Why is this worse than the
+scan simply being uncached — what does it do to other queries? (c) Name two defenses and say how each prevents the flood.</div>
+
+<div class="exercise" id="ex48.7"><span class="ex-label">48.7</span> <span class="ex-tag complexity">cost</span>
+A query repeatedly scans a working set of <var>W</var> distinct pages, uniformly, through a pool of <var>F</var> frames under LRU. (a) Give the
+steady-state hit rate when <var>W</var>&nbsp;&le;&nbsp;<var>F</var> and when <var>W</var>&nbsp;&gt;&nbsp;<var>F</var> in the looping-scan case, and
+explain the cliff between them. (b) Using this chapter's hit/miss costs, write the effective access time on each side of the cliff. (c) Explain why
+this cliff is the quantitative core of the sequential-flooding trap.</div>
+
+<div class="exercise" id="ex48.8"><span class="ex-label">48.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team adds a large analytics scan to a database that serves fast point queries. The point queries
+were at ~99.5% hit rate; while the scan runs, they drop to ~85% and latency spikes.
+<br><strong>Step 1 (given):</strong> the scan reads far more distinct pages than the pool holds, each used once.
+<br><strong>Step 2 (given):</strong> under LRU each scan page evicts a hot point-query page to make room.
+<br><strong>Step 3 (given):</strong> a miss here is ~10,000&times; a hit, so a hit-rate drop from 99.5% to 85% raises effective latency sharply.
+<br><strong>Step 4 (you):</strong> Explain why the scan causes the point queries' hit rate to fall, estimate the effect on their average access
+time using the chapter's numbers, and give a fix that does not require enlarging the pool.</div>
+
+<div class="exercise" id="ex48.9"><span class="ex-label">48.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say which buffer-pool mechanism is responsible — <em>pin count</em>, <em>dirty bit</em>, <em>page table</em>, <em>replacement
+policy</em>, or <em>writeback ordering</em> — and why: (a) a page a query is mid-read on is never evicted; (b) a modified page is written to disk
+before its frame is reused; (c) a page number is resolved to a frame index; (d) a full scan is prevented from evicting the working set; (e) a
+dirty page is not flushed until its log records are durable.</div>
+
+<div class="exercise" id="ex48.10"><span class="ex-label">48.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A buffer-pool hit and a miss cost about the same order of
+magnitude.&rdquo; (b) &ldquo;The clock algorithm gives exactly the same evictions as true LRU.&rdquo; (c) &ldquo;A clean victim page must be
+written to disk before its frame is reused.&rdquo; (d) &ldquo;Enlarging the buffer pool fixes sequential flooding.&rdquo; (e) &ldquo;At a 90% hit
+rate, hits contribute most of the average access time.&rdquo;</div>
+
+<div class="exercise" id="ex48.11"><span class="ex-label">48.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the storage foundation. (a) Trace a single record read from &ldquo;query wants row R&rdquo; down through record identifier (Chapter 47),
+buffer-pool lookup (here), and possibly disk (Chapter 46), naming the cost at each step and where the cliff is. (b) The buffer pool reuses Chapter
+17's demand-paging machinery; state one thing the database knows that the OS does not, and how it changes the design. (c) Argue that hit rate,
+not raw disk speed, is the number that governs a database's storage performance, using the ~10,000&times; gap and the effective-access-time curve
+to make the case.</div>
+
+<div class="exercise" id="ex48.12"><span class="ex-label">48.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Measure the cost of a 4&nbsp;KiB page &ldquo;hit&rdquo; (a <code>memcpy</code> from a resident buffer)
+against a &ldquo;miss&rdquo; (an <code>O_DIRECT</code> <code>pread</code> from a large file), and report both and their ratio. (b) Write a small
+deterministic replacement simulation over a fixed reference string and report FIFO, clock, and LRU hit rates, including a looping scan larger than
+your pool. (c) State your toolchain and CPU, note the hit/miss times are wall-clock and whether your disk is virtualised, and explain which of your
+results are measurements and which are a reproducible simulation — and why that distinction matters for what you can claim.</div>
+
+</section>
+</section>

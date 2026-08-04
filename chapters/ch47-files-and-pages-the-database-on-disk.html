@@ -1,0 +1,349 @@
+<section class="chapter" id="ch47">
+<h1>Chapter 47 — Files and Pages: The Database on Disk</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (the block layer and why sequential, block-aligned I/O
+wins), <a href="#ch41">Chapter 41</a> (durability, <code>fsync</code>, and what &ldquo;written&rdquo; really means),
+<a href="#ch40">Chapter 40</a> (the page cache the OS keeps under your <code>write</code>), <a href="#ch07">Chapter 7</a> (memory layout and
+alignment — we lay records out in bytes the same way), <a href="#ch11">Chapter 11</a> (buffer bounds — an on-disk page is a fixed-size buffer you
+must not overrun). &nbsp;·&nbsp; The last chapter established what the device costs. This one gives the database its on-disk shape: a file treated
+as an array of fixed-size <em>pages</em>, each page a little heap of records, each page write made durable at a price we now measure.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch46">Chapter 46</a> — the block layer hands you fixed-size blocks and rewards large, block-aligned, sequential I/O;
+what unit should a database therefore read and write in? (2) <a href="#ch41">Chapter 41</a> — after <code>write</code> returns, is your data on
+the disk platter yet, and what call forces it there? (3) <em>Predict:</em> a program appends 2,000 small pages to a file two ways — calling
+<code>fsync</code> once at the end, and calling <code>fsync</code> after <em>every</em> page (as a paranoid &ldquo;make each record durable
+immediately&rdquo; loop might). Two questions: how many durable writes per second do you think the per-page version can sustain, and how many times
+slower is it than the batched version — 3&times;, 10&times;, 100&times;? Write your guesses; &sect;47.4 answers them.</p>
+</aside>
+
+<p>A database has to turn the block layer's flat array of numbered blocks into something it can store rows in, look rows up in, and update
+without rewriting the world. The abstraction it chooses, almost universally, is the <strong>page</strong>: a fixed-size chunk — 4, 8, or
+16&nbsp;KiB, a multiple of the device's physical block (Chapter 46) — that is the unit of everything. The database file is one large array of
+pages; the storage manager reads and writes a whole page at a time; the buffer pool (Chapter 48) caches whole pages; the B-tree and the log are
+built out of pages. Inside a page lives a small, self-contained data structure that packs variable-length records and lets you add, find, and
+delete them without disturbing their neighbors. And because a page only becomes durable when you pay the barrier of Chapter 41, the cost of
+<em>persisting</em> a page — not just computing it — becomes a first-class number the design must respect. This chapter builds the on-disk
+database in five steps: the file as a linear space of pages, and page-number-to-offset arithmetic (&sect;47.1); the slotted-page layout that holds
+variable-length records (&sect;47.2); how a single record is laid out in bytes, with fixed and variable fields and a null bitmap (&sect;47.3); the
+cost of making a page durable, measured, and the torn-write hazard (&sect;47.4); and what the storage manager carries into the buffer pool and
+beyond (&sect;47.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The program is C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code>; times are wall-clock and a hardware-counter profiler
+(<code>perf</code>) is <em>not</em> installed. The durability measurement writes 4&nbsp;KiB pages to an <code>ext4</code> file on this machine's
+WSL2 virtual disk (<code>/dev/sdd</code>, <code>physical_block_size</code>&nbsp;4096) and calls <code>fsync</code>/<code>fdatasync</code>; because
+this is a <strong>virtualised</strong> disk behind a hypervisor, the per-<code>fsync</code> cost reflects that stack, not a bare NVMe SSD with
+power-loss-protected cache — the <em>ratio</em> between per-page and batched syncing is the portable lesson, and the run-to-run variance (noted
+below) is real. The slotted-page and record layouts are described in structural terms and cross-checked against the standard references
+(Hellerstein et al.; Ramakrishnan &amp; Gehrke, Chapter 9).</p>
+
+<h2>47.1 The database file: a linear space of pages</h2>
+
+<p>The storage manager takes one (or a few) ordinary OS files and treats each as a contiguous array of fixed-size <strong>pages</strong>, numbered
+0, 1, 2, and so on. That is the entire on-disk model, and its power is in the arithmetic: page number <var>p</var> lives at byte offset
+<var>p</var>&nbsp;&times;&nbsp;<var>pagesize</var>, so to read page <var>p</var> the manager issues <code>pread(fd, buf, pagesize, p*pagesize)</code>
+and to write it, <code>pwrite</code> at the same offset — a whole page, always, never a partial byte range. Choosing <var>pagesize</var> a multiple
+of the device's physical block (4096 on this machine) means one page is a clean unit of device I/O, so a page read is a single well-aligned
+block transfer and a page write does not force the device to read-modify-write a block it only partly touched. This is the direct payoff of
+Chapter 46: the page is the granularity at which the database pays the disk, chosen to match the granularity at which the disk charges. A page
+identifier — the pair (file, page number) — is the database's fundamental address, the equivalent of a pointer but for data that lives on disk
+and outlives the process; everything higher up, from a row's location to a B-tree node's children, is ultimately expressed as page numbers.
+Growing the file is just appending pages at the end (a sequential write, the pattern the disk likes); the manager keeps track of which pages are
+in use, often with a small allocation structure or a free-space map, but the essential picture stays simple: <strong>the database on disk is an
+array of pages, addressed by number, read and written whole.</strong></p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Given a page size of 8&nbsp;KiB, at what byte offset does page number 5 begin, and how many bytes does the storage manager read to fetch it?
+Why is choosing the page size to be a multiple of the device's physical block size (4096 here) worth doing? (Answer after the next section.)</p>
+</aside>
+
+<h2>47.2 Inside a page: the slotted-page layout</h2>
+
+<p>A page has to hold records that are <em>variable-length</em> — a row with a short name and a row with a long one — and it has to let you
+insert, delete, and occasionally grow them without shifting every other record or leaving unusable gaps. The structure that solves this, used by
+essentially every row-store, is the <strong>slotted page</strong> (Ramakrishnan &amp; Gehrke, Chapter 9; Hellerstein et al., the storage-manager
+section). The page is a fixed-size buffer with two regions that grow toward each other from opposite ends. At the top is a small
+<strong>header</strong> (how many slots, where the free space begins) followed by a <strong>slot directory</strong> — an array of slots that grows
+<em>downward</em>; at the bottom is the record data, which grows <em>upward</em>. Each <strong>slot</strong> is a tiny fixed-size entry holding the
+(offset, length) of one record within the page. To find a record you index into the slot directory and follow its offset; to insert one you place
+its bytes just above the current record data, add a slot pointing at them, and advance both boundaries; to delete one you mark its slot free (and
+can later compact the page to reclaim the hole). This indirection — you address a record by <em>slot number</em>, and the slot holds the real
+offset — is what makes the layout flexible: a record can be moved within the page (during compaction) and only its slot's offset changes, so
+every external reference, which names the slot, stays valid. That external reference is the <strong>record identifier</strong>, the pair (page
+number, slot number), and it is how an index or a scan names a specific row: the page number gets you the page from disk (or the buffer pool), and
+the slot number gets you the record within it. Two design points fall out. First, the slot directory means records need not be stored in any
+particular order, yet can be scanned in slot order and addressed stably — order on disk and order of reference are decoupled. Second, when a
+record must grow beyond the free space of its page, the layout offers an escape: leave a <strong>forwarding</strong> pointer in the original slot
+to the record's new home on another page, so its record identifier still resolves — at the cost of one extra page access, a small echo of Chapter
+46's &ldquo;one more disk trip&rdquo; being the unit of expense.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: address records by slot, not by raw offset, so they can move within a page</span>
+<p><strong>1. In words.</strong> A slotted page keeps a directory of (offset, length) slots at one end and the record bytes at the other. You name a
+record by its slot number; the slot holds where the bytes actually are. So the page can compact or rearrange records and only slots change — every
+outside reference, which uses the slot number, keeps working.</p>
+<p><strong>2. As a picture.</strong> Figure 47.1: a page with a header and a slot directory growing down from the top, record data growing up from
+the bottom, free space in the middle; arrows from two slots to their records, and a third slot marked free (a deleted record's hole awaiting
+compaction).</p>
+<p><strong>3. As numbers/contrast.</strong> A record identifier is (page number, slot number): the page number costs one page fetch — a buffer-pool
+hit (~tens of ns) or a disk miss (~hundreds of &micro;s, Chapter 48) — and the slot number costs an array index. Storing a raw byte offset instead
+would save the indirection but freeze every record in place; the slot's one extra lookup buys the freedom to compact and reclaim space.</p>
+</aside>
+
+<p><em>(Answer to the &sect;47.1 quick check: page 5 begins at byte offset 5&nbsp;&times;&nbsp;8192&nbsp;=&nbsp;40,960, and the manager reads the
+whole page — 8,192 bytes — to fetch it. Making the page size a multiple of the physical block (4096) means each page read is one aligned block
+transfer and each page write covers whole device blocks, so the device never has to read-modify-write a block the page only partly filled — the
+page is charged as one clean unit of I/O.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 260" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A slotted page: directory grows down, records grow up, free space between; a record ID is (page, slot).</text>
+<rect x="60" y="30" width="520" height="200" fill="#f7f9fb" stroke="#333"/>
+<rect x="60" y="30" width="520" height="22" fill="#dfe8f4" stroke="#14406b"/><text x="66" y="45" font-size="9" fill="#14406b">header: #slots=3, free-space pointer</text>
+<rect x="60" y="52" width="120" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="66" y="66" font-size="8">slot 0 -&gt; off,len</text>
+<rect x="180" y="52" width="120" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="186" y="66" font-size="8">slot 1 -&gt; off,len</text>
+<rect x="300" y="52" width="120" height="20" fill="#eef1f4" stroke="#999"/><text x="306" y="66" font-size="8">slot 2 (free)</text>
+<text x="66" y="90" font-size="8" fill="#8c3a1d">slot directory grows downward &darr;</text>
+<rect x="60" y="150" width="520" height="80" fill="#faf0ea" stroke="#8c3a1d"/>
+<rect x="360" y="150" width="220" height="80" fill="#f6dcd2" stroke="#8c3a1d"/><text x="366" y="165" font-size="8" fill="#8c3a1d">record for slot 0</text>
+<rect x="180" y="150" width="180" height="80" fill="#fbe9e0" stroke="#8c3a1d"/><text x="186" y="165" font-size="8" fill="#8c3a1d">record for slot 1</text>
+<text x="66" y="200" font-size="8" fill="#8c3a1d">record data grows upward &uarr;</text>
+<text x="200" y="120" font-size="9" fill="#2f7d32">&larr; free space &rarr;</text>
+<path d="M120 72 L470 150" stroke="#14406b" stroke-width="1" fill="none"/>
+<path d="M240 72 L270 150" stroke="#14406b" stroke-width="1" fill="none"/>
+<text x="12" y="250" font-size="8" fill="#14406b">Delete = mark slot free (leaves a hole); compaction slides records and updates only their slots; outside refs use the slot number.</text>
+</svg>
+<figcaption>Figure 47.1: A slotted page. The header and slot directory grow down from the top; record bytes grow up from the bottom; free space
+sits between. A record is addressed by its slot number, so compaction can move the bytes and only the slot's offset changes — every reference by
+(page, slot) stays valid.</figcaption>
+</figure>
+
+<h2>47.3 A record in bytes: fixed fields, variable fields, and nulls</h2>
+
+<p>Inside a slot's bytes is one <strong>record</strong> — a row — and laying it out is the same discipline as laying out a C struct (Chapter 7),
+with two complications the struct did not have: fields can be variable-length, and fields can be null. The standard layout splits the record into
+a fixed-length part and a variable-length part. Fixed-width columns (an <code>int</code>, a <code>double</code>, a timestamp) are stored inline at
+known offsets, so reading column three is a constant-offset load, exactly like a struct member — and alignment matters here for the same reason it
+did in Chapter 7, though on disk the tradeoff is space versus access convenience rather than a hardware fault. Variable-width columns (a
+<code>varchar</code>) cannot sit at a fixed offset because their length is not known at schema time, so the record stores, in the fixed part, an
+<strong>offset</strong> (or length) pointing into a variable-length area at the end of the record where the actual bytes live; reading such a
+column is a two-step indirection within the record, the same pattern as the slot directory one level up. Nullability is handled with a
+<strong>null bitmap</strong>: a small run of bits in the record header, one per nullable column, marking which columns are null so their storage
+can be omitted or ignored — checking a bit is cheaper and denser than storing a sentinel value in the field itself. Turning a record into these
+bytes is <strong>serialization</strong>; turning the bytes back into typed columns on read is <strong>deserialization</strong>; and the format is
+a contract the storage manager and everything above it must agree on, versioned carefully because a page written under one layout may be read
+years later. The through-line from Chapter 7 is exact: a record on disk is a struct whose layout you control byte for byte, extended to carry its
+own variability (offsets for variable fields) and its own optionality (the null bitmap) because, unlike an in-memory struct, it must be
+self-describing enough to survive the round trip to storage and back.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In a record with both fixed-width and variable-width columns, why can a fixed-width column be read at a constant offset while a variable-width
+column needs an offset stored in the record? What does the null bitmap buy over storing a special &ldquo;null&rdquo; value in each field?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>47.4 Making a page durable: the cost of the barrier, measured</h2>
+
+<p>Writing a page and <em>persisting</em> a page are different acts, and the gap between them is where Chapter 41's lesson becomes a number a
+storage engine must design around. When the manager calls <code>pwrite</code> to store a page, the data lands in the OS page cache and the call
+returns almost immediately — but the bytes are not yet on the device, and a crash now loses them (Chapter 40, Chapter 41). Durability requires the
+barrier: <code>fsync</code> (or <code>fdatasync</code>), which does not return until the device reports the data persisted. That barrier is
+expensive because it forces the one thing the whole stack is built to defer — an actual, acknowledged trip to the device — and worse, it cannot be
+pipelined away, so calling it per record serializes the workload behind the disk. To put a number on it, the program appends 2,000 4&nbsp;KiB
+pages two ways: one <code>fsync</code> at the very end, versus an <code>fsync</code> after <em>every</em> page. On this machine:</p>
+
+<pre><code>append 2,000 x 4 KiB pages to an ext4 file (WSL2 virtual disk), representative run:
+  fsync once at the end   :  ~0.06-0.07 s total   (~30-35 &micro;s/page amortized)
+  fsync after every page  :  ~6-8 s total         (~3-4 ms/page, ~250-310 durable writes/s)
+  -> per-page fsync is on the order of 100x slower than batching one sync at the end
+  (fdatasync per page is in the same 3-4 ms range; run-to-run variance is significant)
+</code></pre>
+
+<p>The batched version amortizes a single barrier over all 2,000 pages and finishes in tens of milliseconds; the per-page version pays a full
+device round trip 2,000 times and takes <em>seconds</em>, sustaining only a few hundred durable writes per second. The ratio — on the order of
+<strong>100&times;</strong> here — is the measured cost of confusing &ldquo;<code>write</code> returned&rdquo; with &ldquo;data is safe,&rdquo;
+and it is exactly why a database does not <code>fsync</code> after every row. Instead it <em>batches</em> durability: many changes are made in
+memory and to a sequential log, and one <code>fsync</code> makes a whole batch durable at once — group commit and the write-ahead log, which the
+durability part of this volume builds, are the disciplined answer to this measurement. There is a second, subtler hazard lurking in a page write:
+<strong>atomicity</strong>. A database page (say 8 or 16&nbsp;KiB) may be larger than the unit the device writes atomically, so a crash in the
+middle of persisting a page can leave it <strong>torn</strong> — half old bytes, half new — which corrupts the page rather than merely losing the
+update. Matching the page size to the device's physical block (4096 here) reduces the exposure, but the general defense, again, is the log: a
+technique like full-page logging or double-write records the page's intended contents somewhere durable first, so a torn page can be reconstructed
+after a crash. Both facts — the barrier's cost and the torn-write risk — point the same direction: durability is not free and not automatic, it is
+a specific expensive operation you batch and protect with a log, and pretending otherwise is how a &ldquo;safe&rdquo; storage layer becomes either
+unusably slow or quietly corrupt.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: fsync per record &mdash; paying the full durability barrier on every write</span>
+<p>The intuitive way to make data safe is to force it to disk immediately after each change: <code>write</code> the record, <code>fsync</code>,
+move on. It is correct, and it is catastrophically slow — measured here, an <code>fsync</code> per 4&nbsp;KiB page cost ~3&ndash;4&nbsp;ms and
+capped the system at a few hundred durable writes per second, roughly <strong>100&times;</strong> slower than syncing once at the end, because each
+sync is a full device round trip that cannot be pipelined. The trap is seductive because it passes every correctness test — the data really is
+durable after each call — so the bug is not wrongness but a throughput ceiling that only appears under load, when the system that benchmarked fine
+on one insert falls over at a few hundred inserts a second. Two related mistakes travel with it. First, believing <code>write</code> alone is
+durable (Chapter 41): it is not, the data sits in the page cache, so a crash loses it — under-syncing corrupts, over-syncing crawls, and both are
+failures to think about the barrier. Second, assuming a page write is <em>atomic</em>: a page larger than the device's atomic unit can be
+<strong>torn</strong> by a crash, leaving corruption, not just a lost update. The defense is the discipline the durability part formalizes: do not
+<code>fsync</code> per record — batch many changes behind one barrier, make durability a sequential-log write that one <code>fsync</code> commits
+in a group, and protect page atomicity by logging a page's contents before overwriting it in place. &ldquo;It's safe because we fsync every
+write&rdquo; and &ldquo;it sustains real write throughput&rdquo; are, without batching, not both true.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;To guarantee we never lose data, I made the storage layer <code>fsync</code> after every single
+row insert. It's rock-solid — I tested a crash and nothing was lost.&rdquo; Cover the paragraph and respond in four or five sentences, drawing on
+&sect;47.4.</p>
+<p><em>Model answer.</em> &ldquo;The correctness is right, but that design has a hard throughput ceiling we'll hit fast. An <code>fsync</code> is a
+full device round trip that can't be pipelined — I measured about 3&ndash;4&nbsp;ms per sync on our storage, which caps us at only a few hundred
+durable inserts per second, roughly 100&times; slower than syncing once for a batch. The fix isn't to sync less safely; it's to batch durability:
+make the changes in memory and to a sequential write-ahead log, then one <code>fsync</code> commits a whole group of inserts at once — that's what
+group commit is, and it keeps the same crash guarantee. We should also make sure a page write can't be torn across a crash — if our page is bigger
+than the device's atomic unit, we log the page before overwriting it. So let's keep the durability guarantee but move it to a batched log-and-sync
+instead of a sync per row; same safety, orders of magnitude more throughput.&rdquo; Naming the per-sync cost, the group-commit fix, and the
+torn-page risk is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;47.3 quick check: a fixed-width column has a known size, so its position within the record is a compile-time constant
+and reading it is a constant-offset load; a variable-width column's length is not known in advance, so it cannot occupy a fixed position — the
+record stores an offset/length in its fixed part pointing to the bytes in a variable-length area, and reading it takes that extra indirection. The
+null bitmap packs one bit per nullable column, so testing or marking null is a dense bit check and the column's storage can be omitted entirely,
+rather than reserving space in every row for a special sentinel value.)</em></p>
+
+<h2>47.5 What to carry forward</h2>
+
+<p>A database turns the block layer into an array of fixed-size <strong>pages</strong> addressed by number, where page <var>p</var> lives at offset
+<var>p</var>&nbsp;&times;&nbsp;<var>pagesize</var> and is read and written whole, the page size a multiple of the device's physical block so each
+page is a clean unit of I/O (&sect;47.1). Inside a page, the <strong>slotted-page</strong> layout keeps a directory of (offset, length) slots at
+one end and record bytes at the other, so records are addressed by slot number and can be compacted or moved while every (page, slot) record
+identifier stays valid (&sect;47.2). A <strong>record</strong> is laid out like a struct that must describe itself — fixed-width fields inline,
+variable-width fields via stored offsets into a trailing area, optionality via a null bitmap — serialized on write and deserialized on read
+(&sect;47.3). And persisting a page is a distinct, expensive act: measured here, an <code>fsync</code> per page cost ~3&ndash;4&nbsp;ms and
+~250&ndash;310 durable writes/s, on the order of <strong>100&times;</strong> slower than one batched barrier, while a page larger than the device's
+atomic unit risks a <strong>torn write</strong> — so durability must be batched and protected with a log (&sect;47.4).</p>
+
+<p>This is the storage manager's on-disk world, and it hands two things forward. The immediate one is the subject of the next chapter: pages are
+the unit of caching, and because a disk miss is hundreds of microseconds while a memory hit is tens of nanoseconds (Chapter 46), the database
+keeps hot pages in DRAM in its own hand-managed cache — the <strong>buffer pool</strong> of Chapter 48 — pinning pages in use, tracking which are
+dirty, and choosing which to evict when memory fills. The deferred one is the answer to this chapter's durability measurement: the batching-and-log
+discipline sketched in &sect;47.4 becomes, in the durability part of this volume, the write-ahead log and group commit that turn the expensive
+<code>fsync</code> barrier into a throughput a real system can sustain, and the torn-write defense into crash-consistent recovery. The page is the
+currency; the slot makes it flexible; the barrier makes durability real but costly. Everything the storage engines build next — B-tree nodes and
+LSM runs alike — is made of these pages, laid on this file, persisted through this barrier.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Give the offset of page <var>p</var> and explain why the page size is a multiple of the physical block size.</li>
+<li>Draw a slotted page and explain why records are addressed by slot number rather than raw offset.</li>
+<li>Define a record identifier and say what each of its two parts costs to resolve.</li>
+<li>Lay out a record with fixed and variable fields and a null bitmap, and say why variable fields need stored offsets.</li>
+<li>Quote the measured per-page vs batched <code>fsync</code> cost here and explain why per-record syncing is a throughput trap.</li>
+<li>Explain what a torn write is and why matching page size to the physical block, plus logging, defends against it.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> How does the storage manager turn a file into pages, and how does it compute where page <var>p</var> lives? (&sect;47.1)</li>
+<li><strong>R2.</strong> What are the parts of a slotted page, and why does addressing records by slot number allow compaction? (&sect;47.2)</li>
+<li><strong>R3.</strong> How are fixed-width, variable-width, and nullable columns stored in a record? (&sect;47.3)</li>
+<li><strong>R4.</strong> What were the measured per-page and batched <code>fsync</code> costs, and what does the ratio tell you to do? (&sect;47.4)</li>
+<li><strong>R5.</strong> What is a torn write, and what two defenses reduce or repair it? (&sect;47.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed. (McGraw-Hill, 2003), ISBN 978-0-07-246563-1,
+Chapter 9 (&ldquo;Storing Data: Disks and Files&rdquo;).</strong> The standard textbook treatment behind &sect;47.1&ndash;&sect;47.3: pages, the
+slotted-page layout, record formats, and record identifiers. First author Raghu Ramakrishnan; edition and ISBN verified via the publisher.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, DOI 10.1561/1900000002.</strong> The storage-manager sections frame &sect;47.1&ndash;&sect;47.4: the file and
+page abstraction, the buffer manager it feeds, and where durability sits. First author Joseph M. Hellerstein; venue, year, and DOI verified via
+the ACM Digital Library.</li>
+<li><strong>Marshall K. McKusick, William N. Joy, Samuel J. Leffler &amp; Robert S. Fabry, &ldquo;A Fast File System for UNIX,&rdquo; <em>ACM
+Transactions on Computer Systems</em> 2(3), 1984, pp. 181&ndash;197, DOI 10.1145/989.990.</strong> The classic on-disk-layout paper behind
+&sect;47.1: block sizes, allocation for locality, and turning random file access into sequential I/O — the file-system ancestor of a database's
+page file. First author Marshall K. McKusick; venue, year, and DOI verified via the ACM Digital Library.</li>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em>, &ldquo;File System Implementation&rdquo; (free
+online).</strong> The OS-level counterpart to &sect;47.1: how a file becomes blocks on a device, inodes, and allocation — the abstraction the
+database file sits on. First authors the Arpaci-Dusseaus; chapter title verified against the online edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex47.1"><span class="ex-label">47.1</span> <span class="ex-tag warm">warm-up</span>
+With a 4&nbsp;KiB page size, at what byte offset does page number 10 begin, and how many bytes does one page read transfer?</div>
+
+<div class="exercise" id="ex47.2"><span class="ex-label">47.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two regions of a slotted page and the direction each grows, and say what one slot contains.</div>
+
+<div class="exercise" id="ex47.3"><span class="ex-label">47.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: why does <code>write</code> returning not mean the data is durable, and what does <code>fsync</code> do about it?</div>
+
+<div class="exercise" id="ex47.4"><span class="ex-label">47.4</span> <span class="ex-tag core">core</span>
+Record identifiers. (a) What are the two components of a record identifier, and what does each cost to resolve? (b) Explain why addressing a record
+by slot number (not raw byte offset) lets the page compact away deletion holes without breaking outside references. (c) What is a forwarding
+pointer, when is it needed, and what does it cost on read?</div>
+
+<div class="exercise" id="ex47.5"><span class="ex-label">47.5</span> <span class="ex-tag core">core</span>
+Record layout. (a) For a row with an <code>int</code>, a <code>double</code>, and two <code>varchar</code> columns (one nullable), sketch the
+byte layout: fixed part, variable-length area, and null bitmap. (b) Explain why the two <code>varchar</code>s need stored offsets while the
+<code>int</code> and <code>double</code> do not. (c) Why is a null bitmap denser and cheaper than a sentinel value per field?</div>
+
+<div class="exercise" id="ex47.6"><span class="ex-label">47.6</span> <span class="ex-tag core">core</span>
+The durability measurement. (a) Per-page <code>fsync</code> ran ~100&times; slower than one <code>fsync</code> at the end here; explain physically
+why, in terms of what a sync forces and why it can't be pipelined. (b) What is the batched alternative a database actually uses, and how does it
+keep the same crash guarantee? (c) Why does the per-record-<code>fsync</code> design pass a correctness test yet fail under load?</div>
+
+<div class="exercise" id="ex47.7"><span class="ex-label">47.7</span> <span class="ex-tag complexity">cost</span>
+A workload commits <var>N</var> records. Let one <code>fsync</code> cost <var>s</var> seconds and let non-sync per-record work be negligible. (a)
+Write the total durability time if you <code>fsync</code> per record, and if you <code>fsync</code> once per batch of <var>k</var> records. (b) With
+<var>s</var>&nbsp;=&nbsp;3&nbsp;ms, <var>N</var>&nbsp;=&nbsp;100,000, compute both for <var>k</var>&nbsp;=&nbsp;1 and <var>k</var>&nbsp;=&nbsp;1000.
+(c) What is the sustainable durable-commit rate in each case, and what does this say about why group commit exists?</div>
+
+<div class="exercise" id="ex47.8"><span class="ex-label">47.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A storage layer uses 16&nbsp;KiB pages on a device whose atomic write unit is 4&nbsp;KiB. It overwrites
+pages in place and does no logging. After a crash during a page overwrite, a page is found half-updated and the database won't open.
+<br><strong>Step 1 (given):</strong> a 16&nbsp;KiB page spans four 4&nbsp;KiB atomic units, written non-atomically.
+<br><strong>Step 2 (given):</strong> a crash between the units leaves the page torn — part old, part new — which is corruption, not a lost update.
+<br><strong>Step 3 (given):</strong> in-place overwrite with no prior durable copy means the old contents are gone too.
+<br><strong>Step 4 (you):</strong> Explain why this is worse than merely losing the last write, and describe a logging scheme that would let
+recovery reconstruct the correct page.</div>
+
+<div class="exercise" id="ex47.9"><span class="ex-label">47.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether it belongs in the <em>fixed part</em>, the <em>variable-length area</em>, or the <em>null bitmap</em> of a record, and why:
+(a) a 4-byte integer key; (b) a 200-character product description; (c) the fact that the description column is absent for this row; (d) an
+8-byte timestamp; (e) the offset that locates the description within the record.</div>
+
+<div class="exercise" id="ex47.10"><span class="ex-label">47.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A slotted page stores records in sorted order so scans are
+fast.&rdquo; (b) &ldquo;A record identifier is a raw byte offset into the file.&rdquo; (c) &ldquo;After <code>pwrite</code> returns, the page is
+safely on the device.&rdquo; (d) &ldquo;Calling <code>fsync</code> once per batch gives weaker durability than calling it per record.&rdquo; (e)
+&ldquo;A torn write means the last update was lost.&rdquo;</div>
+
+<div class="exercise" id="ex47.11"><span class="ex-label">47.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the on-disk design. (a) Trace the two levels of indirection between &ldquo;I want row R&rdquo; and its bytes on disk: record identifier
+&rarr; page &rarr; slot &rarr; record, and say what each level buys. (b) The chapter measured a ~100&times; penalty for per-page <code>fsync</code>;
+connect that number to why the write-ahead log (built later) is the shape durability must take, not an optional optimization. (c) Argue that a
+record on disk is &ldquo;a struct that must describe itself,&rdquo; using the variable-field offsets and null bitmap of &sect;47.3 as evidence, and
+say what the round trip to storage adds that an in-memory struct never needs.</div>
+
+<div class="exercise" id="ex47.12"><span class="ex-label">47.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Append many 4&nbsp;KiB pages to a file two ways — one <code>fsync</code> at the end, and one
+<code>fsync</code> per page — and report total time, per-page time, and sustainable durable writes per second for each. (b) Repeat with
+<code>fdatasync</code> and note any difference. (c) State your toolchain and CPU, note the times are wall-clock and whether your disk is
+virtualised, and explain why the <em>ratio</em> between the two is the portable result while the absolute per-sync time is your machine's.</div>
+
+</section>
+</section>

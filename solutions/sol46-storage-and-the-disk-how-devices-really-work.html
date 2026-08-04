@@ -1,0 +1,92 @@
+<section class="solutions" id="sol46">
+<h1>Chapter 46 — Solutions</h1>
+
+<div class="solution" id="sol46.1"><span class="sol-label">46.1</span>
+Fastest to slowest: L1 hit ~1&nbsp;ns, DRAM ~100&nbsp;ns, flash-SSD read ~tens&ndash;100&nbsp;&micro;s, hard-disk seek ~10&nbsp;ms (all
+published/typical). Each step down is roughly three orders of magnitude. <em>Tempting wrong answer:</em> putting SSD and DRAM in the same
+ballpark — an SSD read is about a thousand times slower than DRAM, not comparable. <strong>Feed-forward:</strong> &sect;46.1.</div>
+
+<div class="solution" id="sol46.2"><span class="sol-label">46.2</span>
+A <strong>seek</strong> (moving the head to the right track) and <strong>rotational latency</strong> (waiting for the target sector to rotate
+under the head). Random reads pay both delays every time, while sequential reads pay them once and then stream adjacent sectors. <em>Tempting
+wrong answer:</em> naming only the seek — rotational latency (~4&nbsp;ms at 7200&nbsp;RPM) is a comparable second cost. <strong>Feed-forward:</strong>
+&sect;46.2.</div>
+
+<div class="solution" id="sol46.3"><span class="sol-label">46.3</span>
+Because flash cannot be reprogrammed in place: to rewrite a page you must first <em>erase</em> its surrounding block, and erase operates on a whole
+<strong>erase block</strong> (hundreds of pages), not one page. <em>Tempting wrong answer:</em> &ldquo;you erase a single page&rdquo; — erase is
+per block; the read/program unit (the page) is much smaller than the erase unit. <strong>Feed-forward:</strong> &sect;46.3.</div>
+
+<div class="solution" id="sol46.4"><span class="sol-label">46.4</span>
+(a) time = seek + rotational latency + transfer, naming the head move, the wait for the sector, and the data read. (b) Random 4&nbsp;KiB:
+~9&nbsp;ms seek + ~4.2&nbsp;ms half-rotation + ~0.03&nbsp;ms transfer &asymp; ~13&nbsp;ms, dominated by seek and rotation; the transfer is
+negligible. (c) 1&nbsp;MiB sequential: one seek + rotation up front, then ~7&nbsp;ms of transfer at 150&nbsp;MB/s — so per byte the positioning is
+amortized to near zero and the transfer rate governs. <em>Tempting wrong answer:</em> assuming the transfer term dominates a random read — for
+small reads it is the smallest term. <strong>Feed-forward:</strong> &sect;46.2.</div>
+
+<div class="solution" id="sol46.5"><span class="sol-label">46.5</span>
+(a) A random read is electronic (no head or platter to move), so reaching any page costs the same; a small random write can't overwrite in place,
+so the controller writes elsewhere, remaps, and later erases/garbage-collects. (b) Write amplification: one logical small overwrite triggers
+read-erase-reprogram of a block plus garbage collection, so physical writes exceed logical ones. (c) Both prefer sequential writes — the hard disk
+because it avoids seeks, the SSD because large sequential writes align with erase blocks and cause less amplification. <em>Tempting wrong
+answer:</em> &ldquo;an SSD's cheap random reads mean cheap random writes&rdquo; — writes are the asymmetric, expensive direction.
+<strong>Feed-forward:</strong> &sect;46.3.</div>
+
+<div class="solution" id="sol46.6"><span class="sol-label">46.6</span>
+(a) <strong>I/O size</strong> (1&nbsp;MiB requests amortize per-request overhead over 256&times; more data than 4&nbsp;KiB) and <strong>access
+pattern</strong> (random reads forfeit readahead and locality). (b) The single-4&nbsp;KiB comparison being only ~1.24&times; means the
+pattern penalty is small on this flash-backed device (no seek), so most of the 49&times; is the I/O-size effect. (c) On a spinning disk each random
+read would pay a mechanical seek, so the access-pattern term would explode and come to dominate. <em>Tempting wrong answer:</em> attributing the
+whole 49&times; to &ldquo;random is slow&rdquo; — on this SSD the bigger factor is fetching in bulk. <strong>Feed-forward:</strong> &sect;46.4.</div>
+
+<div class="solution" id="sol46.7"><span class="sol-label">46.7</span>
+(a) Design A: <var>N</var>&nbsp;&times;&nbsp;<var>t</var><sub>r</sub>. Design B: (<var>N</var>/100)&nbsp;&times;&nbsp;<var>t</var><sub>r</sub>. (b)
+With <var>t</var><sub>r</sub>&nbsp;&asymp;&nbsp;10&nbsp;ms and <var>N</var>&nbsp;=&nbsp;10<sup>6</sup>: A &asymp; 10,000&nbsp;s (~2.8 hours); B
+&asymp; 100&nbsp;s. (c) The 100&times; is the number of records that share one page read: packing related records into a page means one disk trip
+serves 100 of them, turning 100 random accesses into one — the entire argument for the page as the unit of I/O. <em>Tempting wrong answer:</em>
+ignoring that B still pays for locality — if the 100 records were scattered across 100 pages, B collapses back to A. <strong>Feed-forward:</strong>
+&sect;46.2, &sect;46.4.</div>
+
+<div class="solution" id="sol46.8"><span class="sol-label">46.8</span>
+<strong>Step 4:</strong> The 6&nbsp;GB/s measured the page cache in DRAM, not the disk — a plain buffered <code>read</code> loop over a warm file
+never reaches the device, so the number is a memory-bandwidth figure. The conclusion is backwards: because they measured DRAM, they saw no
+difference between patterns and inferred layout doesn't matter, when the device (which they never touched) shows a ~49&times; gap that makes layout
+decisive. They should bypass the cache (<code>O_DIRECT</code> or drop caches) and vary both access pattern and I/O size, as in &sect;46.4.
+<em>Tempting wrong answer:</em> &ldquo;6&nbsp;GB/s is the disk, their disk is just fast&rdquo; — no disk here does 6&nbsp;GB/s at 4&nbsp;KiB random;
+that is DRAM. <strong>Feed-forward:</strong> &sect;46.4.</div>
+
+<div class="solution" id="sol46.9"><span class="sol-label">46.9</span>
+(a) <strong>Seek/positioning</strong> — random reads on a spinning disk pay a mechanical seek each. (b) <strong>I/O size</strong> (and raw transfer
+rate) — large sequential SSD reads are bandwidth-bound, not seek-bound. (c) <strong>DRAM ceiling</strong> — a warm cache serves from memory, so
+&ldquo;random&rdquo; costs a memory access, not a disk one. (d) <strong>Flash write amplification</strong> — tiny random overwrites trigger
+erase/garbage-collection work. (e) <strong>I/O size</strong> — same device and pattern, only the request size differs, so 1&nbsp;MiB amortizes
+overhead that 4&nbsp;KiB cannot. <em>Tempting wrong answer:</em> calling (c) seek-bound &ldquo;because it's random&rdquo; — a cache hit never
+reaches the disk. <strong>Feed-forward:</strong> &sect;46.1&ndash;&sect;46.4.</div>
+
+<div class="solution" id="sol46.10"><span class="sol-label">46.10</span>
+(a) <strong>False</strong> — an SSD read (~tens&ndash;100&nbsp;&micro;s) is ~1000&times; slower than DRAM (~100&nbsp;ns). (b) <strong>False</strong>
+(as stated) — the transfer rate is the same; sequential is faster because it pays seek and rotation once instead of per access. (c)
+<strong>False</strong> — random writes suffer the erase-in-place limitation and amplification; only random reads are cheap. (d) <strong>True</strong>
+— the block layer's smallest unit is a block, so a database reads/writes in block-multiple pages. (e) <strong>False</strong> — on this machine the
+<code>rotational</code> flag is a WSL2 virtio artifact; the backing store is an NVMe SSD. <em>Tempting wrong answer:</em> marking (b) true by
+crediting a higher transfer rate rather than amortized positioning. <strong>Feed-forward:</strong> &sect;46.1&ndash;&sect;46.4.</div>
+
+<div class="solution" id="sol46.11"><span class="sol-label">46.11</span>
+(a) &ldquo;An access to disk is enormously more expensive than computation, and random access far more than sequential.&rdquo; The B-tree minimizes
+the <em>number</em> of disk accesses per lookup (high fanout, a few levels); the log turns writes into <em>sequential</em> I/O; the buffer pool
+keeps hot pages in DRAM so most accesses never reach the disk. (b) Both are true because they measure different things: ~49&times; is large
+sequential streaming versus small random I/O (dominated by I/O size on this flash device), while ~1.24&times; is sequential versus random at the
+<em>same</em> small 4&nbsp;KiB size (isolating the pure pattern penalty, tiny without a seek). (c) The unifying discipline is knowing where bytes
+physically are and what reaching them costs — Volume 1's I/O part asked it of the page cache and the wire; here it is asked of the device, and the
+same answer (touch it rarely, in bulk, in the pattern it prefers) falls out. <em>Tempting wrong answer:</em> claiming the two ratios contradict —
+they measure different comparisons. <strong>Feed-forward:</strong> &sect;46.1&ndash;&sect;46.5.</div>
+
+<div class="solution" id="sol46.12"><span class="sol-label">46.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports the three <code>/sys/block</code> values for the right device; (b) gives
+sequential-large-block and random-small-page throughput, per-read latency, and IOPS under <code>O_DIRECT</code>; (c) states toolchain and CPU,
+flags wall-clock timing without hardware counters, notes whether the machine is virtualised (so absolute numbers reflect the stack, not a bare
+device), and separates the I/O-size effect from the access-pattern effect — for instance by also measuring single 4&nbsp;KiB reads sequential vs
+random, which isolates the pattern penalty. <em>Tempting wrong answer:</em> reporting a buffered-<code>read</code> number as the device speed —
+that measures the page cache. <strong>Feed-forward:</strong> &sect;46.4.</div>
+
+</section>

@@ -1,0 +1,109 @@
+<section class="solutions" id="sol16">
+<h1>Chapter 16 — Solutions</h1>
+
+<div class="solution" id="sol16.1"><span class="sol-label">16.1</span>
+The states are <strong>running</strong> (on a CPU now), <strong>ready</strong> (runnable but no free CPU), and
+<strong>blocked</strong> (waiting for an event — I/O, a child, a lock — and unable to run until it arrives). The
+scheduler chooses the next runner from the <strong>ready</strong> threads only; a blocked thread is not a candidate
+until the event wakes it. <em>Tempting wrong answer:</em> "the scheduler picks among all threads" — it cannot run a
+blocked thread; picking one would accomplish nothing until its event fires. <strong>Feed-forward:</strong> §16.1.</div>
+
+<div class="solution" id="sol16.2"><span class="sol-label">16.2</span>
+<strong>Turnaround time</strong> = completion − arrival; <strong>response time</strong> = first-run − arrival. For the
+job: response = 8 − 0 = <strong>8</strong>; turnaround = 40 − 0 = <strong>32</strong>. <em>Tempting wrong answer:</em>
+reporting response as the time it <em>finished</em> (40) — response measures when the job first got the CPU, not when
+it completed. <strong>Feed-forward:</strong> §16.1.</div>
+
+<div class="solution" id="sol16.3"><span class="sol-label">16.3</span>
+The <strong>convoy effect</strong>: short jobs pile up behind a long one (like cars behind a truck), so they inherit
+its runtime and average turnaround balloons. It afflicts <strong>FIFO</strong> (first-come-first-served, no
+preemption). <em>Tempting wrong answer:</em> attributing it to round-robin — RR's small slices are exactly what break
+the convoy. <strong>Feed-forward:</strong> §16.2.</div>
+
+<div class="solution" id="sol16.4"><span class="sol-label">16.4</span>
+<strong>FIFO (X, Y, Z):</strong> X completes at 8, Y at 12, Z at 16 → average turnaround (8+12+16)/3 =
+<strong>12 ms</strong>. <strong>SJF (Y, Z, X):</strong> Y at 4, Z at 8, X at 16 → average (4+8+16)/3 =
+<strong>9.33 ms</strong>. SJF is lower, and it is no accident: when all jobs arrive together, running shorter jobs
+first minimizes the sum of completion times, which is exactly what average turnaround measures — SJF is provably
+optimal for it. <em>Tempting wrong answer:</em> assuming the last-completion time (16 ms in both) decides the
+average — it is the same, yet the averages differ because ordering changes the <em>earlier</em> completions.
+<strong>Feed-forward:</strong> §16.2.</div>
+
+<div class="solution" id="sol16.5"><span class="sol-label">16.5</span>
+SJF minimizes average turnaround because, with simultaneous arrivals, a job's turnaround includes the runtime of
+everything before it; ordering shortest-first makes each long job's runtime fall on the fewest later jobs (any swap
+putting a longer job earlier only adds its length to more waits). It is unusable in general because (1) it needs an
+<strong>oracle</strong> — you must know each job's length in advance, which for interactive and server work you never
+do — and (2) even given the oracle it gives poor <strong>response time</strong>: a job arriving after a long one
+starts must wait (or, with STCF, only if shorter). <em>Tempting wrong answer:</em> "just estimate the length" — MLFQ
+does something like this by observing behavior, but a pure SJF that mis-estimates loses its optimality and can starve.
+<strong>Feed-forward:</strong> §16.2, §16.3.</div>
+
+<div class="solution" id="sol16.6"><span class="sol-label">16.6</span>
+An MLFQ keeps several priority queues and always runs from the highest non-empty one (round-robin within a level). A
+job's priority <em>adapts</em>: it enters at the top; if it uses its entire time slice (CPU-bound), it is demoted a
+level; if it yields before the slice ends (blocks on I/O — interactive), it keeps its level. So interactive jobs,
+which block frequently, stay near the top and are scheduled quickly (low response time), while CPU-bound jobs sink and
+share the leftovers — the scheduler <em>learns</em> each job's character from behavior rather than being told it.
+<em>Tempting wrong answer:</em> "the programmer sets the priority" — MLFQ derives it from observed CPU/blocking
+behavior; a boost and anti-gaming accounting keep it honest. <strong>Feed-forward:</strong> §16.4.</div>
+
+<div class="solution" id="sol16.7"><span class="sol-label">16.7</span>
+(a) Shrinking the slice improves <strong>response time</strong> (jobs cycle onto the CPU sooner) and hurts
+<strong>turnaround/throughput</strong> (more interleaving, more context switches). (b) If the slice equals the switch
+cost, then for every unit of switching the CPU does one unit of useful work — roughly <strong>half</strong> the CPU is
+wasted on switching (and it only gets worse as the slice drops below the switch cost). (c) A few milliseconds is large
+enough that a few-microsecond switch is a tiny percentage overhead, yet small enough that interactive jobs still feel
+instant; seconds would wreck response time, microseconds would drown in switch overhead. <em>Tempting wrong answer:</em>
+"smaller is always more responsive, so make it tiny" — below a threshold, switch overhead dominates and total
+throughput collapses. <strong>Feed-forward:</strong> §16.3.</div>
+
+<div class="solution" id="sol16.8"><span class="sol-label">16.8</span>
+<strong>Step 4:</strong> Lower the dashboard's <code>nice</code> value (or, better, put the two workloads in separate
+<strong>cgroups</strong> and give the dashboard a larger <strong>CPU weight</strong>). Under Linux's proportional-share
+scheduler this grants the dashboard a bigger <em>share</em> of the CPU when the two contend, while the batch job still
+runs freely whenever the dashboard is idle. It is safer than <code>SCHED_FIFO</code> because it changes the
+<em>proportion</em>, not the absolute priority: a low-weight job still gets <em>some</em> CPU, so nothing starves and a
+runaway loop cannot freeze the machine, whereas a CPU-bound <code>SCHED_FIFO</code> thread can starve everything on its
+core, kernel threads included. <em>Tempting wrong answer:</em> "give the dashboard real-time priority" — that fixes the
+starvation by creating a worse one and risks wedging the box. <strong>Feed-forward:</strong> §16.4.</div>
+
+<div class="solution" id="sol16.9"><span class="sol-label">16.9</span>
+(a) <strong>Response time</strong> — the editor must react to each keystroke immediately; the user feels lag directly.
+(b) <strong>Turnaround time</strong> — the batch job's only requirement is that the whole thing finishes by a deadline;
+no user is watching it start. (c) <strong>Throughput</strong> — a build farm is judged by jobs completed per hour in
+aggregate, not any one job's latency. <em>Method-selection cue:</em> a human waiting on each action → response; a job
+that must complete → turnaround; a fleet maximizing aggregate work → throughput. <strong>Feed-forward:</strong> §16.1.</div>
+
+<div class="solution" id="sol16.10"><span class="sol-label">16.10</span>
+(a) <strong>False</strong> — a process blocked on <code>read</code> is off the CPU entirely; it consumes no CPU until
+the data arrives and it becomes ready. (b) <strong>False</strong> — Linux threads are 1:1 kernel-scheduled entities
+(Chapter 15), so the scheduler picks among <em>threads</em>. (c) <strong>False</strong> — a context switch costs
+register save/restore plus cold cache/TLB; the slice size trades responsiveness against that overhead. (d)
+<strong>True</strong> — a lower <code>nice</code> value means a larger weight and thus a larger CPU share under
+contention. <em>Tempting wrong answer:</em> calling (d) false because "nice" sounds like it should lower priority — the
+naming is inverted: <em>lower</em> nice is <em>higher</em> priority. <strong>Feed-forward:</strong> §16.1, §16.4, and
+Ch 15.</div>
+
+<div class="solution" id="sol16.11"><span class="sol-label">16.11</span>
+(a) Strict SJF always runs the shortest ready job; if short jobs keep arriving, a long job is never the shortest and
+<strong>never runs</strong> — indefinite starvation. (b) An MLFQ periodically <strong>boosts</strong> every job back to
+the top priority, guaranteeing even a long, demoted job eventually gets CPU; without the boost, CPU-bound jobs stuck at
+the bottom could starve behind a steady stream of interactive work. (c) A proportional-share scheduler gives every job
+CPU in proportion to its weight, so a low-weight job gets a <em>small</em> share, never <em>zero</em> — "smaller share"
+is not "no share." That is exactly why <code>nice</code> cannot starve a task (it only shrinks the proportion) while
+<code>SCHED_FIFO</code>, being strict priority, can (a higher-priority runnable thread gets <em>all</em> the CPU).
+<em>Tempting wrong answer:</em> "a low nice value can starve a process" — no; only strict-priority classes can starve,
+which is the whole safety argument for using nice/weights instead. <strong>Feed-forward:</strong> §16.4.</div>
+
+<div class="solution" id="sol16.12"><span class="sol-label">16.12</span>
+Machine-specific by design. A correct write-up reports: (a) a loop that spins for N wall-seconds and prints the
+CPU-seconds it accrued; (b) pinned to one shared core, the <code>nice 0</code> copy gets far more CPU than the
+<code>nice 19</code> copy — on the book's machine (Linux 6.18, EEVDF) roughly 4.66 vs 0.09 CPU-seconds over a
+five-second window, about fifty to one; (c) on separate cores the two no longer compete for the same CPU, so each gets
+a full core and the nice difference nearly vanishes — <code>nice</code> only matters <em>under contention for the same
+CPU</em>. The discipline: report exactly what you saw and label kernel/core count/scheduler. <em>Tempting wrong
+answer:</em> "nice 19 was paused/slept" — it was not; it ran continuously but was granted a much smaller <em>share</em>
+of the contended core. <strong>Feed-forward:</strong> §16.4.</div>
+
+</section>

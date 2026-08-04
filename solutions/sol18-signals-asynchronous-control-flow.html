@@ -1,0 +1,123 @@
+<section class="solutions" id="sol18">
+<h1>Chapter 18 — Solutions</h1>
+
+<div class="solution" id="sol18.1"><span class="sol-label">18.1</span>
+A <strong>signal</strong> is an asynchronous notification the kernel delivers to a process to indicate an event (a
+software interrupt). It differs from a normal function call in that the program never <em>calls</em> the handler: the
+kernel <em>injects</em> it into the control flow at an arbitrary instant, suspending whatever was running, then resumes
+that code when the handler returns. <em>Tempting wrong answer:</em> "a signal is just a callback you invoke" — you
+register it, but delivery is forced by the kernel, not called by your code. <strong>Feed-forward:</strong> §18.1,
+§18.2.</div>
+
+<div class="solution" id="sol18.2"><span class="sol-label">18.2</span>
+<strong>Terminate</strong> (<code>SIGTERM</code>, <code>SIGINT</code>); <strong>Terminate and dump core</strong>
+(<code>SIGSEGV</code>, <code>SIGABRT</code>); <strong>Ignore</strong> (<code>SIGCHLD</code>'s default); and
+<strong>Stop/Continue</strong> (<code>SIGSTOP</code>/<code>SIGCONT</code>). <em>Tempting wrong answer:</em> "the default
+is always to terminate" — several signals default to ignore or to stop/continue, not termination. <strong>Feed-
+forward:</strong> §18.1.</div>
+
+<div class="solution" id="sol18.3"><span class="sol-label">18.3</span>
+<strong><code>SIGKILL</code></strong> and <strong><code>SIGSTOP</code></strong> cannot be caught or ignored. If a process
+could catch them, it could refuse to die or to be stopped — a runaway or malicious program would be unkillable, so the
+OS would lose its last-resort control. Keeping these two unblockable guarantees the kernel can always terminate or halt
+any process. <em>Tempting wrong answer:</em> "you can catch <code>SIGKILL</code> to clean up first" — you cannot; that
+is exactly why <code>SIGTERM</code> (catchable) exists for graceful shutdown and <code>SIGKILL</code> for the forced
+kill. <strong>Feed-forward:</strong> §18.1.</div>
+
+<div class="solution" id="sol18.4"><span class="sol-label">18.4</span>
+When <code>Ctrl-C</code> sends <code>SIGINT</code>, the kernel suspends the blocked <code>read</code>, runs the handler,
+and then the <code>read</code> returns <code>-1</code> with <code>errno == EINTR</code> ("interrupted system call"). It
+did not resume waiting because the kernel had to unblock the process to deliver the signal, and the default is to
+report the interruption rather than silently re-block. The two standard fixes: (1) <strong>retry</strong> the call when
+<code>errno == EINTR</code> (a loop), or (2) install the handler with <strong><code>SA_RESTART</code></strong> so the
+kernel auto-restarts many interrupted calls — though not all, so robust code still handles <code>EINTR</code>.
+<em>Tempting wrong answer:</em> "treat <code>EINTR</code> as a real read error and abort" — it is not an error about the
+data; the correct response is to retry. <strong>Feed-forward:</strong> §18.3.</div>
+
+<div class="solution" id="sol18.5"><span class="sol-label">18.5</span>
+It is unsafe because a handler can run in the middle of arbitrary code, including inside <code>printf</code>/
+<code>malloc</code> themselves; those functions hold internal locks / mutable state and are not reentrant, so the
+handler's re-entry can deadlock or corrupt the heap. A function callable from a handler must be
+<strong>async-signal-safe</strong> (essentially reentrant — the <code>signal-safety(7)</code> list, e.g.
+<code>write</code>, <code>_exit</code>). The safe pattern: the handler sets a <code>volatile sig_atomic_t</code> flag
+(or does one <code>write</code> to a self-pipe) and returns; the main loop notices and does the real work
+synchronously. <em>Tempting wrong answer:</em> "it's fine if you only <code>printf</code> occasionally" — it only has
+to interrupt <code>printf</code> once, under load, to hang; rarity is what makes the bug dangerous, not safe.
+<strong>Feed-forward:</strong> §18.4.</div>
+
+<div class="solution" id="sol18.6"><span class="sol-label">18.6</span>
+Standard signals (1–31) are represented by a single pending bit each, so they do <strong>not queue</strong>: if the
+same signal is generated multiple times while pending/blocked, the process sees it once when it is delivered; the extra
+instances coalesce. So if several children exit close together, the parent may receive a single <code>SIGCHLD</code>
+for all of them — reaping exactly one child per signal would leave the others as zombies (Chapter 14). A correct handler
+therefore loops: <code>while (waitpid(-1, &amp;status, WNOHANG) &gt; 0) ;</code> reaps <em>all</em> currently-exited
+children per delivery. <em>Tempting wrong answer:</em> "one <code>SIGCHLD</code> per child, so reap one" — signals
+coalesce, so the count of deliveries does not match the count of events. <strong>Feed-forward:</strong> §18.4, and
+Ch 14.</div>
+
+<div class="solution" id="sol18.7"><span class="sol-label">18.7</span>
+(a) Setting a <code>volatile sig_atomic_t</code> flag is a single, atomic, async-signal-safe store — it cannot deadlock
+or corrupt anything — whereas doing the work directly risks re-entering unsafe libc; and it is cheap (one write). (b)
+The self-pipe / <code>signalfd</code> approach adds a little latency (a <code>write</code> then the main loop's next
+<code>read</code>) but buys correctness: the real work runs in the synchronous main flow where all functions are safe,
+and it integrates signals into an ordinary event loop. (c) It can never be a reliable counter because standard signals
+do not queue — multiple occurrences while pending collapse into one delivery, so the number of handler runs
+under-counts the number of events. <em>Tempting wrong answer:</em> "increment a counter in the handler to count
+events" — coalescing makes that count wrong under load. <strong>Feed-forward:</strong> §18.4.</div>
+
+<div class="solution" id="sol18.8"><span class="sol-label">18.8</span>
+<strong>Step 4:</strong> The bug is an <strong>async-signal-safety violation</strong>: the <code>SIGHUP</code> handler
+calls non-reentrant functions (<code>malloc</code>, stdio <code>fprintf</code>), so when the signal interrupts a request
+thread that is already inside one of them, the handler re-enters it and <strong>deadlocks</strong> (or corrupts the
+heap). It appears only under load because it requires the signal to land <em>during</em> an unsafe call; light testing
+rarely hits that window, but heavy request traffic keeps threads inside <code>malloc</code>/stdio a large fraction of
+the time, so the odds rise — the same schedule-dependent, "passes tests / breaks in production" pathology as a data
+race. The fix: make the handler trivial (set <code>volatile sig_atomic_t reload_requested = 1;</code> or
+<code>write</code> a self-pipe byte and return), and perform the config re-read, <code>malloc</code>, and logging in
+the <strong>main loop</strong> when it observes the flag, where libc is safe to call. <em>Tempting wrong answer:</em>
+"add a lock around the handler's <code>malloc</code>" — the handler may already hold or be blocked on that very lock
+via the interrupted call; locking cannot make a handler reentrant. <strong>Feed-forward:</strong> §18.4.</div>
+
+<div class="solution" id="sol18.9"><span class="sol-label">18.9</span>
+(a) <strong>Signal</strong> (<code>SIGHUP</code> by convention) — a content-free "reload" notification is exactly what a
+signal is for. (b) <strong>Real IPC — a pipe</strong> — a signal carries no data; a byte stream needs a pipe (or
+socket). (c) <strong>Signal</strong> — this <em>is</em> a signal (<code>SIGCHLD</code>); the parent then
+<code>wait</code>s. (d) <strong>Real IPC — a socket</strong> (or a pipe pair) — structured request/reply is a
+conversation, and a signal is only a doorbell. <em>Method-selection cue:</em> a content-free notification → signal;
+moving data or a request/reply → pipe/socket/shared memory. <strong>Feed-forward:</strong> §18.1, §18.5.</div>
+
+<div class="solution" id="sol18.10"><span class="sol-label">18.10</span>
+(a) <strong>False</strong> — the kernel injects the handler asynchronously; the program does not call it. (b)
+<strong>False</strong> — <code>SA_RESTART</code> restarts <em>many</em> but not all interrupted calls, so robust code
+still handles <code>EINTR</code>. (c) <strong>False</strong> — <code>SIGKILL</code> cannot be caught, so no cleanup runs;
+use <code>SIGTERM</code> for graceful shutdown. (d) <strong>True</strong> — an invalid memory access causes the kernel
+to deliver <code>SIGSEGV</code>, whose default disposition terminates (and cores) the process. <em>Tempting wrong
+answer:</em> calling (d) false because "a segfault is a hardware thing" — the hardware fault is <em>translated</em> by
+the kernel into the <code>SIGSEGV</code> signal. <strong>Feed-forward:</strong> §18.1, §18.2, §18.3, and Ch 11.</div>
+
+<div class="solution" id="sol18.11"><span class="sol-label">18.11</span>
+(a) <code>volatile</code> stops the compiler from caching the flag in a register or optimizing the read away, so the
+main loop actually re-reads memory the handler wrote; <code>sig_atomic_t</code> guarantees the read/write is a single
+uninterruptible operation, so the handler cannot catch a half-written value. Without both, the compiler might never
+observe the change, or the main loop might see a torn value. (b) It is <em>similar</em> to a data race: two flows of
+control touch the same memory with no ordering, so the shared access needs care. It is <em>different</em> in that there
+is one thread — the handler cannot run truly simultaneously with the main flow, only interrupt it — so the concern is
+atomicity of a single access and compiler visibility, not simultaneous multi-core writes (which is why
+<code>sig_atomic_t</code> suffices here where full synchronization is needed between threads). (c) Because the handler
+is a second, asynchronously-scheduled flow of control sharing memory with the main flow, a single-threaded program with
+signals already has concurrency — the interruption can happen between any two instructions. <em>Tempting wrong
+answer:</em> "a single-threaded program can't have concurrency bugs" — signals introduce asynchronous control flow,
+which is concurrency. <strong>Feed-forward:</strong> §18.4, and Ch 15.</div>
+
+<div class="solution" id="sol18.12"><span class="sol-label">18.12</span>
+Machine-specific by design. A correct write-up reports: (a) with a plain handler (no <code>SA_RESTART</code>), the
+<code>read</code> interrupted by <code>SIGALRM</code> returns <code>-1</code> with <code>errno == EINTR</code> (on the
+book's machine, "errno=4 (Interrupted system call)"); reinstalling with <code>SA_RESTART</code> makes the kernel
+restart the <code>read</code> so it keeps blocking (no <code>EINTR</code> surfaced). (b) The counting handler runs
+<strong>once</strong>, not five times, because the five blocked <code>SIGUSR1</code>s coalesce into one pending bit
+("handler count so far = 0" while blocked, then "ran 1 time(s)" after unblock). (c) The first shows a caught signal
+interrupts a blocking call; the second shows standard signals do not queue. Label compiler/kernel. <em>Tempting wrong
+answer:</em> "the handler should run five times" — non-queuing standard signals collapse the repeats. <strong>Feed-
+forward:</strong> §18.3, §18.4.</div>
+
+</section>

@@ -1,0 +1,119 @@
+<section class="solutions" id="sol17">
+<h1>Chapter 17 — Solutions</h1>
+
+<div class="solution" id="sol17.1"><span class="sol-label">17.1</span>
+A <strong>virtual page</strong> is a fixed-size chunk (4 KiB on x86-64) of a process's virtual address space; a
+<strong>physical frame</strong> is an equal-size chunk of physical RAM. A page-table entry's <strong>present bit</strong>
+records whether that virtual page currently occupies a frame (present) or does not (not present). <em>Tempting wrong
+answer:</em> "pages and frames are the same thing" — they are the same size, but a page is virtual and a frame is
+physical; the page table is exactly the mapping between them. <strong>Feed-forward:</strong> §17.1.</div>
+
+<div class="solution" id="sol17.2"><span class="sol-label">17.2</span>
+A <strong>page fault</strong> is a hardware exception raised when a process accesses a virtual page whose PTE is not
+present; it traps into the kernel's fault handler. The two broad outcomes: (1) the access is <strong>legal</strong>, so
+the handler materializes the page — finds a frame, zeroes it (anonymous) or reads it from a file/swap, sets present,
+and restarts the instruction; or (2) the access is <strong>illegal</strong>, so the handler delivers
+<code>SIGSEGV</code>. <em>Tempting wrong answer:</em> "a page fault means a crash" — most page faults are the normal,
+successful mechanism of demand paging; only the illegal case becomes a fault the program sees. <strong>Feed-forward:</strong>
+§17.2.</div>
+
+<div class="solution" id="sol17.3"><span class="sol-label">17.3</span>
+A <strong>minor</strong> fault is satisfied without disk I/O — the page comes from a zeroed frame or one already in
+memory (e.g. the page cache). A <strong>major</strong> fault must read the page in from a file or swap, costing a disk
+access. <em>Tempting wrong answer:</em> "all page faults hit the disk" — anonymous demand-zero and cache-hit faults are
+minor and never touch the disk. <strong>Feed-forward:</strong> §17.2, §17.3.</div>
+
+<div class="solution" id="sol17.4"><span class="sol-label">17.4</span>
+The <code>mmap</code> only recorded a 1 GiB mapping in the page table with the present bits clear — no frames spent —
+so RSS was just the program itself immediately afterward. As the program touched pages, each first touch raised a page
+fault, the handler gave that page a frame and set present, and RSS climbed one page at a time toward 1 GiB. The
+allocation did not consume 1 GiB up front because <strong>demand paging</strong> makes allocation a promise;
+<em>residency</em> is paid per touched page. <em>Tempting wrong answer:</em> "the OS was slow to account for the
+memory" — nothing was resident to account for; the frames genuinely did not exist until the touches. <strong>Feed-
+forward:</strong> §17.2.</div>
+
+<div class="solution" id="sol17.5"><span class="sol-label">17.5</span>
+Reference 1 2 3 1 4 2 5, 3 frames. <strong>FIFO</strong> = <strong>5</strong> faults: [1]→[1,2]→[1,2,3]→hit
+1→evict 1 for 4 [2,3,4]→hit 2→evict 2 for 5 [3,4,5]. <strong>LRU</strong> = <strong>6</strong> faults:
+[1]→[1,2]→[1,2,3]→hit 1 (1 now MRU) [2,3,1]→evict LRU 2 for 4 [3,1,4]→evict LRU 3 for 2 [1,4,2]→evict LRU 1 for 5
+[4,2,5]. Here <strong>FIFO does better</strong> (5 vs 6) — a deliberate reminder that LRU is a <em>heuristic</em> that
+pays off when the reference stream has locality; on a short string engineered without it, LRU can lose. Only OPT is
+guaranteed optimal. <em>Tempting wrong answer:</em> "LRU always beats FIFO" — LRU usually wins on real (local)
+workloads, but not on every string; this one is a counterexample. <strong>Feed-forward:</strong> §17.4.</div>
+
+<div class="solution" id="sol17.6"><span class="sol-label">17.6</span>
+<strong>Belady's anomaly</strong> is that giving a program more page frames can <em>increase</em> its fault count. It
+is exhibited by <strong>FIFO</strong> (on 1 2 3 4 1 2 5 1 2 3 4 5, FIFO takes 9 faults with 3 frames but 10 with 4).
+LRU and OPT cannot exhibit it because they are <em>stack algorithms</em>: their <strong>resident set with more frames
+is a superset of the resident set with fewer</strong>, so any page that would have been a hit with N frames is still
+resident with N+1 — adding frames can only remove faults, never add them. FIFO lacks this property because a larger
+queue reorders evictions and can eject a soon-to-be-reused page it would have kept. <em>Tempting wrong answer:</em>
+"more memory always means fewer faults" — true for LRU/OPT, false for FIFO; that surprise is the whole point of the
+anomaly. <strong>Feed-forward:</strong> §17.4.</div>
+
+<div class="solution" id="sol17.7"><span class="sol-label">17.7</span>
+(a) A minor fault costs a handful of instructions plus a zeroed or already-resident frame — sub-microsecond; a major
+fault waits on a disk. Using Chapter 3's hierarchy, DRAM access is tens of nanoseconds while an SSD read is tens of
+microseconds and a spinning disk seek is milliseconds — so a major fault is roughly a thousand to a million times
+slower than a minor one. (b) A <em>clean</em> page is an unmodified copy of data still on disk (or a file), so the OS
+can drop it and re-read later; a <em>dirty</em> page has been modified, so it must be <strong>written out</strong> to
+swap before its frame is reused — an extra disk write. (c) The likely cause is paging/swap pressure: the working set no
+longer fits, so the service takes major faults that stall it for disk-access times. The fix is <em>not</em> in the
+CPU-bound code — it is to shrink the memory footprint or add RAM so the working set fits. <em>Tempting wrong answer:</em>
+"profile and optimize the hot function" — the CPU is not the bottleneck; the cores are idle waiting on disk.
+<strong>Feed-forward:</strong> §17.3, §17.4, and Ch 3.</div>
+
+<div class="solution" id="sol17.8"><span class="sol-label">17.8</span>
+<strong>Step 4:</strong> The phenomenon is <strong>thrashing</strong> — the combined working set exceeds physical
+memory, so nearly every eviction removes a page another thread is about to need, producing a storm of
+<strong>major</strong> page faults. CPU utilization is near <em>zero</em> because the cores are almost always
+<em>blocked waiting on disk I/O</em> (paging pages in and out), not computing — the machine is I/O-bound on the swap
+device, not CPU-bound. The fix is to shrink the working set, not "optimize the loop": go back to one (or a few)
+sequential passes so the active window fits in RAM, or add memory. <em>Tempting wrong answer:</em> "add more threads /
+cores to speed it up" — more concurrent passes enlarge the working set and make the thrashing worse; the original
+single sequential pass was faster precisely because its working set fit. <strong>Feed-forward:</strong> §17.4.</div>
+
+<div class="solution" id="sol17.9"><span class="sol-label">17.9</span>
+(a) <strong>Demand paging / overcommit</strong> — the allocation only reserved mappings; the slowdown is the pages
+faulting in as they are first touched. Measure: RSS climbing over time (vs the reserved VSZ). (b) <strong>Thrashing</strong>
+— the dataset just crossed the size where the working set stopped fitting in RAM, so the system is now swapping.
+Measure: major-fault rate and swap I/O. (c) <strong>Page cache / demand paging of a file mapping</strong> — the first
+pass takes major faults reading the file from disk; the second pass hits the now-cached pages (minor or no faults).
+Measure: major faults on first pass vs near-zero on the second. <em>Method-selection cue:</em> "allocate huge/fast then
+slow" → demand paging; "small growth, huge slowdown" → crossed the working-set cliff (thrashing); "slow first, fast
+second" → cache warming. <strong>Feed-forward:</strong> §17.2, §17.3, §17.4.</div>
+
+<div class="solution" id="sol17.10"><span class="sol-label">17.10</span>
+(a) <strong>False</strong> — a successful <code>malloc</code> records mappings; physical RAM is consumed only as pages
+are touched (demand paging/overcommit). (b) <strong>True</strong> — a segmentation fault is a page fault the handler
+found no legal mapping for, so it delivered <code>SIGSEGV</code>. (c) <strong>False</strong> — <code>fork</code> uses
+<em>copy-on-write</em>: it copies page tables, not data; frames are shared read-only until a write faults and copies
+one page. (d) <strong>False</strong> — each process has its own page table, so the same virtual address in two processes
+normally maps to <em>different</em> frames (that is the isolation); they share a frame only through explicit shared
+memory or a shared file mapping. <em>Tempting wrong answer:</em> calling (d) true by analogy to threads — threads share
+one page table; distinct processes do not. <strong>Feed-forward:</strong> §17.1, §17.2, and Ch 4, Ch 14.</div>
+
+<div class="solution" id="sol17.11"><span class="sol-label">17.11</span>
+(a) <code>fork</code> copies the parent's <em>page tables</em>, mapping the child's pages to the same physical frames
+as the parent's, but marks every shared writable page <strong>read-only</strong> — so the "copy" is instantaneous and
+shares all data. (b) When the child (or parent) writes to a read-only shared page, the write raises a
+<strong>protection page fault</strong>; the handler sees a copy-on-write page, allocates a fresh frame, copies
+<em>that one page</em>'s contents into it, remaps the writer's PTE to the new frame with write permission, and restarts
+the instruction — exactly <strong>one</strong> page is copied per first write. (c) This makes
+<code>fork</code>-then-<code>exec</code> nearly free even for a large parent: <code>exec</code> immediately replaces the
+address space, so almost none of the shared pages are ever written before being discarded — copying them eagerly would
+be wasted work. A single write to a shared page costs one page fault plus one page copy. <em>Tempting wrong answer:</em>
+"the first write copies the whole address space" — copy-on-write copies only the single page touched, on demand.
+<strong>Feed-forward:</strong> §17.5, and Ch 14.</div>
+
+<div class="solution" id="sol17.12"><span class="sol-label">17.12</span>
+Machine-specific by design. A correct write-up reports: (a) touching one byte per 4 KiB page across the region yields
+about one minor fault per page (on the book's machine, 25,672 minor faults and 0 major faults to touch 100 MiB), shown
+via <code>/usr/bin/time -v</code>; (b) <code>VmRSS</code> is tiny right after a large <code>mmap</code> and grows to
+about the mapping size after touching it all (on the book's machine, 1,364 kB → 525,976 kB for 512 MiB) — reservation
+vs residency; (c) if you dare to exceed RAM, major-fault and swap-I/O rates climb while CPU utilization drops, the
+signature of thrashing — stop before the box wedges or the OOM killer fires. Label kernel/page size/RAM.
+<em>Tempting wrong answer:</em> "RSS should equal the mapping size right after <code>mmap</code>" — it should not;
+that is exactly what demand paging prevents. <strong>Feed-forward:</strong> §17.2, §17.4.</div>
+
+</section>

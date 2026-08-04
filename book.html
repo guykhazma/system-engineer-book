@@ -255,6 +255,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch13">Chapter 13 — The System-Call Boundary</a></li>
 <li class="toc-ch"><a href="#ch14">Chapter 14 — Processes: fork, exec, and wait</a></li>
 <li class="toc-ch"><a href="#ch15">Chapter 15 — Threads: Shared Memory and Its Hazards</a></li>
+<li class="toc-ch"><a href="#ch16">Chapter 16 — CPU Scheduling</a></li>
+<li class="toc-ch"><a href="#ch17">Chapter 17 — Virtual Memory: Demand Paging and Page Replacement</a></li>
+<li class="toc-ch"><a href="#ch18">Chapter 18 — Signals: Asynchronous Control Flow</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part IV &mdash; Concurrency & Parallelism</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part V &mdash; Rust for Systems</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VI &mdash; Performance Engineering</li>
@@ -6713,6 +6716,1146 @@ explain why a "correct" run does not mean the code is correct. Label your compil
 </section>
 </section>
 
+<section class="chapter" id="ch16">
+<h1>Chapter 16 — CPU Scheduling</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch15">Chapter 15</a> (Linux threads are 1:1
+kernel-scheduled entities — <em>these</em> are what the scheduler picks among), <a href="#ch14">Chapter 14</a> (a
+process blocks in <code>wait</code> or on I/O — a blocked task is off the CPU and off the scheduler's radar),
+<a href="#ch13">Chapter 13</a> (a system call is a trap into the kernel — where the scheduler lives). &nbsp;·&nbsp;
+Chapters 14 and 15 gave you more runnable things than you have CPUs. This chapter is about the OS's answer to the
+question that creates: <em>who runs next, and for how long?</em></p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch14">Chapter 14</a> — when a process calls <code>read</code> on a
+socket with no data, it <em>blocks</em>; is a blocked process using the CPU while it waits? (2) <a href="#ch15">Chapter
+15</a> — Linux schedules each <code>pthread</code> one-to-one with a kernel thread; so is the unit the scheduler places
+on a CPU the process or the thread? (3) <em>Predict:</em> three jobs arrive at almost the same instant — one needs 100
+ms of CPU, the other two need 10 ms each. If the scheduler runs them strictly in arrival order (the 100 ms job first),
+what is the <em>average</em> time from arrival to completion across the three? What if it ran the two short ones first
+instead? Write both numbers down — we will compute them exactly in §16.2.</p>
+</aside>
+
+<p>A modern machine has a handful of CPUs and, at any moment, dozens or hundreds of runnable threads. Something must
+decide which runnable thread occupies each CPU and when to take it away and give the CPU to another — that something is
+the <strong>scheduler</strong>, and the decision is <strong>scheduling</strong>. Chapter 13 gave the mechanism the
+scheduler rides on (a timer interrupt traps into the kernel, which can switch the running thread); this chapter is about
+the <strong>policy</strong> — the algorithm that chooses. We start by naming what a scheduler optimizes and the metrics
+that make "good" precise (§16.1); build up the classic policies from the simplest, FIFO, through shortest-job-first and
+its convoy trap (§16.2); add preemption and the time slice with round-robin, exposing the response-vs-turnaround
+trade-off (§16.3); and then meet the schedulers real systems ship — the multi-level feedback queue and Linux's
+proportional-share scheduler — which approximate the ideal without an oracle (§16.4). We close by carrying forward what
+"the OS multiplexes the CPU" really costs and buys (§16.5).</p>
+
+<h2>16.1 The scheduling problem, and how to measure a scheduler</h2>
+
+<p>At any instant each thread is in one of a few states. A <strong>running</strong> thread is on a CPU right now. A
+<strong>ready</strong> (runnable) thread could run but no CPU is free for it. A <strong>blocked</strong> thread is
+waiting for something — I/O to complete, a child to exit, a lock to free — and <em>cannot</em> run until that event
+arrives, so it is not the scheduler's concern until it wakes. The scheduler's job is to pick, from the ready threads,
+which one each CPU runs, and a <strong>context switch</strong> (Chapter 13's mechanism) is how it hands a CPU from one
+thread to another: save the outgoing thread's registers, load the incoming thread's, resume. The switch is not free —
+it costs the direct register save/restore plus the indirect cost of a cold cache and TLB (Chapter 3) for the new thread
+— which is why the scheduler cannot simply switch on every instruction.</p>
+
+<p>"Good" needs a definition, and there are several, often in tension. The two that matter most here are
+<strong>turnaround time</strong> — completion time minus arrival time, how long the whole job took to finish, the
+metric a batch workload cares about — and <strong>response time</strong> — first-run time minus arrival time, how long
+until the job <em>started</em> getting served, the metric an interactive user feels as lag. A scheduler also cares
+about <strong>throughput</strong> (jobs completed per unit time), <strong>fairness</strong> (each job gets a defensible
+share), and avoiding <strong>starvation</strong> (no ready job waits forever). The reason scheduling is hard is that
+these goals conflict: as we will see, the policy that minimizes average turnaround is not the one that minimizes
+response time, and the one that is "fair" may not be either.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define turnaround time and response time in one line each. A job arrives at t=0, first gets the CPU at t=5, and
+finishes at t=30. What is its response time and its turnaround time? (Answer after the next section.)</p>
+</aside>
+
+<h2>16.2 FIFO, shortest-job-first, and the convoy effect</h2>
+
+<p>The simplest possible policy is <strong>FIFO</strong> (first-in, first-out, also called FCFS): run jobs to
+completion in arrival order, no preemption. It is obviously fair in one sense and trivial to implement — and it has a
+sharp failure mode. Take the opener's workload: three jobs, A needs 100 ms and B and C need 10 ms each, all arriving at
+essentially t=0 with A first. FIFO runs A to completion, then B, then C. A finishes at 100, B at 110, C at 120, so
+average turnaround is (100 + 110 + 120) / 3 = <strong>110 ms</strong>. The two short jobs sat behind the long one for
+almost their entire wait. This is the <strong>convoy effect</strong>: short jobs pile up behind a long one like cars
+behind a truck, and average turnaround balloons because everyone inherits the long job's runtime.</p>
+
+<p>The fix, if you knew the run times, is to run the short jobs first. <strong>Shortest-Job-First (SJF)</strong>
+schedules the ready jobs in increasing order of length. On the same workload it runs B, then C, then A: B finishes at
+10, C at 20, A at 120, and average turnaround drops to (10 + 20 + 120) / 3 = <strong>50 ms</strong> — less than half of
+FIFO's, for the exact same jobs. That is not a coincidence: when all jobs arrive together, SJF is <em>provably optimal</em>
+for average turnaround (any swap that puts a longer job earlier only adds its length to more jobs' waits). When jobs
+arrive over time, the preemptive version — <strong>Shortest-Time-to-Completion-First (STCF)</strong>, which preempts the
+running job if a newly arrived one has less work left — extends the same idea. These are the numbers you predicted;
+here they are, computed by a scheduling simulator:</p>
+
+<pre><code>workload: A=100ms, B=10ms, C=10ms, all arrive ~t=0
+FIFO (order A,B,C): finish A=100 B=110 C=120  -> avg turnaround 110.0 ms
+SJF  (order B,C,A): finish B=10  C=20  A=120  -> avg turnaround  50.0 ms</code></pre>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">The convoy effect: same three jobs, two orders. Bar length = CPU time; number = completion.</text>
+<text x="20" y="52" font-size="10" fill="#14406b">FIFO (A first):</text>
+<rect x="120" y="40" width="360" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="290" y="54" font-size="9">A (100 ms)</text><text x="484" y="54" font-size="8">100</text>
+<rect x="480" y="40" width="36" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="490" y="54" font-size="8">B</text><text x="520" y="54" font-size="8">110</text>
+<rect x="516" y="40" width="36" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="526" y="54" font-size="8">C</text><text x="556" y="54" font-size="8">120</text>
+<text x="120" y="82" font-size="9" fill="#8c3a1d">avg turnaround = (100+110+120)/3 = 110 ms — B and C wait behind the truck</text>
+<text x="20" y="122" font-size="10" fill="#14406b">SJF (short first):</text>
+<rect x="120" y="110" width="36" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="130" y="124" font-size="8">B</text><text x="150" y="124" font-size="8">10</text>
+<rect x="156" y="110" width="36" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="166" y="124" font-size="8">C</text><text x="186" y="124" font-size="8">20</text>
+<rect x="192" y="110" width="360" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="350" y="124" font-size="9">A (100 ms)</text><text x="556" y="124" font-size="8">120</text>
+<text x="120" y="152" font-size="9" fill="#2e6b34">avg turnaround = (10+20+120)/3 = 50 ms — short jobs clear first</text>
+<text x="20" y="190" font-size="9" fill="#14406b">Same jobs, same total work (120 ms), same last-completion (120). Only the ORDER changed — and average turnaround more than halved.</text>
+</svg>
+<figcaption>Figure 16.1: FIFO vs SJF on A=100, B=10, C=10 (arriving together). Running the long job first makes every
+short job inherit its runtime (the convoy effect); running short jobs first minimizes average turnaround — which SJF
+provably does when all jobs arrive at once.</figcaption>
+</figure>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: order dominates average turnaround</span>
+<p><strong>1. In words.</strong> Turnaround is completion minus arrival. When jobs share a CPU, a job's turnaround
+includes the runtime of everything scheduled before it. So putting a long job first adds its length to every later
+job's turnaround; putting short jobs first minimizes the total. That is why SJF beats FIFO on average turnaround.</p>
+<p><strong>2. As a picture.</strong> Figure 16.1: the same three bars, packed truck-first versus short-first. The
+sum of the completion marks — not the total width — is what average turnaround measures, and reordering shrinks it.</p>
+<p><strong>3. As numbers.</strong> A=100, B=10, C=10: FIFO averages (100+110+120)/3 = 110 ms; SJF averages
+(10+20+120)/3 = 50 ms. Identical work, identical finish of the last job (120 ms), less than half the average
+turnaround — purely from order.</p>
+</aside>
+
+<p><em>(Answer to the §16.1 quick check: response time = first-run − arrival = 5 − 0 = 5; turnaround = completion −
+arrival = 30 − 0 = 30.)</em></p>
+
+<h2>16.3 Preemption, the time slice, and round-robin</h2>
+
+<p>SJF minimizes turnaround, but it has two problems. First, it needs an <strong>oracle</strong> — you must know each
+job's length in advance, which for interactive and server workloads you never do. Second, even with the oracle its
+<em>response</em> time is bad: a job that arrives just after a long one starts must wait for it to finish (or, with
+STCF, only if it is shorter). Interactive workloads care about response time above all — you want the cursor to move
+the instant you type — so we need a policy that shares the CPU in <em>small slices</em> rather than running each job to
+completion. That policy is <strong>round-robin (RR)</strong>: run each ready job for a fixed <strong>time slice</strong>
+(quantum), then preempt it (via the timer interrupt) and move to the next, cycling forever until jobs finish.</p>
+
+<p>Round-robin's whole point is response time. On the A/B/C workload with a 1 ms slice, all three jobs get their first
+turn within the first few milliseconds, so every job's response time is essentially immediate (about 1 ms on average)
+rather than SJF's — where C waited 10 ms and A waited 20. But that responsiveness has a price: RR's average
+<em>turnaround</em> is worse than SJF's, because it stretches every job out by interleaving. Here are all three
+policies on the same workload from the simulator:</p>
+
+<pre><code>workload: A=100ms, B=10ms, C=10ms
+FIFO:        avg turnaround 110.0 ms,  avg response  70.0 ms  (B waits 100, C waits 110)
+SJF:         avg turnaround  50.0 ms,  avg response  10.0 ms  (C waits 10, A waits 20)
+RR (q=1ms):  avg turnaround  59.7 ms,  avg response  ~1.0 ms  (every job starts almost at once)</code></pre>
+
+<p>That is the fundamental trade-off in one table: <strong>SJF wins turnaround, round-robin wins response, and you
+cannot have both</strong>. The <strong>size</strong> of the time slice is the knob. A tiny slice gives excellent
+response (jobs cycle fast) but pays a context-switch cost on every single switch — and if the slice approaches the
+switch cost itself, the CPU spends a large fraction of its time switching rather than working. A large slice amortizes
+the switch cost (better throughput) but degrades response time toward FIFO's. Real schedulers pick a slice large enough
+that the switch overhead is a small percentage, and small enough that interactivity stays crisp — typically a few
+milliseconds.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Round-robin makes the time slice small to improve one metric and worsen another — which is which? And what goes
+wrong if you make the slice as small as the cost of a single context switch? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>16.4 What real schedulers do: MLFQ and proportional share</h2>
+
+<p>Real systems cannot use pure SJF (no oracle) or pure round-robin (ignores that jobs differ in importance and
+behavior). Two ideas dominate real schedulers, and both aim to get SJF-like behavior — favor short, interactive work —
+<em>without</em> knowing job lengths in advance, by <strong>learning from the past</strong>.</p>
+
+<p>The first is the <strong>multi-level feedback queue (MLFQ)</strong>. Keep several ready queues, each a priority
+level; always run a job from the highest non-empty level, round-robin within a level. The trick is how a job's priority
+<em>changes</em>: a new job enters at the top; if it uses its whole time slice (CPU-bound behavior) it is demoted a
+level; if it gives up the CPU before the slice ends (blocking on I/O — interactive behavior) it stays high. Over a few
+slices this <em>learns</em> each job's character: interactive jobs, which block often, float near the top and get
+scheduled quickly (great response time); CPU-bound jobs sink to the bottom and share the leftovers. That approximates
+"short jobs first" using observed behavior instead of an oracle. Two refinements make it work in practice: to prevent a
+long job from <strong>starving</strong> at the bottom forever, MLFQ periodically <strong>boosts</strong> every job back
+to the top; and to stop a job from <strong>gaming</strong> the rule (yielding just before each slice ends to keep its
+priority), it accounts for total CPU used at a level rather than per-slice behavior.</p>
+
+<p>The second idea is <strong>proportional share</strong> (fair-share): rather than juggle priorities, give each job a
+<strong>weight</strong> and hand out CPU time in proportion to weight, so a job with twice the weight gets twice the CPU
+over time. This is the family Linux's normal scheduler belongs to. For over a decade Linux used the <strong>Completely
+Fair Scheduler (CFS)</strong>, which tracks each task's accumulated virtual runtime and always runs the task that has
+had the least, weighted by priority; kernel 6.6 (2023) replaced CFS with <strong>EEVDF</strong> (Earliest Eligible
+Virtual Deadline First), a proportional-share scheduler with better latency guarantees. In both, a process's
+<strong>nice</strong> value (−20 to +19, set with <code>nice</code>/<code>renice</code>; lower is "less nice," i.e.
+higher priority) sets its weight: a lower nice value claims a larger share. You can see this directly. Two identical
+CPU-bound loops pinned to the <em>same</em> core so they must compete, one at nice 0 and one at nice 19, run for five
+wall-clock seconds on this machine (Linux 6.18, which uses EEVDF; numbers illustrative):</p>
+
+<pre><code>taskset -c 0 nice -n 0  ./hog    ->  nice0:  cpu-seconds used = 4.66
+taskset -c 0 nice -n 19 ./hog    ->  nice19: cpu-seconds used = 0.09</code></pre>
+
+<p>The nice-0 loop got roughly fifty times the CPU of the nice-19 loop over the same wall-clock window — not because
+nice 19 was "paused," but because the proportional-share scheduler weighted its slice far smaller. That is the whole
+idea made visible: <code>nice</code> does not change what a program computes, only what <em>fraction of the CPU</em> it
+is entitled to when there is contention. (Linux also offers strict real-time classes — <code>SCHED_FIFO</code> and
+<code>SCHED_RR</code> — that sit above the normal class and always preempt it; those are for bounded-latency work and
+are a foot-gun for everything else, as the warning below explains.)</p>
+
+<aside class="warning">
+<span class="box-title">Trap: reaching for real-time priority (<code>SCHED_FIFO</code>) to "make it faster"</span>
+<p>When a latency-sensitive service is being starved by a background job, the tempting fix is to promote the service to
+a real-time scheduling class — <code>SCHED_FIFO</code> or <code>SCHED_RR</code> — so it always wins. This is
+<em>strict fixed-priority</em> scheduling, and it does not mean "a bit faster": a runnable <code>SCHED_FIFO</code>
+thread preempts <strong>every</strong> normal task and runs until it blocks or a higher real-time thread appears. If
+that thread is CPU-bound and never blocks — a busy loop, a spin-wait, a bug — it will monopolize its core and
+<strong>starve everything else on it, including kernel threads</strong>, and can wedge the machine hard enough to
+require a reboot. (Linux mitigates this with real-time throttling — <code>sched_rt_runtime_us</code> caps RT time per
+period — precisely because the default is so dangerous.) Real-time priority is the right tool only for work that is
+both genuinely latency-critical <em>and</em> bounded in CPU (it blocks regularly). To bias the normal scheduler toward
+an important service, reach first for <code>nice</code> or cgroup CPU weights, which change the <em>share</em> under
+contention without the power to starve the system. The lesson: "higher priority" is not a speed dial; strict priority
+is a loaded gun pointed at every other task on the CPU.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our request service and the nightly compaction job share a box, and
+compaction is starving the service's tail latency. Let's just give the service <code>SCHED_FIFO</code> real-time
+priority so it always wins." Cover the paragraph and respond in three or four sentences, drawing on §16.4.</p>
+<p><em>Model answer.</em> "The instinct is right — the service should win against a background batch job — but
+<code>SCHED_FIFO</code> is a much bigger hammer than we want: it is strict fixed priority, so if any of the service's
+threads ever spins or busy-loops without blocking, it will preempt everything on that core, including kernel threads,
+and can hang the box, which is why the kernel even throttles real-time time by default. What we actually want is a
+bigger <em>share</em> under contention, not absolute priority — so lower the service's <code>nice</code> value or,
+better, put the two workloads in separate cgroups and give the service a larger CPU weight (and cap or de-prioritize
+compaction). That fixes the starvation through the fair scheduler, keeps the system stable, and leaves headroom if
+compaction ever needs to burst. Save real-time scheduling for work that is both latency-critical and provably bounded
+in CPU." Distinguishing "bigger share" from "strict priority," and naming the starvation and hang risk, is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the §16.3 quick check: a small time slice improves <strong>response</strong> time (jobs cycle onto
+the CPU quickly) and worsens <strong>turnaround</strong> and throughput (more interleaving and more context switches).
+If the slice approaches the cost of one context switch, the CPU spends a large fraction of its time switching rather
+than doing useful work — overhead dominates.)</em></p>
+
+<h2>16.5 What to carry forward</h2>
+
+<p>The <strong>scheduler</strong> decides which ready thread each CPU runs and for how long; a <strong>context
+switch</strong> is the (non-free) mechanism that hands a CPU from one thread to another. We measure schedulers by
+<strong>turnaround</strong> (completion − arrival) and <strong>response</strong> (first-run − arrival) time, among
+others, and the central fact is that these goals conflict. FIFO is simple but suffers the <strong>convoy effect</strong>;
+<strong>SJF/STCF</strong> minimize average turnaround but need an oracle and give poor response; <strong>round-robin</strong>
+with a small time slice wins response at the cost of turnaround, with the slice size trading responsiveness against
+switch overhead. Real schedulers approximate "favor short, interactive work" without an oracle by learning from
+behavior — the <strong>multi-level feedback queue</strong> (priorities that adapt, with boosting to prevent starvation)
+— or by handing out CPU in proportion to a <strong>weight</strong> — Linux's proportional-share scheduler (CFS, then
+EEVDF from 6.6), where the <strong>nice</strong> value sets the share, which we watched split one core roughly fifty to
+one between a nice-0 and a nice-19 loop.</p>
+
+<p>Step back and see what this part is assembling. Chapter 14 gave you many processes and Chapter 15 many threads;
+this chapter is how one machine <em>pretends</em> to run them all at once — by slicing the CPU in time so fast that
+each thread perceives a CPU (nearly) to itself. That is the CPU half of the operating system's core illusion. The
+other half is the same trick played on <em>memory</em>: giving each process the illusion of a large private address
+space on a machine whose physical memory is smaller and shared. Chapter 4 showed the hardware that makes an address
+virtual; the next chapter is the OS policy that makes the illusion hold when memory runs short — demand paging, page
+faults as a mechanism, and the replacement decisions that are this chapter's turnaround-versus-response trade-off
+played again on pages instead of milliseconds.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name the three scheduling-relevant states of a thread (running, ready, blocked) and say which ones the scheduler
+chooses among.</li>
+<li>Define turnaround time and response time, and compute both for a job given its arrival, first-run, and completion
+times.</li>
+<li>Explain the convoy effect with the A=100/B=10/C=10 example, and give FIFO's and SJF's average turnaround (110 vs
+50 ms).</li>
+<li>State why SJF is optimal for average turnaround yet unusable in practice, and what round-robin trades to win
+response time.</li>
+<li>Explain how a multi-level feedback queue approximates SJF without an oracle, and why it needs priority boosting.</li>
+<li>Explain what a <code>nice</code> value does under Linux's proportional-share scheduler, and why
+<code>SCHED_FIFO</code> is dangerous.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are the running/ready/blocked states, and which does the scheduler pick among? (§16.1)</li>
+<li><strong>R2.</strong> Define turnaround and response time. (§16.1)</li>
+<li><strong>R3.</strong> What is the convoy effect, and what were FIFO's and SJF's average turnarounds on A/B/C?
+(§16.2)</li>
+<li><strong>R4.</strong> Why does round-robin improve response time but hurt turnaround, and what does the time-slice
+size trade? (§16.3)</li>
+<li><strong>R5.</strong> How does an MLFQ learn to favor interactive jobs without knowing their lengths, and what does
+a <code>nice</code> value control? (§16.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Scheduling: Introduction" and "Scheduling: The Multi-Level Feedback Queue."</strong> The free chapters that develop
+turnaround/response metrics, FIFO/SJF/STCF/round-robin, and MLFQ (including boosting and anti-gaming). The reference
+for §16.1–16.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 8
+(Exceptional Control Flow).</strong> Context switches and the timer interrupt that preemption rides on, from the
+programmer's view.</li>
+<li><strong>The Linux <code>sched(7)</code> and <code>nice(2)</code> / <code>sched_setscheduler(2)</code> manual
+pages.</strong> Primary sources for the scheduling classes (<code>SCHED_OTHER</code>/normal, <code>SCHED_FIFO</code>,
+<code>SCHED_RR</code>), the nice range, and real-time throttling. Verify per kernel version.</li>
+<li><strong>The Linux kernel scheduler documentation (<code>docs.kernel.org/scheduler/</code>), including the EEVDF
+scheduler page.</strong> The authority for the CFS-to-EEVDF change in 6.6 and how proportional share is implemented.
+Fast-moving; treat details as version-specific.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex16.1"><span class="ex-label">16.1</span> <span class="ex-tag warm">warm-up</span>
+Name the three scheduling-relevant states of a thread, and say which state(s) the scheduler chooses the next runner
+from.</div>
+
+<div class="exercise" id="ex16.2"><span class="ex-label">16.2</span> <span class="ex-tag warm">warm-up</span>
+Define turnaround time and response time. For a job that arrives at t=0, first runs at t=8, and completes at t=40,
+give both.</div>
+
+<div class="exercise" id="ex16.3"><span class="ex-label">16.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is the convoy effect, and which simple scheduling policy suffers from it?</div>
+
+<div class="exercise" id="ex16.4"><span class="ex-label">16.4</span> <span class="ex-tag core">core</span>
+Three jobs arrive at t=0: X needs 8 ms, Y needs 4 ms, Z needs 4 ms. Compute the average turnaround time under FIFO
+(order X, Y, Z) and under SJF, showing each job's completion time. Which is lower, and why is that no accident?</div>
+
+<div class="exercise" id="ex16.5"><span class="ex-label">16.5</span> <span class="ex-tag core">core</span>
+Explain why SJF minimizes average turnaround when all jobs arrive together, and give the two reasons it is
+nonetheless unusable as a general-purpose scheduler.</div>
+
+<div class="exercise" id="ex16.6"><span class="ex-label">16.6</span> <span class="ex-tag core">core</span>
+Describe how a multi-level feedback queue decides a job's priority over time, and explain how this makes interactive
+(I/O-bound) jobs get scheduled quickly and CPU-bound jobs sink — without the scheduler ever being told which is
+which.</div>
+
+<div class="exercise" id="ex16.7"><span class="ex-label">16.7</span> <span class="ex-tag complexity">cost</span>
+(a) What does shrinking the round-robin time slice buy you, and what does it cost? (b) A context switch on a machine
+costs roughly a few microseconds; if you set the time slice equal to that, what fraction of the CPU is wasted on
+switching, and why? (c) Give the qualitative reason real schedulers use a slice of a few milliseconds rather than a
+few microseconds or a few seconds.</div>
+
+<div class="exercise" id="ex16.8"><span class="ex-label">16.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A batch analytics job and an interactive dashboard API share one server.
+Users complain the dashboard is laggy whenever the batch job runs, even though the box has spare capacity at night.
+<br><strong>Step 1 (given):</strong> The dashboard is I/O-bound and latency-sensitive (response time matters); the
+batch job is CPU-bound and only turnaround matters.
+<br><strong>Step 2 (given):</strong> Under a pure round-robin or a naive equal-share policy, the CPU-heavy batch job
+gets an equal turn each cycle, so the dashboard waits behind it and its response time suffers.
+<br><strong>Step 3 (given):</strong> The two workloads should not get equal CPU: the dashboard should be favored under
+contention, but the batch job must still make progress (not starve).
+<br><strong>Step 4 (you):</strong> Name a concrete Linux mechanism (not real-time priority) that gives the dashboard a
+larger share under contention while letting the batch job run when the dashboard is idle, and say in one line why this
+is safer than <code>SCHED_FIFO</code>.</div>
+
+<div class="exercise" id="ex16.9"><span class="ex-label">16.9</span> <span class="ex-tag mixed">mixed</span>
+For each situation, name the scheduling metric that matters most (turnaround, response time, or throughput), and
+justify in a line: (a) a text editor reacting to keystrokes; (b) a nightly batch job that must finish before the
+business day; (c) a build farm maximizing jobs completed per hour across many machines.</div>
+
+<div class="exercise" id="ex16.10"><span class="ex-label">16.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 13–16, classify each claim as <em>true</em> or <em>false</em> and fix the false ones: (a) "A
+process blocked on <code>read</code> is consuming CPU while it waits." (b) "On Linux the scheduler picks among
+processes, not threads." (c) "A context switch is free, so the time-slice size does not matter." (d) "Lowering a
+process's <code>nice</code> value increases the CPU share it gets under contention."</div>
+
+<div class="exercise" id="ex16.11"><span class="ex-label">16.11</span> <span class="ex-tag stretch">stretch</span>
+Starvation is a scheduler's cardinal sin. (a) Show how strict shortest-job-first can starve a long job indefinitely
+if short jobs keep arriving. (b) Explain how a multi-level feedback queue's periodic priority <em>boost</em> prevents
+this, and what would go wrong without it. (c) Explain why a proportional-share scheduler (weight-based) does not
+starve a low-weight job even under load — contrast "smaller share" with "no share," and connect this to why
+<code>nice</code> cannot starve a task but <code>SCHED_FIFO</code> can.</div>
+
+<div class="exercise" id="ex16.12"><span class="ex-label">16.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a CPU-bound loop that runs for a fixed number of wall-clock seconds and reports the
+CPU-seconds it actually accumulated (via <code>CLOCK_THREAD_CPUTIME_ID</code>). (b) Run two copies pinned to the
+<em>same</em> core with <code>taskset -c 0</code> so they must compete, one at <code>nice 0</code> and one at
+<code>nice 19</code>, and report the CPU-seconds each got — you should see the nice-0 copy dominate by a large ratio.
+(c) Now run them on <em>different</em> cores (or without pinning on a multi-core box) and explain why the nice
+difference nearly disappears. Label your kernel version, core count, and scheduler (CFS vs EEVDF). Explain what
+<code>nice</code> did and did not change.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch17">
+<h1>Chapter 17 — Virtual Memory: Demand Paging and Page Replacement</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch04">Chapter 4</a> (the hardware that makes an
+address virtual — the MMU, page tables, and the TLB translate a virtual page to a physical frame; <em>this</em> chapter
+is the OS policy that fills those tables), <a href="#ch16">Chapter 16</a> (the OS multiplexes the CPU in time; it
+multiplexes memory in space the same way), <a href="#ch13">Chapter 13</a> (a page fault is exceptional control flow — a
+trap into the kernel). &nbsp;·&nbsp; Chapter 4 showed <em>how</em> a virtual address becomes a physical one. This
+chapter is what the OS does when the answer is "that page isn't in memory."</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch04">Chapter 4</a> — an address is <em>virtual</em>; what hardware
+structure translates a virtual page number to a physical frame, and what small cache speeds that translation up? (2)
+<a href="#ch16">Chapter 16</a> — the scheduler faced conflicting goals (turnaround vs response); name the sin a
+scheduler must avoid (a job that never runs). (3) <em>Predict:</em> a program calls <code>mmap</code> to reserve 512
+MiB of memory and immediately checks its resident memory (RSS) <em>before touching any of it</em>. Is its RSS about 512
+MiB, about 0, or somewhere in between? Then it writes to every byte and checks again. Write down both guesses — we will
+measure them in §17.2.</p>
+</aside>
+
+<p>Chapter 4 gave a process the illusion of a large, private, contiguous address space, and showed the hardware — the
+MMU walking a page table, the TLB caching recent translations — that turns each virtual address into a physical one on
+every memory access. But that chapter assumed the page was <em>there</em>: that every virtual page a process uses has a
+physical frame behind it. It usually does not, and cannot: the sum of every process's address space is far larger than
+physical RAM. The operating system sustains the illusion anyway, and this chapter is how. We reframe memory as the OS
+sees it — physical frames it hands out and page tables it owns (§17.1); introduce <strong>demand paging</strong>, where
+a page gets a frame only when first touched, and the <strong>page fault</strong> that makes it happen — measured
+(§17.2); go beyond physical memory to <strong>swapping</strong> and the replacement question it forces (§17.3); and work
+through the replacement policies — OPT, FIFO, LRU — and the anomaly that makes FIFO treacherous (§17.4). We close by
+carrying forward the mechanisms this unlocks — <code>mmap</code>, copy-on-write, the page cache — that the rest of the
+book runs on (§17.5).</p>
+
+<h2>17.1 Memory as the OS sees it: frames, page tables, and the illusion</h2>
+
+<p>Recall the two vocabularies. A process sees <strong>virtual pages</strong>: its address space, chopped into
+fixed-size pages (4 KiB on x86-64 by default). Physical memory is chopped into equal-size <strong>frames</strong>. A
+<strong>page table</strong>, one per process and owned by the OS, maps each virtual page to a frame — or records that it
+has none. Each page-table entry (PTE) holds the frame number plus control bits, and the one that matters here is the
+<strong>present bit</strong>: set if the page currently lives in a frame, clear if it does not. On every access the MMU
+consults the page table (via the TLB); if the translation says present, the access proceeds at hardware speed. This is
+the machinery of Chapter 4, now seen from the OS's chair: the OS is the party that <em>fills in</em> those tables, hands
+out frames, and decides what to do when a PTE's present bit is clear.</p>
+
+<p>That last case is the whole subject of this chapter. Because every process has its own page table, each gets its own
+private virtual address space — the same virtual address in two processes maps to different frames, which is the
+isolation Chapter 14 relied on. And because the OS controls the present bit, it can lie productively: it can promise a
+process a page it has not actually backed with a frame yet, and make good on the promise only when the process reaches
+for it. When the process touches a page whose PTE is not present, the hardware cannot proceed — so it traps.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does the <em>present bit</em> in a page-table entry mean, and who sets it — the hardware or the OS? If a
+process accesses a virtual page whose PTE has the present bit clear, what happens next? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>17.2 Demand paging and the page fault, measured</h2>
+
+<p>When a running instruction accesses a virtual page whose PTE is not present, the MMU raises a <strong>page
+fault</strong> — a hardware exception, Chapter 13's exceptional control flow, that traps into the kernel's page-fault
+handler. The handler inspects why the page is absent and chooses: if the access is <em>legal</em> but the page simply
+was never materialized (a freshly <code>mmap</code>'d region, the first touch of newly allocated heap), it finds a free
+frame, fills it appropriately — zeroed for anonymous memory, read from a file for a file mapping — sets the PTE's
+present bit, and restarts the faulting instruction, which now succeeds. If the access is <em>illegal</em> (a wild
+pointer into an unmapped region), the handler delivers <code>SIGSEGV</code> instead — the segmentation fault of
+Chapters 7–11, now revealed as "the page-fault handler found no valid mapping." This lazy strategy — give a page a
+frame only when it is first used — is <strong>demand paging</strong>, and it is why allocating memory is cheap:
+<code>malloc</code> or <code>mmap</code> mostly just records a promise in the page tables; the physical frames are
+spent only on the pages you actually touch.</p>
+
+<p>You can watch it directly. A program that <code>malloc</code>s 100 MiB and writes one byte to every 4 KiB page
+should take exactly one page fault per page — 100 MiB / 4 KiB = 25,600 of them — and, because anonymous pages are
+served from zeroed frames with no disk I/O, they should all be <strong>minor</strong> faults (frame available without
+I/O), never <strong>major</strong> (required disk I/O). Running it under <code>/usr/bin/time -v</code> (gcc 11.4.0,
+Linux 6.18, x86-64):</p>
+
+<pre><code>Maximum resident set size (kbytes): 103852        # ~100 MiB actually resident after touching
+Minor (reclaiming a frame) page faults: 25672     # ~one per 4 KiB page touched (25,600) + a little
+Major (requiring I/O) page faults: 0              # no disk I/O — anonymous demand-zero pages</code></pre>
+
+<p>And the reservation-versus-use split from the opener: a program that <code>mmap</code>s 512 MiB and checks its
+resident memory before and after touching it:</p>
+
+<pre><code>after mmap 512 MiB: VmRSS = 1364 kB       # the mapping exists, but almost nothing is resident
+after touching all: VmRSS = 525976 kB     # now every page has been faulted in (~512 MiB)</code></pre>
+
+<p>The 512 MiB mapping cost essentially <em>no</em> physical memory until it was used: RSS was about 1.3 MiB (just the
+program itself), not 512 MiB, right after the <code>mmap</code> succeeded. Touching every page faulted each one in, and
+only then did RSS climb to ~512 MiB. That is demand paging in two numbers: <strong>allocation is a promise; residency
+is paid page by page, on first touch</strong>.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: demand paging pays per touched page</span>
+<p><strong>1. In words.</strong> Reserving address space (via <code>mmap</code>/<code>malloc</code>) only records
+mappings in the page table with the present bit clear; no frame is spent. The first access to each page faults, the
+kernel gives it a frame and sets present, and the instruction restarts. So physical memory is consumed in proportion
+to pages <em>touched</em>, not pages <em>reserved</em>.</p>
+<p><strong>2. As a picture.</strong> Figure 17.1: a virtual page with present=0 → access → page fault trap → handler
+grabs a free frame, zeroes/loads it, sets present=1 → instruction restarts and succeeds. Later faults on other pages
+repeat the path.</p>
+<p><strong>3. As numbers.</strong> <code>mmap</code> 512 MiB: RSS 1,364 kB before touching, 525,976 kB after touching
+all. Writing one byte per page across 100 MiB took 25,672 minor faults (≈ one per 4 KiB page) and <em>zero</em> major
+faults — anonymous pages are served from zeroed frames, no disk I/O.</p>
+</aside>
+
+<p><em>(Answer to the §17.1 quick check: the present bit means the page currently occupies a physical frame; the
+<strong>OS</strong> sets it (the hardware only reads it during translation). Accessing a not-present page raises a page
+fault — a trap into the kernel's fault handler, which either materializes the page or delivers <code>SIGSEGV</code>.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A page fault on first touch (demand paging), then the restart.</text>
+<rect x="20" y="30" width="120" height="46" fill="#f5f8fb" stroke="#14406b"/><text x="30" y="50" font-size="9">access virtual</text><text x="30" y="64" font-size="9">page (present=0)</text>
+<text x="146" y="57" font-size="16" fill="#8c3a1d">&#8594;</text>
+<rect x="170" y="30" width="120" height="46" fill="#fdeee6" stroke="#8c3a1d"/><text x="180" y="50" font-size="9">MMU: not present</text><text x="180" y="64" font-size="9">&#8594; PAGE FAULT (trap)</text>
+<text x="296" y="57" font-size="16" fill="#8c3a1d">&#8594;</text>
+<rect x="320" y="24" width="300" height="58" fill="#f5f8fb" stroke="#14406b"/><text x="330" y="42" font-size="9" fill="#14406b">kernel page-fault handler decides:</text>
+<text x="330" y="58" font-size="8">legal + anonymous &#8594; zeroed frame (MINOR, no I/O)</text>
+<text x="330" y="72" font-size="8">legal + file/swap &#8594; read from disk (MAJOR, I/O) · illegal &#8594; SIGSEGV</text>
+<rect x="170" y="120" width="200" height="46" fill="#cfe8cf" stroke="#2e6b34"/><text x="180" y="140" font-size="9">set PTE present=1,</text><text x="180" y="154" font-size="9">point it at the frame</text>
+<text x="376" y="147" font-size="16" fill="#2e6b34">&#8594;</text>
+<rect x="400" y="120" width="220" height="46" fill="#cfe8cf" stroke="#2e6b34"/><text x="410" y="140" font-size="9">RESTART the faulting</text><text x="410" y="154" font-size="9">instruction — now it succeeds</text>
+<text x="20" y="195" font-size="9" fill="#8c3a1d">The faulting instruction is re-executed from scratch after the handler returns; the program never sees the fault, only a slight pause.</text>
+</svg>
+<figcaption>Figure 17.1: The demand-paging fault path. A first touch of a not-present page traps into the kernel, which
+materializes the page (a minor fault if no disk I/O is needed, a major fault if it must read from a file or swap),
+sets the present bit, and restarts the instruction. Illegal accesses become <code>SIGSEGV</code> instead.</figcaption>
+</figure>
+
+<h2>17.3 Beyond physical memory: swapping and the replacement question</h2>
+
+<p>Demand paging is easy while free frames last. The hard case is when physical memory fills and a new page must be
+brought in with no frame to spare. The OS's answer is <strong>swapping</strong> (paging to a backing store): it
+<em>evicts</em> some resident page — writing it out to a swap area on disk if it has been modified since it was loaded
+(a "dirty" page; a clean page backed by a file can just be dropped and re-read later) — freeing that frame for the
+incoming page. Later, if the evicted page is touched again, it faults back in from disk. This is where the
+minor/major distinction bites: a fault that can be satisfied from a free or droppable frame is a <strong>minor</strong>
+fault (fast, no I/O); a fault that must <em>read the page back from disk or swap</em> is a <strong>major</strong> fault,
+and it costs a disk access — Chapter 3's numbers make the gap vivid, since a disk (even an SSD) is orders of magnitude
+slower than DRAM, and a spinning disk millions of times slower than a cache hit.</p>
+
+<p>Swapping keeps programs running past the size of RAM, but it turns the choice of <em>which page to evict</em> into a
+performance decision of the first order: every eviction of a page that is about to be needed again forces an expensive
+major fault to bring it back. This is the <strong>page-replacement problem</strong>, and it is Chapter 16's dilemma in a
+new guise — a policy question about a scarce, multiplexed resource, where a wrong choice is not incorrect, merely slow.
+The metric here is the <strong>page-fault rate</strong> (equivalently, the miss rate against the frames you have), and
+the goal is a replacement policy that minimizes it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What is the difference between a <em>minor</em> and a <em>major</em> page fault, and which one involves disk I/O?
+When the OS evicts a page to make room, why does it matter whether that page is "dirty" (modified since it was loaded)?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>17.4 Replacement policies: OPT, FIFO, LRU, and Belady's anomaly</h2>
+
+<p>What should the OS evict? The unbeatable baseline is <strong>OPT</strong> (Belady's MIN, 1966): evict the page whose
+<em>next</em> use is farthest in the future. It provably minimizes faults — but it needs to see the future, so it is
+only a yardstick, not an implementable policy. The simplest real policy is <strong>FIFO</strong>: evict the page that
+has been resident longest, regardless of use. It is trivial but ignores <em>how</em> pages are used. The workhorse
+approximation is <strong>LRU</strong> (least-recently-used): evict the page that has gone longest without being
+accessed, betting that the recent past predicts the near future — which, thanks to <strong>locality of reference</strong>
+(Chapter 3), it usually does. On a short reference string, simulated exactly:</p>
+
+<pre><code>reference string: 0 1 2 0 1 3 0 3 1 2 1   (3 frames)
+FIFO: 7 page faults
+LRU : 5 page faults
+OPT : 5 page faults        # the lower bound; no policy can do better on this string</code></pre>
+
+<p>FIFO takes 7 faults here where LRU and OPT take 5, because FIFO evicts pages by age even when they are about to be
+reused. But FIFO's real hazard is subtler and worth naming, because it violates an intuition everyone has: that giving
+a program <em>more</em> memory can only help. For FIFO, it can hurt. On the classic reference string of Belady, Nelson
+&amp; Shedler (1969), FIFO takes <em>more</em> faults with four frames than with three:</p>
+
+<pre><code>reference string: 1 2 3 4 1 2 5 1 2 3 4 5
+FIFO, 3 frames: 9 page faults
+FIFO, 4 frames: 10 page faults      # MORE memory, MORE faults</code></pre>
+
+<p>This is <strong>Belady's anomaly</strong>: for FIFO, adding a frame can increase the fault count, because a larger
+FIFO queue changes the eviction order in a way that can evict a soon-to-be-reused page it would have kept with fewer
+frames. LRU and OPT are immune — they belong to a class (stack algorithms) whose resident set with N frames is always a
+superset of its resident set with N−1, so more memory never adds faults. The anomaly is the sharpest argument against
+FIFO and for use-based policies like LRU: a policy that ignores usage can be not just suboptimal but
+<em>non-monotonic</em>, punishing you for adding memory. (Real kernels do not implement true LRU — tracking exact
+recency on every access is too expensive — but approximate it cheaply with a per-page reference bit and a clock/second-
+chance sweep, keeping LRU's monotonic, locality-exploiting behavior without its bookkeeping cost.)</p>
+
+<aside class="warning">
+<span class="box-title">Trap: thrashing — when the working set doesn't fit</span>
+<p>Replacement policy only helps while the pages a program actively uses — its <strong>working set</strong> — fit in
+the frames it has. When the sum of all running processes' working sets exceeds physical memory, <em>no</em> replacement
+policy can win: every page the OS evicts is one that is about to be needed, so the system generates major fault after
+major fault, and the CPU sits idle waiting on disk while throughput collapses. This is <strong>thrashing</strong>, and
+its signature is a machine that is nearly idle on CPU yet grinding — high major-fault and swap-I/O rates, everything
+slow. The trap is diagnosing it as a CPU or code problem and "optimizing the hot loop," when the real fix is to reduce
+the memory footprint (smaller working set, fewer concurrent jobs) or add RAM so the working set fits. Modern Linux
+often does not let you thrash gently to a halt: when memory (plus swap) is truly exhausted, the <strong>OOM killer</strong>
+picks a process and kills it outright. Either way the lesson is the same — paging is a graceful extension of memory
+only up to the working-set boundary; past it, performance does not degrade linearly, it falls off a cliff. Watch
+major-fault and swap rates, not just CPU.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our service <code>malloc</code>ed a 40 GB buffer on a 16 GB box and the
+allocation <em>succeeded</em> — so we clearly have enough memory, and we can fill it up. Great." Cover the paragraph
+and respond in three or four sentences, drawing on §17.2 and the thrashing trap.</p>
+<p><em>Model answer.</em> "A successful <code>malloc</code> doesn't mean the memory exists — it means the kernel
+recorded the mapping; under demand paging (and overcommit) no physical frames are spent until you <em>touch</em> the
+pages, so a 40 GB allocation on a 16 GB box can succeed while backing almost nothing. The moment we actually write
+across all 40 GB, each page faults in, resident memory climbs past 16 GB, and the OS has to swap — if our working set
+genuinely exceeds RAM we'll thrash (near-idle CPU, endless major faults, everything crawling) or get OOM-killed
+outright. So allocation success proves nothing about capacity; what matters is the <em>resident working set</em>. Let's
+size the buffer to what fits with headroom, stream instead of buffering everything, and watch RSS and major-fault rates
+under load — not just whether <code>malloc</code> returned non-NULL." Separating "reserved" from "resident," and naming
+thrashing and the OOM killer, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §17.3 quick check: a <strong>minor</strong> fault is satisfied without disk I/O — the page is
+served from a zeroed or already-cached frame; a <strong>major</strong> fault must read the page from a file or swap, so
+it costs a disk access. A "dirty" (modified) page must be <strong>written out</strong> to swap before its frame can be
+reused, whereas a clean page — an unmodified copy of file data — can be dropped and re-read later, so evicting clean
+pages is cheaper.)</em></p>
+
+<h2>17.5 What to carry forward</h2>
+
+<p>The OS owns physical <strong>frames</strong> and each process's <strong>page table</strong>, and the
+<strong>present bit</strong> lets it back a virtual page with a frame lazily. <strong>Demand paging</strong> materializes
+a page only on first touch: the access to a not-present page raises a <strong>page fault</strong> (a trap), and the
+handler either supplies the page — a <strong>minor</strong> fault if no I/O is needed, a <strong>major</strong> fault if
+it must read from disk or swap — or delivers <code>SIGSEGV</code>. Allocation is therefore a promise (we watched a 512
+MiB mapping cost ~1 MiB of RSS until touched), and residency is paid page by page (25,672 minor faults to touch 100
+MiB). When RAM fills, <strong>swapping</strong> evicts pages to disk, making the choice of victim — the
+<strong>page-replacement problem</strong> — a performance decision: OPT is the unbeatable but unimplementable
+yardstick, FIFO is simple but suffers <strong>Belady's anomaly</strong> (more memory, more faults), and LRU (approximated
+in real kernels) exploits locality and is monotonic. Past the working-set boundary, no policy saves you:
+<strong>thrashing</strong>, then the OOM killer.</p>
+
+<p>With this the operating system's core illusion is complete: Chapter 16 sliced the CPU in time, this chapter backs
+each address space with a smaller physical memory, and together they let many processes share one machine as if each
+owned it. The mechanisms this chapter unlocked are the ones the rest of the book leans on. The same page table that
+holds the present bit also holds protection and sharing bits, which give us <strong>memory-mapped files</strong>
+(<code>mmap</code> a file and read/write it as memory, the page cache faulting data in on demand) and
+<strong>copy-on-write</strong> — the trick from Chapter 14's <code>fork</code>, now seen fully: parent and child share
+every frame read-only, and only a write faults and copies the one page touched. Copy-on-write and shared mappings are
+also how separate processes can deliberately share a region of memory — the fast path for the inter-process
+communication that a later chapter takes up, and the reason the isolation of processes need not mean the cost of
+copying. Virtual memory is not only protection; it is the substrate for sharing, laziness, and speed.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain, using the present bit, how the OS can promise a process a page it has not yet backed with a frame.</li>
+<li>Trace the page-fault path for a first touch of anonymous memory, and say why it is a minor fault, not a major
+one.</li>
+<li>State what demand paging makes cheap, and give the two measured numbers (RSS before/after touch; minor faults per
+page).</li>
+<li>Distinguish minor and major faults, and explain why evicting a dirty page costs more than evicting a clean
+one.</li>
+<li>Rank OPT, FIFO, and LRU, and explain Belady's anomaly and why LRU/OPT are immune to it.</li>
+<li>Define thrashing and the working set, and explain why a successful <code>malloc</code> does not prove you have the
+memory.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does the present bit mean, and what happens on an access to a not-present page? (§17.1,
+§17.2)</li>
+<li><strong>R2.</strong> What is demand paging, and what did the <code>mmap</code>-512-MiB measurement show about
+reserved vs resident memory? (§17.2)</li>
+<li><strong>R3.</strong> Distinguish minor and major page faults; which involves disk I/O? (§17.2, §17.3)</li>
+<li><strong>R4.</strong> What is the page-replacement problem, and how do OPT, FIFO, and LRU differ? (§17.4)</li>
+<li><strong>R5.</strong> What is Belady's anomaly, and what is thrashing? (§17.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Paging: Introduction," "Beyond Physical Memory: Mechanisms," and "Beyond Physical Memory: Policies."</strong> The free
+chapters on the page as the unit, the page fault and swapping mechanism, and the replacement policies (OPT/FIFO/LRU,
+the anomaly, clock). The reference for §17.1–17.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 9
+(Virtual Memory).</strong> Address spaces, page tables, demand paging, and memory mapping from the programmer's view;
+the companion to Chapter 4's hardware treatment.</li>
+<li><strong>Belady, "A study of replacement algorithms for a virtual-storage computer," <em>IBM Systems Journal</em>
+5(2):78–101 (1966);</strong> and <strong>Belady, Nelson &amp; Shedler, "An anomaly in space-time characteristics of
+certain programs running in a paging machine," <em>Communications of the ACM</em> 12(6):349–353 (1969).</strong> The
+primary sources for the optimal (MIN) policy and for Belady's anomaly, respectively.</li>
+<li><strong>The Linux <code>mmap(2)</code>, <code>madvise(2)</code>, and <code>proc(5)</code> manual pages.</strong>
+Primary sources for memory mapping, demand-paging hints, and the <code>/proc/&lt;pid&gt;/status</code> fields
+(<code>VmRSS</code>) used to measure residency. Verify per kernel version.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex17.1"><span class="ex-label">17.1</span> <span class="ex-tag warm">warm-up</span>
+Define a virtual page and a physical frame, and say what a page-table entry's present bit records.</div>
+
+<div class="exercise" id="ex17.2"><span class="ex-label">17.2</span> <span class="ex-tag warm">warm-up</span>
+What is a page fault, and what two broad outcomes can the kernel's fault handler produce for it?</div>
+
+<div class="exercise" id="ex17.3"><span class="ex-label">17.3</span> <span class="ex-tag warm">warm-up</span>
+In one line each, distinguish a minor page fault from a major page fault.</div>
+
+<div class="exercise" id="ex17.4"><span class="ex-label">17.4</span> <span class="ex-tag core">core</span>
+A program <code>mmap</code>s 1 GiB and its RSS is a few megabytes immediately afterward, then climbs toward 1 GiB as
+it works. Explain what happened at each stage in terms of demand paging, and why the allocation did not consume 1 GiB
+of physical memory up front.</div>
+
+<div class="exercise" id="ex17.5"><span class="ex-label">17.5</span> <span class="ex-tag core">core</span>
+Simulate FIFO and LRU on the reference string 1 2 3 1 4 2 5 with 3 frames. Give the number of page faults for each and
+show the resident set after each reference. Which policy does better here, and why?</div>
+
+<div class="exercise" id="ex17.6"><span class="ex-label">17.6</span> <span class="ex-tag core">core</span>
+Explain Belady's anomaly: state what it is, which policy exhibits it, and why LRU and OPT cannot. Use the phrase
+"resident set is a superset with more frames" in your explanation of the immune policies.</div>
+
+<div class="exercise" id="ex17.7"><span class="ex-label">17.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is a major page fault dramatically more expensive than a minor one — put rough numbers on it using Chapter 3's
+memory hierarchy. (b) Why does evicting a <em>clean</em> page cost less than evicting a <em>dirty</em> one? (c) A
+service's p99 latency has sudden 50 ms spikes that correlate with high major-fault counts; what is the likely cause,
+and is the fix in the CPU-bound code?</div>
+
+<div class="exercise" id="ex17.8"><span class="ex-label">17.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A batch job processes a 30 GB dataset on a 32 GB machine by
+<code>mmap</code>ing the whole file and iterating over it once, sequentially. It runs fine. A colleague "optimizes" it
+to make ten concurrent passes over the same mapping from ten threads to "use all the cores," and now the machine
+crawls with near-zero CPU utilization.
+<br><strong>Step 1 (given):</strong> The single sequential pass has a small working set at any instant (a sliding
+window of recently touched pages), so it fits comfortably in RAM and pages stream in and out cleanly.
+<br><strong>Step 2 (given):</strong> Ten concurrent passes at different file offsets touch ten far-apart regions at
+once, so the combined working set is large and scattered.
+<br><strong>Step 3 (given):</strong> That combined working set exceeds physical memory, so every page the OS evicts is
+soon needed by another thread, generating major fault after major fault.
+<br><strong>Step 4 (you):</strong> Name the phenomenon precisely, explain why CPU utilization is near <em>zero</em>
+during it (what are the cores waiting on?), and give the direction of the fix (not "optimize the loop").</div>
+
+<div class="exercise" id="ex17.9"><span class="ex-label">17.9</span> <span class="ex-tag mixed">mixed</span>
+For each observation, name the most likely cause and one thing to measure to confirm it: (a) allocating a huge array
+succeeds instantly but the program slows down later as it fills the array; (b) a program that fit in RAM last week now
+runs 100× slower after the dataset grew slightly; (c) reading a memory-mapped file is fast the second time through but
+slow the first.</div>
+
+<div class="exercise" id="ex17.10"><span class="ex-label">17.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 4, 14, and 17, classify each statement as <em>true</em> or <em>false</em> and fix the false ones:
+(a) "After a successful 8 GB <code>malloc</code>, 8 GB of physical RAM is now in use." (b) "A segmentation fault is
+just a page fault the handler could not satisfy legally." (c) "<code>fork</code> copies the parent's entire address
+space immediately." (d) "Two processes with the same virtual address are reading the same physical frame."</div>
+
+<div class="exercise" id="ex17.11"><span class="ex-label">17.11</span> <span class="ex-tag stretch">stretch</span>
+Copy-on-write ties this chapter to Chapter 14. (a) Explain how the page table lets <code>fork</code> give the child a
+"copy" of the address space while physically copying no data at first. (b) Describe exactly what happens, page by
+page, when the child later writes to one page — which fault fires, what the handler does, and how many pages get
+copied. (c) Explain why this makes the common <code>fork</code>-then-<code>exec</code> pattern (Chapter 14) nearly free
+even for a large parent, and what a single write to a shared page costs.</div>
+
+<div class="exercise" id="ex17.12"><span class="ex-label">17.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a program that <code>malloc</code>s (or <code>mmap</code>s) a few hundred MiB and touches
+one byte per 4 KiB page; run it under <code>/usr/bin/time -v</code> and report the minor-fault count — confirm it is
+about one per page. (b) Read <code>VmRSS</code> from <code>/proc/self/status</code> before and after touching a large
+mapping, and report both values to show reservation vs residency. (c) Optional and careful: on a machine you can afford
+to stress (or a VM), allocate and touch more than physical RAM and observe swap I/O / major faults climbing — describe
+the thrashing behavior and stop before you wedge the box. Label your kernel version, page size, and RAM.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch18">
+<h1>Chapter 18 — Signals: Asynchronous Control Flow</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch14">Chapter 14</a> (when a child exits, the
+kernel notifies the parent with <code>SIGCHLD</code> — that notification <em>is</em> a signal; and
+<code>wait</code> reaps the child), <a href="#ch13">Chapter 13</a> (a blocking system call can be interrupted — this
+chapter is what interrupts it), <a href="#ch11">Chapter 11</a> (a bad memory access became a segmentation fault —
+<code>SIGSEGV</code> is a signal too). &nbsp;·&nbsp; Every earlier chapter's control flow was <em>synchronous</em>: the
+program ran its own instructions in order. This chapter adds a second, <em>asynchronous</em> flow the kernel can force
+on a process at almost any instant.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch14">Chapter 14</a> — after a child process exits but before the parent
+<code>wait</code>s for it, what is the child called, and how did the parent learn the child had finished? (2)
+<a href="#ch13">Chapter 13</a> — a process blocked in a <code>read</code> that never completes is off the CPU; name one
+thing that could wake it besides the data arriving. (3) <em>Predict:</em> a program installs a handler for
+<code>SIGUSR1</code>, then blocks that signal, sends it to itself <em>five</em> times in a tight loop, and finally
+unblocks it. How many times does the handler run — five, one, or zero? Write down your guess and why — we will measure
+it in §18.4.</p>
+</aside>
+
+<p>So far a program's control flow has been its own: it executes its instructions, calls functions, makes system calls,
+and returns — a single thread of cause and effect (threads in Chapter 15 added more such flows, but each was still
+running <em>its own</em> code). A <strong>signal</strong> breaks that assumption. It is an <strong>asynchronous
+notification</strong> the kernel delivers to a process to tell it that an event happened — a software analog of a
+hardware interrupt — and when one arrives, the process's normal flow is suspended, a designated <strong>handler</strong>
+runs, and then the normal flow resumes where it left off. You have already met signals without naming them: the
+segmentation fault (<code>SIGSEGV</code>) of Chapter 11, the <code>Ctrl-C</code> that kills a program
+(<code>SIGINT</code>), the <code>SIGCHLD</code> that told a parent its child had exited (Chapter 14). This chapter makes
+the mechanism precise: what a signal is and its default dispositions (§18.1), how to catch one with a handler (§18.2),
+how signals interrupt blocking system calls — the <code>EINTR</code> you must handle (§18.3) — and the sharp hazards of
+running code asynchronously, namely async-signal-safety and the fact that standard signals do not queue (§18.4). We
+close by placing signals among the OS's communication mechanisms (§18.5). Signals are the kernel's way of interrupting
+your program to tell it something; the danger is that "at almost any instant" means the handler can run in the middle
+of anything.</p>
+
+<h2>18.1 What a signal is, and its default disposition</h2>
+
+<p>A <strong>signal</strong> is a small integer, identified by name, delivered to a process to indicate an event. Some
+are sent by the kernel in response to hardware or program conditions — <code>SIGSEGV</code> (invalid memory access),
+<code>SIGFPE</code> (arithmetic error like divide-by-zero), <code>SIGCHLD</code> (a child changed state). Some are sent
+by users or programs to control a process — <code>SIGINT</code> (from <code>Ctrl-C</code>), <code>SIGTERM</code> (the
+polite "please exit," what <code>kill</code> sends by default), <code>SIGKILL</code> (the un-catchable "die now"),
+<code>SIGUSR1</code>/<code>SIGUSR2</code> (application-defined). A process can send a signal to another (subject to
+permissions) with the <code>kill</code> system call — poorly named, since it sends <em>any</em> signal, not only lethal
+ones.</p>
+
+<p>Every signal has a <strong>default disposition</strong> — what happens if the process does nothing about it. The
+common defaults are: <strong>Terminate</strong> the process (<code>SIGTERM</code>, <code>SIGINT</code>);
+<strong>Terminate and dump core</strong> (<code>SIGSEGV</code>, <code>SIGABRT</code> — the core file for a debugger);
+<strong>Ignore</strong> the signal (<code>SIGCHLD</code>'s default is to be ignored — which is why an un-reaped child
+still becomes a zombie, per Chapter 14; the notification is delivered but discarded); and <strong>Stop</strong> /
+<strong>Continue</strong> the process (<code>SIGSTOP</code>/<code>SIGCONT</code>, job control). A process can
+<em>change</em> the disposition of most signals — catch them with a handler, or ask to ignore them — with two crucial
+exceptions: <strong><code>SIGKILL</code> and <code>SIGSTOP</code> can neither be caught nor ignored.</strong> That is by
+design: the OS must retain an unblockable way to kill or halt any process, so that a program cannot make itself
+immortal by trapping every signal.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the four broad default dispositions a signal can have. Which two signals can a process <em>not</em> catch or
+ignore, and why does the OS insist on that? (Answer after the next section.)</p>
+</aside>
+
+<h2>18.2 Catching a signal: handlers and <code>sigaction</code></h2>
+
+<p>To catch a signal, a process installs a <strong>signal handler</strong>: a function the kernel will call when that
+signal is delivered. The portable, well-defined way to install one is the <code>sigaction</code> system call (the older
+<code>signal()</code> function has historically ambiguous semantics across systems; prefer <code>sigaction</code>). You
+fill in a <code>struct sigaction</code> with your handler function and flags, and register it for a given signal
+number:</p>
+
+<pre><code>void handler(int signum){ /* runs asynchronously when the signal arrives */ }
+
+struct sigaction sa;
+memset(&amp;sa, 0, sizeof sa);
+sa.sa_handler = handler;
+sigaction(SIGINT, &amp;sa, NULL);   /* from now on, Ctrl-C runs handler() instead of terminating */</code></pre>
+
+<p>Once installed, the handler runs <em>asynchronously</em>: when <code>SIGINT</code> arrives, the kernel suspends
+whatever the process was doing, calls <code>handler</code>, and — when the handler returns — resumes the interrupted
+code exactly where it left off. The program did not <em>call</em> the handler; the kernel injected it into the control
+flow. This is the defining strangeness of signals and the source of every hazard in §18.4: the handler can begin
+executing between any two instructions of your main code, including in the middle of a library call. The handler's
+signature is fixed (<code>void handler(int)</code>, receiving the signal number so one handler can serve several
+signals), and while it runs, the same signal is (by default) blocked so the handler does not interrupt itself.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Which system call installs a signal handler the well-defined way, and why is the older <code>signal()</code>
+discouraged? In what sense does the program <em>not</em> call its own handler? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>18.3 Signals interrupt system calls: <code>EINTR</code></h2>
+
+<p>Here is the consequence that bites every real program. Suppose a process is blocked in a slow system call —
+<code>read</code> waiting for input that has not arrived, <code>wait</code> for a child, <code>sleep</code> — and a
+signal arrives that the process catches. The kernel cannot both run the handler and leave the process cleanly blocked,
+so it interrupts the system call: it runs the handler, and then the blocked call returns early with the error
+<strong><code>EINTR</code></strong> ("interrupted system call"). The call did not fail for any reason of its own — the
+data may still be coming — it was simply cut short to deliver the signal. Here is a program that blocks in
+<code>read</code> on an empty pipe, arranges <code>SIGALRM</code> to fire after one second (handler installed
+<em>without</em> the restart flag), and reports what <code>read</code> returns (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>alarm(1);                                  /* deliver SIGALRM in 1 second */
+ssize_t n = read(fd[0], buf, sizeof buf);  /* blocks; nobody writes to the pipe */
+/* ... one second later the signal fires, the handler runs, and read returns: */
+
+read returned -1, errno=4 (Interrupted system call)</code></pre>
+
+<p>The <code>read</code> returned <code>-1</code> with <code>errno == EINTR</code>, not because the pipe failed but
+because the signal interrupted it. A correct program must expect this: any slow system call that can be interrupted by
+a caught signal may return <code>EINTR</code>, and the usual fix is to <strong>retry the call</strong> (the classic
+<code>while ((n = read(...)) &lt; 0 &amp;&amp; errno == EINTR);</code> loop). Alternatively you can install the handler
+with the <strong><code>SA_RESTART</code></strong> flag, which asks the kernel to <em>automatically restart</em> many
+interrupted system calls instead of failing them with <code>EINTR</code> — but the coverage is incomplete (some calls
+still return <code>EINTR</code> even with <code>SA_RESTART</code>), so robust code handles <code>EINTR</code> regardless.
+The naive assumption that a system call either blocks until it succeeds or fails for a real reason is simply wrong once
+signals are in play.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a caught signal cuts a blocking call short</span>
+<p><strong>1. In words.</strong> A process blocked in a slow system call cannot stay cleanly blocked while a handler
+runs, so the kernel interrupts the call: it runs the handler, then the call returns <code>-1</code> with
+<code>errno == EINTR</code>. The operation did not truly fail; it was cut short to deliver the signal, so the program
+must retry it (or use <code>SA_RESTART</code>, with caveats).</p>
+<p><strong>2. As a picture.</strong> Figure 18.1: main thread blocked in <code>read</code> → signal arrives → handler
+runs → control returns to <code>read</code>, which unwinds and returns <code>EINTR</code> rather than resuming the
+block.</p>
+<p><strong>3. As numbers.</strong> A <code>read</code> on an empty pipe with a <code>SIGALRM</code> after one second
+(no <code>SA_RESTART</code>): <code>read returned -1, errno=4 (Interrupted system call)</code>. With a correct retry
+loop it would resume waiting; with <code>SA_RESTART</code> the kernel would restart it for you.</p>
+</aside>
+
+<p><em>(Answer to the §18.1 quick check: the four default dispositions are Terminate, Terminate-and-dump-core, Ignore,
+and Stop/Continue. <code>SIGKILL</code> and <code>SIGSTOP</code> cannot be caught or ignored, so the OS always retains a
+way to kill or halt any process — a program cannot trap its way to immortality.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A signal injects a handler into the control flow — here, interrupting a blocked read.</text>
+<line x1="60" y1="40" x2="60" y2="180" stroke="#14406b"/><text x="30" y="44" font-size="9" fill="#14406b">main</text>
+<rect x="45" y="50" width="30" height="90" fill="#f5f8fb" stroke="#14406b"/><text x="80" y="80" font-size="9">read() blocked</text><text x="80" y="96" font-size="9">(waiting on pipe)</text>
+<text x="80" y="60" font-size="8" fill="#8c3a1d">&#9679; SIGALRM arrives at t=1s</text>
+<line x1="60" y1="60" x2="360" y2="60" stroke="#8c3a1d" stroke-dasharray="3,2"/>
+<rect x="360" y="46" width="140" height="34" fill="#fdeee6" stroke="#8c3a1d"/><text x="370" y="66" font-size="9">handler(SIGALRM) runs</text>
+<line x1="360" y1="140" x2="500" y2="80" stroke="#8c3a1d" stroke-dasharray="3,2"/>
+<rect x="45" y="140" width="30" height="30" fill="#cfe8cf" stroke="#2e6b34"/>
+<text x="80" y="150" font-size="9" fill="#2e6b34">read() returns -1, errno=EINTR (4)</text>
+<text x="80" y="164" font-size="8">— cut short to deliver the signal; the program must retry (or use SA_RESTART)</text>
+<text x="20" y="192" font-size="9" fill="#8c3a1d">The handler ran between the block and the return; the read did not fail on its own — it was interrupted.</text>
+</svg>
+<figcaption>Figure 18.1: A caught signal interrupts a blocking system call. The kernel suspends the block, runs the
+handler, then the interrupted call returns <code>-1</code> with <code>errno == EINTR</code> instead of continuing to
+wait — which the program must handle (retry) or opt out of with <code>SA_RESTART</code>.</figcaption>
+</figure>
+
+<h2>18.4 The hazards: async-signal-safety and non-queuing</h2>
+
+<p>Because a handler can run between any two instructions of your program — including inside a library function that is
+halfway through updating its own state — the code a handler may safely execute is sharply restricted. A function is
+<strong>async-signal-safe</strong> if it is safe to call from a signal handler, which essentially means it is reentrant:
+it does not rely on global state that a signal could catch mid-update. Most of the standard library is <em>not</em>
+async-signal-safe. The classic trap is calling <code>printf</code> (or <code>malloc</code>) in a handler: if the signal
+arrives while the main program is already inside <code>printf</code> or <code>malloc</code> — holding an internal lock
+or partway through a data structure — the handler's second call to the same function re-enters it and can deadlock
+(waiting on a lock the interrupted call holds) or corrupt the heap. The kernel documents the exact set of functions
+guaranteed safe (the <code>signal-safety(7)</code> man page); it is a short list — <code>write</code>,
+<code>_exit</code>, and a handful of others — and <code>printf</code>/<code>malloc</code>/most of libc are not on it.
+The safe idiom is to do almost nothing in a handler: set a flag of type <code>volatile sig_atomic_t</code> and return,
+then let the main loop notice the flag and do the real work synchronously.</p>
+
+<p>The second hazard is delivery semantics, and it settles the opener's prediction. Standard signals (numbers 1–31)
+are <strong>not queued</strong>: a signal is either pending or not, a single bit, so if the same signal is generated
+several times while it is blocked, the process still sees it <em>once</em> when unblocked — the extra instances
+coalesce and are lost. Here is the opener's exact program — install a <code>SIGUSR1</code> handler that counts calls,
+block <code>SIGUSR1</code>, send it to ourselves five times, then unblock:</p>
+
+<pre><code>sigprocmask(SIG_BLOCK, ...);       /* block SIGUSR1 */
+for (int i=0;i&lt;5;i++) raise(SIGUSR1);   /* send it 5 times while blocked */
+/* handler count so far = 0  (blocked, so not delivered yet) */
+sigprocmask(SIG_UNBLOCK, ...);     /* unblock: the pending signal is delivered */
+
+sent 5 while blocked; handler count so far = 0
+after unblock, handler ran 1 time(s)</code></pre>
+
+<p>The handler ran <strong>once</strong>, not five times: the five sends collapsed into a single pending bit. This is
+why you must never use a standard signal as a counter or a reliable event stream — if two children exit at nearly the
+same moment, the parent may get a single <code>SIGCHLD</code>, so a correct <code>SIGCHLD</code> handler reaps
+<em>all</em> available children in a loop (<code>while (waitpid(-1, ..., WNOHANG) &gt; 0)</code>), not one per signal.
+(POSIX real-time signals, <code>SIGRTMIN</code> through <code>SIGRTMAX</code>, <em>do</em> queue and can carry a small
+payload, at the cost of more machinery — the exception that proves the rule.) The robust modern pattern for turning
+asynchronous signals into something a normal event loop can consume is the <strong>self-pipe trick</strong> (the
+handler does one async-signal-safe <code>write</code> to a pipe the main loop reads) or Linux's <code>signalfd</code>,
+both of which move the real work out of the handler and back into the synchronous main flow.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: doing real work in a signal handler</span>
+<p>The natural instinct on catching a signal — log a message, update a data structure, free some resources, flush
+state — is exactly what you must not do, because a handler runs <em>asynchronously, in the middle of arbitrary code</em>.
+Calling anything not on the async-signal-safe list (which is nearly all of libc, including <code>printf</code>,
+<code>malloc</code>/<code>free</code>, and most of the standard library) risks a deadlock or heap corruption if the
+signal interrupted that very function. The bug is vicious because it is <em>rare</em>: it only manifests when the
+signal happens to land inside the unsafe call, so the program runs fine in testing and hangs or crashes in production
+under load — the same "passes the test, broken anyway" pathology as the data race of Chapter 15, and for the same
+reason (a schedule-dependent window). The discipline: a handler should do the minimum async-signal-safe thing — set
+<code>volatile sig_atomic_t got_signal = 1;</code> (or <code>write</code> one byte down a self-pipe) and return — and the
+main loop does the real work when it is safe. If you find yourself wanting to <code>printf</code> from a handler to
+debug it, that itch is the bug.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "For graceful shutdown I added a <code>SIGTERM</code> handler that logs
+'shutting down,' flushes the in-memory cache to disk, closes the DB connections, and calls <code>exit</code> — all
+right there in the handler. Clean, right?" Cover the paragraph and respond in three or four sentences, drawing on
+§18.4.</p>
+<p><em>Model answer.</em> "The intent is right but the handler is doing far too much: it runs asynchronously, possibly
+in the middle of a <code>malloc</code> or an <code>fprintf</code>, and logging, flushing, and closing all call
+functions that are not async-signal-safe — so if <code>SIGTERM</code> lands at the wrong instant, the handler deadlocks
+on a lock the interrupted code holds or corrupts the heap, and your 'graceful' shutdown hangs the process precisely
+when you're trying to stop it cleanly. The safe pattern is to make the handler trivial — set a
+<code>volatile sig_atomic_t shutdown_requested = 1;</code> (or <code>write</code> a byte to a self-pipe) and return —
+and let the main loop, on seeing the flag, do the flush, close, and exit synchronously where all of libc is safe to
+call. That also lets you bound and order the shutdown steps instead of racing them inside an interrupt. Keep handlers to
+a flag; do the work in the main flow." Naming async-signal-safety and moving the work out of the handler is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the §18.2 quick check: <code>sigaction</code> is the well-defined way to install a handler; the older
+<code>signal()</code> is discouraged because its semantics — handler persistence, whether the signal is blocked during
+its own handler, and system-call restart behavior — historically vary across systems. The program does not call its
+handler: the kernel <strong>injects</strong> it into the control flow at delivery time, suspending whatever was running
+and resuming it when the handler returns.)</em></p>
+
+<h2>18.5 What to carry forward</h2>
+
+<p>A <strong>signal</strong> is an asynchronous notification the kernel delivers to a process — a software interrupt —
+and each has a <strong>default disposition</strong> (terminate, terminate-and-core, ignore, stop/continue), with
+<code>SIGKILL</code> and <code>SIGSTOP</code> the two that can never be caught or ignored. A process catches a signal by
+installing a handler with <code>sigaction</code>; the handler runs asynchronously, injected into the control flow, and
+returns to where the program was interrupted. Two consequences dominate correct use. First, a caught signal
+<strong>interrupts blocking system calls</strong>, which return <code>-1</code> with <code>errno == EINTR</code> (we
+measured a <code>read</code> cut short to <code>errno 4</code>) — you must retry, or use <code>SA_RESTART</code> with
+care. Second, a handler runs in the middle of arbitrary code, so it may call only <strong>async-signal-safe</strong>
+functions (not <code>printf</code>/<code>malloc</code>/most of libc), and standard signals <strong>do not queue</strong>
+— five rapid <code>SIGUSR1</code>s coalesced into a single delivery in our measurement — so the safe pattern is a
+handler that sets a <code>volatile sig_atomic_t</code> flag (or writes a self-pipe) and defers the real work to the
+synchronous main loop.</p>
+
+<p>Signals complete the picture of how the operating system talks <em>to</em> a process: the system-call boundary
+(Chapter 13) is how a process asks the kernel for things synchronously; signals are how the kernel (or another process)
+interrupts a process asynchronously to tell it something happened. But a signal carries almost no information — just its
+number (real-time signals add a small payload) — so it is a doorbell, not a conversation. When processes need to
+exchange real <em>data</em> rather than notifications, they need genuine inter-process communication: pipes and FIFOs
+for byte streams, shared memory (built, as Chapter 17 showed, on shared mappings in the page tables) for the fastest
+sharing, and sockets for talking across machines. That IPC toolkit — the channels that carry data between the isolated
+address spaces this part has spent five chapters building and protecting — is where the operating system part of this
+volume finishes, and it is the bridge to the low-level I/O and networking that the data systems in later volumes are
+made of.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Define a signal as asynchronous control flow, and name its four default dispositions.</li>
+<li>Say which two signals can never be caught or ignored, and why the OS insists on that.</li>
+<li>Install a handler with <code>sigaction</code> from memory, and explain in what sense the kernel "injects" the
+handler.</li>
+<li>Explain <code>EINTR</code>: why a caught signal makes a blocking call return it, and the two ways to cope.</li>
+<li>Explain async-signal-safety and why <code>printf</code> in a handler is a bug, and give the safe handler
+pattern.</li>
+<li>Explain why standard signals do not queue, and what that means for a <code>SIGCHLD</code> handler reaping
+children.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a signal, and what are the four default dispositions? (§18.1)</li>
+<li><strong>R2.</strong> Which two signals cannot be caught or ignored, and why? (§18.1)</li>
+<li><strong>R3.</strong> What does <code>sigaction</code> do, and in what sense does a handler run asynchronously?
+(§18.2)</li>
+<li><strong>R4.</strong> What is <code>EINTR</code>, when does it occur, and how do you handle it? (§18.3)</li>
+<li><strong>R5.</strong> What does async-signal-safe mean, and why do standard signals not queue? (§18.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 8
+(Exceptional Control Flow), §8.5 (Signals).</strong> Signals as exceptional control flow, handlers, blocking, and the
+concurrency hazards of handlers — the reference for §18.1–18.4.</li>
+<li><strong>Stevens &amp; Rago, <em>Advanced Programming in the UNIX Environment</em>, 3rd ed. (2013), Chapter 10
+(Signals).</strong> The canonical, thorough treatment of signal semantics, <code>sigaction</code>, reliable signals,
+and interrupted system calls. <code>[⚠ reference — not free]</code></li>
+<li><strong>The Linux <code>signal(7)</code>, <code>sigaction(2)</code>, and <code>signal-safety(7)</code> manual
+pages.</strong> Primary sources for the signal list and default dispositions, the <code>SA_RESTART</code>/EINTR
+behavior, and the exact set of async-signal-safe functions. Verify per system.</li>
+<li><strong>The Linux <code>signalfd(2)</code> manual page and the "self-pipe trick" (D. J. Bernstein).</strong> The
+documented ways to turn asynchronous signal delivery into a synchronous, event-loop-friendly readable stream — the
+robust alternative to doing work in a handler.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex18.1"><span class="ex-label">18.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is a signal, and how does it differ from a normal function call in how it enters the program?</div>
+
+<div class="exercise" id="ex18.2"><span class="ex-label">18.2</span> <span class="ex-tag warm">warm-up</span>
+Name the four broad default dispositions a signal can have, with one example signal for each if you can.</div>
+
+<div class="exercise" id="ex18.3"><span class="ex-label">18.3</span> <span class="ex-tag warm">warm-up</span>
+Which two signals can a process neither catch nor ignore, and what would go wrong if it could?</div>
+
+<div class="exercise" id="ex18.4"><span class="ex-label">18.4</span> <span class="ex-tag core">core</span>
+A program blocks in <code>read</code> waiting for input and catches <code>SIGINT</code> with a handler. Explain, step
+by step, what happens when the user presses <code>Ctrl-C</code>: what the <code>read</code> returns, what
+<code>errno</code> is, and why the call did not simply resume waiting. Give the two standard ways to make the program
+robust to this.</div>
+
+<div class="exercise" id="ex18.5"><span class="ex-label">18.5</span> <span class="ex-tag core">core</span>
+Explain why calling <code>printf</code> (or <code>malloc</code>) inside a signal handler is unsafe. What property must
+a function have to be callable from a handler, and what is the safe pattern for a handler that needs to trigger real
+work?</div>
+
+<div class="exercise" id="ex18.6"><span class="ex-label">18.6</span> <span class="ex-tag core">core</span>
+Explain why standard signals do not queue, and why this means a <code>SIGCHLD</code> handler must reap children in a
+loop (with <code>WNOHANG</code>) rather than reaping exactly one child per delivered signal. Tie this back to Chapter
+14's zombies.</div>
+
+<div class="exercise" id="ex18.7"><span class="ex-label">18.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is a handler that only sets a <code>volatile sig_atomic_t</code> flag both cheap and safe, compared with one
+that does the work directly? (b) What is the latency cost of the self-pipe / <code>signalfd</code> approach versus a
+direct handler, and what correctness benefit do you buy with it? (c) Why can a signal-based design never be a reliable
+<em>counter</em> of events under load?</div>
+
+<div class="exercise" id="ex18.8"><span class="ex-label">18.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A long-running server installs a <code>SIGHUP</code> handler to reload
+its config. The handler re-reads the config file, rebuilds several in-memory structures with <code>malloc</code>, and
+logs progress with <code>fprintf</code>. In testing it works; in production, under heavy request load, the server
+occasionally hangs completely when config is reloaded.
+<br><strong>Step 1 (given):</strong> The handler runs asynchronously and can interrupt the main code at any instant,
+including while the main code is inside <code>malloc</code> or <code>fprintf</code>.
+<br><strong>Step 2 (given):</strong> <code>malloc</code> and stdio hold internal locks / mutable state; they are not
+async-signal-safe.
+<br><strong>Step 3 (given):</strong> Under heavy load the odds rise that <code>SIGHUP</code> lands while a request
+thread is inside one of those functions, so the handler's own call to it re-enters and deadlocks.
+<br><strong>Step 4 (you):</strong> Name the bug precisely, explain why it appears only under load (not in tests), and
+describe the redesign that fixes it — what the handler should do and where the reload work should actually run.</div>
+
+<div class="exercise" id="ex18.9"><span class="ex-label">18.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, say whether a <em>signal</em> is the right mechanism or whether you want real IPC (a pipe, shared memory,
+or a socket), and justify in a line: (a) tell a running daemon to re-read its configuration; (b) stream a megabyte of
+data from one process to another on the same host; (c) notify a parent that a child has exited; (d) send a structured
+request and get a structured reply between two processes.</div>
+
+<div class="exercise" id="ex18.10"><span class="ex-label">18.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 13–18, classify each statement as <em>true</em> or <em>false</em> and fix the false ones: (a) "A
+signal handler is called by the program the way any other function is." (b) "If you install a handler with
+<code>SA_RESTART</code>, you never have to worry about <code>EINTR</code>." (c) "Sending a process
+<code>SIGKILL</code> lets it run cleanup code first." (d) "A segmentation fault is the delivery of the
+<code>SIGSEGV</code> signal."</div>
+
+<div class="exercise" id="ex18.11"><span class="ex-label">18.11</span> <span class="ex-tag stretch">stretch</span>
+A signal handler and the main program both touch a shared <code>int running</code> flag. (a) Why must that flag be
+declared <code>volatile sig_atomic_t</code> rather than a plain <code>int</code> — what could the compiler or the
+hardware otherwise do? (b) Compare this hazard with the data race of Chapter 15: how is a handler-vs-main-flow conflict
+similar to a thread-vs-thread race, and how is it different (single thread, asynchronous interruption)? (c) Explain why
+this makes signals a form of concurrency even in a single-threaded program.</div>
+
+<div class="exercise" id="ex18.12"><span class="ex-label">18.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a program that blocks in <code>read</code> on an empty pipe, sets an <code>alarm</code>,
+and prints what <code>read</code> returns and <code>errno</code> when <code>SIGALRM</code> fires — confirm you see
+<code>EINTR</code> (errno 4); then reinstall the handler with <code>SA_RESTART</code> and observe the difference. (b)
+Write a program that installs a counting handler for <code>SIGUSR1</code>, blocks it, <code>raise</code>s it five
+times, unblocks, and prints how many times the handler ran — confirm it is once, not five. (c) Explain both results in
+terms of interrupted system calls and non-queuing standard signals. Label your compiler and kernel version.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part IV</div><h1>Concurrency & Parallelism</h1><p class='part-blurb'>Threads, locks and their hazards, lock-free techniques, atomics, and the memory model that makes concurrent code correct (or not).</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part V</div><h1>Rust for Systems</h1><p class='part-blurb'>Ownership, borrowing, and lifetimes — memory safety without a GC, and how the type system encodes the invariants the previous parts made you prove by hand.</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VI</div><h1>Performance Engineering</h1><p class='part-blurb'>Measure before you optimize: profiling, benchmarking, cache-aware and data-oriented design, SIMD, and reasoning about where time actually goes.</p></div>
@@ -8548,6 +9691,360 @@ demonstrating that a correct-looking run does not mean the code is correct. Esse
 what you saw and label compiler/core count/hardware. <em>Tempting wrong answer:</em> "the version that printed
 4,000,000 is the correct one" — it is the same racy code; it merely failed to manifest.
 <strong>Feed-forward:</strong> §15.4.</div>
+
+</section>
+
+<section class="solutions" id="sol16">
+<h1>Chapter 16 — Solutions</h1>
+
+<div class="solution" id="sol16.1"><span class="sol-label">16.1</span>
+The states are <strong>running</strong> (on a CPU now), <strong>ready</strong> (runnable but no free CPU), and
+<strong>blocked</strong> (waiting for an event — I/O, a child, a lock — and unable to run until it arrives). The
+scheduler chooses the next runner from the <strong>ready</strong> threads only; a blocked thread is not a candidate
+until the event wakes it. <em>Tempting wrong answer:</em> "the scheduler picks among all threads" — it cannot run a
+blocked thread; picking one would accomplish nothing until its event fires. <strong>Feed-forward:</strong> §16.1.</div>
+
+<div class="solution" id="sol16.2"><span class="sol-label">16.2</span>
+<strong>Turnaround time</strong> = completion − arrival; <strong>response time</strong> = first-run − arrival. For the
+job: response = 8 − 0 = <strong>8</strong>; turnaround = 40 − 0 = <strong>32</strong>. <em>Tempting wrong answer:</em>
+reporting response as the time it <em>finished</em> (40) — response measures when the job first got the CPU, not when
+it completed. <strong>Feed-forward:</strong> §16.1.</div>
+
+<div class="solution" id="sol16.3"><span class="sol-label">16.3</span>
+The <strong>convoy effect</strong>: short jobs pile up behind a long one (like cars behind a truck), so they inherit
+its runtime and average turnaround balloons. It afflicts <strong>FIFO</strong> (first-come-first-served, no
+preemption). <em>Tempting wrong answer:</em> attributing it to round-robin — RR's small slices are exactly what break
+the convoy. <strong>Feed-forward:</strong> §16.2.</div>
+
+<div class="solution" id="sol16.4"><span class="sol-label">16.4</span>
+<strong>FIFO (X, Y, Z):</strong> X completes at 8, Y at 12, Z at 16 → average turnaround (8+12+16)/3 =
+<strong>12 ms</strong>. <strong>SJF (Y, Z, X):</strong> Y at 4, Z at 8, X at 16 → average (4+8+16)/3 =
+<strong>9.33 ms</strong>. SJF is lower, and it is no accident: when all jobs arrive together, running shorter jobs
+first minimizes the sum of completion times, which is exactly what average turnaround measures — SJF is provably
+optimal for it. <em>Tempting wrong answer:</em> assuming the last-completion time (16 ms in both) decides the
+average — it is the same, yet the averages differ because ordering changes the <em>earlier</em> completions.
+<strong>Feed-forward:</strong> §16.2.</div>
+
+<div class="solution" id="sol16.5"><span class="sol-label">16.5</span>
+SJF minimizes average turnaround because, with simultaneous arrivals, a job's turnaround includes the runtime of
+everything before it; ordering shortest-first makes each long job's runtime fall on the fewest later jobs (any swap
+putting a longer job earlier only adds its length to more waits). It is unusable in general because (1) it needs an
+<strong>oracle</strong> — you must know each job's length in advance, which for interactive and server work you never
+do — and (2) even given the oracle it gives poor <strong>response time</strong>: a job arriving after a long one
+starts must wait (or, with STCF, only if shorter). <em>Tempting wrong answer:</em> "just estimate the length" — MLFQ
+does something like this by observing behavior, but a pure SJF that mis-estimates loses its optimality and can starve.
+<strong>Feed-forward:</strong> §16.2, §16.3.</div>
+
+<div class="solution" id="sol16.6"><span class="sol-label">16.6</span>
+An MLFQ keeps several priority queues and always runs from the highest non-empty one (round-robin within a level). A
+job's priority <em>adapts</em>: it enters at the top; if it uses its entire time slice (CPU-bound), it is demoted a
+level; if it yields before the slice ends (blocks on I/O — interactive), it keeps its level. So interactive jobs,
+which block frequently, stay near the top and are scheduled quickly (low response time), while CPU-bound jobs sink and
+share the leftovers — the scheduler <em>learns</em> each job's character from behavior rather than being told it.
+<em>Tempting wrong answer:</em> "the programmer sets the priority" — MLFQ derives it from observed CPU/blocking
+behavior; a boost and anti-gaming accounting keep it honest. <strong>Feed-forward:</strong> §16.4.</div>
+
+<div class="solution" id="sol16.7"><span class="sol-label">16.7</span>
+(a) Shrinking the slice improves <strong>response time</strong> (jobs cycle onto the CPU sooner) and hurts
+<strong>turnaround/throughput</strong> (more interleaving, more context switches). (b) If the slice equals the switch
+cost, then for every unit of switching the CPU does one unit of useful work — roughly <strong>half</strong> the CPU is
+wasted on switching (and it only gets worse as the slice drops below the switch cost). (c) A few milliseconds is large
+enough that a few-microsecond switch is a tiny percentage overhead, yet small enough that interactive jobs still feel
+instant; seconds would wreck response time, microseconds would drown in switch overhead. <em>Tempting wrong answer:</em>
+"smaller is always more responsive, so make it tiny" — below a threshold, switch overhead dominates and total
+throughput collapses. <strong>Feed-forward:</strong> §16.3.</div>
+
+<div class="solution" id="sol16.8"><span class="sol-label">16.8</span>
+<strong>Step 4:</strong> Lower the dashboard's <code>nice</code> value (or, better, put the two workloads in separate
+<strong>cgroups</strong> and give the dashboard a larger <strong>CPU weight</strong>). Under Linux's proportional-share
+scheduler this grants the dashboard a bigger <em>share</em> of the CPU when the two contend, while the batch job still
+runs freely whenever the dashboard is idle. It is safer than <code>SCHED_FIFO</code> because it changes the
+<em>proportion</em>, not the absolute priority: a low-weight job still gets <em>some</em> CPU, so nothing starves and a
+runaway loop cannot freeze the machine, whereas a CPU-bound <code>SCHED_FIFO</code> thread can starve everything on its
+core, kernel threads included. <em>Tempting wrong answer:</em> "give the dashboard real-time priority" — that fixes the
+starvation by creating a worse one and risks wedging the box. <strong>Feed-forward:</strong> §16.4.</div>
+
+<div class="solution" id="sol16.9"><span class="sol-label">16.9</span>
+(a) <strong>Response time</strong> — the editor must react to each keystroke immediately; the user feels lag directly.
+(b) <strong>Turnaround time</strong> — the batch job's only requirement is that the whole thing finishes by a deadline;
+no user is watching it start. (c) <strong>Throughput</strong> — a build farm is judged by jobs completed per hour in
+aggregate, not any one job's latency. <em>Method-selection cue:</em> a human waiting on each action → response; a job
+that must complete → turnaround; a fleet maximizing aggregate work → throughput. <strong>Feed-forward:</strong> §16.1.</div>
+
+<div class="solution" id="sol16.10"><span class="sol-label">16.10</span>
+(a) <strong>False</strong> — a process blocked on <code>read</code> is off the CPU entirely; it consumes no CPU until
+the data arrives and it becomes ready. (b) <strong>False</strong> — Linux threads are 1:1 kernel-scheduled entities
+(Chapter 15), so the scheduler picks among <em>threads</em>. (c) <strong>False</strong> — a context switch costs
+register save/restore plus cold cache/TLB; the slice size trades responsiveness against that overhead. (d)
+<strong>True</strong> — a lower <code>nice</code> value means a larger weight and thus a larger CPU share under
+contention. <em>Tempting wrong answer:</em> calling (d) false because "nice" sounds like it should lower priority — the
+naming is inverted: <em>lower</em> nice is <em>higher</em> priority. <strong>Feed-forward:</strong> §16.1, §16.4, and
+Ch 15.</div>
+
+<div class="solution" id="sol16.11"><span class="sol-label">16.11</span>
+(a) Strict SJF always runs the shortest ready job; if short jobs keep arriving, a long job is never the shortest and
+<strong>never runs</strong> — indefinite starvation. (b) An MLFQ periodically <strong>boosts</strong> every job back to
+the top priority, guaranteeing even a long, demoted job eventually gets CPU; without the boost, CPU-bound jobs stuck at
+the bottom could starve behind a steady stream of interactive work. (c) A proportional-share scheduler gives every job
+CPU in proportion to its weight, so a low-weight job gets a <em>small</em> share, never <em>zero</em> — "smaller share"
+is not "no share." That is exactly why <code>nice</code> cannot starve a task (it only shrinks the proportion) while
+<code>SCHED_FIFO</code>, being strict priority, can (a higher-priority runnable thread gets <em>all</em> the CPU).
+<em>Tempting wrong answer:</em> "a low nice value can starve a process" — no; only strict-priority classes can starve,
+which is the whole safety argument for using nice/weights instead. <strong>Feed-forward:</strong> §16.4.</div>
+
+<div class="solution" id="sol16.12"><span class="sol-label">16.12</span>
+Machine-specific by design. A correct write-up reports: (a) a loop that spins for N wall-seconds and prints the
+CPU-seconds it accrued; (b) pinned to one shared core, the <code>nice 0</code> copy gets far more CPU than the
+<code>nice 19</code> copy — on the book's machine (Linux 6.18, EEVDF) roughly 4.66 vs 0.09 CPU-seconds over a
+five-second window, about fifty to one; (c) on separate cores the two no longer compete for the same CPU, so each gets
+a full core and the nice difference nearly vanishes — <code>nice</code> only matters <em>under contention for the same
+CPU</em>. The discipline: report exactly what you saw and label kernel/core count/scheduler. <em>Tempting wrong
+answer:</em> "nice 19 was paused/slept" — it was not; it ran continuously but was granted a much smaller <em>share</em>
+of the contended core. <strong>Feed-forward:</strong> §16.4.</div>
+
+</section>
+
+<section class="solutions" id="sol17">
+<h1>Chapter 17 — Solutions</h1>
+
+<div class="solution" id="sol17.1"><span class="sol-label">17.1</span>
+A <strong>virtual page</strong> is a fixed-size chunk (4 KiB on x86-64) of a process's virtual address space; a
+<strong>physical frame</strong> is an equal-size chunk of physical RAM. A page-table entry's <strong>present bit</strong>
+records whether that virtual page currently occupies a frame (present) or does not (not present). <em>Tempting wrong
+answer:</em> "pages and frames are the same thing" — they are the same size, but a page is virtual and a frame is
+physical; the page table is exactly the mapping between them. <strong>Feed-forward:</strong> §17.1.</div>
+
+<div class="solution" id="sol17.2"><span class="sol-label">17.2</span>
+A <strong>page fault</strong> is a hardware exception raised when a process accesses a virtual page whose PTE is not
+present; it traps into the kernel's fault handler. The two broad outcomes: (1) the access is <strong>legal</strong>, so
+the handler materializes the page — finds a frame, zeroes it (anonymous) or reads it from a file/swap, sets present,
+and restarts the instruction; or (2) the access is <strong>illegal</strong>, so the handler delivers
+<code>SIGSEGV</code>. <em>Tempting wrong answer:</em> "a page fault means a crash" — most page faults are the normal,
+successful mechanism of demand paging; only the illegal case becomes a fault the program sees. <strong>Feed-forward:</strong>
+§17.2.</div>
+
+<div class="solution" id="sol17.3"><span class="sol-label">17.3</span>
+A <strong>minor</strong> fault is satisfied without disk I/O — the page comes from a zeroed frame or one already in
+memory (e.g. the page cache). A <strong>major</strong> fault must read the page in from a file or swap, costing a disk
+access. <em>Tempting wrong answer:</em> "all page faults hit the disk" — anonymous demand-zero and cache-hit faults are
+minor and never touch the disk. <strong>Feed-forward:</strong> §17.2, §17.3.</div>
+
+<div class="solution" id="sol17.4"><span class="sol-label">17.4</span>
+The <code>mmap</code> only recorded a 1 GiB mapping in the page table with the present bits clear — no frames spent —
+so RSS was just the program itself immediately afterward. As the program touched pages, each first touch raised a page
+fault, the handler gave that page a frame and set present, and RSS climbed one page at a time toward 1 GiB. The
+allocation did not consume 1 GiB up front because <strong>demand paging</strong> makes allocation a promise;
+<em>residency</em> is paid per touched page. <em>Tempting wrong answer:</em> "the OS was slow to account for the
+memory" — nothing was resident to account for; the frames genuinely did not exist until the touches. <strong>Feed-
+forward:</strong> §17.2.</div>
+
+<div class="solution" id="sol17.5"><span class="sol-label">17.5</span>
+Reference 1 2 3 1 4 2 5, 3 frames. <strong>FIFO</strong> = <strong>5</strong> faults: [1]→[1,2]→[1,2,3]→hit
+1→evict 1 for 4 [2,3,4]→hit 2→evict 2 for 5 [3,4,5]. <strong>LRU</strong> = <strong>6</strong> faults:
+[1]→[1,2]→[1,2,3]→hit 1 (1 now MRU) [2,3,1]→evict LRU 2 for 4 [3,1,4]→evict LRU 3 for 2 [1,4,2]→evict LRU 1 for 5
+[4,2,5]. Here <strong>FIFO does better</strong> (5 vs 6) — a deliberate reminder that LRU is a <em>heuristic</em> that
+pays off when the reference stream has locality; on a short string engineered without it, LRU can lose. Only OPT is
+guaranteed optimal. <em>Tempting wrong answer:</em> "LRU always beats FIFO" — LRU usually wins on real (local)
+workloads, but not on every string; this one is a counterexample. <strong>Feed-forward:</strong> §17.4.</div>
+
+<div class="solution" id="sol17.6"><span class="sol-label">17.6</span>
+<strong>Belady's anomaly</strong> is that giving a program more page frames can <em>increase</em> its fault count. It
+is exhibited by <strong>FIFO</strong> (on 1 2 3 4 1 2 5 1 2 3 4 5, FIFO takes 9 faults with 3 frames but 10 with 4).
+LRU and OPT cannot exhibit it because they are <em>stack algorithms</em>: their <strong>resident set with more frames
+is a superset of the resident set with fewer</strong>, so any page that would have been a hit with N frames is still
+resident with N+1 — adding frames can only remove faults, never add them. FIFO lacks this property because a larger
+queue reorders evictions and can eject a soon-to-be-reused page it would have kept. <em>Tempting wrong answer:</em>
+"more memory always means fewer faults" — true for LRU/OPT, false for FIFO; that surprise is the whole point of the
+anomaly. <strong>Feed-forward:</strong> §17.4.</div>
+
+<div class="solution" id="sol17.7"><span class="sol-label">17.7</span>
+(a) A minor fault costs a handful of instructions plus a zeroed or already-resident frame — sub-microsecond; a major
+fault waits on a disk. Using Chapter 3's hierarchy, DRAM access is tens of nanoseconds while an SSD read is tens of
+microseconds and a spinning disk seek is milliseconds — so a major fault is roughly a thousand to a million times
+slower than a minor one. (b) A <em>clean</em> page is an unmodified copy of data still on disk (or a file), so the OS
+can drop it and re-read later; a <em>dirty</em> page has been modified, so it must be <strong>written out</strong> to
+swap before its frame is reused — an extra disk write. (c) The likely cause is paging/swap pressure: the working set no
+longer fits, so the service takes major faults that stall it for disk-access times. The fix is <em>not</em> in the
+CPU-bound code — it is to shrink the memory footprint or add RAM so the working set fits. <em>Tempting wrong answer:</em>
+"profile and optimize the hot function" — the CPU is not the bottleneck; the cores are idle waiting on disk.
+<strong>Feed-forward:</strong> §17.3, §17.4, and Ch 3.</div>
+
+<div class="solution" id="sol17.8"><span class="sol-label">17.8</span>
+<strong>Step 4:</strong> The phenomenon is <strong>thrashing</strong> — the combined working set exceeds physical
+memory, so nearly every eviction removes a page another thread is about to need, producing a storm of
+<strong>major</strong> page faults. CPU utilization is near <em>zero</em> because the cores are almost always
+<em>blocked waiting on disk I/O</em> (paging pages in and out), not computing — the machine is I/O-bound on the swap
+device, not CPU-bound. The fix is to shrink the working set, not "optimize the loop": go back to one (or a few)
+sequential passes so the active window fits in RAM, or add memory. <em>Tempting wrong answer:</em> "add more threads /
+cores to speed it up" — more concurrent passes enlarge the working set and make the thrashing worse; the original
+single sequential pass was faster precisely because its working set fit. <strong>Feed-forward:</strong> §17.4.</div>
+
+<div class="solution" id="sol17.9"><span class="sol-label">17.9</span>
+(a) <strong>Demand paging / overcommit</strong> — the allocation only reserved mappings; the slowdown is the pages
+faulting in as they are first touched. Measure: RSS climbing over time (vs the reserved VSZ). (b) <strong>Thrashing</strong>
+— the dataset just crossed the size where the working set stopped fitting in RAM, so the system is now swapping.
+Measure: major-fault rate and swap I/O. (c) <strong>Page cache / demand paging of a file mapping</strong> — the first
+pass takes major faults reading the file from disk; the second pass hits the now-cached pages (minor or no faults).
+Measure: major faults on first pass vs near-zero on the second. <em>Method-selection cue:</em> "allocate huge/fast then
+slow" → demand paging; "small growth, huge slowdown" → crossed the working-set cliff (thrashing); "slow first, fast
+second" → cache warming. <strong>Feed-forward:</strong> §17.2, §17.3, §17.4.</div>
+
+<div class="solution" id="sol17.10"><span class="sol-label">17.10</span>
+(a) <strong>False</strong> — a successful <code>malloc</code> records mappings; physical RAM is consumed only as pages
+are touched (demand paging/overcommit). (b) <strong>True</strong> — a segmentation fault is a page fault the handler
+found no legal mapping for, so it delivered <code>SIGSEGV</code>. (c) <strong>False</strong> — <code>fork</code> uses
+<em>copy-on-write</em>: it copies page tables, not data; frames are shared read-only until a write faults and copies
+one page. (d) <strong>False</strong> — each process has its own page table, so the same virtual address in two processes
+normally maps to <em>different</em> frames (that is the isolation); they share a frame only through explicit shared
+memory or a shared file mapping. <em>Tempting wrong answer:</em> calling (d) true by analogy to threads — threads share
+one page table; distinct processes do not. <strong>Feed-forward:</strong> §17.1, §17.2, and Ch 4, Ch 14.</div>
+
+<div class="solution" id="sol17.11"><span class="sol-label">17.11</span>
+(a) <code>fork</code> copies the parent's <em>page tables</em>, mapping the child's pages to the same physical frames
+as the parent's, but marks every shared writable page <strong>read-only</strong> — so the "copy" is instantaneous and
+shares all data. (b) When the child (or parent) writes to a read-only shared page, the write raises a
+<strong>protection page fault</strong>; the handler sees a copy-on-write page, allocates a fresh frame, copies
+<em>that one page</em>'s contents into it, remaps the writer's PTE to the new frame with write permission, and restarts
+the instruction — exactly <strong>one</strong> page is copied per first write. (c) This makes
+<code>fork</code>-then-<code>exec</code> nearly free even for a large parent: <code>exec</code> immediately replaces the
+address space, so almost none of the shared pages are ever written before being discarded — copying them eagerly would
+be wasted work. A single write to a shared page costs one page fault plus one page copy. <em>Tempting wrong answer:</em>
+"the first write copies the whole address space" — copy-on-write copies only the single page touched, on demand.
+<strong>Feed-forward:</strong> §17.5, and Ch 14.</div>
+
+<div class="solution" id="sol17.12"><span class="sol-label">17.12</span>
+Machine-specific by design. A correct write-up reports: (a) touching one byte per 4 KiB page across the region yields
+about one minor fault per page (on the book's machine, 25,672 minor faults and 0 major faults to touch 100 MiB), shown
+via <code>/usr/bin/time -v</code>; (b) <code>VmRSS</code> is tiny right after a large <code>mmap</code> and grows to
+about the mapping size after touching it all (on the book's machine, 1,364 kB → 525,976 kB for 512 MiB) — reservation
+vs residency; (c) if you dare to exceed RAM, major-fault and swap-I/O rates climb while CPU utilization drops, the
+signature of thrashing — stop before the box wedges or the OOM killer fires. Label kernel/page size/RAM.
+<em>Tempting wrong answer:</em> "RSS should equal the mapping size right after <code>mmap</code>" — it should not;
+that is exactly what demand paging prevents. <strong>Feed-forward:</strong> §17.2, §17.4.</div>
+
+</section>
+
+<section class="solutions" id="sol18">
+<h1>Chapter 18 — Solutions</h1>
+
+<div class="solution" id="sol18.1"><span class="sol-label">18.1</span>
+A <strong>signal</strong> is an asynchronous notification the kernel delivers to a process to indicate an event (a
+software interrupt). It differs from a normal function call in that the program never <em>calls</em> the handler: the
+kernel <em>injects</em> it into the control flow at an arbitrary instant, suspending whatever was running, then resumes
+that code when the handler returns. <em>Tempting wrong answer:</em> "a signal is just a callback you invoke" — you
+register it, but delivery is forced by the kernel, not called by your code. <strong>Feed-forward:</strong> §18.1,
+§18.2.</div>
+
+<div class="solution" id="sol18.2"><span class="sol-label">18.2</span>
+<strong>Terminate</strong> (<code>SIGTERM</code>, <code>SIGINT</code>); <strong>Terminate and dump core</strong>
+(<code>SIGSEGV</code>, <code>SIGABRT</code>); <strong>Ignore</strong> (<code>SIGCHLD</code>'s default); and
+<strong>Stop/Continue</strong> (<code>SIGSTOP</code>/<code>SIGCONT</code>). <em>Tempting wrong answer:</em> "the default
+is always to terminate" — several signals default to ignore or to stop/continue, not termination. <strong>Feed-
+forward:</strong> §18.1.</div>
+
+<div class="solution" id="sol18.3"><span class="sol-label">18.3</span>
+<strong><code>SIGKILL</code></strong> and <strong><code>SIGSTOP</code></strong> cannot be caught or ignored. If a process
+could catch them, it could refuse to die or to be stopped — a runaway or malicious program would be unkillable, so the
+OS would lose its last-resort control. Keeping these two unblockable guarantees the kernel can always terminate or halt
+any process. <em>Tempting wrong answer:</em> "you can catch <code>SIGKILL</code> to clean up first" — you cannot; that
+is exactly why <code>SIGTERM</code> (catchable) exists for graceful shutdown and <code>SIGKILL</code> for the forced
+kill. <strong>Feed-forward:</strong> §18.1.</div>
+
+<div class="solution" id="sol18.4"><span class="sol-label">18.4</span>
+When <code>Ctrl-C</code> sends <code>SIGINT</code>, the kernel suspends the blocked <code>read</code>, runs the handler,
+and then the <code>read</code> returns <code>-1</code> with <code>errno == EINTR</code> ("interrupted system call"). It
+did not resume waiting because the kernel had to unblock the process to deliver the signal, and the default is to
+report the interruption rather than silently re-block. The two standard fixes: (1) <strong>retry</strong> the call when
+<code>errno == EINTR</code> (a loop), or (2) install the handler with <strong><code>SA_RESTART</code></strong> so the
+kernel auto-restarts many interrupted calls — though not all, so robust code still handles <code>EINTR</code>.
+<em>Tempting wrong answer:</em> "treat <code>EINTR</code> as a real read error and abort" — it is not an error about the
+data; the correct response is to retry. <strong>Feed-forward:</strong> §18.3.</div>
+
+<div class="solution" id="sol18.5"><span class="sol-label">18.5</span>
+It is unsafe because a handler can run in the middle of arbitrary code, including inside <code>printf</code>/
+<code>malloc</code> themselves; those functions hold internal locks / mutable state and are not reentrant, so the
+handler's re-entry can deadlock or corrupt the heap. A function callable from a handler must be
+<strong>async-signal-safe</strong> (essentially reentrant — the <code>signal-safety(7)</code> list, e.g.
+<code>write</code>, <code>_exit</code>). The safe pattern: the handler sets a <code>volatile sig_atomic_t</code> flag
+(or does one <code>write</code> to a self-pipe) and returns; the main loop notices and does the real work
+synchronously. <em>Tempting wrong answer:</em> "it's fine if you only <code>printf</code> occasionally" — it only has
+to interrupt <code>printf</code> once, under load, to hang; rarity is what makes the bug dangerous, not safe.
+<strong>Feed-forward:</strong> §18.4.</div>
+
+<div class="solution" id="sol18.6"><span class="sol-label">18.6</span>
+Standard signals (1–31) are represented by a single pending bit each, so they do <strong>not queue</strong>: if the
+same signal is generated multiple times while pending/blocked, the process sees it once when it is delivered; the extra
+instances coalesce. So if several children exit close together, the parent may receive a single <code>SIGCHLD</code>
+for all of them — reaping exactly one child per signal would leave the others as zombies (Chapter 14). A correct handler
+therefore loops: <code>while (waitpid(-1, &amp;status, WNOHANG) &gt; 0) ;</code> reaps <em>all</em> currently-exited
+children per delivery. <em>Tempting wrong answer:</em> "one <code>SIGCHLD</code> per child, so reap one" — signals
+coalesce, so the count of deliveries does not match the count of events. <strong>Feed-forward:</strong> §18.4, and
+Ch 14.</div>
+
+<div class="solution" id="sol18.7"><span class="sol-label">18.7</span>
+(a) Setting a <code>volatile sig_atomic_t</code> flag is a single, atomic, async-signal-safe store — it cannot deadlock
+or corrupt anything — whereas doing the work directly risks re-entering unsafe libc; and it is cheap (one write). (b)
+The self-pipe / <code>signalfd</code> approach adds a little latency (a <code>write</code> then the main loop's next
+<code>read</code>) but buys correctness: the real work runs in the synchronous main flow where all functions are safe,
+and it integrates signals into an ordinary event loop. (c) It can never be a reliable counter because standard signals
+do not queue — multiple occurrences while pending collapse into one delivery, so the number of handler runs
+under-counts the number of events. <em>Tempting wrong answer:</em> "increment a counter in the handler to count
+events" — coalescing makes that count wrong under load. <strong>Feed-forward:</strong> §18.4.</div>
+
+<div class="solution" id="sol18.8"><span class="sol-label">18.8</span>
+<strong>Step 4:</strong> The bug is an <strong>async-signal-safety violation</strong>: the <code>SIGHUP</code> handler
+calls non-reentrant functions (<code>malloc</code>, stdio <code>fprintf</code>), so when the signal interrupts a request
+thread that is already inside one of them, the handler re-enters it and <strong>deadlocks</strong> (or corrupts the
+heap). It appears only under load because it requires the signal to land <em>during</em> an unsafe call; light testing
+rarely hits that window, but heavy request traffic keeps threads inside <code>malloc</code>/stdio a large fraction of
+the time, so the odds rise — the same schedule-dependent, "passes tests / breaks in production" pathology as a data
+race. The fix: make the handler trivial (set <code>volatile sig_atomic_t reload_requested = 1;</code> or
+<code>write</code> a self-pipe byte and return), and perform the config re-read, <code>malloc</code>, and logging in
+the <strong>main loop</strong> when it observes the flag, where libc is safe to call. <em>Tempting wrong answer:</em>
+"add a lock around the handler's <code>malloc</code>" — the handler may already hold or be blocked on that very lock
+via the interrupted call; locking cannot make a handler reentrant. <strong>Feed-forward:</strong> §18.4.</div>
+
+<div class="solution" id="sol18.9"><span class="sol-label">18.9</span>
+(a) <strong>Signal</strong> (<code>SIGHUP</code> by convention) — a content-free "reload" notification is exactly what a
+signal is for. (b) <strong>Real IPC — a pipe</strong> — a signal carries no data; a byte stream needs a pipe (or
+socket). (c) <strong>Signal</strong> — this <em>is</em> a signal (<code>SIGCHLD</code>); the parent then
+<code>wait</code>s. (d) <strong>Real IPC — a socket</strong> (or a pipe pair) — structured request/reply is a
+conversation, and a signal is only a doorbell. <em>Method-selection cue:</em> a content-free notification → signal;
+moving data or a request/reply → pipe/socket/shared memory. <strong>Feed-forward:</strong> §18.1, §18.5.</div>
+
+<div class="solution" id="sol18.10"><span class="sol-label">18.10</span>
+(a) <strong>False</strong> — the kernel injects the handler asynchronously; the program does not call it. (b)
+<strong>False</strong> — <code>SA_RESTART</code> restarts <em>many</em> but not all interrupted calls, so robust code
+still handles <code>EINTR</code>. (c) <strong>False</strong> — <code>SIGKILL</code> cannot be caught, so no cleanup runs;
+use <code>SIGTERM</code> for graceful shutdown. (d) <strong>True</strong> — an invalid memory access causes the kernel
+to deliver <code>SIGSEGV</code>, whose default disposition terminates (and cores) the process. <em>Tempting wrong
+answer:</em> calling (d) false because "a segfault is a hardware thing" — the hardware fault is <em>translated</em> by
+the kernel into the <code>SIGSEGV</code> signal. <strong>Feed-forward:</strong> §18.1, §18.2, §18.3, and Ch 11.</div>
+
+<div class="solution" id="sol18.11"><span class="sol-label">18.11</span>
+(a) <code>volatile</code> stops the compiler from caching the flag in a register or optimizing the read away, so the
+main loop actually re-reads memory the handler wrote; <code>sig_atomic_t</code> guarantees the read/write is a single
+uninterruptible operation, so the handler cannot catch a half-written value. Without both, the compiler might never
+observe the change, or the main loop might see a torn value. (b) It is <em>similar</em> to a data race: two flows of
+control touch the same memory with no ordering, so the shared access needs care. It is <em>different</em> in that there
+is one thread — the handler cannot run truly simultaneously with the main flow, only interrupt it — so the concern is
+atomicity of a single access and compiler visibility, not simultaneous multi-core writes (which is why
+<code>sig_atomic_t</code> suffices here where full synchronization is needed between threads). (c) Because the handler
+is a second, asynchronously-scheduled flow of control sharing memory with the main flow, a single-threaded program with
+signals already has concurrency — the interruption can happen between any two instructions. <em>Tempting wrong
+answer:</em> "a single-threaded program can't have concurrency bugs" — signals introduce asynchronous control flow,
+which is concurrency. <strong>Feed-forward:</strong> §18.4, and Ch 15.</div>
+
+<div class="solution" id="sol18.12"><span class="sol-label">18.12</span>
+Machine-specific by design. A correct write-up reports: (a) with a plain handler (no <code>SA_RESTART</code>), the
+<code>read</code> interrupted by <code>SIGALRM</code> returns <code>-1</code> with <code>errno == EINTR</code> (on the
+book's machine, "errno=4 (Interrupted system call)"); reinstalling with <code>SA_RESTART</code> makes the kernel
+restart the <code>read</code> so it keeps blocking (no <code>EINTR</code> surfaced). (b) The counting handler runs
+<strong>once</strong>, not five times, because the five blocked <code>SIGUSR1</code>s coalesce into one pending bit
+("handler count so far = 0" while blocked, then "ran 1 time(s)" after unblock). (c) The first shows a caught signal
+interrupts a blocking call; the second shows standard signals do not queue. Label compiler/kernel. <em>Tempting wrong
+answer:</em> "the handler should run five times" — non-queuing standard signals collapse the repeats. <strong>Feed-
+forward:</strong> §18.3, §18.4.</div>
 
 </section>
 </body></html>

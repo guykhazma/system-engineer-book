@@ -1,0 +1,375 @@
+<section class="chapter" id="ch17">
+<h1>Chapter 17 — Virtual Memory: Demand Paging and Page Replacement</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch04">Chapter 4</a> (the hardware that makes an
+address virtual — the MMU, page tables, and the TLB translate a virtual page to a physical frame; <em>this</em> chapter
+is the OS policy that fills those tables), <a href="#ch16">Chapter 16</a> (the OS multiplexes the CPU in time; it
+multiplexes memory in space the same way), <a href="#ch13">Chapter 13</a> (a page fault is exceptional control flow — a
+trap into the kernel). &nbsp;·&nbsp; Chapter 4 showed <em>how</em> a virtual address becomes a physical one. This
+chapter is what the OS does when the answer is "that page isn't in memory."</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch04">Chapter 4</a> — an address is <em>virtual</em>; what hardware
+structure translates a virtual page number to a physical frame, and what small cache speeds that translation up? (2)
+<a href="#ch16">Chapter 16</a> — the scheduler faced conflicting goals (turnaround vs response); name the sin a
+scheduler must avoid (a job that never runs). (3) <em>Predict:</em> a program calls <code>mmap</code> to reserve 512
+MiB of memory and immediately checks its resident memory (RSS) <em>before touching any of it</em>. Is its RSS about 512
+MiB, about 0, or somewhere in between? Then it writes to every byte and checks again. Write down both guesses — we will
+measure them in §17.2.</p>
+</aside>
+
+<p>Chapter 4 gave a process the illusion of a large, private, contiguous address space, and showed the hardware — the
+MMU walking a page table, the TLB caching recent translations — that turns each virtual address into a physical one on
+every memory access. But that chapter assumed the page was <em>there</em>: that every virtual page a process uses has a
+physical frame behind it. It usually does not, and cannot: the sum of every process's address space is far larger than
+physical RAM. The operating system sustains the illusion anyway, and this chapter is how. We reframe memory as the OS
+sees it — physical frames it hands out and page tables it owns (§17.1); introduce <strong>demand paging</strong>, where
+a page gets a frame only when first touched, and the <strong>page fault</strong> that makes it happen — measured
+(§17.2); go beyond physical memory to <strong>swapping</strong> and the replacement question it forces (§17.3); and work
+through the replacement policies — OPT, FIFO, LRU — and the anomaly that makes FIFO treacherous (§17.4). We close by
+carrying forward the mechanisms this unlocks — <code>mmap</code>, copy-on-write, the page cache — that the rest of the
+book runs on (§17.5).</p>
+
+<h2>17.1 Memory as the OS sees it: frames, page tables, and the illusion</h2>
+
+<p>Recall the two vocabularies. A process sees <strong>virtual pages</strong>: its address space, chopped into
+fixed-size pages (4 KiB on x86-64 by default). Physical memory is chopped into equal-size <strong>frames</strong>. A
+<strong>page table</strong>, one per process and owned by the OS, maps each virtual page to a frame — or records that it
+has none. Each page-table entry (PTE) holds the frame number plus control bits, and the one that matters here is the
+<strong>present bit</strong>: set if the page currently lives in a frame, clear if it does not. On every access the MMU
+consults the page table (via the TLB); if the translation says present, the access proceeds at hardware speed. This is
+the machinery of Chapter 4, now seen from the OS's chair: the OS is the party that <em>fills in</em> those tables, hands
+out frames, and decides what to do when a PTE's present bit is clear.</p>
+
+<p>That last case is the whole subject of this chapter. Because every process has its own page table, each gets its own
+private virtual address space — the same virtual address in two processes maps to different frames, which is the
+isolation Chapter 14 relied on. And because the OS controls the present bit, it can lie productively: it can promise a
+process a page it has not actually backed with a frame yet, and make good on the promise only when the process reaches
+for it. When the process touches a page whose PTE is not present, the hardware cannot proceed — so it traps.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does the <em>present bit</em> in a page-table entry mean, and who sets it — the hardware or the OS? If a
+process accesses a virtual page whose PTE has the present bit clear, what happens next? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>17.2 Demand paging and the page fault, measured</h2>
+
+<p>When a running instruction accesses a virtual page whose PTE is not present, the MMU raises a <strong>page
+fault</strong> — a hardware exception, Chapter 13's exceptional control flow, that traps into the kernel's page-fault
+handler. The handler inspects why the page is absent and chooses: if the access is <em>legal</em> but the page simply
+was never materialized (a freshly <code>mmap</code>'d region, the first touch of newly allocated heap), it finds a free
+frame, fills it appropriately — zeroed for anonymous memory, read from a file for a file mapping — sets the PTE's
+present bit, and restarts the faulting instruction, which now succeeds. If the access is <em>illegal</em> (a wild
+pointer into an unmapped region), the handler delivers <code>SIGSEGV</code> instead — the segmentation fault of
+Chapters 7–11, now revealed as "the page-fault handler found no valid mapping." This lazy strategy — give a page a
+frame only when it is first used — is <strong>demand paging</strong>, and it is why allocating memory is cheap:
+<code>malloc</code> or <code>mmap</code> mostly just records a promise in the page tables; the physical frames are
+spent only on the pages you actually touch.</p>
+
+<p>You can watch it directly. A program that <code>malloc</code>s 100 MiB and writes one byte to every 4 KiB page
+should take exactly one page fault per page — 100 MiB / 4 KiB = 25,600 of them — and, because anonymous pages are
+served from zeroed frames with no disk I/O, they should all be <strong>minor</strong> faults (frame available without
+I/O), never <strong>major</strong> (required disk I/O). Running it under <code>/usr/bin/time -v</code> (gcc 11.4.0,
+Linux 6.18, x86-64):</p>
+
+<pre><code>Maximum resident set size (kbytes): 103852        # ~100 MiB actually resident after touching
+Minor (reclaiming a frame) page faults: 25672     # ~one per 4 KiB page touched (25,600) + a little
+Major (requiring I/O) page faults: 0              # no disk I/O — anonymous demand-zero pages</code></pre>
+
+<p>And the reservation-versus-use split from the opener: a program that <code>mmap</code>s 512 MiB and checks its
+resident memory before and after touching it:</p>
+
+<pre><code>after mmap 512 MiB: VmRSS = 1364 kB       # the mapping exists, but almost nothing is resident
+after touching all: VmRSS = 525976 kB     # now every page has been faulted in (~512 MiB)</code></pre>
+
+<p>The 512 MiB mapping cost essentially <em>no</em> physical memory until it was used: RSS was about 1.3 MiB (just the
+program itself), not 512 MiB, right after the <code>mmap</code> succeeded. Touching every page faulted each one in, and
+only then did RSS climb to ~512 MiB. That is demand paging in two numbers: <strong>allocation is a promise; residency
+is paid page by page, on first touch</strong>.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: demand paging pays per touched page</span>
+<p><strong>1. In words.</strong> Reserving address space (via <code>mmap</code>/<code>malloc</code>) only records
+mappings in the page table with the present bit clear; no frame is spent. The first access to each page faults, the
+kernel gives it a frame and sets present, and the instruction restarts. So physical memory is consumed in proportion
+to pages <em>touched</em>, not pages <em>reserved</em>.</p>
+<p><strong>2. As a picture.</strong> Figure 17.1: a virtual page with present=0 → access → page fault trap → handler
+grabs a free frame, zeroes/loads it, sets present=1 → instruction restarts and succeeds. Later faults on other pages
+repeat the path.</p>
+<p><strong>3. As numbers.</strong> <code>mmap</code> 512 MiB: RSS 1,364 kB before touching, 525,976 kB after touching
+all. Writing one byte per page across 100 MiB took 25,672 minor faults (≈ one per 4 KiB page) and <em>zero</em> major
+faults — anonymous pages are served from zeroed frames, no disk I/O.</p>
+</aside>
+
+<p><em>(Answer to the §17.1 quick check: the present bit means the page currently occupies a physical frame; the
+<strong>OS</strong> sets it (the hardware only reads it during translation). Accessing a not-present page raises a page
+fault — a trap into the kernel's fault handler, which either materializes the page or delivers <code>SIGSEGV</code>.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A page fault on first touch (demand paging), then the restart.</text>
+<rect x="20" y="30" width="120" height="46" fill="#f5f8fb" stroke="#14406b"/><text x="30" y="50" font-size="9">access virtual</text><text x="30" y="64" font-size="9">page (present=0)</text>
+<text x="146" y="57" font-size="16" fill="#8c3a1d">&#8594;</text>
+<rect x="170" y="30" width="120" height="46" fill="#fdeee6" stroke="#8c3a1d"/><text x="180" y="50" font-size="9">MMU: not present</text><text x="180" y="64" font-size="9">&#8594; PAGE FAULT (trap)</text>
+<text x="296" y="57" font-size="16" fill="#8c3a1d">&#8594;</text>
+<rect x="320" y="24" width="300" height="58" fill="#f5f8fb" stroke="#14406b"/><text x="330" y="42" font-size="9" fill="#14406b">kernel page-fault handler decides:</text>
+<text x="330" y="58" font-size="8">legal + anonymous &#8594; zeroed frame (MINOR, no I/O)</text>
+<text x="330" y="72" font-size="8">legal + file/swap &#8594; read from disk (MAJOR, I/O) · illegal &#8594; SIGSEGV</text>
+<rect x="170" y="120" width="200" height="46" fill="#cfe8cf" stroke="#2e6b34"/><text x="180" y="140" font-size="9">set PTE present=1,</text><text x="180" y="154" font-size="9">point it at the frame</text>
+<text x="376" y="147" font-size="16" fill="#2e6b34">&#8594;</text>
+<rect x="400" y="120" width="220" height="46" fill="#cfe8cf" stroke="#2e6b34"/><text x="410" y="140" font-size="9">RESTART the faulting</text><text x="410" y="154" font-size="9">instruction — now it succeeds</text>
+<text x="20" y="195" font-size="9" fill="#8c3a1d">The faulting instruction is re-executed from scratch after the handler returns; the program never sees the fault, only a slight pause.</text>
+</svg>
+<figcaption>Figure 17.1: The demand-paging fault path. A first touch of a not-present page traps into the kernel, which
+materializes the page (a minor fault if no disk I/O is needed, a major fault if it must read from a file or swap),
+sets the present bit, and restarts the instruction. Illegal accesses become <code>SIGSEGV</code> instead.</figcaption>
+</figure>
+
+<h2>17.3 Beyond physical memory: swapping and the replacement question</h2>
+
+<p>Demand paging is easy while free frames last. The hard case is when physical memory fills and a new page must be
+brought in with no frame to spare. The OS's answer is <strong>swapping</strong> (paging to a backing store): it
+<em>evicts</em> some resident page — writing it out to a swap area on disk if it has been modified since it was loaded
+(a "dirty" page; a clean page backed by a file can just be dropped and re-read later) — freeing that frame for the
+incoming page. Later, if the evicted page is touched again, it faults back in from disk. This is where the
+minor/major distinction bites: a fault that can be satisfied from a free or droppable frame is a <strong>minor</strong>
+fault (fast, no I/O); a fault that must <em>read the page back from disk or swap</em> is a <strong>major</strong> fault,
+and it costs a disk access — Chapter 3's numbers make the gap vivid, since a disk (even an SSD) is orders of magnitude
+slower than DRAM, and a spinning disk millions of times slower than a cache hit.</p>
+
+<p>Swapping keeps programs running past the size of RAM, but it turns the choice of <em>which page to evict</em> into a
+performance decision of the first order: every eviction of a page that is about to be needed again forces an expensive
+major fault to bring it back. This is the <strong>page-replacement problem</strong>, and it is Chapter 16's dilemma in a
+new guise — a policy question about a scarce, multiplexed resource, where a wrong choice is not incorrect, merely slow.
+The metric here is the <strong>page-fault rate</strong> (equivalently, the miss rate against the frames you have), and
+the goal is a replacement policy that minimizes it.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What is the difference between a <em>minor</em> and a <em>major</em> page fault, and which one involves disk I/O?
+When the OS evicts a page to make room, why does it matter whether that page is "dirty" (modified since it was loaded)?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>17.4 Replacement policies: OPT, FIFO, LRU, and Belady's anomaly</h2>
+
+<p>What should the OS evict? The unbeatable baseline is <strong>OPT</strong> (Belady's MIN, 1966): evict the page whose
+<em>next</em> use is farthest in the future. It provably minimizes faults — but it needs to see the future, so it is
+only a yardstick, not an implementable policy. The simplest real policy is <strong>FIFO</strong>: evict the page that
+has been resident longest, regardless of use. It is trivial but ignores <em>how</em> pages are used. The workhorse
+approximation is <strong>LRU</strong> (least-recently-used): evict the page that has gone longest without being
+accessed, betting that the recent past predicts the near future — which, thanks to <strong>locality of reference</strong>
+(Chapter 3), it usually does. On a short reference string, simulated exactly:</p>
+
+<pre><code>reference string: 0 1 2 0 1 3 0 3 1 2 1   (3 frames)
+FIFO: 7 page faults
+LRU : 5 page faults
+OPT : 5 page faults        # the lower bound; no policy can do better on this string</code></pre>
+
+<p>FIFO takes 7 faults here where LRU and OPT take 5, because FIFO evicts pages by age even when they are about to be
+reused. But FIFO's real hazard is subtler and worth naming, because it violates an intuition everyone has: that giving
+a program <em>more</em> memory can only help. For FIFO, it can hurt. On the classic reference string of Belady, Nelson
+&amp; Shedler (1969), FIFO takes <em>more</em> faults with four frames than with three:</p>
+
+<pre><code>reference string: 1 2 3 4 1 2 5 1 2 3 4 5
+FIFO, 3 frames: 9 page faults
+FIFO, 4 frames: 10 page faults      # MORE memory, MORE faults</code></pre>
+
+<p>This is <strong>Belady's anomaly</strong>: for FIFO, adding a frame can increase the fault count, because a larger
+FIFO queue changes the eviction order in a way that can evict a soon-to-be-reused page it would have kept with fewer
+frames. LRU and OPT are immune — they belong to a class (stack algorithms) whose resident set with N frames is always a
+superset of its resident set with N−1, so more memory never adds faults. The anomaly is the sharpest argument against
+FIFO and for use-based policies like LRU: a policy that ignores usage can be not just suboptimal but
+<em>non-monotonic</em>, punishing you for adding memory. (Real kernels do not implement true LRU — tracking exact
+recency on every access is too expensive — but approximate it cheaply with a per-page reference bit and a clock/second-
+chance sweep, keeping LRU's monotonic, locality-exploiting behavior without its bookkeeping cost.)</p>
+
+<aside class="warning">
+<span class="box-title">Trap: thrashing — when the working set doesn't fit</span>
+<p>Replacement policy only helps while the pages a program actively uses — its <strong>working set</strong> — fit in
+the frames it has. When the sum of all running processes' working sets exceeds physical memory, <em>no</em> replacement
+policy can win: every page the OS evicts is one that is about to be needed, so the system generates major fault after
+major fault, and the CPU sits idle waiting on disk while throughput collapses. This is <strong>thrashing</strong>, and
+its signature is a machine that is nearly idle on CPU yet grinding — high major-fault and swap-I/O rates, everything
+slow. The trap is diagnosing it as a CPU or code problem and "optimizing the hot loop," when the real fix is to reduce
+the memory footprint (smaller working set, fewer concurrent jobs) or add RAM so the working set fits. Modern Linux
+often does not let you thrash gently to a halt: when memory (plus swap) is truly exhausted, the <strong>OOM killer</strong>
+picks a process and kills it outright. Either way the lesson is the same — paging is a graceful extension of memory
+only up to the working-set boundary; past it, performance does not degrade linearly, it falls off a cliff. Watch
+major-fault and swap rates, not just CPU.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our service <code>malloc</code>ed a 40 GB buffer on a 16 GB box and the
+allocation <em>succeeded</em> — so we clearly have enough memory, and we can fill it up. Great." Cover the paragraph
+and respond in three or four sentences, drawing on §17.2 and the thrashing trap.</p>
+<p><em>Model answer.</em> "A successful <code>malloc</code> doesn't mean the memory exists — it means the kernel
+recorded the mapping; under demand paging (and overcommit) no physical frames are spent until you <em>touch</em> the
+pages, so a 40 GB allocation on a 16 GB box can succeed while backing almost nothing. The moment we actually write
+across all 40 GB, each page faults in, resident memory climbs past 16 GB, and the OS has to swap — if our working set
+genuinely exceeds RAM we'll thrash (near-idle CPU, endless major faults, everything crawling) or get OOM-killed
+outright. So allocation success proves nothing about capacity; what matters is the <em>resident working set</em>. Let's
+size the buffer to what fits with headroom, stream instead of buffering everything, and watch RSS and major-fault rates
+under load — not just whether <code>malloc</code> returned non-NULL." Separating "reserved" from "resident," and naming
+thrashing and the OOM killer, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §17.3 quick check: a <strong>minor</strong> fault is satisfied without disk I/O — the page is
+served from a zeroed or already-cached frame; a <strong>major</strong> fault must read the page from a file or swap, so
+it costs a disk access. A "dirty" (modified) page must be <strong>written out</strong> to swap before its frame can be
+reused, whereas a clean page — an unmodified copy of file data — can be dropped and re-read later, so evicting clean
+pages is cheaper.)</em></p>
+
+<h2>17.5 What to carry forward</h2>
+
+<p>The OS owns physical <strong>frames</strong> and each process's <strong>page table</strong>, and the
+<strong>present bit</strong> lets it back a virtual page with a frame lazily. <strong>Demand paging</strong> materializes
+a page only on first touch: the access to a not-present page raises a <strong>page fault</strong> (a trap), and the
+handler either supplies the page — a <strong>minor</strong> fault if no I/O is needed, a <strong>major</strong> fault if
+it must read from disk or swap — or delivers <code>SIGSEGV</code>. Allocation is therefore a promise (we watched a 512
+MiB mapping cost ~1 MiB of RSS until touched), and residency is paid page by page (25,672 minor faults to touch 100
+MiB). When RAM fills, <strong>swapping</strong> evicts pages to disk, making the choice of victim — the
+<strong>page-replacement problem</strong> — a performance decision: OPT is the unbeatable but unimplementable
+yardstick, FIFO is simple but suffers <strong>Belady's anomaly</strong> (more memory, more faults), and LRU (approximated
+in real kernels) exploits locality and is monotonic. Past the working-set boundary, no policy saves you:
+<strong>thrashing</strong>, then the OOM killer.</p>
+
+<p>With this the operating system's core illusion is complete: Chapter 16 sliced the CPU in time, this chapter backs
+each address space with a smaller physical memory, and together they let many processes share one machine as if each
+owned it. The mechanisms this chapter unlocked are the ones the rest of the book leans on. The same page table that
+holds the present bit also holds protection and sharing bits, which give us <strong>memory-mapped files</strong>
+(<code>mmap</code> a file and read/write it as memory, the page cache faulting data in on demand) and
+<strong>copy-on-write</strong> — the trick from Chapter 14's <code>fork</code>, now seen fully: parent and child share
+every frame read-only, and only a write faults and copies the one page touched. Copy-on-write and shared mappings are
+also how separate processes can deliberately share a region of memory — the fast path for the inter-process
+communication that a later chapter takes up, and the reason the isolation of processes need not mean the cost of
+copying. Virtual memory is not only protection; it is the substrate for sharing, laziness, and speed.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain, using the present bit, how the OS can promise a process a page it has not yet backed with a frame.</li>
+<li>Trace the page-fault path for a first touch of anonymous memory, and say why it is a minor fault, not a major
+one.</li>
+<li>State what demand paging makes cheap, and give the two measured numbers (RSS before/after touch; minor faults per
+page).</li>
+<li>Distinguish minor and major faults, and explain why evicting a dirty page costs more than evicting a clean
+one.</li>
+<li>Rank OPT, FIFO, and LRU, and explain Belady's anomaly and why LRU/OPT are immune to it.</li>
+<li>Define thrashing and the working set, and explain why a successful <code>malloc</code> does not prove you have the
+memory.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does the present bit mean, and what happens on an access to a not-present page? (§17.1,
+§17.2)</li>
+<li><strong>R2.</strong> What is demand paging, and what did the <code>mmap</code>-512-MiB measurement show about
+reserved vs resident memory? (§17.2)</li>
+<li><strong>R3.</strong> Distinguish minor and major page faults; which involves disk I/O? (§17.2, §17.3)</li>
+<li><strong>R4.</strong> What is the page-replacement problem, and how do OPT, FIFO, and LRU differ? (§17.4)</li>
+<li><strong>R5.</strong> What is Belady's anomaly, and what is thrashing? (§17.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Paging: Introduction," "Beyond Physical Memory: Mechanisms," and "Beyond Physical Memory: Policies."</strong> The free
+chapters on the page as the unit, the page fault and swapping mechanism, and the replacement policies (OPT/FIFO/LRU,
+the anomaly, clock). The reference for §17.1–17.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 9
+(Virtual Memory).</strong> Address spaces, page tables, demand paging, and memory mapping from the programmer's view;
+the companion to Chapter 4's hardware treatment.</li>
+<li><strong>Belady, "A study of replacement algorithms for a virtual-storage computer," <em>IBM Systems Journal</em>
+5(2):78–101 (1966);</strong> and <strong>Belady, Nelson &amp; Shedler, "An anomaly in space-time characteristics of
+certain programs running in a paging machine," <em>Communications of the ACM</em> 12(6):349–353 (1969).</strong> The
+primary sources for the optimal (MIN) policy and for Belady's anomaly, respectively.</li>
+<li><strong>The Linux <code>mmap(2)</code>, <code>madvise(2)</code>, and <code>proc(5)</code> manual pages.</strong>
+Primary sources for memory mapping, demand-paging hints, and the <code>/proc/&lt;pid&gt;/status</code> fields
+(<code>VmRSS</code>) used to measure residency. Verify per kernel version.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex17.1"><span class="ex-label">17.1</span> <span class="ex-tag warm">warm-up</span>
+Define a virtual page and a physical frame, and say what a page-table entry's present bit records.</div>
+
+<div class="exercise" id="ex17.2"><span class="ex-label">17.2</span> <span class="ex-tag warm">warm-up</span>
+What is a page fault, and what two broad outcomes can the kernel's fault handler produce for it?</div>
+
+<div class="exercise" id="ex17.3"><span class="ex-label">17.3</span> <span class="ex-tag warm">warm-up</span>
+In one line each, distinguish a minor page fault from a major page fault.</div>
+
+<div class="exercise" id="ex17.4"><span class="ex-label">17.4</span> <span class="ex-tag core">core</span>
+A program <code>mmap</code>s 1 GiB and its RSS is a few megabytes immediately afterward, then climbs toward 1 GiB as
+it works. Explain what happened at each stage in terms of demand paging, and why the allocation did not consume 1 GiB
+of physical memory up front.</div>
+
+<div class="exercise" id="ex17.5"><span class="ex-label">17.5</span> <span class="ex-tag core">core</span>
+Simulate FIFO and LRU on the reference string 1 2 3 1 4 2 5 with 3 frames. Give the number of page faults for each and
+show the resident set after each reference. Which policy does better here, and why?</div>
+
+<div class="exercise" id="ex17.6"><span class="ex-label">17.6</span> <span class="ex-tag core">core</span>
+Explain Belady's anomaly: state what it is, which policy exhibits it, and why LRU and OPT cannot. Use the phrase
+"resident set is a superset with more frames" in your explanation of the immune policies.</div>
+
+<div class="exercise" id="ex17.7"><span class="ex-label">17.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is a major page fault dramatically more expensive than a minor one — put rough numbers on it using Chapter 3's
+memory hierarchy. (b) Why does evicting a <em>clean</em> page cost less than evicting a <em>dirty</em> one? (c) A
+service's p99 latency has sudden 50 ms spikes that correlate with high major-fault counts; what is the likely cause,
+and is the fix in the CPU-bound code?</div>
+
+<div class="exercise" id="ex17.8"><span class="ex-label">17.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A batch job processes a 30 GB dataset on a 32 GB machine by
+<code>mmap</code>ing the whole file and iterating over it once, sequentially. It runs fine. A colleague "optimizes" it
+to make ten concurrent passes over the same mapping from ten threads to "use all the cores," and now the machine
+crawls with near-zero CPU utilization.
+<br><strong>Step 1 (given):</strong> The single sequential pass has a small working set at any instant (a sliding
+window of recently touched pages), so it fits comfortably in RAM and pages stream in and out cleanly.
+<br><strong>Step 2 (given):</strong> Ten concurrent passes at different file offsets touch ten far-apart regions at
+once, so the combined working set is large and scattered.
+<br><strong>Step 3 (given):</strong> That combined working set exceeds physical memory, so every page the OS evicts is
+soon needed by another thread, generating major fault after major fault.
+<br><strong>Step 4 (you):</strong> Name the phenomenon precisely, explain why CPU utilization is near <em>zero</em>
+during it (what are the cores waiting on?), and give the direction of the fix (not "optimize the loop").</div>
+
+<div class="exercise" id="ex17.9"><span class="ex-label">17.9</span> <span class="ex-tag mixed">mixed</span>
+For each observation, name the most likely cause and one thing to measure to confirm it: (a) allocating a huge array
+succeeds instantly but the program slows down later as it fills the array; (b) a program that fit in RAM last week now
+runs 100× slower after the dataset grew slightly; (c) reading a memory-mapped file is fast the second time through but
+slow the first.</div>
+
+<div class="exercise" id="ex17.10"><span class="ex-label">17.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 4, 14, and 17, classify each statement as <em>true</em> or <em>false</em> and fix the false ones:
+(a) "After a successful 8 GB <code>malloc</code>, 8 GB of physical RAM is now in use." (b) "A segmentation fault is
+just a page fault the handler could not satisfy legally." (c) "<code>fork</code> copies the parent's entire address
+space immediately." (d) "Two processes with the same virtual address are reading the same physical frame."</div>
+
+<div class="exercise" id="ex17.11"><span class="ex-label">17.11</span> <span class="ex-tag stretch">stretch</span>
+Copy-on-write ties this chapter to Chapter 14. (a) Explain how the page table lets <code>fork</code> give the child a
+"copy" of the address space while physically copying no data at first. (b) Describe exactly what happens, page by
+page, when the child later writes to one page — which fault fires, what the handler does, and how many pages get
+copied. (c) Explain why this makes the common <code>fork</code>-then-<code>exec</code> pattern (Chapter 14) nearly free
+even for a large parent, and what a single write to a shared page costs.</div>
+
+<div class="exercise" id="ex17.12"><span class="ex-label">17.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a program that <code>malloc</code>s (or <code>mmap</code>s) a few hundred MiB and touches
+one byte per 4 KiB page; run it under <code>/usr/bin/time -v</code> and report the minor-fault count — confirm it is
+about one per page. (b) Read <code>VmRSS</code> from <code>/proc/self/status</code> before and after touching a large
+mapping, and report both values to show reservation vs residency. (c) Optional and careful: on a machine you can afford
+to stress (or a VM), allocate and touch more than physical RAM and observe swap I/O / major faults climbing — describe
+the thrashing behavior and stop before you wedge the box. Label your kernel version, page size, and RAM.</div>
+
+</section>
+</section>

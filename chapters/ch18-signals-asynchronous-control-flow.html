@@ -1,0 +1,386 @@
+<section class="chapter" id="ch18">
+<h1>Chapter 18 — Signals: Asynchronous Control Flow</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch14">Chapter 14</a> (when a child exits, the
+kernel notifies the parent with <code>SIGCHLD</code> — that notification <em>is</em> a signal; and
+<code>wait</code> reaps the child), <a href="#ch13">Chapter 13</a> (a blocking system call can be interrupted — this
+chapter is what interrupts it), <a href="#ch11">Chapter 11</a> (a bad memory access became a segmentation fault —
+<code>SIGSEGV</code> is a signal too). &nbsp;·&nbsp; Every earlier chapter's control flow was <em>synchronous</em>: the
+program ran its own instructions in order. This chapter adds a second, <em>asynchronous</em> flow the kernel can force
+on a process at almost any instant.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch14">Chapter 14</a> — after a child process exits but before the parent
+<code>wait</code>s for it, what is the child called, and how did the parent learn the child had finished? (2)
+<a href="#ch13">Chapter 13</a> — a process blocked in a <code>read</code> that never completes is off the CPU; name one
+thing that could wake it besides the data arriving. (3) <em>Predict:</em> a program installs a handler for
+<code>SIGUSR1</code>, then blocks that signal, sends it to itself <em>five</em> times in a tight loop, and finally
+unblocks it. How many times does the handler run — five, one, or zero? Write down your guess and why — we will measure
+it in §18.4.</p>
+</aside>
+
+<p>So far a program's control flow has been its own: it executes its instructions, calls functions, makes system calls,
+and returns — a single thread of cause and effect (threads in Chapter 15 added more such flows, but each was still
+running <em>its own</em> code). A <strong>signal</strong> breaks that assumption. It is an <strong>asynchronous
+notification</strong> the kernel delivers to a process to tell it that an event happened — a software analog of a
+hardware interrupt — and when one arrives, the process's normal flow is suspended, a designated <strong>handler</strong>
+runs, and then the normal flow resumes where it left off. You have already met signals without naming them: the
+segmentation fault (<code>SIGSEGV</code>) of Chapter 11, the <code>Ctrl-C</code> that kills a program
+(<code>SIGINT</code>), the <code>SIGCHLD</code> that told a parent its child had exited (Chapter 14). This chapter makes
+the mechanism precise: what a signal is and its default dispositions (§18.1), how to catch one with a handler (§18.2),
+how signals interrupt blocking system calls — the <code>EINTR</code> you must handle (§18.3) — and the sharp hazards of
+running code asynchronously, namely async-signal-safety and the fact that standard signals do not queue (§18.4). We
+close by placing signals among the OS's communication mechanisms (§18.5). Signals are the kernel's way of interrupting
+your program to tell it something; the danger is that "at almost any instant" means the handler can run in the middle
+of anything.</p>
+
+<h2>18.1 What a signal is, and its default disposition</h2>
+
+<p>A <strong>signal</strong> is a small integer, identified by name, delivered to a process to indicate an event. Some
+are sent by the kernel in response to hardware or program conditions — <code>SIGSEGV</code> (invalid memory access),
+<code>SIGFPE</code> (arithmetic error like divide-by-zero), <code>SIGCHLD</code> (a child changed state). Some are sent
+by users or programs to control a process — <code>SIGINT</code> (from <code>Ctrl-C</code>), <code>SIGTERM</code> (the
+polite "please exit," what <code>kill</code> sends by default), <code>SIGKILL</code> (the un-catchable "die now"),
+<code>SIGUSR1</code>/<code>SIGUSR2</code> (application-defined). A process can send a signal to another (subject to
+permissions) with the <code>kill</code> system call — poorly named, since it sends <em>any</em> signal, not only lethal
+ones.</p>
+
+<p>Every signal has a <strong>default disposition</strong> — what happens if the process does nothing about it. The
+common defaults are: <strong>Terminate</strong> the process (<code>SIGTERM</code>, <code>SIGINT</code>);
+<strong>Terminate and dump core</strong> (<code>SIGSEGV</code>, <code>SIGABRT</code> — the core file for a debugger);
+<strong>Ignore</strong> the signal (<code>SIGCHLD</code>'s default is to be ignored — which is why an un-reaped child
+still becomes a zombie, per Chapter 14; the notification is delivered but discarded); and <strong>Stop</strong> /
+<strong>Continue</strong> the process (<code>SIGSTOP</code>/<code>SIGCONT</code>, job control). A process can
+<em>change</em> the disposition of most signals — catch them with a handler, or ask to ignore them — with two crucial
+exceptions: <strong><code>SIGKILL</code> and <code>SIGSTOP</code> can neither be caught nor ignored.</strong> That is by
+design: the OS must retain an unblockable way to kill or halt any process, so that a program cannot make itself
+immortal by trapping every signal.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the four broad default dispositions a signal can have. Which two signals can a process <em>not</em> catch or
+ignore, and why does the OS insist on that? (Answer after the next section.)</p>
+</aside>
+
+<h2>18.2 Catching a signal: handlers and <code>sigaction</code></h2>
+
+<p>To catch a signal, a process installs a <strong>signal handler</strong>: a function the kernel will call when that
+signal is delivered. The portable, well-defined way to install one is the <code>sigaction</code> system call (the older
+<code>signal()</code> function has historically ambiguous semantics across systems; prefer <code>sigaction</code>). You
+fill in a <code>struct sigaction</code> with your handler function and flags, and register it for a given signal
+number:</p>
+
+<pre><code>void handler(int signum){ /* runs asynchronously when the signal arrives */ }
+
+struct sigaction sa;
+memset(&amp;sa, 0, sizeof sa);
+sa.sa_handler = handler;
+sigaction(SIGINT, &amp;sa, NULL);   /* from now on, Ctrl-C runs handler() instead of terminating */</code></pre>
+
+<p>Once installed, the handler runs <em>asynchronously</em>: when <code>SIGINT</code> arrives, the kernel suspends
+whatever the process was doing, calls <code>handler</code>, and — when the handler returns — resumes the interrupted
+code exactly where it left off. The program did not <em>call</em> the handler; the kernel injected it into the control
+flow. This is the defining strangeness of signals and the source of every hazard in §18.4: the handler can begin
+executing between any two instructions of your main code, including in the middle of a library call. The handler's
+signature is fixed (<code>void handler(int)</code>, receiving the signal number so one handler can serve several
+signals), and while it runs, the same signal is (by default) blocked so the handler does not interrupt itself.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Which system call installs a signal handler the well-defined way, and why is the older <code>signal()</code>
+discouraged? In what sense does the program <em>not</em> call its own handler? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>18.3 Signals interrupt system calls: <code>EINTR</code></h2>
+
+<p>Here is the consequence that bites every real program. Suppose a process is blocked in a slow system call —
+<code>read</code> waiting for input that has not arrived, <code>wait</code> for a child, <code>sleep</code> — and a
+signal arrives that the process catches. The kernel cannot both run the handler and leave the process cleanly blocked,
+so it interrupts the system call: it runs the handler, and then the blocked call returns early with the error
+<strong><code>EINTR</code></strong> ("interrupted system call"). The call did not fail for any reason of its own — the
+data may still be coming — it was simply cut short to deliver the signal. Here is a program that blocks in
+<code>read</code> on an empty pipe, arranges <code>SIGALRM</code> to fire after one second (handler installed
+<em>without</em> the restart flag), and reports what <code>read</code> returns (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>alarm(1);                                  /* deliver SIGALRM in 1 second */
+ssize_t n = read(fd[0], buf, sizeof buf);  /* blocks; nobody writes to the pipe */
+/* ... one second later the signal fires, the handler runs, and read returns: */
+
+read returned -1, errno=4 (Interrupted system call)</code></pre>
+
+<p>The <code>read</code> returned <code>-1</code> with <code>errno == EINTR</code>, not because the pipe failed but
+because the signal interrupted it. A correct program must expect this: any slow system call that can be interrupted by
+a caught signal may return <code>EINTR</code>, and the usual fix is to <strong>retry the call</strong> (the classic
+<code>while ((n = read(...)) &lt; 0 &amp;&amp; errno == EINTR);</code> loop). Alternatively you can install the handler
+with the <strong><code>SA_RESTART</code></strong> flag, which asks the kernel to <em>automatically restart</em> many
+interrupted system calls instead of failing them with <code>EINTR</code> — but the coverage is incomplete (some calls
+still return <code>EINTR</code> even with <code>SA_RESTART</code>), so robust code handles <code>EINTR</code> regardless.
+The naive assumption that a system call either blocks until it succeeds or fails for a real reason is simply wrong once
+signals are in play.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a caught signal cuts a blocking call short</span>
+<p><strong>1. In words.</strong> A process blocked in a slow system call cannot stay cleanly blocked while a handler
+runs, so the kernel interrupts the call: it runs the handler, then the call returns <code>-1</code> with
+<code>errno == EINTR</code>. The operation did not truly fail; it was cut short to deliver the signal, so the program
+must retry it (or use <code>SA_RESTART</code>, with caveats).</p>
+<p><strong>2. As a picture.</strong> Figure 18.1: main thread blocked in <code>read</code> → signal arrives → handler
+runs → control returns to <code>read</code>, which unwinds and returns <code>EINTR</code> rather than resuming the
+block.</p>
+<p><strong>3. As numbers.</strong> A <code>read</code> on an empty pipe with a <code>SIGALRM</code> after one second
+(no <code>SA_RESTART</code>): <code>read returned -1, errno=4 (Interrupted system call)</code>. With a correct retry
+loop it would resume waiting; with <code>SA_RESTART</code> the kernel would restart it for you.</p>
+</aside>
+
+<p><em>(Answer to the §18.1 quick check: the four default dispositions are Terminate, Terminate-and-dump-core, Ignore,
+and Stop/Continue. <code>SIGKILL</code> and <code>SIGSTOP</code> cannot be caught or ignored, so the OS always retains a
+way to kill or halt any process — a program cannot trap its way to immortality.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A signal injects a handler into the control flow — here, interrupting a blocked read.</text>
+<line x1="60" y1="40" x2="60" y2="180" stroke="#14406b"/><text x="30" y="44" font-size="9" fill="#14406b">main</text>
+<rect x="45" y="50" width="30" height="90" fill="#f5f8fb" stroke="#14406b"/><text x="80" y="80" font-size="9">read() blocked</text><text x="80" y="96" font-size="9">(waiting on pipe)</text>
+<text x="80" y="60" font-size="8" fill="#8c3a1d">&#9679; SIGALRM arrives at t=1s</text>
+<line x1="60" y1="60" x2="360" y2="60" stroke="#8c3a1d" stroke-dasharray="3,2"/>
+<rect x="360" y="46" width="140" height="34" fill="#fdeee6" stroke="#8c3a1d"/><text x="370" y="66" font-size="9">handler(SIGALRM) runs</text>
+<line x1="360" y1="140" x2="500" y2="80" stroke="#8c3a1d" stroke-dasharray="3,2"/>
+<rect x="45" y="140" width="30" height="30" fill="#cfe8cf" stroke="#2e6b34"/>
+<text x="80" y="150" font-size="9" fill="#2e6b34">read() returns -1, errno=EINTR (4)</text>
+<text x="80" y="164" font-size="8">— cut short to deliver the signal; the program must retry (or use SA_RESTART)</text>
+<text x="20" y="192" font-size="9" fill="#8c3a1d">The handler ran between the block and the return; the read did not fail on its own — it was interrupted.</text>
+</svg>
+<figcaption>Figure 18.1: A caught signal interrupts a blocking system call. The kernel suspends the block, runs the
+handler, then the interrupted call returns <code>-1</code> with <code>errno == EINTR</code> instead of continuing to
+wait — which the program must handle (retry) or opt out of with <code>SA_RESTART</code>.</figcaption>
+</figure>
+
+<h2>18.4 The hazards: async-signal-safety and non-queuing</h2>
+
+<p>Because a handler can run between any two instructions of your program — including inside a library function that is
+halfway through updating its own state — the code a handler may safely execute is sharply restricted. A function is
+<strong>async-signal-safe</strong> if it is safe to call from a signal handler, which essentially means it is reentrant:
+it does not rely on global state that a signal could catch mid-update. Most of the standard library is <em>not</em>
+async-signal-safe. The classic trap is calling <code>printf</code> (or <code>malloc</code>) in a handler: if the signal
+arrives while the main program is already inside <code>printf</code> or <code>malloc</code> — holding an internal lock
+or partway through a data structure — the handler's second call to the same function re-enters it and can deadlock
+(waiting on a lock the interrupted call holds) or corrupt the heap. The kernel documents the exact set of functions
+guaranteed safe (the <code>signal-safety(7)</code> man page); it is a short list — <code>write</code>,
+<code>_exit</code>, and a handful of others — and <code>printf</code>/<code>malloc</code>/most of libc are not on it.
+The safe idiom is to do almost nothing in a handler: set a flag of type <code>volatile sig_atomic_t</code> and return,
+then let the main loop notice the flag and do the real work synchronously.</p>
+
+<p>The second hazard is delivery semantics, and it settles the opener's prediction. Standard signals (numbers 1–31)
+are <strong>not queued</strong>: a signal is either pending or not, a single bit, so if the same signal is generated
+several times while it is blocked, the process still sees it <em>once</em> when unblocked — the extra instances
+coalesce and are lost. Here is the opener's exact program — install a <code>SIGUSR1</code> handler that counts calls,
+block <code>SIGUSR1</code>, send it to ourselves five times, then unblock:</p>
+
+<pre><code>sigprocmask(SIG_BLOCK, ...);       /* block SIGUSR1 */
+for (int i=0;i&lt;5;i++) raise(SIGUSR1);   /* send it 5 times while blocked */
+/* handler count so far = 0  (blocked, so not delivered yet) */
+sigprocmask(SIG_UNBLOCK, ...);     /* unblock: the pending signal is delivered */
+
+sent 5 while blocked; handler count so far = 0
+after unblock, handler ran 1 time(s)</code></pre>
+
+<p>The handler ran <strong>once</strong>, not five times: the five sends collapsed into a single pending bit. This is
+why you must never use a standard signal as a counter or a reliable event stream — if two children exit at nearly the
+same moment, the parent may get a single <code>SIGCHLD</code>, so a correct <code>SIGCHLD</code> handler reaps
+<em>all</em> available children in a loop (<code>while (waitpid(-1, ..., WNOHANG) &gt; 0)</code>), not one per signal.
+(POSIX real-time signals, <code>SIGRTMIN</code> through <code>SIGRTMAX</code>, <em>do</em> queue and can carry a small
+payload, at the cost of more machinery — the exception that proves the rule.) The robust modern pattern for turning
+asynchronous signals into something a normal event loop can consume is the <strong>self-pipe trick</strong> (the
+handler does one async-signal-safe <code>write</code> to a pipe the main loop reads) or Linux's <code>signalfd</code>,
+both of which move the real work out of the handler and back into the synchronous main flow.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: doing real work in a signal handler</span>
+<p>The natural instinct on catching a signal — log a message, update a data structure, free some resources, flush
+state — is exactly what you must not do, because a handler runs <em>asynchronously, in the middle of arbitrary code</em>.
+Calling anything not on the async-signal-safe list (which is nearly all of libc, including <code>printf</code>,
+<code>malloc</code>/<code>free</code>, and most of the standard library) risks a deadlock or heap corruption if the
+signal interrupted that very function. The bug is vicious because it is <em>rare</em>: it only manifests when the
+signal happens to land inside the unsafe call, so the program runs fine in testing and hangs or crashes in production
+under load — the same "passes the test, broken anyway" pathology as the data race of Chapter 15, and for the same
+reason (a schedule-dependent window). The discipline: a handler should do the minimum async-signal-safe thing — set
+<code>volatile sig_atomic_t got_signal = 1;</code> (or <code>write</code> one byte down a self-pipe) and return — and the
+main loop does the real work when it is safe. If you find yourself wanting to <code>printf</code> from a handler to
+debug it, that itch is the bug.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "For graceful shutdown I added a <code>SIGTERM</code> handler that logs
+'shutting down,' flushes the in-memory cache to disk, closes the DB connections, and calls <code>exit</code> — all
+right there in the handler. Clean, right?" Cover the paragraph and respond in three or four sentences, drawing on
+§18.4.</p>
+<p><em>Model answer.</em> "The intent is right but the handler is doing far too much: it runs asynchronously, possibly
+in the middle of a <code>malloc</code> or an <code>fprintf</code>, and logging, flushing, and closing all call
+functions that are not async-signal-safe — so if <code>SIGTERM</code> lands at the wrong instant, the handler deadlocks
+on a lock the interrupted code holds or corrupts the heap, and your 'graceful' shutdown hangs the process precisely
+when you're trying to stop it cleanly. The safe pattern is to make the handler trivial — set a
+<code>volatile sig_atomic_t shutdown_requested = 1;</code> (or <code>write</code> a byte to a self-pipe) and return —
+and let the main loop, on seeing the flag, do the flush, close, and exit synchronously where all of libc is safe to
+call. That also lets you bound and order the shutdown steps instead of racing them inside an interrupt. Keep handlers to
+a flag; do the work in the main flow." Naming async-signal-safety and moving the work out of the handler is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the §18.2 quick check: <code>sigaction</code> is the well-defined way to install a handler; the older
+<code>signal()</code> is discouraged because its semantics — handler persistence, whether the signal is blocked during
+its own handler, and system-call restart behavior — historically vary across systems. The program does not call its
+handler: the kernel <strong>injects</strong> it into the control flow at delivery time, suspending whatever was running
+and resuming it when the handler returns.)</em></p>
+
+<h2>18.5 What to carry forward</h2>
+
+<p>A <strong>signal</strong> is an asynchronous notification the kernel delivers to a process — a software interrupt —
+and each has a <strong>default disposition</strong> (terminate, terminate-and-core, ignore, stop/continue), with
+<code>SIGKILL</code> and <code>SIGSTOP</code> the two that can never be caught or ignored. A process catches a signal by
+installing a handler with <code>sigaction</code>; the handler runs asynchronously, injected into the control flow, and
+returns to where the program was interrupted. Two consequences dominate correct use. First, a caught signal
+<strong>interrupts blocking system calls</strong>, which return <code>-1</code> with <code>errno == EINTR</code> (we
+measured a <code>read</code> cut short to <code>errno 4</code>) — you must retry, or use <code>SA_RESTART</code> with
+care. Second, a handler runs in the middle of arbitrary code, so it may call only <strong>async-signal-safe</strong>
+functions (not <code>printf</code>/<code>malloc</code>/most of libc), and standard signals <strong>do not queue</strong>
+— five rapid <code>SIGUSR1</code>s coalesced into a single delivery in our measurement — so the safe pattern is a
+handler that sets a <code>volatile sig_atomic_t</code> flag (or writes a self-pipe) and defers the real work to the
+synchronous main loop.</p>
+
+<p>Signals complete the picture of how the operating system talks <em>to</em> a process: the system-call boundary
+(Chapter 13) is how a process asks the kernel for things synchronously; signals are how the kernel (or another process)
+interrupts a process asynchronously to tell it something happened. But a signal carries almost no information — just its
+number (real-time signals add a small payload) — so it is a doorbell, not a conversation. When processes need to
+exchange real <em>data</em> rather than notifications, they need genuine inter-process communication: pipes and FIFOs
+for byte streams, shared memory (built, as Chapter 17 showed, on shared mappings in the page tables) for the fastest
+sharing, and sockets for talking across machines. That IPC toolkit — the channels that carry data between the isolated
+address spaces this part has spent five chapters building and protecting — is where the operating system part of this
+volume finishes, and it is the bridge to the low-level I/O and networking that the data systems in later volumes are
+made of.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Define a signal as asynchronous control flow, and name its four default dispositions.</li>
+<li>Say which two signals can never be caught or ignored, and why the OS insists on that.</li>
+<li>Install a handler with <code>sigaction</code> from memory, and explain in what sense the kernel "injects" the
+handler.</li>
+<li>Explain <code>EINTR</code>: why a caught signal makes a blocking call return it, and the two ways to cope.</li>
+<li>Explain async-signal-safety and why <code>printf</code> in a handler is a bug, and give the safe handler
+pattern.</li>
+<li>Explain why standard signals do not queue, and what that means for a <code>SIGCHLD</code> handler reaping
+children.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a signal, and what are the four default dispositions? (§18.1)</li>
+<li><strong>R2.</strong> Which two signals cannot be caught or ignored, and why? (§18.1)</li>
+<li><strong>R3.</strong> What does <code>sigaction</code> do, and in what sense does a handler run asynchronously?
+(§18.2)</li>
+<li><strong>R4.</strong> What is <code>EINTR</code>, when does it occur, and how do you handle it? (§18.3)</li>
+<li><strong>R5.</strong> What does async-signal-safe mean, and why do standard signals not queue? (§18.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 8
+(Exceptional Control Flow), §8.5 (Signals).</strong> Signals as exceptional control flow, handlers, blocking, and the
+concurrency hazards of handlers — the reference for §18.1–18.4.</li>
+<li><strong>Stevens &amp; Rago, <em>Advanced Programming in the UNIX Environment</em>, 3rd ed. (2013), Chapter 10
+(Signals).</strong> The canonical, thorough treatment of signal semantics, <code>sigaction</code>, reliable signals,
+and interrupted system calls. <code>[⚠ reference — not free]</code></li>
+<li><strong>The Linux <code>signal(7)</code>, <code>sigaction(2)</code>, and <code>signal-safety(7)</code> manual
+pages.</strong> Primary sources for the signal list and default dispositions, the <code>SA_RESTART</code>/EINTR
+behavior, and the exact set of async-signal-safe functions. Verify per system.</li>
+<li><strong>The Linux <code>signalfd(2)</code> manual page and the "self-pipe trick" (D. J. Bernstein).</strong> The
+documented ways to turn asynchronous signal delivery into a synchronous, event-loop-friendly readable stream — the
+robust alternative to doing work in a handler.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex18.1"><span class="ex-label">18.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is a signal, and how does it differ from a normal function call in how it enters the program?</div>
+
+<div class="exercise" id="ex18.2"><span class="ex-label">18.2</span> <span class="ex-tag warm">warm-up</span>
+Name the four broad default dispositions a signal can have, with one example signal for each if you can.</div>
+
+<div class="exercise" id="ex18.3"><span class="ex-label">18.3</span> <span class="ex-tag warm">warm-up</span>
+Which two signals can a process neither catch nor ignore, and what would go wrong if it could?</div>
+
+<div class="exercise" id="ex18.4"><span class="ex-label">18.4</span> <span class="ex-tag core">core</span>
+A program blocks in <code>read</code> waiting for input and catches <code>SIGINT</code> with a handler. Explain, step
+by step, what happens when the user presses <code>Ctrl-C</code>: what the <code>read</code> returns, what
+<code>errno</code> is, and why the call did not simply resume waiting. Give the two standard ways to make the program
+robust to this.</div>
+
+<div class="exercise" id="ex18.5"><span class="ex-label">18.5</span> <span class="ex-tag core">core</span>
+Explain why calling <code>printf</code> (or <code>malloc</code>) inside a signal handler is unsafe. What property must
+a function have to be callable from a handler, and what is the safe pattern for a handler that needs to trigger real
+work?</div>
+
+<div class="exercise" id="ex18.6"><span class="ex-label">18.6</span> <span class="ex-tag core">core</span>
+Explain why standard signals do not queue, and why this means a <code>SIGCHLD</code> handler must reap children in a
+loop (with <code>WNOHANG</code>) rather than reaping exactly one child per delivered signal. Tie this back to Chapter
+14's zombies.</div>
+
+<div class="exercise" id="ex18.7"><span class="ex-label">18.7</span> <span class="ex-tag complexity">cost</span>
+(a) Why is a handler that only sets a <code>volatile sig_atomic_t</code> flag both cheap and safe, compared with one
+that does the work directly? (b) What is the latency cost of the self-pipe / <code>signalfd</code> approach versus a
+direct handler, and what correctness benefit do you buy with it? (c) Why can a signal-based design never be a reliable
+<em>counter</em> of events under load?</div>
+
+<div class="exercise" id="ex18.8"><span class="ex-label">18.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A long-running server installs a <code>SIGHUP</code> handler to reload
+its config. The handler re-reads the config file, rebuilds several in-memory structures with <code>malloc</code>, and
+logs progress with <code>fprintf</code>. In testing it works; in production, under heavy request load, the server
+occasionally hangs completely when config is reloaded.
+<br><strong>Step 1 (given):</strong> The handler runs asynchronously and can interrupt the main code at any instant,
+including while the main code is inside <code>malloc</code> or <code>fprintf</code>.
+<br><strong>Step 2 (given):</strong> <code>malloc</code> and stdio hold internal locks / mutable state; they are not
+async-signal-safe.
+<br><strong>Step 3 (given):</strong> Under heavy load the odds rise that <code>SIGHUP</code> lands while a request
+thread is inside one of those functions, so the handler's own call to it re-enters and deadlocks.
+<br><strong>Step 4 (you):</strong> Name the bug precisely, explain why it appears only under load (not in tests), and
+describe the redesign that fixes it — what the handler should do and where the reload work should actually run.</div>
+
+<div class="exercise" id="ex18.9"><span class="ex-label">18.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, say whether a <em>signal</em> is the right mechanism or whether you want real IPC (a pipe, shared memory,
+or a socket), and justify in a line: (a) tell a running daemon to re-read its configuration; (b) stream a megabyte of
+data from one process to another on the same host; (c) notify a parent that a child has exited; (d) send a structured
+request and get a structured reply between two processes.</div>
+
+<div class="exercise" id="ex18.10"><span class="ex-label">18.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 13–18, classify each statement as <em>true</em> or <em>false</em> and fix the false ones: (a) "A
+signal handler is called by the program the way any other function is." (b) "If you install a handler with
+<code>SA_RESTART</code>, you never have to worry about <code>EINTR</code>." (c) "Sending a process
+<code>SIGKILL</code> lets it run cleanup code first." (d) "A segmentation fault is the delivery of the
+<code>SIGSEGV</code> signal."</div>
+
+<div class="exercise" id="ex18.11"><span class="ex-label">18.11</span> <span class="ex-tag stretch">stretch</span>
+A signal handler and the main program both touch a shared <code>int running</code> flag. (a) Why must that flag be
+declared <code>volatile sig_atomic_t</code> rather than a plain <code>int</code> — what could the compiler or the
+hardware otherwise do? (b) Compare this hazard with the data race of Chapter 15: how is a handler-vs-main-flow conflict
+similar to a thread-vs-thread race, and how is it different (single thread, asynchronous interruption)? (c) Explain why
+this makes signals a form of concurrency even in a single-threaded program.</div>
+
+<div class="exercise" id="ex18.12"><span class="ex-label">18.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a program that blocks in <code>read</code> on an empty pipe, sets an <code>alarm</code>,
+and prints what <code>read</code> returns and <code>errno</code> when <code>SIGALRM</code> fires — confirm you see
+<code>EINTR</code> (errno 4); then reinstall the handler with <code>SA_RESTART</code> and observe the difference. (b)
+Write a program that installs a counting handler for <code>SIGUSR1</code>, blocks it, <code>raise</code>s it five
+times, unblocks, and prints how many times the handler ran — confirm it is once, not five. (c) Explain both results in
+terms of interrupted system calls and non-queuing standard signals. Label your compiler and kernel version.</div>
+
+</section>
+</section>

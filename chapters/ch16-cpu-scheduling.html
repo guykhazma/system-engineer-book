@@ -1,0 +1,376 @@
+<section class="chapter" id="ch16">
+<h1>Chapter 16 — CPU Scheduling</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch15">Chapter 15</a> (Linux threads are 1:1
+kernel-scheduled entities — <em>these</em> are what the scheduler picks among), <a href="#ch14">Chapter 14</a> (a
+process blocks in <code>wait</code> or on I/O — a blocked task is off the CPU and off the scheduler's radar),
+<a href="#ch13">Chapter 13</a> (a system call is a trap into the kernel — where the scheduler lives). &nbsp;·&nbsp;
+Chapters 14 and 15 gave you more runnable things than you have CPUs. This chapter is about the OS's answer to the
+question that creates: <em>who runs next, and for how long?</em></p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch14">Chapter 14</a> — when a process calls <code>read</code> on a
+socket with no data, it <em>blocks</em>; is a blocked process using the CPU while it waits? (2) <a href="#ch15">Chapter
+15</a> — Linux schedules each <code>pthread</code> one-to-one with a kernel thread; so is the unit the scheduler places
+on a CPU the process or the thread? (3) <em>Predict:</em> three jobs arrive at almost the same instant — one needs 100
+ms of CPU, the other two need 10 ms each. If the scheduler runs them strictly in arrival order (the 100 ms job first),
+what is the <em>average</em> time from arrival to completion across the three? What if it ran the two short ones first
+instead? Write both numbers down — we will compute them exactly in §16.2.</p>
+</aside>
+
+<p>A modern machine has a handful of CPUs and, at any moment, dozens or hundreds of runnable threads. Something must
+decide which runnable thread occupies each CPU and when to take it away and give the CPU to another — that something is
+the <strong>scheduler</strong>, and the decision is <strong>scheduling</strong>. Chapter 13 gave the mechanism the
+scheduler rides on (a timer interrupt traps into the kernel, which can switch the running thread); this chapter is about
+the <strong>policy</strong> — the algorithm that chooses. We start by naming what a scheduler optimizes and the metrics
+that make "good" precise (§16.1); build up the classic policies from the simplest, FIFO, through shortest-job-first and
+its convoy trap (§16.2); add preemption and the time slice with round-robin, exposing the response-vs-turnaround
+trade-off (§16.3); and then meet the schedulers real systems ship — the multi-level feedback queue and Linux's
+proportional-share scheduler — which approximate the ideal without an oracle (§16.4). We close by carrying forward what
+"the OS multiplexes the CPU" really costs and buys (§16.5).</p>
+
+<h2>16.1 The scheduling problem, and how to measure a scheduler</h2>
+
+<p>At any instant each thread is in one of a few states. A <strong>running</strong> thread is on a CPU right now. A
+<strong>ready</strong> (runnable) thread could run but no CPU is free for it. A <strong>blocked</strong> thread is
+waiting for something — I/O to complete, a child to exit, a lock to free — and <em>cannot</em> run until that event
+arrives, so it is not the scheduler's concern until it wakes. The scheduler's job is to pick, from the ready threads,
+which one each CPU runs, and a <strong>context switch</strong> (Chapter 13's mechanism) is how it hands a CPU from one
+thread to another: save the outgoing thread's registers, load the incoming thread's, resume. The switch is not free —
+it costs the direct register save/restore plus the indirect cost of a cold cache and TLB (Chapter 3) for the new thread
+— which is why the scheduler cannot simply switch on every instruction.</p>
+
+<p>"Good" needs a definition, and there are several, often in tension. The two that matter most here are
+<strong>turnaround time</strong> — completion time minus arrival time, how long the whole job took to finish, the
+metric a batch workload cares about — and <strong>response time</strong> — first-run time minus arrival time, how long
+until the job <em>started</em> getting served, the metric an interactive user feels as lag. A scheduler also cares
+about <strong>throughput</strong> (jobs completed per unit time), <strong>fairness</strong> (each job gets a defensible
+share), and avoiding <strong>starvation</strong> (no ready job waits forever). The reason scheduling is hard is that
+these goals conflict: as we will see, the policy that minimizes average turnaround is not the one that minimizes
+response time, and the one that is "fair" may not be either.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define turnaround time and response time in one line each. A job arrives at t=0, first gets the CPU at t=5, and
+finishes at t=30. What is its response time and its turnaround time? (Answer after the next section.)</p>
+</aside>
+
+<h2>16.2 FIFO, shortest-job-first, and the convoy effect</h2>
+
+<p>The simplest possible policy is <strong>FIFO</strong> (first-in, first-out, also called FCFS): run jobs to
+completion in arrival order, no preemption. It is obviously fair in one sense and trivial to implement — and it has a
+sharp failure mode. Take the opener's workload: three jobs, A needs 100 ms and B and C need 10 ms each, all arriving at
+essentially t=0 with A first. FIFO runs A to completion, then B, then C. A finishes at 100, B at 110, C at 120, so
+average turnaround is (100 + 110 + 120) / 3 = <strong>110 ms</strong>. The two short jobs sat behind the long one for
+almost their entire wait. This is the <strong>convoy effect</strong>: short jobs pile up behind a long one like cars
+behind a truck, and average turnaround balloons because everyone inherits the long job's runtime.</p>
+
+<p>The fix, if you knew the run times, is to run the short jobs first. <strong>Shortest-Job-First (SJF)</strong>
+schedules the ready jobs in increasing order of length. On the same workload it runs B, then C, then A: B finishes at
+10, C at 20, A at 120, and average turnaround drops to (10 + 20 + 120) / 3 = <strong>50 ms</strong> — less than half of
+FIFO's, for the exact same jobs. That is not a coincidence: when all jobs arrive together, SJF is <em>provably optimal</em>
+for average turnaround (any swap that puts a longer job earlier only adds its length to more jobs' waits). When jobs
+arrive over time, the preemptive version — <strong>Shortest-Time-to-Completion-First (STCF)</strong>, which preempts the
+running job if a newly arrived one has less work left — extends the same idea. These are the numbers you predicted;
+here they are, computed by a scheduling simulator:</p>
+
+<pre><code>workload: A=100ms, B=10ms, C=10ms, all arrive ~t=0
+FIFO (order A,B,C): finish A=100 B=110 C=120  -> avg turnaround 110.0 ms
+SJF  (order B,C,A): finish B=10  C=20  A=120  -> avg turnaround  50.0 ms</code></pre>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">The convoy effect: same three jobs, two orders. Bar length = CPU time; number = completion.</text>
+<text x="20" y="52" font-size="10" fill="#14406b">FIFO (A first):</text>
+<rect x="120" y="40" width="360" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="290" y="54" font-size="9">A (100 ms)</text><text x="484" y="54" font-size="8">100</text>
+<rect x="480" y="40" width="36" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="490" y="54" font-size="8">B</text><text x="520" y="54" font-size="8">110</text>
+<rect x="516" y="40" width="36" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="526" y="54" font-size="8">C</text><text x="556" y="54" font-size="8">120</text>
+<text x="120" y="82" font-size="9" fill="#8c3a1d">avg turnaround = (100+110+120)/3 = 110 ms — B and C wait behind the truck</text>
+<text x="20" y="122" font-size="10" fill="#14406b">SJF (short first):</text>
+<rect x="120" y="110" width="36" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="130" y="124" font-size="8">B</text><text x="150" y="124" font-size="8">10</text>
+<rect x="156" y="110" width="36" height="20" fill="#cfe8cf" stroke="#2e6b34"/><text x="166" y="124" font-size="8">C</text><text x="186" y="124" font-size="8">20</text>
+<rect x="192" y="110" width="360" height="20" fill="#fdeee6" stroke="#8c3a1d"/><text x="350" y="124" font-size="9">A (100 ms)</text><text x="556" y="124" font-size="8">120</text>
+<text x="120" y="152" font-size="9" fill="#2e6b34">avg turnaround = (10+20+120)/3 = 50 ms — short jobs clear first</text>
+<text x="20" y="190" font-size="9" fill="#14406b">Same jobs, same total work (120 ms), same last-completion (120). Only the ORDER changed — and average turnaround more than halved.</text>
+</svg>
+<figcaption>Figure 16.1: FIFO vs SJF on A=100, B=10, C=10 (arriving together). Running the long job first makes every
+short job inherit its runtime (the convoy effect); running short jobs first minimizes average turnaround — which SJF
+provably does when all jobs arrive at once.</figcaption>
+</figure>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: order dominates average turnaround</span>
+<p><strong>1. In words.</strong> Turnaround is completion minus arrival. When jobs share a CPU, a job's turnaround
+includes the runtime of everything scheduled before it. So putting a long job first adds its length to every later
+job's turnaround; putting short jobs first minimizes the total. That is why SJF beats FIFO on average turnaround.</p>
+<p><strong>2. As a picture.</strong> Figure 16.1: the same three bars, packed truck-first versus short-first. The
+sum of the completion marks — not the total width — is what average turnaround measures, and reordering shrinks it.</p>
+<p><strong>3. As numbers.</strong> A=100, B=10, C=10: FIFO averages (100+110+120)/3 = 110 ms; SJF averages
+(10+20+120)/3 = 50 ms. Identical work, identical finish of the last job (120 ms), less than half the average
+turnaround — purely from order.</p>
+</aside>
+
+<p><em>(Answer to the §16.1 quick check: response time = first-run − arrival = 5 − 0 = 5; turnaround = completion −
+arrival = 30 − 0 = 30.)</em></p>
+
+<h2>16.3 Preemption, the time slice, and round-robin</h2>
+
+<p>SJF minimizes turnaround, but it has two problems. First, it needs an <strong>oracle</strong> — you must know each
+job's length in advance, which for interactive and server workloads you never do. Second, even with the oracle its
+<em>response</em> time is bad: a job that arrives just after a long one starts must wait for it to finish (or, with
+STCF, only if it is shorter). Interactive workloads care about response time above all — you want the cursor to move
+the instant you type — so we need a policy that shares the CPU in <em>small slices</em> rather than running each job to
+completion. That policy is <strong>round-robin (RR)</strong>: run each ready job for a fixed <strong>time slice</strong>
+(quantum), then preempt it (via the timer interrupt) and move to the next, cycling forever until jobs finish.</p>
+
+<p>Round-robin's whole point is response time. On the A/B/C workload with a 1 ms slice, all three jobs get their first
+turn within the first few milliseconds, so every job's response time is essentially immediate (about 1 ms on average)
+rather than SJF's — where C waited 10 ms and A waited 20. But that responsiveness has a price: RR's average
+<em>turnaround</em> is worse than SJF's, because it stretches every job out by interleaving. Here are all three
+policies on the same workload from the simulator:</p>
+
+<pre><code>workload: A=100ms, B=10ms, C=10ms
+FIFO:        avg turnaround 110.0 ms,  avg response  70.0 ms  (B waits 100, C waits 110)
+SJF:         avg turnaround  50.0 ms,  avg response  10.0 ms  (C waits 10, A waits 20)
+RR (q=1ms):  avg turnaround  59.7 ms,  avg response  ~1.0 ms  (every job starts almost at once)</code></pre>
+
+<p>That is the fundamental trade-off in one table: <strong>SJF wins turnaround, round-robin wins response, and you
+cannot have both</strong>. The <strong>size</strong> of the time slice is the knob. A tiny slice gives excellent
+response (jobs cycle fast) but pays a context-switch cost on every single switch — and if the slice approaches the
+switch cost itself, the CPU spends a large fraction of its time switching rather than working. A large slice amortizes
+the switch cost (better throughput) but degrades response time toward FIFO's. Real schedulers pick a slice large enough
+that the switch overhead is a small percentage, and small enough that interactivity stays crisp — typically a few
+milliseconds.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Round-robin makes the time slice small to improve one metric and worsen another — which is which? And what goes
+wrong if you make the slice as small as the cost of a single context switch? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>16.4 What real schedulers do: MLFQ and proportional share</h2>
+
+<p>Real systems cannot use pure SJF (no oracle) or pure round-robin (ignores that jobs differ in importance and
+behavior). Two ideas dominate real schedulers, and both aim to get SJF-like behavior — favor short, interactive work —
+<em>without</em> knowing job lengths in advance, by <strong>learning from the past</strong>.</p>
+
+<p>The first is the <strong>multi-level feedback queue (MLFQ)</strong>. Keep several ready queues, each a priority
+level; always run a job from the highest non-empty level, round-robin within a level. The trick is how a job's priority
+<em>changes</em>: a new job enters at the top; if it uses its whole time slice (CPU-bound behavior) it is demoted a
+level; if it gives up the CPU before the slice ends (blocking on I/O — interactive behavior) it stays high. Over a few
+slices this <em>learns</em> each job's character: interactive jobs, which block often, float near the top and get
+scheduled quickly (great response time); CPU-bound jobs sink to the bottom and share the leftovers. That approximates
+"short jobs first" using observed behavior instead of an oracle. Two refinements make it work in practice: to prevent a
+long job from <strong>starving</strong> at the bottom forever, MLFQ periodically <strong>boosts</strong> every job back
+to the top; and to stop a job from <strong>gaming</strong> the rule (yielding just before each slice ends to keep its
+priority), it accounts for total CPU used at a level rather than per-slice behavior.</p>
+
+<p>The second idea is <strong>proportional share</strong> (fair-share): rather than juggle priorities, give each job a
+<strong>weight</strong> and hand out CPU time in proportion to weight, so a job with twice the weight gets twice the CPU
+over time. This is the family Linux's normal scheduler belongs to. For over a decade Linux used the <strong>Completely
+Fair Scheduler (CFS)</strong>, which tracks each task's accumulated virtual runtime and always runs the task that has
+had the least, weighted by priority; kernel 6.6 (2023) replaced CFS with <strong>EEVDF</strong> (Earliest Eligible
+Virtual Deadline First), a proportional-share scheduler with better latency guarantees. In both, a process's
+<strong>nice</strong> value (−20 to +19, set with <code>nice</code>/<code>renice</code>; lower is "less nice," i.e.
+higher priority) sets its weight: a lower nice value claims a larger share. You can see this directly. Two identical
+CPU-bound loops pinned to the <em>same</em> core so they must compete, one at nice 0 and one at nice 19, run for five
+wall-clock seconds on this machine (Linux 6.18, which uses EEVDF; numbers illustrative):</p>
+
+<pre><code>taskset -c 0 nice -n 0  ./hog    ->  nice0:  cpu-seconds used = 4.66
+taskset -c 0 nice -n 19 ./hog    ->  nice19: cpu-seconds used = 0.09</code></pre>
+
+<p>The nice-0 loop got roughly fifty times the CPU of the nice-19 loop over the same wall-clock window — not because
+nice 19 was "paused," but because the proportional-share scheduler weighted its slice far smaller. That is the whole
+idea made visible: <code>nice</code> does not change what a program computes, only what <em>fraction of the CPU</em> it
+is entitled to when there is contention. (Linux also offers strict real-time classes — <code>SCHED_FIFO</code> and
+<code>SCHED_RR</code> — that sit above the normal class and always preempt it; those are for bounded-latency work and
+are a foot-gun for everything else, as the warning below explains.)</p>
+
+<aside class="warning">
+<span class="box-title">Trap: reaching for real-time priority (<code>SCHED_FIFO</code>) to "make it faster"</span>
+<p>When a latency-sensitive service is being starved by a background job, the tempting fix is to promote the service to
+a real-time scheduling class — <code>SCHED_FIFO</code> or <code>SCHED_RR</code> — so it always wins. This is
+<em>strict fixed-priority</em> scheduling, and it does not mean "a bit faster": a runnable <code>SCHED_FIFO</code>
+thread preempts <strong>every</strong> normal task and runs until it blocks or a higher real-time thread appears. If
+that thread is CPU-bound and never blocks — a busy loop, a spin-wait, a bug — it will monopolize its core and
+<strong>starve everything else on it, including kernel threads</strong>, and can wedge the machine hard enough to
+require a reboot. (Linux mitigates this with real-time throttling — <code>sched_rt_runtime_us</code> caps RT time per
+period — precisely because the default is so dangerous.) Real-time priority is the right tool only for work that is
+both genuinely latency-critical <em>and</em> bounded in CPU (it blocks regularly). To bias the normal scheduler toward
+an important service, reach first for <code>nice</code> or cgroup CPU weights, which change the <em>share</em> under
+contention without the power to starve the system. The lesson: "higher priority" is not a speed dial; strict priority
+is a loaded gun pointed at every other task on the CPU.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our request service and the nightly compaction job share a box, and
+compaction is starving the service's tail latency. Let's just give the service <code>SCHED_FIFO</code> real-time
+priority so it always wins." Cover the paragraph and respond in three or four sentences, drawing on §16.4.</p>
+<p><em>Model answer.</em> "The instinct is right — the service should win against a background batch job — but
+<code>SCHED_FIFO</code> is a much bigger hammer than we want: it is strict fixed priority, so if any of the service's
+threads ever spins or busy-loops without blocking, it will preempt everything on that core, including kernel threads,
+and can hang the box, which is why the kernel even throttles real-time time by default. What we actually want is a
+bigger <em>share</em> under contention, not absolute priority — so lower the service's <code>nice</code> value or,
+better, put the two workloads in separate cgroups and give the service a larger CPU weight (and cap or de-prioritize
+compaction). That fixes the starvation through the fair scheduler, keeps the system stable, and leaves headroom if
+compaction ever needs to burst. Save real-time scheduling for work that is both latency-critical and provably bounded
+in CPU." Distinguishing "bigger share" from "strict priority," and naming the starvation and hang risk, is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the §16.3 quick check: a small time slice improves <strong>response</strong> time (jobs cycle onto
+the CPU quickly) and worsens <strong>turnaround</strong> and throughput (more interleaving and more context switches).
+If the slice approaches the cost of one context switch, the CPU spends a large fraction of its time switching rather
+than doing useful work — overhead dominates.)</em></p>
+
+<h2>16.5 What to carry forward</h2>
+
+<p>The <strong>scheduler</strong> decides which ready thread each CPU runs and for how long; a <strong>context
+switch</strong> is the (non-free) mechanism that hands a CPU from one thread to another. We measure schedulers by
+<strong>turnaround</strong> (completion − arrival) and <strong>response</strong> (first-run − arrival) time, among
+others, and the central fact is that these goals conflict. FIFO is simple but suffers the <strong>convoy effect</strong>;
+<strong>SJF/STCF</strong> minimize average turnaround but need an oracle and give poor response; <strong>round-robin</strong>
+with a small time slice wins response at the cost of turnaround, with the slice size trading responsiveness against
+switch overhead. Real schedulers approximate "favor short, interactive work" without an oracle by learning from
+behavior — the <strong>multi-level feedback queue</strong> (priorities that adapt, with boosting to prevent starvation)
+— or by handing out CPU in proportion to a <strong>weight</strong> — Linux's proportional-share scheduler (CFS, then
+EEVDF from 6.6), where the <strong>nice</strong> value sets the share, which we watched split one core roughly fifty to
+one between a nice-0 and a nice-19 loop.</p>
+
+<p>Step back and see what this part is assembling. Chapter 14 gave you many processes and Chapter 15 many threads;
+this chapter is how one machine <em>pretends</em> to run them all at once — by slicing the CPU in time so fast that
+each thread perceives a CPU (nearly) to itself. That is the CPU half of the operating system's core illusion. The
+other half is the same trick played on <em>memory</em>: giving each process the illusion of a large private address
+space on a machine whose physical memory is smaller and shared. Chapter 4 showed the hardware that makes an address
+virtual; the next chapter is the OS policy that makes the illusion hold when memory runs short — demand paging, page
+faults as a mechanism, and the replacement decisions that are this chapter's turnaround-versus-response trade-off
+played again on pages instead of milliseconds.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name the three scheduling-relevant states of a thread (running, ready, blocked) and say which ones the scheduler
+chooses among.</li>
+<li>Define turnaround time and response time, and compute both for a job given its arrival, first-run, and completion
+times.</li>
+<li>Explain the convoy effect with the A=100/B=10/C=10 example, and give FIFO's and SJF's average turnaround (110 vs
+50 ms).</li>
+<li>State why SJF is optimal for average turnaround yet unusable in practice, and what round-robin trades to win
+response time.</li>
+<li>Explain how a multi-level feedback queue approximates SJF without an oracle, and why it needs priority boosting.</li>
+<li>Explain what a <code>nice</code> value does under Linux's proportional-share scheduler, and why
+<code>SCHED_FIFO</code> is dangerous.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are the running/ready/blocked states, and which does the scheduler pick among? (§16.1)</li>
+<li><strong>R2.</strong> Define turnaround and response time. (§16.1)</li>
+<li><strong>R3.</strong> What is the convoy effect, and what were FIFO's and SJF's average turnarounds on A/B/C?
+(§16.2)</li>
+<li><strong>R4.</strong> Why does round-robin improve response time but hurt turnaround, and what does the time-slice
+size trade? (§16.3)</li>
+<li><strong>R5.</strong> How does an MLFQ learn to favor interactive jobs without knowing their lengths, and what does
+a <code>nice</code> value control? (§16.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP),
+"Scheduling: Introduction" and "Scheduling: The Multi-Level Feedback Queue."</strong> The free chapters that develop
+turnaround/response metrics, FIFO/SJF/STCF/round-robin, and MLFQ (including boosting and anti-gaming). The reference
+for §16.1–16.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 8
+(Exceptional Control Flow).</strong> Context switches and the timer interrupt that preemption rides on, from the
+programmer's view.</li>
+<li><strong>The Linux <code>sched(7)</code> and <code>nice(2)</code> / <code>sched_setscheduler(2)</code> manual
+pages.</strong> Primary sources for the scheduling classes (<code>SCHED_OTHER</code>/normal, <code>SCHED_FIFO</code>,
+<code>SCHED_RR</code>), the nice range, and real-time throttling. Verify per kernel version.</li>
+<li><strong>The Linux kernel scheduler documentation (<code>docs.kernel.org/scheduler/</code>), including the EEVDF
+scheduler page.</strong> The authority for the CFS-to-EEVDF change in 6.6 and how proportional share is implemented.
+Fast-moving; treat details as version-specific.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex16.1"><span class="ex-label">16.1</span> <span class="ex-tag warm">warm-up</span>
+Name the three scheduling-relevant states of a thread, and say which state(s) the scheduler chooses the next runner
+from.</div>
+
+<div class="exercise" id="ex16.2"><span class="ex-label">16.2</span> <span class="ex-tag warm">warm-up</span>
+Define turnaround time and response time. For a job that arrives at t=0, first runs at t=8, and completes at t=40,
+give both.</div>
+
+<div class="exercise" id="ex16.3"><span class="ex-label">16.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what is the convoy effect, and which simple scheduling policy suffers from it?</div>
+
+<div class="exercise" id="ex16.4"><span class="ex-label">16.4</span> <span class="ex-tag core">core</span>
+Three jobs arrive at t=0: X needs 8 ms, Y needs 4 ms, Z needs 4 ms. Compute the average turnaround time under FIFO
+(order X, Y, Z) and under SJF, showing each job's completion time. Which is lower, and why is that no accident?</div>
+
+<div class="exercise" id="ex16.5"><span class="ex-label">16.5</span> <span class="ex-tag core">core</span>
+Explain why SJF minimizes average turnaround when all jobs arrive together, and give the two reasons it is
+nonetheless unusable as a general-purpose scheduler.</div>
+
+<div class="exercise" id="ex16.6"><span class="ex-label">16.6</span> <span class="ex-tag core">core</span>
+Describe how a multi-level feedback queue decides a job's priority over time, and explain how this makes interactive
+(I/O-bound) jobs get scheduled quickly and CPU-bound jobs sink — without the scheduler ever being told which is
+which.</div>
+
+<div class="exercise" id="ex16.7"><span class="ex-label">16.7</span> <span class="ex-tag complexity">cost</span>
+(a) What does shrinking the round-robin time slice buy you, and what does it cost? (b) A context switch on a machine
+costs roughly a few microseconds; if you set the time slice equal to that, what fraction of the CPU is wasted on
+switching, and why? (c) Give the qualitative reason real schedulers use a slice of a few milliseconds rather than a
+few microseconds or a few seconds.</div>
+
+<div class="exercise" id="ex16.8"><span class="ex-label">16.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A batch analytics job and an interactive dashboard API share one server.
+Users complain the dashboard is laggy whenever the batch job runs, even though the box has spare capacity at night.
+<br><strong>Step 1 (given):</strong> The dashboard is I/O-bound and latency-sensitive (response time matters); the
+batch job is CPU-bound and only turnaround matters.
+<br><strong>Step 2 (given):</strong> Under a pure round-robin or a naive equal-share policy, the CPU-heavy batch job
+gets an equal turn each cycle, so the dashboard waits behind it and its response time suffers.
+<br><strong>Step 3 (given):</strong> The two workloads should not get equal CPU: the dashboard should be favored under
+contention, but the batch job must still make progress (not starve).
+<br><strong>Step 4 (you):</strong> Name a concrete Linux mechanism (not real-time priority) that gives the dashboard a
+larger share under contention while letting the batch job run when the dashboard is idle, and say in one line why this
+is safer than <code>SCHED_FIFO</code>.</div>
+
+<div class="exercise" id="ex16.9"><span class="ex-label">16.9</span> <span class="ex-tag mixed">mixed</span>
+For each situation, name the scheduling metric that matters most (turnaround, response time, or throughput), and
+justify in a line: (a) a text editor reacting to keystrokes; (b) a nightly batch job that must finish before the
+business day; (c) a build farm maximizing jobs completed per hour across many machines.</div>
+
+<div class="exercise" id="ex16.10"><span class="ex-label">16.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 13–16, classify each claim as <em>true</em> or <em>false</em> and fix the false ones: (a) "A
+process blocked on <code>read</code> is consuming CPU while it waits." (b) "On Linux the scheduler picks among
+processes, not threads." (c) "A context switch is free, so the time-slice size does not matter." (d) "Lowering a
+process's <code>nice</code> value increases the CPU share it gets under contention."</div>
+
+<div class="exercise" id="ex16.11"><span class="ex-label">16.11</span> <span class="ex-tag stretch">stretch</span>
+Starvation is a scheduler's cardinal sin. (a) Show how strict shortest-job-first can starve a long job indefinitely
+if short jobs keep arriving. (b) Explain how a multi-level feedback queue's periodic priority <em>boost</em> prevents
+this, and what would go wrong without it. (c) Explain why a proportional-share scheduler (weight-based) does not
+starve a low-weight job even under load — contrast "smaller share" with "no share," and connect this to why
+<code>nice</code> cannot starve a task but <code>SCHED_FIFO</code> can.</div>
+
+<div class="exercise" id="ex16.12"><span class="ex-label">16.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a CPU-bound loop that runs for a fixed number of wall-clock seconds and reports the
+CPU-seconds it actually accumulated (via <code>CLOCK_THREAD_CPUTIME_ID</code>). (b) Run two copies pinned to the
+<em>same</em> core with <code>taskset -c 0</code> so they must compete, one at <code>nice 0</code> and one at
+<code>nice 19</code>, and report the CPU-seconds each got — you should see the nice-0 copy dominate by a large ratio.
+(c) Now run them on <em>different</em> cores (or without pinning on a multi-core box) and explain why the nice
+difference nearly disappears. Label your kernel version, core count, and scheduler (CFS vs EEVDF). Explain what
+<code>nice</code> did and did not change.</div>
+
+</section>
+</section>

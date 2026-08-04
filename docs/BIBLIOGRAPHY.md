@@ -25,12 +25,19 @@ NEVER make anything up. This is the single most important rule in the entire ser
 - **Bryant & O'Hallaron — *Computer Systems: A Programmer's Perspective* (CS:APP).** `[⚠ reference — not free]`
   The canonical machine/OS-from-the-programmer's-view text; the CMU 15-213 course materials are free. Cited in
   **ch13** (Ch 8, exceptional control flow / traps & system calls), **ch14** (Ch 8, processes, process creation,
-  reaping children), **ch15** (Ch 12, concurrent programming — threads, shared variables, races).
+  reaping children), **ch15** (Ch 12, concurrent programming — threads, shared variables, races), **ch16** (Ch 8,
+  context switches and the timer interrupt behind preemption), **ch17** (Ch 9, virtual memory — address spaces, page
+  tables, demand paging, memory mapping), **ch18** (Ch 8 §8.5, signals — exceptional control flow, handlers, and the
+  hazards of handler code).
 - **Arpaci-Dusseau — *Operating Systems: Three Easy Pieces* (OSTEP).** FREE full text (`pages.cs.wisc.edu/~remzi/OSTEP/`).
   Processes, scheduling, virtual memory, concurrency, persistence. Cited in **ch13** ("Mechanism: Limited Direct
   Execution" — user/kernel mode, traps, the system-call mechanism), **ch14** ("Abstraction: The Process" and
   "Interlude: Process API" — <code>fork</code>/<code>exec</code>/<code>wait</code>), **ch15** ("Concurrency: An
-  Introduction" and "Interlude: Thread API" — threads, the shared/private split, the data race).
+  Introduction" and "Interlude: Thread API" — threads, the shared/private split, the data race), **ch16**
+  ("Scheduling: Introduction" — turnaround/response metrics, FIFO/SJF/STCF/round-robin — and "Scheduling: The
+  Multi-Level Feedback Queue" — MLFQ, boosting, anti-gaming), **ch17** ("Paging: Introduction," "Beyond Physical
+  Memory: Mechanisms," and "Beyond Physical Memory: Policies" — the page, demand paging/swapping, and OPT/FIFO/LRU
+  replacement). *(Exact chapter titles verified against the OSTEP PDFs.)*
 - **Beej's Guide to C / Network Programming.** Free (`beej.us`). Practical C and sockets.
 - **The Rust Programming Language ("the book").** Free (`doc.rust-lang.org/book/`), and the Rustonomicon for unsafe.
 - **Drepper — *What Every Programmer Should Know About Memory* (2007).** Free PDF. Caches/memory (dated but seminal).
@@ -44,7 +51,24 @@ NEVER make anything up. This is the single most important rule in the entire ser
   `rdi,rsi,rdx,r10,r8,r9`, result in `rax`; `vdso(7)` — the vDSO serving `clock_gettime`/`gettimeofday` without a
   trap), **ch14** (`fork(2)`, `execve(2)`, `wait(2)` — copy-on-write, image replacement, zombies/orphans), **ch15**
   (`pthreads(7)`, `clone(2)` — the NPTL one-to-one model and the `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD` flags that
-  distinguish a thread from a `fork`). Verify per kernel/architecture.
+  distinguish a thread from a `fork`), **ch16** (`sched(7)`, `nice(2)`, `sched_setscheduler(2)` — scheduling classes
+  `SCHED_OTHER`/`SCHED_FIFO`/`SCHED_RR`, the nice range −20..+19, and real-time throttling), **ch17** (`mmap(2)`,
+  `madvise(2)`, `proc(5)` — demand-paged memory mapping and the `/proc/<pid>/status` `VmRSS` residency field), **ch18**
+  (`signal(7)`, `sigaction(2)`, `signal-safety(7)`, `signalfd(2)` — the signal list and default dispositions, the
+  `SA_RESTART`/`EINTR` behavior, the async-signal-safe function set, and file-based signal delivery). Verify per
+  kernel/architecture.
+- **The Linux kernel scheduler documentation** (`docs.kernel.org/scheduler/`, including the EEVDF scheduler page). Free.
+  The authority for Linux's proportional-share scheduler and the CFS→EEVDF change in kernel 6.6 (2023). Cited in **ch16**
+  for documented behavior; fast-moving, treat details as version-specific. *(CFS→EEVDF-in-6.6 corroborated by the kernel
+  docs and Phoronix's 6.6 merge coverage; verified.)*
+- **Belady — "A study of replacement algorithms for a virtual-storage computer," *IBM Systems Journal* 5(2):78–101
+  (1966);** and **Belady, Nelson & Shedler — "An anomaly in space-time characteristics of certain programs running in a
+  paging machine," *Communications of the ACM* 12(6):349–353 (1969)** (DOI 10.1145/363011.363155). Primary sources for
+  the optimal (MIN/OPT) replacement policy and for Belady's anomaly (FIFO can fault more with more frames). Cited in
+  **ch17**; author/venue/year verified via dblp and the ACM Digital Library.
+- **Stevens & Rago — *Advanced Programming in the UNIX Environment*, 3rd ed. (2013), Addison-Wesley.** `[⚠ reference —
+  not free]` The canonical UNIX systems-programming reference. Cited in **ch18** (Chapter 10, Signals — `sigaction`,
+  reliable signals, interrupted system calls). Author/edition/year verified.
 - **AddressSanitizer / LeakSanitizer / MemorySanitizer documentation** (Clang/GCC; `github.com/google/sanitizers`, LLVM/GCC docs). Free. The compile-time (`-fsanitize=address`) memory-error detectors; cited in ch09 for documented behavior only (use-after-free, heap-overflow, double-free, leaks — ASan does not catch uninitialized reads; that is MSan/Valgrind). Verify flags per compiler version.
 - **Valgrind (Memcheck) documentation** (`valgrind.org`). Free. The runtime memory-error/leak detector; cited in ch09 as a complementary tool to the sanitizers. Documented behavior only.
 - **Chris Lattner — "What Every C Programmer Should Know About Undefined Behavior"** (The LLVM Project Blog, May 2011, three parts; `blog.llvm.org/2011/05/what-every-c-programmer-should-know.html`). Free. The compiler-writer's account of how/why optimizers exploit UB (signed overflow, null-check elimination, strict aliasing). Cited in ch10.

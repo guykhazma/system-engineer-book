@@ -1,0 +1,128 @@
+<section class="solutions" id="sol21">
+<h1>Chapter 21 — Solutions</h1>
+
+<div class="solution" id="sol21.1"><span class="sol-label">21.1</span>
+Because a spinning thread stays <em>runnable</em>, so the scheduler keeps giving it a CPU while it does no useful work —
+it burns a core (and, if it spins holding the lock, prevents the very progress it waits for). A blocking wait takes the
+thread <em>off</em> the CPU until it is woken, freeing the core for threads with work. <em>Tempting wrong answer:</em>
+"spinning is faster because there's no context switch" — true only for waits shorter than a context switch; for any
+appreciable wait, spinning wastes a whole core. <strong>Feed-forward:</strong> §21.1.</div>
+
+<div class="solution" id="sol21.2"><span class="sol-label">21.2</span>
+<code>wait</code>, <code>signal</code>, and <code>broadcast</code>. <code>wait</code> (called with the mutex held)
+<strong>atomically releases the mutex and sleeps</strong>; when later woken it re-acquires the mutex before returning.
+<code>signal</code> wakes one waiter; <code>broadcast</code> wakes all. <em>Tempting wrong answer:</em> "<code>wait</code>
+keeps the mutex so no one else can interfere" — it must release it, or the signalling thread could never acquire the lock
+to change the state. <strong>Feed-forward:</strong> §21.2.</div>
+
+<div class="solution" id="sol21.3"><span class="sol-label">21.3</span>
+At most <strong>N</strong> threads can be inside the guarded section at once: the semaphore starts with N permits, each
+<code>wait</code> takes one (blocking at zero), each <code>post</code> returns one. <em>Tempting wrong answer:</em> "it
+lets exactly N threads run and blocks the rest forever" — blocked threads proceed as permits are posted back; N is a
+concurrency cap, not a hard total. <strong>Feed-forward:</strong> §21.3.</div>
+
+<div class="solution" id="sol21.4"><span class="sol-label">21.4</span>
+Two reasons. (1) <strong>Spurious wakeups</strong>: POSIX permits <code>cond_wait</code> to return with no signal, so the
+predicate may not hold on waking. (2) <strong>Stolen condition</strong>: even after a real signal, between the signal and
+this thread re-acquiring the mutex, another thread can run and consume the item, so the predicate is false again.
+Two-consumer example: buffer has one item; producer signals; consumer C1 and C2 both were waiting; C1 wakes, re-acquires,
+pops the item; C2 wakes next, re-acquires — with <code>if</code> it does not re-check and pops from the now-empty buffer,
+reading garbage or crashing. With <code>while</code>, C2 re-tests <code>count == 0</code> and waits again.
+<em>Tempting wrong answer:</em> "one signal per item means one wakeup per item, so <code>if</code> is fine" — spurious
+wakeups and stolen conditions both break that count. <strong>Feed-forward:</strong> §21.2, §21.4.</div>
+
+<div class="solution" id="sol21.5"><span class="sol-label">21.5</span>
+(a) A condition variable's <code>signal</code> with no waiter is lost — it wakes no one and leaves no trace. So if a
+producer signals in the window after a consumer checked the predicate but before it called <code>cond_wait</code>, the
+consumer misses the signal and sleeps forever though the item is present. (b) Discipline: update the shared state
+<em>under the mutex</em> and then signal (still holding, or immediately after, the lock), and have the waiter loop
+<code>while (!predicate) cond_wait(...)</code>; holding the lock means the waiter cannot be mid-check-and-not-yet-asleep
+when you signal, and the loop re-checks the state on waking. (c) A semaphore's count <em>remembers</em> the post: a
+<code>sem_post</code> with no waiter increments the count, so a later <code>sem_wait</code> succeeds immediately — the
+"signal before wait" ordering is harmless. <em>Tempting wrong answer:</em> "signal before locking to be fast" — that is
+exactly the lost-wakeup race. <strong>Feed-forward:</strong> §21.3, §21.4.</div>
+
+<div class="solution" id="sol21.6"><span class="sol-label">21.6</span>
+<pre><code>producer(x):                          consumer():
+  lock(m)                               lock(m)
+  while (count == CAP)                  while (count == 0)
+    wait(not_full, m)                     wait(not_empty, m)
+  buf[in]=x; in=(in+1)%CAP; count++     x=buf[out]; out=(out+1)%CAP; count--
+  signal(not_empty)                     signal(not_full)
+  unlock(m)                             unlock(m)</code></pre>
+It cannot overflow because the producer waits on <code>not_full</code> while <code>count == CAP</code>, so it never
+enqueues into a full buffer; it cannot underflow because the consumer waits on <code>not_empty</code> while
+<code>count == 0</code>. The loops are necessary because a wakeup may be spurious or the slot/item may have been taken by
+another producer/consumer before this thread re-acquires the mutex, so the predicate must be re-checked.
+<em>Method-selection cue:</em> "wait until a condition over shared state, then act" is precisely mutex + condition
+variable in a loop. <strong>Feed-forward:</strong> §21.2.</div>
+
+<div class="solution" id="sol21.7"><span class="sol-label">21.7</span>
+(a) The spinner stays runnable, so the scheduler keeps it on a CPU for the whole ~0.5 s (≈100% of a core = ~0.5 s CPU),
+while the blocker is off the CPU (blocked state) the entire time, waking only at the end (~0.001 s CPU). (b) A short spin
+beats blocking when the expected wait is <em>shorter than the cost of a context switch pair</em> (sleep + wake); the
+crossover quantity is that context-switch cost — below it, spinning avoids two scheduler round-trips. (c)
+<code>cond_wait</code> costs a context switch to sleep and another to wake (plus scheduler bookkeeping); it is still right
+for a long wait because it frees the core for real work, and the two switches are negligible against a long wait.
+<em>Tempting wrong answer:</em> "blocking is always cheaper" — for sub-microsecond waits the two context switches can cost
+more than a brief spin. <strong>Feed-forward:</strong> §21.1, and Ch 16.</div>
+
+<div class="solution" id="sol21.8"><span class="sol-label">21.8</span>
+<strong>Step 4:</strong> Bug 1 is <code>if</code>-not-<code>while</code>: a worker checks the queue once, waits, and on a
+spurious wakeup (or after another worker took the task) pops from an empty queue and crashes. Bug 2 is a <strong>lost
+wakeup</strong>: the producer signals without holding the lock and enqueuing under it, so a worker between its check and
+its <code>cond_wait</code> misses the signal, and since the condition variable does not remember it, the task sits with no
+one woken. Both are intermittent and load-dependent because each needs a specific interleaving that is rare under light
+load and common under heavy concurrency. Corrected:
+<pre><code>worker:                     producer(task):
+  lock(m)                     lock(m)
+  while (queue.empty())       queue.push(task)
+    cond_wait(cv, m)          cond_signal(cv)      // under the lock, after enqueue
+  t = queue.pop()             unlock(m)
+  unlock(m); run(t)</code></pre>
+The <code>while</code> fixes bug 1 (re-check on wake); enqueue-under-lock-then-signal fixes bug 2 (no window to miss the
+signal). <em>Tempting wrong answer:</em> "signal before locking so the worker wakes sooner" — that reintroduces the lost
+wakeup. <strong>Feed-forward:</strong> §21.2, §21.4.</div>
+
+<div class="solution" id="sol21.9"><span class="sol-label">21.9</span>
+(a) <strong>Plain mutex</strong> — a single shared counter needs exclusion, not waiting. (b) <strong>Counting
+semaphore</strong> initialized to 5 — "at most 5 at once" is exactly a permit pool. (c) <strong>Condition variable +
+mutex</strong> — "block until a predicate over shared state (an item exists) becomes true" is the condition-variable
+pattern. (d) <strong>Condition variable + mutex, using <code>broadcast</code></strong> — a one-shot event to <em>many</em>
+waiters wants a broadcast (or a latch); a single <code>signal</code> would wake only one. <em>Method-selection cue:</em>
+just exclude &#8594; mutex; cap concurrency at N &#8594; counting semaphore; wait for a state predicate &#8594; condition
+variable (broadcast to wake all). <strong>Feed-forward:</strong> §21.2, §21.3.</div>
+
+<div class="solution" id="sol21.10"><span class="sol-label">21.10</span>
+(a) <strong>False</strong> — a <code>cond_signal</code> with no waiter is lost, not remembered (that is a semaphore's
+property). (b) <strong>False</strong> — <code>cond_wait</code> releases the mutex while it sleeps and re-acquires it on
+waking. (c) <strong>True</strong> — a binary semaphore (0/1) behaves much like a mutex (with caveats about ownership).
+(d) <strong>False</strong> — even without spurious wakeups, a stolen condition (another thread consumes it first) still
+requires the <code>while</code>; keep the loop. (e) <strong>True</strong> — a mutex, like a signal-handler flag, is a
+mechanism for coordinating two flows of control over shared memory (Chapter 18's single-threaded concurrency generalizes).
+<em>Tempting wrong answer:</em> calling (d) true because "spurious wakeups are the only reason for the loop" — the stolen
+condition is a second, independent reason. <strong>Feed-forward:</strong> §21.2, §21.3, and Ch 18.</div>
+
+<div class="solution" id="sol21.11"><span class="sol-label">21.11</span>
+(a) A monitor enforces that all access to the shared state goes through procedures that automatically hold the monitor's
+mutex and coordinate via its condition variables, so the "lock before touching state," "signal under the lock," and
+"wait in a loop" rules are built into the structure rather than re-implemented (and forgotten) at each call site. (b) Java
+<code>synchronized</code>/<code>wait</code>/<code>notify</code> hides the mutex and condition variable behind object
+methods; a thread-safe blocking queue hides the mutex, the two condition variables, and the predicate discipline behind
+<code>put</code>/<code>take</code>. (c) Because the primitives are where the subtle, load-dependent bugs live
+(<code>if</code>-not-<code>while</code>, lost wakeups, lock ordering), using a vetted higher-level abstraction removes
+whole bug classes; you would still drop to raw condition variables for a custom waiting policy the high-level type does not
+express (e.g. priority-ordered wakeups, or waiting on a compound predicate over several structures). <em>Tempting wrong answer:</em> "always hand-roll for performance" — the abstraction's overhead is usually negligible against the cost of a
+concurrency bug in production. <strong>Feed-forward:</strong> §21.4.</div>
+
+<div class="solution" id="sol21.12"><span class="sol-label">21.12</span>
+Machine-specific by design. A correct write-up reports: (a) the busy-poll waiter consumes ~100% of a core for the wait
+(on the book's machine ~0.499 s CPU for a ~0.5 s wait) while the condition-variable waiter consumes almost none (~0.001 s),
+because it is blocked, not runnable. (b) The bounded buffer's produced and consumed totals match (e.g. both 210 for items
+1..20) and the buffer never exceeds its capacity, confirming correct coordination via the <code>while</code>-loops. (c)
+With a semaphore initialized to three, at most three of the ten threads are ever in the guarded section simultaneously.
+Label compiler/kernel; the CPU figures are illustrative. <em>Tempting wrong answer:</em> "the spinner is fine, it got the
+same result" — it wasted a core to do so; correctness plus efficiency both matter. <strong>Feed-forward:</strong> §21.1,
+§21.2, §21.3.</div>
+
+</section>

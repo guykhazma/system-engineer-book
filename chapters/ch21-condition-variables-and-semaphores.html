@@ -1,0 +1,384 @@
+<section class="chapter" id="ch21">
+<h1>Chapter 21 — Coordinating Threads: Condition Variables and Semaphores</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch20">Chapter 20</a> (a mutex gives mutual exclusion
+over a critical section, but no way to <em>wait</em> for a condition), <a href="#ch16">Chapter 16</a> (a blocked thread is
+off the CPU; a runnable one competes for it — the difference between sleeping and spinning), <a href="#ch15">Chapter
+15</a> (threads share memory, so one can produce what another consumes). &nbsp;·&nbsp; Locks kept threads <em>out</em> of
+each other's way; this chapter is how one thread <em>waits</em> for another to make something true — coordination on top
+of exclusion.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch20">Chapter 20</a> — what does a mutex guarantee, and name one of the four
+conditions required for deadlock. (2) <a href="#ch16">Chapter 16</a> — a thread <em>spinning</em> in a loop checking a
+flag versus a thread <em>blocked</em> waiting: which one competes for the CPU, and what does that cost? (3)
+<em>Predict:</em> a consumer waits ~0.5 seconds for a producer, first by spinning in a loop that re-checks a flag under a
+lock, then by blocking on a proper wait primitive. How much CPU time do you think each consumes during that half-second?
+Write both guesses; we measure them in §21.1.</p>
+</aside>
+
+<p>A mutex answers "may I touch the shared state?" It does not answer "is the shared state <em>ready</em> yet?" Consider a
+bounded buffer between a producer and a consumer: the consumer must not dequeue from an empty buffer, and the producer
+must not enqueue into a full one. A lock protects the buffer's fields, but it cannot make a consumer <em>wait</em> for an
+item to appear — and the naive fix, spinning in a loop re-checking under the lock, is a disaster: it burns a whole CPU
+doing nothing and, worse, holds the lock the producer needs, so the very condition it waits for can never come true. What
+a waiting thread needs is to <strong>release the lock and sleep until signalled</strong>, then wake and re-check. This
+chapter builds that: why busy-waiting is wrong (§21.1); the <strong>condition variable</strong> — wait, signal,
+broadcast — and the non-negotiable rule that the wait sits in a <code>while</code> loop, not an <code>if</code> (§21.2);
+the <strong>semaphore</strong>, Dijkstra's counting primitive that <em>remembers</em> signals (§21.3); and the classic
+ways to get coordination wrong, plus the monitor discipline that packages it (§21.4). We close by carrying the blocking
+toolkit toward atomics and the memory model (§21.5). Exclusion was half of shared-memory correctness; waiting is the
+other half.</p>
+
+<h2>21.1 Waiting without wasting: why busy-waiting is wrong</h2>
+
+<p>The obvious way to wait for a condition is to loop until it holds — a <strong>busy-wait</strong>, or spin. It is
+almost always wrong for a thread that may wait more than a few instructions, for two reasons. First, a spinning thread is
+<em>runnable</em>, so the scheduler keeps giving it the CPU (Chapter 16) while it does no useful work — it burns a core.
+Second, and more insidious in the bounded-buffer case, if the spin holds the lock while re-checking, it locks out the very
+thread that would make the condition true, so the wait can never end: a self-inflicted deadlock. Here is the CPU cost
+measured — a thread waits ~0.5 s for a signal, first by busy-polling a flag under a lock, then by blocking on a condition
+variable (gcc 11.4.0, Linux 6.18; CPU time via <code>getrusage</code>):</p>
+
+<pre><code>busy-poll (spins):  waited ~0.5s wall, consumed 0.499 s CPU
+condvar (blocks):   waited ~0.5s wall, consumed 0.001 s CPU</code></pre>
+
+<p>The spinning waiter burned essentially a full core-second of CPU for half a second of wall-clock waiting — 100% of a
+core doing nothing — while the blocking waiter consumed a thousandth of that, because it was <em>off the CPU</em>, asleep,
+until woken. That five-hundred-fold difference answers the opener and states the whole motivation: a thread that must wait
+should <strong>sleep</strong>, not spin, so the CPU goes to threads with work to do. (Spinning is not always wrong — for a
+wait known to be shorter than a context switch, a brief spin, or a spinlock, can beat sleeping; the point is that
+unbounded or long waits must block.) The primitive that lets a thread sleep until a condition changes, without holding the
+lock while it sleeps, is the condition variable.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Give the two reasons busy-waiting is wrong for a thread that may wait a while, and say which one turns a spin-under-lock
+into a deadlock. Roughly how much CPU did the spinning waiter burn versus the blocking one? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>21.2 Condition variables: wait, signal, and the <code>while</code> rule</h2>
+
+<p>A <strong>condition variable</strong> is a queue of threads waiting for some predicate over shared state to become
+true. It is always paired with a mutex (the one guarding that state) and has three operations. <code>wait(cv, m)</code>
+must be called with the mutex held; it <em>atomically</em> releases the mutex and puts the thread to sleep on the
+condition variable, and when the thread is later woken it <em>re-acquires the mutex</em> before returning — so the thread
+sleeps without holding the lock but wakes holding it again. <code>signal(cv)</code> wakes one waiting thread;
+<code>broadcast(cv)</code> wakes all of them. The atomic "release-and-sleep" is the crucial part: it closes the window in
+which a thread could check the predicate, decide to wait, and miss a signal that arrives before it actually sleeps.</p>
+
+<p>The rule that trips up everyone learning this is: <strong>always wait in a <code>while</code> loop that re-checks the
+predicate, never a bare <code>if</code></strong>. Here is the producer–consumer bounded buffer done correctly (gcc 11.4.0,
+Linux 6.18) — note the <code>while</code>:</p>
+
+<pre><code>/* consumer */
+pthread_mutex_lock(&amp;m);
+while (count == 0)                 /* while, NOT if */
+    pthread_cond_wait(&amp;not_empty, &amp;m);
+item = buf[out]; out = (out+1) % CAP; count--;
+pthread_cond_signal(&amp;not_full);
+pthread_mutex_unlock(&amp;m);
+
+produced sum=210 consumed sum=210 (1..20 sum=210); buffer never exceeded CAP=4</code></pre>
+
+<p>Producer and consumer agreed exactly (both sums 210, the sum of 1..20) and the buffer never exceeded its capacity of
+four — the coordination is correct. The <code>while</code> is mandatory for two independent reasons. (1)
+<strong>Spurious wakeups</strong>: POSIX explicitly permits <code>cond_wait</code> to return without any signal, so on
+waking you must re-verify the predicate actually holds. (2) <strong>Stolen conditions</strong>: even with a real signal,
+between the signal and this thread re-acquiring the mutex, <em>another</em> thread may have run and consumed the item, so
+the predicate you were signalled about may already be false again. In both cases the <code>while</code> simply re-checks
+and, if the predicate is still false, waits again — turning "I was woken" into "I woke <em>and</em> confirmed the
+condition," which is what correctness requires. An <code>if</code> assumes the wakeup means the predicate holds; under
+either hazard, that assumption is a bug.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: wait releases the lock, sleeps, re-checks in a loop</span>
+<p><strong>1. In words.</strong> <code>cond_wait</code> atomically releases the mutex and sleeps; a <code>signal</code>
+wakes a waiter, which re-acquires the mutex and — because the wakeup may be spurious or the condition already re-consumed
+— re-tests the predicate in a <code>while</code> loop, waiting again if it is still false.</p>
+<p><strong>2. As a picture.</strong> Figure 21.1: the consumer holds the mutex, finds <code>count == 0</code>, calls
+<code>wait</code> (drops the lock, sleeps); the producer locks, enqueues, <code>signal</code>s; the consumer wakes,
+re-acquires the lock, re-checks <code>count</code>, and proceeds.</p>
+<p><strong>3. As numbers.</strong> The bounded buffer with <code>while</code>-loops: produced and consumed sums both 210
+over items 1..20, buffer never above CAP = 4. Blocking on the condition variable cost 0.001 s CPU versus the spinner's
+0.499 s.</p>
+</aside>
+
+<p><em>(Answer to the §21.1 quick check: busy-waiting is wrong because a spinning thread stays runnable and burns a CPU
+doing no work, and — the deadlock case — if it spins while holding the lock, it locks out the thread that would make the
+condition true, so the wait never ends. The spinning waiter burned ~0.499 s of CPU for a ~0.5 s wait, roughly 500&#215;
+the ~0.001 s the blocking waiter used.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">cond_wait releases the lock and sleeps; signal wakes it; it re-acquires and re-checks.</text>
+<line x1="70" y1="34" x2="70" y2="184" stroke="#14406b"/><text x="24" y="38" font-size="9" fill="#14406b">consumer</text>
+<line x1="380" y1="34" x2="380" y2="184" stroke="#14406b"/><text x="336" y="38" font-size="9" fill="#14406b">producer</text>
+<rect x="55" y="48" width="30" height="28" fill="#f5f8fb" stroke="#14406b"/><text x="92" y="66" font-size="9">lock; count==0 &#8594; wait()</text>
+<rect x="55" y="82" width="30" height="40" fill="#fdeee6" stroke="#8c3a1d"/><text x="92" y="106" font-size="9" fill="#8c3a1d">asleep (lock released)</text>
+<rect x="365" y="70" width="30" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="270" y="90" font-size="9" fill="#2e6b34">lock; enqueue; signal()</text>
+<line x1="365" y1="95" x2="85" y2="118" stroke="#2e6b34" stroke-dasharray="3,2"/>
+<rect x="55" y="128" width="30" height="46" fill="#cfe8cf" stroke="#2e6b34"/><text x="92" y="146" font-size="9">wake &#8594; re-acquire lock</text><text x="92" y="162" font-size="9">while re-checks count &gt; 0 &#8594; dequeue</text>
+<text x="20" y="200" font-size="9" fill="#8c3a1d">The while loop guards against spurious wakeups and a condition another thread already consumed.</text>
+</svg>
+<figcaption>Figure 21.1: A condition variable. The consumer, holding the mutex, finds the buffer empty and
+<code>wait</code>s — atomically releasing the lock and sleeping. The producer enqueues and <code>signal</code>s; the
+consumer wakes, re-acquires the mutex, and re-checks the predicate in its <code>while</code> loop before proceeding.</figcaption>
+</figure>
+
+<h2>21.3 Semaphores: counting permits that remember</h2>
+
+<p>A <strong>semaphore</strong> (Dijkstra, 1965) is an integer with two atomic operations and a waiting queue:
+<strong>wait</strong> (historically <em>P</em>; POSIX <code>sem_wait</code>) decrements the count, blocking if it is
+already zero, and <strong>post</strong> (historically <em>V</em>; POSIX <code>sem_post</code>) increments the count,
+waking a waiter if any. A <em>binary</em> semaphore (count 0 or 1) behaves much like a mutex; a <em>counting</em>
+semaphore initialized to N models a pool of N interchangeable permits. Ten threads competing for a semaphore initialized
+to three never exceed three inside the guarded section (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>sem_init(&amp;slots, 0, 3);   /* three permits */
+/* each worker: sem_wait(&amp;slots) ... work ... sem_post(&amp;slots) */
+
+10 threads, semaphore initialized to 3: max concurrently in section = 3</code></pre>
+
+<p>The semaphore capped concurrency at exactly its initial count — the natural tool for "at most N at once" (a connection
+pool, a bounded worker set, N copies of a resource). The producer–consumer buffer has an elegant semaphore form too: a
+semaphore <code>empty</code> initialized to the buffer size counts free slots (the producer <code>wait</code>s it before
+enqueuing), and a semaphore <code>full</code> initialized to zero counts filled slots (the consumer <code>wait</code>s it
+before dequeuing), with a mutex protecting the buffer indices. The crucial property that distinguishes a semaphore from a
+condition variable is <strong>memory</strong>: a semaphore's count <em>remembers</em> posts. A <code>sem_post</code> with
+no waiter increments the count, so a later <code>sem_wait</code> succeeds immediately — the signal is not lost. A
+<code>cond_signal</code> with no waiter, by contrast, <em>vanishes</em>: it wakes no one and leaves no trace. That single
+difference is why a condition variable must always be paired with a shared-state predicate checked under the mutex (the
+state is the memory; the condition variable is only the wakeup), whereas a semaphore <em>is</em> its own state.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What do a semaphore's two operations do, and what does a counting semaphore initialized to N give you? State the one
+key difference between a semaphore and a condition variable regarding a signal sent with no one waiting. (Answer below the
+communicate box.)</p>
+</aside>
+
+<h2>21.4 Getting it wrong: lost wakeups, <code>if</code>-not-<code>while</code>, and the monitor</h2>
+
+<p>The coordination primitives are small, and the bugs cluster around a few classic mistakes — all versions of confusing
+"I was woken" with "the condition holds," or of signalling without the shared state to back it. The most common is using
+<code>if</code> where the rule demands <code>while</code>: a single check on waking, which a spurious wakeup or a
+condition consumed by another thread turns into acting on a false predicate — dequeuing from a now-empty buffer,
+proceeding on data that is not there. Its cousin is the <strong>lost wakeup</strong>: signalling a condition variable
+<em>without</em> updating (and holding the lock over) the shared state, so a waiter that has not yet slept misses the
+signal and a waiter that has slept is never woken. Because a condition variable does not remember signals (§21.3), the
+discipline is ironclad: change the shared state under the mutex, <em>then</em> signal; and always wait in a loop on a
+predicate over that state. A semaphore, which remembers, forgives the timing — but a semaphore misused as a mutex you
+forget to post, or posted the wrong number of times, deadlocks or over-admits just as badly.</p>
+
+<p>These patterns recur so reliably that they have a structuring discipline: the <strong>monitor</strong> (Hoare, 1974;
+Brinch Hansen). A monitor bundles shared state with the mutex that protects it and the condition variables threads wait on,
+so that all access goes through procedures that hold the lock and coordinate through the conditions — the programmer stops
+hand-wiring locks and signals and instead works with an object whose methods are automatically mutually exclusive. This is
+exactly what a Java object's <code>synchronized</code> methods with <code>wait</code>/<code>notify</code> package, and what
+higher-level constructs like a thread-safe blocking queue or a Go channel give you: the mutex, the condition variables, and
+the predicate discipline, wrapped so you cannot forget the <code>while</code> loop or the "signal under the lock" rule. The
+lesson to carry: prefer the highest-level correct abstraction available — a concurrent queue over hand-rolled condition
+variables, a monitor over raw locks and signals — and drop to the primitives only when you must, because the primitives are
+where the subtle bugs live.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: <code>if</code> instead of <code>while</code> around <code>cond_wait</code> (and signalling
+without the state)</span>
+<p>Two coupled mistakes cause most condition-variable bugs. The first is guarding <code>cond_wait</code> with an
+<code>if</code> instead of a <code>while</code>: you check the predicate once, wait, and on waking assume it holds — but
+POSIX permits <strong>spurious wakeups</strong> (waking with no signal), and even a real signal can be "stolen" by another
+thread that re-acquires the lock first and consumes the condition, so on waking the predicate may be false. Acting on it —
+dequeuing from an empty buffer, using data that is not there — corrupts state or crashes, and it is rare and
+load-dependent, so it survives testing. The second is the <strong>lost wakeup</strong>: because a condition variable does
+<em>not</em> remember a signal sent with no waiter (unlike a semaphore's count), if you signal without holding the lock and
+updating the shared state, a thread that is about-to-wait can miss the signal and sleep forever. The discipline that kills
+both: (1) always <code>while (!predicate) cond_wait(...)</code>, never <code>if</code>; (2) always update the shared state
+under the mutex and then signal. If you find yourself reasoning "the wakeup means the item is there," you have the
+<code>if</code>-not-<code>while</code> bug.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "My worker waits for jobs like this: <code>if (queue_empty)
+pthread_cond_wait(&amp;cv, &amp;m);</code> then it pops a job. And to avoid missing wakeups I call
+<code>pthread_cond_signal</code> right before I take the lock to enqueue. Simple and fast — what could go wrong?" Cover
+the paragraph and respond in four or five sentences, drawing on §21.2 and §21.4.</p>
+<p><em>Model answer.</em> "Two bugs, both timing-dependent, so they'll pass your tests and fail in production. First, the
+<code>if</code> must be a <code>while</code>: <code>cond_wait</code> can return spuriously, and even on a real signal
+another worker may have popped the job before you re-acquire the lock, so on waking you must re-check
+<code>queue_empty</code> — with <code>if</code>, you'll pop from an empty queue. Second, signalling <em>before</em> taking
+the lock and enqueuing is a lost-wakeup race: a condition variable doesn't remember a signal sent with no waiter, so if
+the worker is between its check and its <code>cond_wait</code> when you signal, it misses it and may sleep forever with a
+job sitting in the queue. The fix is the standard discipline — enqueue under the mutex, <em>then</em> signal while still
+holding it (or right after), and have the worker loop <code>while (queue_empty) cond_wait(...)</code>. Honestly, I'd wrap
+this in a thread-safe blocking queue so nobody has to remember these rules per call site." Naming both the
+<code>if</code>-not-<code>while</code> and the lost-wakeup, and reaching for a higher-level abstraction, is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the §21.3 quick check: <code>wait</code>/P decrements the count, blocking if it is zero;
+<code>post</code>/V increments it, waking a waiter if any. A counting semaphore initialized to N admits at most N threads
+at once — a pool of N permits. The key difference from a condition variable: a semaphore <strong>remembers</strong> a post
+made with no waiter (the count rises, so a later wait succeeds), whereas a condition-variable signal with no waiter is
+lost.)</em></p>
+
+<h2>21.5 What to carry forward</h2>
+
+<p>Locks (Chapter 20) exclude; this chapter's primitives <strong>coordinate</strong>. A thread that must wait for a
+condition should <strong>sleep, not spin</strong> — we measured a busy-poll burning 0.499 s of CPU against a blocking
+waiter's 0.001 s for the same half-second wait. A <strong>condition variable</strong> lets a thread atomically release its
+mutex and sleep until <code>signal</code>/<code>broadcast</code> wakes it, whereupon it re-acquires the mutex; the wait
+<em>must</em> sit in a <code>while</code> loop re-checking the predicate, because wakeups can be spurious and the condition
+can be consumed by another thread first — our bounded buffer with <code>while</code>-loops kept producer and consumer in
+exact agreement (sums 210) and the buffer within capacity. A <strong>semaphore</strong> is a counting primitive whose
+<code>wait</code>/<code>post</code> (P/V) admit at most its initial count of threads — three permits capped ten threads at
+three — and, unlike a condition variable, it <em>remembers</em> posts sent with no waiter, which is why a condition
+variable must always pair with a predicate over shared state while a semaphore is its own state. The bugs cluster on
+<code>if</code>-not-<code>while</code> and lost wakeups; the <strong>monitor</strong> (and its descendants — Java
+<code>synchronized</code>/<code>wait</code>/<code>notify</code>, blocking queues, channels) packages the discipline so you
+need not rebuild it per call site.</p>
+
+<p>With locks, condition variables, and semaphores, you have the classical <em>blocking</em> synchronization toolkit —
+enough to write correct shared-memory concurrency. But it rests on assumptions this part must now examine directly. Every
+primitive here blocks a thread (a scheduler cost), and every one relies on the guarantee that memory operations become
+visible in a sensible order across cores — a guarantee that real multicore hardware does <em>not</em> provide for plain
+loads and stores, and that these primitives quietly supply through the same atomics that a lock is built on. The rest of
+this part opens that box: the hardware <strong>atomics</strong> (compare-and-swap and friends) that let you build
+synchronization — and lock-free data structures that avoid blocking entirely — and the <strong>memory model</strong> that
+states precisely what a concurrent program means, why a data race is undefined behavior, and what ordering you are and are
+not entitled to assume. The primitives you now know are the correct, comprehensible baseline; the chapters ahead show what
+they cost, how they work underneath, and when you can do without them.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Give the two reasons busy-waiting is wrong, and the CPU numbers that show a blocking wait beating a spin.</li>
+<li>Explain what <code>cond_wait</code> does atomically, and why that atomicity closes a missed-signal window.</li>
+<li>State the <code>while</code>-not-<code>if</code> rule and give both reasons it is mandatory (spurious wakeups; stolen
+condition).</li>
+<li>Describe a semaphore's <code>wait</code>/<code>post</code>, what a counting semaphore of N gives you, and that it
+remembers posts.</li>
+<li>State the one difference between a semaphore and a condition variable regarding a signal with no waiter.</li>
+<li>Explain the lost-wakeup bug and the two-part discipline (update-under-lock-then-signal; wait in a loop) that prevents
+it.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why is busy-waiting wrong, and which failure makes a spin-under-lock a deadlock? (§21.1)</li>
+<li><strong>R2.</strong> What does <code>cond_wait</code> do, and why must the wait be in a <code>while</code> loop?
+(§21.2)</li>
+<li><strong>R3.</strong> What do a semaphore's two operations do, and what does an initial count of N mean? (§21.3)</li>
+<li><strong>R4.</strong> How does a semaphore differ from a condition variable when a signal is sent with no waiter?
+(§21.3)</li>
+<li><strong>R5.</strong> What is a lost wakeup, and what discipline prevents it? (§21.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP), "Condition Variables," "Semaphores,"
+and "Common Concurrency Problems."</strong> Free (<code>pages.cs.wisc.edu/~remzi/OSTEP/</code>). The
+<code>while</code>-loop rule, the producer–consumer and reader–writer problems, semaphores, and the taxonomy of
+concurrency bugs — the reference for §21.1–§21.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 12
+(Concurrent Programming), §12.5 (synchronizing threads with semaphores).</strong> Semaphores, mutual exclusion, and
+producer–consumer from the programmer's view. <code>[⚠ reference — not free]</code>; CMU 15-213 materials free.</li>
+<li><strong>Dijkstra, "Cooperating Sequential Processes" (EWD123, 1965; published 1968).</strong> The origin of the
+semaphore and its P/V operations. Free via the E. W. Dijkstra Archive (<code>cs.utexas.edu/~EWD/</code>).</li>
+<li><strong>Hoare, "Monitors: An Operating System Structuring Concept," <em>Communications of the ACM</em> 17(10):549–557
+(1974), DOI 10.1145/355620.361161.</strong> The primary source for monitors, with the bounded buffer and reader–writer
+examples. Author/venue/year verified via the ACM Digital Library.</li>
+<li><strong>The Linux <code>pthread_cond_wait(3)</code> and <code>sem_overview(7)</code> manual pages.</strong> Primary
+sources for POSIX condition-variable semantics (including permitted spurious wakeups) and POSIX semaphores. Verify per
+system.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex21.1"><span class="ex-label">21.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, why should a thread that may wait a while <em>sleep</em> rather than <em>spin</em>?</div>
+
+<div class="exercise" id="ex21.2"><span class="ex-label">21.2</span> <span class="ex-tag warm">warm-up</span>
+What three operations does a condition variable have, and what does <code>wait</code> do to the mutex when it is
+called?</div>
+
+<div class="exercise" id="ex21.3"><span class="ex-label">21.3</span> <span class="ex-tag warm">warm-up</span>
+What does a counting semaphore initialized to N guarantee about how many threads can be inside the section it guards?</div>
+
+<div class="exercise" id="ex21.4"><span class="ex-label">21.4</span> <span class="ex-tag core">core</span>
+Explain why <code>cond_wait</code> must be called inside a <code>while</code> loop that re-checks the predicate, not an
+<code>if</code>. Give the two independent reasons (spurious wakeups and a condition consumed by another thread) and show,
+with a two-consumer example, how an <code>if</code> leads to acting on a false predicate.</div>
+
+<div class="exercise" id="ex21.5"><span class="ex-label">21.5</span> <span class="ex-tag core">core</span>
+A condition variable does not remember a signal sent with no waiter, but a semaphore's count does. (a) Explain the
+lost-wakeup bug this creates for condition variables. (b) State the discipline (update shared state under the lock, then
+signal; wait in a loop) that prevents it. (c) Why does a semaphore not need this discipline for the "signal arrives before
+the waiter sleeps" case?</div>
+
+<div class="exercise" id="ex21.6"><span class="ex-label">21.6</span> <span class="ex-tag core">core</span>
+Implement (in pseudocode) a bounded buffer with a mutex and two condition variables (<code>not_full</code>,
+<code>not_empty</code>). Show the producer and consumer, mark where each waits and signals, and explain why the buffer can
+never overflow or underflow and why the loops are necessary.</div>
+
+<div class="exercise" id="ex21.7"><span class="ex-label">21.7</span> <span class="ex-tag complexity">cost</span>
+(a) A busy-poll waiter burned ~0.499 s of CPU for a ~0.5 s wait while a blocking waiter used ~0.001 s — explain the ~500&#215;
+gap in terms of runnable-vs-blocked (Chapter 16). (b) When is a short spin actually <em>cheaper</em> than blocking, and
+what is the crossover quantity? (c) What does <code>cond_wait</code> cost that a spin does not (name the two scheduler
+events on the sleep/wake path), and why is it still the right default for a long wait?</div>
+
+<div class="exercise" id="ex21.8"><span class="ex-label">21.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A thread pool's workers wait for tasks. Each worker does
+<code>if (queue.empty()) cond_wait(&amp;cv, &amp;m);</code> then pops. Occasionally, under load, a worker pops from an
+empty queue and crashes; occasionally a submitted task is never picked up though workers are idle.
+<br><strong>Step 1 (given):</strong> The <code>if</code> checks the predicate only once; on waking (spuriously, or after
+another worker took the task) the queue may be empty.
+<br><strong>Step 2 (given):</strong> If the producer signals without holding the lock and updating the queue, a
+not-yet-sleeping worker can miss the signal.
+<br><strong>Step 3 (given):</strong> A condition variable does not remember a signal with no waiter, so the missed signal
+is gone and the task waits with no one woken.
+<br><strong>Step 4 (you):</strong> Name both bugs precisely, explain why each is intermittent and load-dependent, and give
+the corrected worker and producer (the <code>while</code> loop and the enqueue-under-lock-then-signal order), stating which
+bug each change fixes.</div>
+
+<div class="exercise" id="ex21.9"><span class="ex-label">21.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, choose the best primitive (a plain mutex, a condition variable + mutex, or a counting semaphore) and
+justify in a line: (a) protect a single shared counter; (b) let at most 5 requests use a resource pool at once; (c) have a
+consumer block until a producer makes an item available; (d) signal "shutdown requested" to many waiting threads at
+once.</div>
+
+<div class="exercise" id="ex21.10"><span class="ex-label">21.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 18–21, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "A
+<code>cond_signal</code> with no thread waiting is remembered and delivered to the next waiter." (b) "<code>cond_wait</code>
+keeps holding the mutex while it sleeps." (c) "A binary semaphore behaves much like a mutex." (d) "You can safely replace
+the <code>while</code> around <code>cond_wait</code> with an <code>if</code> if your platform has no spurious wakeups." (e)
+"A blocking mutex, like a signal handler flag, is a way to coordinate two flows of control over shared memory."</div>
+
+<div class="exercise" id="ex21.11"><span class="ex-label">21.11</span> <span class="ex-tag stretch">stretch</span>
+A monitor bundles shared state, its mutex, and its condition variables. (a) Explain what discipline a monitor enforces
+that raw locks-and-signals leave to the programmer, and how that eliminates the <code>if</code>-not-<code>while</code> and
+lost-wakeup traps at the call site. (b) A Java object's <code>synchronized</code> methods with <code>wait</code>/
+<code>notify</code>, and a thread-safe blocking queue, are both monitors — explain what each hides. (c) Argue for
+"prefer the highest-level correct abstraction" using the fact that the primitives are where the subtle bugs live, and give
+one case where you would still drop to raw condition variables.</div>
+
+<div class="exercise" id="ex21.12"><span class="ex-label">21.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a waiter that blocks ~0.5 s two ways — busy-polling a flag under a lock, and blocking on a
+condition variable — and measure CPU time with <code>getrusage</code>; confirm the spinner burns ~100% of a core and the
+blocker ~0. (b) Build a producer–consumer bounded buffer with a mutex and two condition variables (using <code>while</code>
+loops); confirm produced and consumed totals match and the buffer never exceeds its capacity. (c) Run ten threads against
+a semaphore initialized to three and confirm at most three are ever in the section at once. Label your compiler and kernel
+version, and note the CPU numbers are illustrative.</div>
+
+</section>
+</section>

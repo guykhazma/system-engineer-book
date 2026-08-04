@@ -1,0 +1,390 @@
+<section class="chapter" id="ch20">
+<h1>Chapter 20 — Mutual Exclusion: Locks and the Critical Section</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch15">Chapter 15</a> (two threads incrementing a
+shared counter lost more than half their updates — the data race this chapter fixes), <a href="#ch19">Chapter 19</a>
+(shared memory gave two processes raw sharing with no synchronization — the same debt), <a href="#ch16">Chapter 16</a>
+(the scheduler can preempt a thread between <em>any</em> two instructions — which is why the race window is always open).
+&nbsp;·&nbsp; Part III showed how the OS creates concurrency; Part IV is how to make it <em>correct</em>, and it starts
+with the most basic tool: excluding all but one thread from a critical section.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch15">Chapter 15</a> — decompose <code>counter++</code> into the three
+machine steps it really is, and show one interleaving of two threads that loses an update. (2) <a href="#ch19">Chapter
+19</a> — shared memory gave two processes the sharing; what one thing did it <em>not</em> give them, that this chapter
+supplies? (3) <em>Predict:</em> wrapping a one-nanosecond increment in a lock and unlock, on an uncontended lock (no
+other thread competing), how much time do you think the lock and unlock add — about the same, ~10&#215;, ~1000&#215;?
+Write your guess; we measure it in §20.3.</p>
+</aside>
+
+<p>Chapter 15 left us with a debt and Chapter 19 doubled it: whenever two flows of control — threads in a process, or
+processes over shared memory — read and write the same memory without coordination, the result is a <strong>data
+race</strong>, which loses updates nondeterministically and is undefined behavior in C and C++. The fix has a name and a
+shape. The updates were lost because <code>counter++</code> is really <em>load, add, store</em>, and two threads
+interleaved those steps; the cure is to ensure that once a thread begins that sequence, no other thread may begin it
+until the first finishes — to make the sequence a <strong>critical section</strong> that runs with <strong>mutual
+exclusion</strong>. This chapter builds that guarantee: what a critical section is and why it needs mutual exclusion
+(§20.1), the <strong>mutex</strong> that provides it and what has to exist underneath (§20.2), the cost of locking —
+uncontended and contended (§20.3) — and the sharpest failure mode locks introduce, <strong>deadlock</strong>, with the
+four conditions that produce it (§20.4). We close by carrying locks forward to the coordination primitives of the next
+chapter (§20.5). A lock is the simplest correct answer to the data race, and every complication in this part is a reaction
+to a cost a lock imposes.</p>
+
+<h2>20.1 The critical section and mutual exclusion</h2>
+
+<p>A <strong>race condition</strong> is a situation where the correctness of a computation depends on the relative timing
+or interleaving of multiple flows of control. The specific race we keep meeting is on a shared read–modify–write:
+<code>counter++</code> loads the value, adds one, and stores it back, and if a second thread loads the same old value
+before the first stores, one increment is overwritten. The region of code that must not be interleaved — here, the
+load–add–store — is a <strong>critical section</strong>: code that touches shared state and produces a wrong answer if two
+threads execute it concurrently. The property we need over a critical section is <strong>mutual exclusion</strong>: at
+most one thread is inside it at any instant. Mutual exclusion turns "load–add–store" from a sequence three other threads
+can climb into the middle of into an <em>indivisible</em> step, restoring the intuition that <code>counter++</code> just
+adds one.</p>
+
+<p>Here is the debt and its repayment measured on the same workload — four threads, each incrementing a shared counter one
+million times, so the correct total is 4,000,000 (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>no lock:    counter=1187737 (expected 4000000)
+no lock:    counter=1144730 (expected 4000000)
+no lock:    counter=2766329 (expected 4000000)
+with mutex: counter=4000000 (expected 4000000)
+with mutex: counter=4000000 (expected 4000000)
+with mutex: counter=4000000 (expected 4000000)</code></pre>
+
+<p>Unsynchronized, the count is wrong and <em>different every run</em> — over half the updates lost in some runs,
+nondeterministically, because the interleaving depends on the scheduler. With a mutex guarding the increment, the count
+is exactly 4,000,000 every time. That determinism is the point of mutual exclusion: it does not make the program faster
+(it is slower, §20.3) — it makes it <em>correct</em>, and correct <em>reproducibly</em>, which no amount of re-running an
+unlocked version can achieve. As Chapter 15 warned, a racing program can even print the right answer by luck; mutual
+exclusion is how you stop depending on luck.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define a critical section and the property (mutual exclusion) you need over it. Why does the unsynchronized counter
+give a <em>different</em> wrong answer each run, while the locked one is always exactly right? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>20.2 The mutex: how to lock, and what is underneath</h2>
+
+<p>The primitive that provides mutual exclusion is the <strong>mutex</strong> (mutual-exclusion lock). It has two
+operations: <strong>lock</strong> (acquire) and <strong>unlock</strong> (release). A mutex is either free or held by one
+thread; <code>lock</code> on a free mutex takes it and returns, <code>lock</code> on a held mutex <em>blocks</em> the
+caller until the holder unlocks. So the discipline is: lock before the critical section, unlock after, and only the one
+thread holding the lock runs the protected code. In POSIX threads:</p>
+
+<pre><code>pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_lock(&amp;m);      /* enter critical section — blocks if another thread holds m */
+counter++;                    /* protected: at most one thread here at a time */
+pthread_mutex_unlock(&amp;m);    /* leave; a waiting thread may now proceed */</code></pre>
+
+<p>Two disciplines matter beyond the mechanics. First, all threads that touch the shared state must lock the
+<em>same</em> mutex — a lock excludes only the threads that agree to take it; a critical section guarded by a lock one
+racer ignores is not guarded at all. Second, hold the lock for <em>as short a critical section as correctness allows</em>:
+while you hold it, every other thread that needs it is stalled, so the lock serializes exactly the code it covers (§20.3).
+There is a bonus the mutex delivers beyond exclusion: the POSIX lock and unlock operations also <strong>synchronize
+memory</strong>, establishing an ordering (a happens-before edge) between the unlock in one thread and the next lock in
+another. That is why the non-atomic <code>counter++</code> inside a critical section is not merely excluded but
+<em>well-defined</em> — the lock supplies the ordering the memory model otherwise denies a plain shared access (the
+memory model itself is a later chapter in this part).</p>
+
+<p>What has to exist under <code>lock</code> for it to work? The lock operation must itself be race-free — but "check if
+the mutex is free and take it" is a read–modify–write, the very thing we cannot do safely without help. The help comes
+from the <strong>hardware</strong>: CPUs provide atomic read-modify-write instructions — test-and-set, compare-and-swap,
+atomic exchange — that perform "read the old value and write a new one" as one indivisible step no other core can split.
+A mutex is built on one of these. (Pure-software mutual exclusion is possible — Dekker's and Peterson's algorithms
+achieve it with only ordinary loads and stores — but it is subtle and slow, and real locks use the hardware atomic; those
+atomics are a chapter of their own later in this part.) On Linux, a typical mutex takes the fast path entirely in user
+space with an atomic when uncontended, and only traps into the kernel — via the <code>futex</code> system call — to sleep
+when it must actually wait, which is why an uncontended lock is cheap but not free, the subject of §20.3.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What are the two operations on a mutex, and what does <code>lock</code> do when the mutex is already held? Why must a
+lock be built on a hardware atomic instruction rather than an ordinary "if free, take it"? (Answer below the communicate
+box.)</p>
+</aside>
+
+<h2>20.3 The cost of a lock: uncontended and contended</h2>
+
+<p>A lock is not free even when no one is competing for it. Measured single-threaded — a plain increment versus the same
+increment wrapped in an uncontended lock and unlock (gcc 11.4.0 <code>-O2</code>, Linux 6.18; illustrative, machine- and
+run-dependent):</p>
+
+<pre><code>plain increment:                    ~1.0 ns/op
+lock + increment + unlock:          ~12 ns/op
+ratio:                              ~12x</code></pre>
+
+<p>The uncontended lock adds roughly an order of magnitude to a trivial operation — a handful of nanoseconds for the
+atomic and the bookkeeping, answering the opener: not "about the same," and not 1000&#215;, but ~10&#215; on a bare
+increment. That overhead is the <em>floor</em>. The real cost arrives under <strong>contention</strong>, when threads
+actually compete, and it grows in three ways. (1) <strong>Serialization</strong>: the lock forces the critical section to
+run one thread at a time, so if a large fraction of the work is inside the lock, adding cores stops helping — this is
+Amdahl's law applied to a critical section, and it is why "hold the lock briefly" is a performance rule, not just style.
+(2) <strong>Cache-line bouncing</strong>: the lock word (and the data it guards) ping-pongs between cores' caches as
+ownership changes hands, and each transfer is a cross-core cache miss — the mechanical-sympathy cost from Part I, now paid
+per contended acquisition. (3) <strong>Context switches</strong>: when a blocking mutex makes a waiting thread sleep,
+acquiring the lock later means waking it, a scheduler round-trip (Chapter 16) far more expensive than the atomic itself.</p>
+
+<p>These costs drive the central design tension of locking: <strong>coarse-grained</strong> versus
+<strong>fine-grained</strong>. One big lock around a whole data structure is simple and easy to reason about, but it
+serializes all access, throttling concurrency. Many small locks — one per bucket, per node, per shard — let independent
+operations proceed in parallel, but they multiply the overhead, complicate the code, and, crucially, open the door to
+<strong>deadlock</strong> when a thread must hold more than one at a time (§20.4). There is no free lunch: you trade
+simplicity and safety against concurrency, and the right point depends on how contended the structure actually is —
+which, per Part I's discipline, you should <em>measure</em> before assuming.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a lock serializes a critical section</span>
+<p><strong>1. In words.</strong> A mutex admits one thread at a time to the critical section; others block at
+<code>lock</code> until the holder <code>unlock</code>s. That guarantees correctness (mutual exclusion) and imposes a
+cost (serialization plus per-acquisition overhead), so the lock should cover the smallest region that is still correct.</p>
+<p><strong>2. As a picture.</strong> Figure 20.1: two threads' timelines; thread B's <code>lock</code> blocks while A is
+inside the critical section, then proceeds after A's <code>unlock</code> — the protected region never overlaps.</p>
+<p><strong>3. As numbers.</strong> Uncontended, a lock+unlock turns a ~1 ns increment into ~12 ns (~10&#215;). Contended,
+the four-thread counter is <em>correct</em> (4,000,000 every run) but slower than the racing version — you buy
+determinism with throughput.</p>
+</aside>
+
+<p><em>(Answer to the §20.1 quick check: a critical section is code touching shared state that misbehaves if two threads
+run it concurrently; mutual exclusion means at most one thread is inside it at a time. The unlocked counter varies because
+the lost updates depend on the scheduler's interleaving, which differs each run; the locked counter is always exactly
+right because mutual exclusion makes the load–add–store indivisible, removing the interleaving entirely.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A mutex admits one thread at a time; the other blocks at lock() until unlock().</text>
+<line x1="60" y1="36" x2="60" y2="180" stroke="#14406b"/><text x="30" y="40" font-size="9" fill="#14406b">A</text>
+<line x1="360" y1="36" x2="360" y2="180" stroke="#14406b"/><text x="332" y="40" font-size="9" fill="#14406b">B</text>
+<rect x="45" y="55" width="30" height="60" fill="#cfe8cf" stroke="#2e6b34"/><text x="80" y="80" font-size="9" fill="#2e6b34">A: lock &#8594; counter++ &#8594; unlock</text>
+<rect x="345" y="55" width="30" height="60" fill="#fdeee6" stroke="#8c3a1d"/><text x="388" y="88" font-size="9" fill="#8c3a1d">B: blocked in lock()</text>
+<line x1="75" y1="115" x2="345" y2="120" stroke="#8c3a1d" stroke-dasharray="3,2"/><text x="120" y="134" font-size="8" fill="#8c3a1d">A unlocks &#8594; B may now enter</text>
+<rect x="345" y="120" width="30" height="55" fill="#cfe8cf" stroke="#2e6b34"/><text x="388" y="150" font-size="9" fill="#2e6b34">B: lock &#8594; counter++ &#8594; unlock</text>
+<text x="20" y="194" font-size="9" fill="#8c3a1d">The critical sections never overlap — the cost of that guarantee is B's wait.</text>
+</svg>
+<figcaption>Figure 20.1: Mutual exclusion by a mutex. While thread A holds the lock, thread B blocks inside
+<code>lock()</code>; only after A's <code>unlock()</code> does B enter its critical section. The protected regions are
+serialized — that is the correctness guarantee and, simultaneously, the throughput cost.</figcaption>
+</figure>
+
+<h2>20.4 Deadlock and the four conditions</h2>
+
+<p>Fine-grained locking buys concurrency but introduces a new way to fail completely. When a thread must hold more than
+one lock at a time, two threads acquiring the same locks in <em>different orders</em> can each grab one and then wait
+forever for the other's — a <strong>deadlock</strong> (Dijkstra's "deadly embrace"). Here are two threads and two mutexes
+A and B: thread 1 locks A then B, thread 2 locks B then A. Run with opposite orders versus a consistent order (gcc
+11.4.0, Linux 6.18; the deadlocking run is killed after a 3-second timeout):</p>
+
+<pre><code>opposite lock order (t1: A,B ; t2: B,A):   hangs; killed after 3s (exit 124 = timed out)
+consistent lock order (both: A,B):         t1 got both; t2 got both; both threads finished</code></pre>
+
+<p>With opposite orders the program hangs: thread 1 holds A and waits for B while thread 2 holds B and waits for A —
+neither can proceed, forever. With a consistent order it always completes, because two threads wanting both locks can
+never form the cycle. That fix generalizes into the theory. Deadlock requires <strong>all four</strong> of the classic
+conditions (Coffman, Elphick &amp; Shoshani, 1971) to hold simultaneously: <strong>mutual exclusion</strong> (a resource
+is held exclusively), <strong>hold-and-wait</strong> (a thread holds one resource while requesting another), <strong>no
+preemption</strong> (a resource cannot be forcibly taken from its holder), and <strong>circular wait</strong> (a cycle of
+threads each waiting on the next). Break <em>any one</em> and deadlock is impossible. The most practical break is the
+last: impose a <strong>global lock order</strong> — always acquire locks in the same agreed sequence — and no circular
+wait can form, which is exactly what the consistent-order run did.</p>
+
+<p>Two relatives round out the failure family. <strong>Livelock</strong>: threads are not blocked but keep reacting to
+each other and make no progress (two people stepping aside in the same direction repeatedly). And <strong>priority
+inversion</strong>: a low-priority thread holds a lock a high-priority thread needs, and a medium-priority thread —
+runnable, so it preempts the low one under a strict-priority scheduler (Chapter 16's <code>SCHED_FIFO</code>) — keeps the
+low thread off the CPU, so it never releases the lock, and the high-priority thread is stuck behind both. (This is the
+mechanism famously diagnosed on the 1997 Mars Pathfinder mission; the standard cure is <em>priority inheritance</em>,
+where the lock holder temporarily inherits the priority of the highest waiter.) All three share a moral: locks compose
+badly, and the more locks you hold at once, the more carefully you must reason about the order and the priorities.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: inconsistent lock ordering (the deadly embrace)</span>
+<p>The classic deadlock bug is two code paths that acquire the same two locks in <em>opposite</em> orders — one
+<code>lock(A); lock(B)</code>, another <code>lock(B); lock(A)</code>. Each thread grabs its first lock, then blocks
+forever on the second, which the other holds: total, permanent stall. The bug is vicious for the usual reason — it needs
+the two paths to interleave at just the wrong moment, so it is <em>rare</em>: the code passes tests and every demo, then
+one day under load two requests hit the two paths simultaneously and the service freezes with no crash, no error, no log —
+just threads stuck in <code>lock()</code>. It is especially insidious when the two locks are acquired far apart in the
+call graph, or hidden inside library calls, so nobody sees both orders in one place. The discipline: define a
+<strong>global lock ordering</strong> and always acquire multiple locks in that order (break circular wait), hold as few
+locks as possible for as short a time as possible (attack hold-and-wait), and use <code>trylock</code> with a back-off if
+you truly cannot order them. If you ever write <code>lock(X)</code> while already holding <code>lock(Y)</code>, you owe
+yourself a proof that no other path ever takes them the other way.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our service froze in production — no crash, no error, CPU near zero, it just
+stopped serving. I restarted it and it was fine for a week, now it's frozen again. Must be a hardware glitch, right?"
+You have a thread dump showing several threads stuck in <code>pthread_mutex_lock</code>. Cover the paragraph and respond
+in four or five sentences, drawing on §20.4.</p>
+<p><em>Model answer.</em> "That is the signature of a <em>deadlock</em>, not hardware: CPU near zero (nobody is spinning,
+everyone is blocked), no crash or error (deadlock is a permanent wait, not a fault), and threads parked in
+<code>pthread_mutex_lock</code> — which the dump confirms. It reproduces rarely because it needs two code paths to acquire
+the same locks in opposite orders and to interleave at just the wrong instant, so it hides for a week and then, under the
+right concurrent load, forms a cycle: each thread holds one lock and waits on the other forever. The fix is to establish a
+<em>global lock ordering</em> so every path takes those locks in the same sequence — that breaks the circular-wait
+condition and makes the cycle impossible — plus shrink the critical sections so we hold fewer locks at once. Let's diff
+the two paths in the dump to find the inconsistent order, and add a lint or a runtime lock-order check so the next one
+fails loudly in testing instead of silently in production." Naming the deadlock from its fingerprint — blocked threads,
+zero CPU, no error — and prescribing a lock order is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §20.2 quick check: the two operations are <code>lock</code> (acquire) and <code>unlock</code>
+(release); <code>lock</code> on a held mutex <strong>blocks</strong> the caller until the holder releases it. A lock must
+be built on a hardware atomic read-modify-write because "check if free, then take it" is itself a read–modify–write —
+without an indivisible instruction, two threads could both see the mutex free and both "take" it, which is the very race
+the lock is supposed to prevent.)</em></p>
+
+<h2>20.5 What to carry forward</h2>
+
+<p>A <strong>race condition</strong> is correctness that depends on interleaving; the region that must not interleave is a
+<strong>critical section</strong>; and the property that fixes it is <strong>mutual exclusion</strong> — at most one
+thread inside at a time. A <strong>mutex</strong> supplies it with <code>lock</code>/<code>unlock</code>: we watched a
+four-thread counter go from a nondeterministic ~1.1–2.8 million to exactly 4,000,000 every run. A lock also
+<em>synchronizes memory</em>, giving the ordering that makes the guarded non-atomic accesses well-defined, and it rests on
+a hardware atomic instruction because "if free, take it" is itself a race. Locks are not free: an uncontended lock is
+~10&#215; a bare increment, and under contention the costs are serialization (Amdahl on the critical section), cache-line
+bouncing between cores, and context switches when waiters sleep — which is why you hold the lock for the smallest correct
+region and choose coarse vs. fine granularity by measurement. And locks introduce <strong>deadlock</strong>: all four
+Coffman conditions (mutual exclusion, hold-and-wait, no preemption, circular wait) must hold, so breaking one — most
+practically by imposing a global lock order — prevents it, as the consistent-order run showed against the hanging
+opposite-order one.</p>
+
+<p>Locks give us <em>safety</em>: they keep threads out of each other's critical sections. What they do not give us is a
+way to <em>wait for a condition</em>. A consumer thread that needs data another thread has not yet produced cannot make
+progress by locking harder — and it must not sit spinning while holding the lock, since that both burns the CPU and keeps
+the producer out. What it needs is to <em>release the lock and sleep until the condition it is waiting for becomes true</em>,
+then wake and re-check — coordination, not just exclusion. That is the <strong>condition variable</strong>, and its
+counting cousin the <strong>semaphore</strong>: the next chapter builds the producer–consumer pattern on them, and shows
+why the wait must sit in a loop rather than an <code>if</code>. Mutual exclusion was the first half of shared-memory
+correctness; waiting and signalling is the second, and together they are the classical toolkit that everything lock-free
+and every memory-model rule later in this part is measured against.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Define race condition, critical section, and mutual exclusion, and say how they relate.</li>
+<li>Write a mutex-guarded critical section from memory, and explain why every racing thread must take the
+<em>same</em> lock.</li>
+<li>Explain why a mutex must rest on a hardware atomic, and what "if free, take it" gets wrong without one.</li>
+<li>State the uncontended lock cost (~10&#215; a bare op) and the three ways contention makes it worse.</li>
+<li>Explain the coarse- vs. fine-grained locking trade-off in terms of concurrency, overhead, and deadlock risk.</li>
+<li>List the four deadlock conditions and give the most practical one to break, with the fix that breaks it.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a critical section, and what property must hold over it? (§20.1)</li>
+<li><strong>R2.</strong> What are a mutex's two operations, and why must all racers take the same one? (§20.2)</li>
+<li><strong>R3.</strong> Why must a lock be built on a hardware atomic instruction? (§20.2)</li>
+<li><strong>R4.</strong> Name the three ways contention makes a lock expensive. (§20.3)</li>
+<li><strong>R5.</strong> List the four deadlock conditions and name the most practical one to break. (§20.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP), "Locks" and "Lock-based Concurrent
+Data Structures."</strong> Free (<code>pages.cs.wisc.edu/~remzi/OSTEP/</code>). Building a lock from hardware atomics
+(test-and-set, compare-and-swap), spin vs. sleeping locks, and locking real data structures — the reference for
+§20.1–§20.3.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 12
+(Concurrent Programming).</strong> Threads, shared variables, mutual exclusion, and synchronization from the programmer's
+view. <code>[⚠ reference — not free]</code>; CMU 15-213 materials free.</li>
+<li><strong>Coffman, Elphick &amp; Shoshani, "System Deadlocks," <em>ACM Computing Surveys</em> 3(2):67–78 (1971),
+DOI 10.1145/356586.356588.</strong> The primary source for the four necessary conditions for deadlock. Author/venue/year
+verified via the ACM Digital Library.</li>
+<li><strong>Dijkstra, "Cooperating Sequential Processes" (EWD123, 1965; published 1968).</strong> The origin of the
+critical-section and mutual-exclusion problem, the "deadly embrace" (deadlock), and the semaphore. Free via the E. W.
+Dijkstra Archive (<code>cs.utexas.edu/~EWD/</code>).</li>
+<li><strong>The Linux <code>pthread_mutex_lock(3)</code> and <code>futex(2)</code> manual pages.</strong> Primary sources
+for POSIX mutex semantics and the fast-user-space/kernel-sleep mechanism under a mutex. Verify per system.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex20.1"><span class="ex-label">20.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define a critical section and mutual exclusion, and say why <code>counter++</code> needs the
+latter.</div>
+
+<div class="exercise" id="ex20.2"><span class="ex-label">20.2</span> <span class="ex-tag warm">warm-up</span>
+What are the two operations on a mutex, and what does the acquire operation do when the mutex is already held by another
+thread?</div>
+
+<div class="exercise" id="ex20.3"><span class="ex-label">20.3</span> <span class="ex-tag warm">warm-up</span>
+Name the four conditions that must all hold for deadlock, and give the one most practical to break in application code.</div>
+
+<div class="exercise" id="ex20.4"><span class="ex-label">20.4</span> <span class="ex-tag core">core</span>
+Explain why a mutex must be built on a hardware atomic read-modify-write instruction. Walk through what could go wrong if
+<code>lock</code> were implemented as "if the mutex is free, set it to held" with ordinary loads and stores, and connect
+that failure to the data race of Chapter 15.</div>
+
+<div class="exercise" id="ex20.5"><span class="ex-label">20.5</span> <span class="ex-tag core">core</span>
+Two threads each lock mutexes A and B, but thread 1 does <code>A then B</code> and thread 2 does <code>B then A</code>.
+(a) Show an interleaving that deadlocks. (b) Explain which of the four conditions your fix removes when you make both
+threads acquire in the order <code>A then B</code>. (c) Why does this bug typically pass tests and only appear in
+production?</div>
+
+<div class="exercise" id="ex20.6"><span class="ex-label">20.6</span> <span class="ex-tag core">core</span>
+A mutex both <em>excludes</em> other threads and <em>synchronizes memory</em>. Explain each role, and why the second is
+what makes a non-atomic <code>counter++</code> inside a critical section not just serialized but well-defined under the
+C/C++ memory model. Tie this to why a plain shared access without a lock is undefined behavior (Chapter 15).</div>
+
+<div class="exercise" id="ex20.7"><span class="ex-label">20.7</span> <span class="ex-tag complexity">cost</span>
+(a) An uncontended lock+unlock measured ~12 ns against a ~1 ns bare increment — explain where that ~10&#215; goes. (b)
+Under heavy contention the cost is far higher; name the three sources (serialization, cache-line bouncing, context
+switches) and say which dominates when the critical section is tiny versus when threads must sleep. (c) Using Amdahl's
+reasoning, explain why shrinking the critical section can matter more than making the lock itself faster.</div>
+
+<div class="exercise" id="ex20.8"><span class="ex-label">20.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A bank-transfer function locks the source account, then the destination
+account, then moves money. Under load the service occasionally freezes; a thread dump shows threads blocked in
+<code>lock</code>.
+<br><strong>Step 1 (given):</strong> Transfer <code>X&#8594;Y</code> locks X then Y; a concurrent transfer
+<code>Y&#8594;X</code> locks Y then X.
+<br><strong>Step 2 (given):</strong> If both start together, the first holds X and waits for Y; the second holds Y and
+waits for X.
+<br><strong>Step 3 (given):</strong> That is a circular wait — all four Coffman conditions now hold — so both threads
+block forever.
+<br><strong>Step 4 (you):</strong> Name the bug, explain why it is load- and timing-dependent, and give a concrete fix
+that imposes a global lock order on accounts (say, by account id) so no cycle can form — and state which condition your
+fix removes.</div>
+
+<div class="exercise" id="ex20.9"><span class="ex-label">20.9</span> <span class="ex-tag mixed">mixed</span>
+For each scenario, decide whether the right tool is (i) a single mutex, (ii) fine-grained per-item mutexes, or (iii) no
+lock at all because there is no sharing — and justify: (a) a global counter incremented by all threads; (b) a hash map
+where operations on different buckets are independent; (c) a value each thread keeps in its own thread-local storage; (d)
+a rarely-updated configuration read by everyone on every request.</div>
+
+<div class="exercise" id="ex20.10"><span class="ex-label">20.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 15–20, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "If two threads
+take different locks, they are safely mutually exclusive." (b) "A deadlocked program spins the CPU at 100%." (c) "A mutex
+makes the guarded code faster." (d) "Holding a lock longer is always safer." (e) "You can implement a correct lock with
+only ordinary loads and stores and no hardware atomic."</div>
+
+<div class="exercise" id="ex20.11"><span class="ex-label">20.11</span> <span class="ex-tag stretch">stretch</span>
+A strict priority scheduler (Chapter 16's <code>SCHED_FIFO</code>) runs three threads: low L holds a lock, high H needs
+it, medium M is CPU-bound and needs no lock. (a) Explain how H can end up blocked indefinitely even though it is the
+highest priority — name the phenomenon. (b) Why does M, not H, keep L off the CPU? (c) Describe priority inheritance and
+exactly which link in the chain it breaks. (d) Relate this to why holding a lock while doing unbounded work is dangerous
+under real-time scheduling.</div>
+
+<div class="exercise" id="ex20.12"><span class="ex-label">20.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) run four threads incrementing a shared counter one million times each, first with no lock, then
+with a mutex — confirm the unlocked total is wrong and varies while the locked total is exactly 4,000,000. (b) Time a
+plain increment versus a lock+increment+unlock in a tight loop and report the ratio (expect roughly an order of
+magnitude). (c) Write two threads that lock two mutexes in opposite orders and observe the hang; then fix the order and
+confirm it completes. Label your compiler and kernel version, and note that the timing numbers are illustrative.</div>
+
+</section>
+</section>

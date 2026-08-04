@@ -28,7 +28,9 @@ NEVER make anything up. This is the single most important rule in the entire ser
   reaping children), **ch15** (Ch 12, concurrent programming — threads, shared variables, races), **ch16** (Ch 8,
   context switches and the timer interrupt behind preemption), **ch17** (Ch 9, virtual memory — address spaces, page
   tables, demand paging, memory mapping), **ch18** (Ch 8 §8.5, signals — exceptional control flow, handlers, and the
-  hazards of handler code).
+  hazards of handler code), **ch19** (Ch 10, System-Level I/O — Unix I/O; Ch 11, Network Programming — the sockets
+  interface), **ch20** (Ch 12, Concurrent Programming — threads, shared variables, mutual exclusion), **ch21** (Ch 12
+  §12.5, Concurrent Programming — synchronizing threads with semaphores, producer–consumer).
 - **Arpaci-Dusseau — *Operating Systems: Three Easy Pieces* (OSTEP).** FREE full text (`pages.cs.wisc.edu/~remzi/OSTEP/`).
   Processes, scheduling, virtual memory, concurrency, persistence. Cited in **ch13** ("Mechanism: Limited Direct
   Execution" — user/kernel mode, traps, the system-call mechanism), **ch14** ("Abstraction: The Process" and
@@ -37,8 +39,12 @@ NEVER make anything up. This is the single most important rule in the entire ser
   ("Scheduling: Introduction" — turnaround/response metrics, FIFO/SJF/STCF/round-robin — and "Scheduling: The
   Multi-Level Feedback Queue" — MLFQ, boosting, anti-gaming), **ch17** ("Paging: Introduction," "Beyond Physical
   Memory: Mechanisms," and "Beyond Physical Memory: Policies" — the page, demand paging/swapping, and OPT/FIFO/LRU
-  replacement). *(Exact chapter titles verified against the OSTEP PDFs.)*
-- **Beej's Guide to C / Network Programming.** Free (`beej.us`). Practical C and sockets.
+  replacement), **ch20** ("Locks" and "Lock-based Concurrent Data Structures" — building a lock from hardware atomics,
+  spin vs. sleeping locks, and locking real data structures), **ch21** ("Condition Variables," "Semaphores," and "Common
+  Concurrency Problems" — the wait/signal loop discipline, producer–consumer, and the taxonomy of concurrency bugs).
+  *(Exact chapter titles verified against the OSTEP PDFs.)*
+- **Beej's Guide to C / Network Programming.** Free (`beej.us`). Practical C and sockets. Cited in **ch19** (the sockets
+  API, stream vs. datagram, and application-level framing over TCP).
 - **The Rust Programming Language ("the book").** Free (`doc.rust-lang.org/book/`), and the Rustonomicon for unsafe.
 - **Drepper — *What Every Programmer Should Know About Memory* (2007).** Free PDF. Caches/memory (dated but seminal).
 - **Agner Fog — optimization manuals.** Free (`agner.org`). Microarchitecture/perf (dated; verify).
@@ -55,7 +61,12 @@ NEVER make anything up. This is the single most important rule in the entire ser
   `SCHED_OTHER`/`SCHED_FIFO`/`SCHED_RR`, the nice range −20..+19, and real-time throttling), **ch17** (`mmap(2)`,
   `madvise(2)`, `proc(5)` — demand-paged memory mapping and the `/proc/<pid>/status` `VmRSS` residency field), **ch18**
   (`signal(7)`, `sigaction(2)`, `signal-safety(7)`, `signalfd(2)` — the signal list and default dispositions, the
-  `SA_RESTART`/`EINTR` behavior, the async-signal-safe function set, and file-based signal delivery). Verify per
+  `SA_RESTART`/`EINTR` behavior, the async-signal-safe function set, and file-based signal delivery), **ch19**
+  (`pipe(2)`, `pipe(7)`, `mmap(2)`, `shm_overview(7)`, `unix(7)`, `socket(2)` — the pipe capacity (16 pages = 65536 bytes)
+  and `PIPE_BUF` atomicity, `MAP_SHARED` semantics, POSIX shared memory, Unix-domain sockets, and the stream/datagram
+  socket types), **ch20** (`pthread_mutex_lock(3)`, `futex(2)` — POSIX mutex semantics and the fast-userspace-mutex
+  mechanism that sleeps in the kernel only under contention), **ch21** (`pthread_cond_wait(3)`, `sem_overview(7)` — POSIX
+  condition-variable semantics including permitted spurious wakeups, and POSIX semaphores). Verify per
   kernel/architecture.
 - **The Linux kernel scheduler documentation** (`docs.kernel.org/scheduler/`, including the EEVDF scheduler page). Free.
   The authority for Linux's proportional-share scheduler and the CFS→EEVDF change in kernel 6.6 (2023). Cited in **ch16**
@@ -68,7 +79,9 @@ NEVER make anything up. This is the single most important rule in the entire ser
   **ch17**; author/venue/year verified via dblp and the ACM Digital Library.
 - **Stevens & Rago — *Advanced Programming in the UNIX Environment*, 3rd ed. (2013), Addison-Wesley.** `[⚠ reference —
   not free]` The canonical UNIX systems-programming reference. Cited in **ch18** (Chapter 10, Signals — `sigaction`,
-  reliable signals, interrupted system calls). Author/edition/year verified.
+  reliable signals, interrupted system calls) and **ch19** (Chapters 15, Interprocess Communication; 16, Network IPC:
+  Sockets; and 17, Advanced IPC — pipes, FIFOs, shared memory, Unix-domain sockets, and descriptor passing).
+  Author/edition/year verified; chapter numbering (15/16/17) verified against the 3rd-edition table of contents.
 - **AddressSanitizer / LeakSanitizer / MemorySanitizer documentation** (Clang/GCC; `github.com/google/sanitizers`, LLVM/GCC docs). Free. The compile-time (`-fsanitize=address`) memory-error detectors; cited in ch09 for documented behavior only (use-after-free, heap-overflow, double-free, leaks — ASan does not catch uninitialized reads; that is MSan/Valgrind). Verify flags per compiler version.
 - **Valgrind (Memcheck) documentation** (`valgrind.org`). Free. The runtime memory-error/leak detector; cited in ch09 as a complementary tool to the sanitizers. Documented behavior only.
 - **Chris Lattner — "What Every C Programmer Should Know About Undefined Behavior"** (The LLVM Project Blog, May 2011, three parts; `blog.llvm.org/2011/05/what-every-c-programmer-should-know.html`). Free. The compiler-writer's account of how/why optimizers exploit UB (signed overflow, null-check elimination, strict aliasing). Cited in ch10.
@@ -80,7 +93,18 @@ NEVER make anything up. This is the single most important rule in the entire ser
 - **Berger, Zorn & McKinley — "Reconsidering Custom Memory Allocation," OOPSLA 2002** (ACM SIGPLAN; free from authors, `people.cs.umass.edu/~emery/pubs/berger-oopsla2002.pdf`). Empirical study: a good general-purpose allocator matches/beats most hand-written custom allocators; regions (arenas) the exception (up to 44% faster, with a memory-consumption downside). Cited in ch12.
 - **Jeff Bonwick — "The Slab Allocator: An Object-Caching Kernel Memory Allocator," USENIX Summer 1994**, pp. 87–98. Free. The production pool/slab allocator (SunOS; later Linux). Cited in ch12 for the fixed-size/free-list model.
 - **cppreference.com / the C standard — `<string.h>` functions and integer/overflow rules.** The authority for `strcpy`/`strncpy`/`strcat`/`snprintf`/`fgets` contracts (and the removal of `gets` in C11), and for signed/unsigned overflow and the §3.4 behavior categories. Cited in ch10–ch12,
-  and in **ch15** for the C11/C++11 memory model — a data race is undefined behavior.
+  and in **ch15** and **ch20** for the C11/C++11 memory model — a data race is undefined behavior, and a lock's
+  acquire/release establishes the happens-before ordering that makes guarded non-atomic accesses well-defined.
+- **Coffman, Elphick & Shoshani — "System Deadlocks," *ACM Computing Surveys* 3(2):67–78 (1971)** (DOI
+  10.1145/356586.356588). Primary source for the four necessary conditions for deadlock (mutual exclusion, hold-and-wait,
+  no preemption, circular wait). Cited in **ch20**; author/venue/year/DOI verified via the ACM Digital Library.
+- **Dijkstra — "Cooperating Sequential Processes" (EWD123, written 1965; published 1968 in *Programming Languages*, ed.
+  Genuys).** Free via the E. W. Dijkstra Archive (`cs.utexas.edu/~EWD/`). The origin of the critical-section/mutual-exclusion
+  problem, the "deadly embrace" (deadlock), and the semaphore with its P/V operations. Cited in **ch20** and **ch21**;
+  attribution verified via the Dijkstra Archive.
+- **Hoare — "Monitors: An Operating System Structuring Concept," *Communications of the ACM* 17(10):549–557 (1974)** (DOI
+  10.1145/355620.361161). Primary source for monitors (shared state + mutex + condition variables), with the bounded-buffer
+  and reader–writer examples. Cited in **ch21**; author/venue/year/DOI verified via the ACM Digital Library and dblp.
 
 ## Vol 2 — Database Internals
 - **Petrov — *Database Internals* (2019).** `[⚠ reference — not free]` Storage engines, B-trees/LSM, distributed DBs.

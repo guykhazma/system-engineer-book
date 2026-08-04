@@ -1,0 +1,124 @@
+<section class="solutions" id="sol19">
+<h1>Chapter 19 — Solutions</h1>
+
+<div class="solution" id="sol19.1"><span class="sol-label">19.1</span>
+The toolkit splits into channels the kernel <strong>copies</strong> bytes through and arrangements that
+<strong>share</strong> the same physical memory. Copy side: a <strong>pipe</strong> (or FIFO, or socket) — bytes go
+sender &#8594; kernel buffer &#8594; receiver. Share side: <strong>shared memory</strong> (<code>MAP_SHARED</code>) —
+both processes map the same frames and touch them directly, moving no data. <em>Tempting wrong answer:</em> "sockets are
+the sharing mechanism" — a socket copies through the kernel like a pipe; only shared memory truly shares.
+<strong>Feed-forward:</strong> §19.1.</div>
+
+<div class="solution" id="sol19.2"><span class="sol-label">19.2</span>
+A bare pipe usefully connects processes that share its descriptors, which happens because file descriptors survive
+<code>fork</code> — so a parent creates the pipe and forks, and parent and child inherit the ends. A <strong>FIFO</strong>
+(named pipe, made with <code>mkfifo</code>) adds a <em>filesystem name</em>, so <em>unrelated</em> processes with no
+common ancestor can meet by opening the same path. <em>Tempting wrong answer:</em> "two unrelated processes can just call
+<code>pipe()</code> and connect" — a plain pipe's descriptors are private to the creator and its descendants; unrelated
+processes need a FIFO (or a socket). <strong>Feed-forward:</strong> §19.2.</div>
+
+<div class="solution" id="sol19.3"><span class="sol-label">19.3</span>
+When all write ends are closed, a <code>read</code> returns <strong>0</strong> — end-of-file — which is how the reader
+learns the writer is done. Writing to a pipe whose read ends are all closed raises <strong><code>SIGPIPE</code></strong>
+(default: terminate the writer), or, if that signal is ignored, fails the <code>write</code> with
+<code>errno == EPIPE</code>. <em>Tempting wrong answer:</em> "<code>read</code> blocks forever when the writer is gone" —
+it returns 0; it blocks only while a writer still holds the write end but has sent nothing. <strong>Feed-forward:</strong>
+§19.2.</div>
+
+<div class="solution" id="sol19.4"><span class="sol-label">19.4</span>
+A pipe is a byte stream: the kernel concatenates all writes and does not record how many <code>write</code>s produced the
+bytes, so two 3-byte writes are indistinguishable from one 6-byte write — measured as one <code>read</code> returning
+<code>"ABCDEF"</code>. For discrete messages you must add <strong>framing</strong>. Two schemes: (1) a fixed-size
+<strong>length prefix</strong> before each message (read the prefix, then read exactly that many bytes); (2) a
+<strong>delimiter</strong> (e.g. newline-terminated records), reading until the delimiter. <em>Tempting wrong answer:</em>
+"just do one <code>write</code> per message and one <code>read</code> per message" — the stream may coalesce or split
+regardless of how you wrote it, so the boundary is not preserved. <strong>Feed-forward:</strong> §19.2, §19.4.</div>
+
+<div class="solution" id="sol19.5"><span class="sol-label">19.5</span>
+Fastest because it <strong>copies nothing</strong>: both processes map the same physical frames (Chapter 17's shared
+mapping), so a store by one is a load by the other with no kernel round-trip. Most hazardous because it provides sharing
+and <em>nothing else</em> — no ordering, no mutual exclusion. <code>MAP_SHARED</code>: the child's write of 42 is visible
+to the parent (<code>shared == 42</code>). <code>MAP_PRIVATE</code>: copy-on-write splits the page on the child's write,
+so the parent still sees 0 (<code>private == 0</code>). Two processes racing a shared counter lost ~700,000 of two
+million updates — the Chapter 15 data race across processes. <em>Tempting wrong answer:</em> "shared memory is safe
+because there is only one copy of the data" — one copy is exactly why concurrent unsynchronized writes corrupt it.
+<strong>Feed-forward:</strong> §19.3, and Ch 15.</div>
+
+<div class="solution" id="sol19.6"><span class="sol-label">19.6</span>
+A <strong>stream socket</strong> (<code>SOCK_STREAM</code>, TCP) is a reliable, ordered byte stream with no message
+boundaries; a <strong>datagram socket</strong> (<code>SOCK_DGRAM</code>, UDP) preserves message boundaries but may lose,
+duplicate, or reorder datagrams. (a) reliable in-order request/response &#8594; <strong>stream</strong> (TCP), which gives
+you reliability and ordering for free (add framing for message boundaries). (b) low-latency telemetry tolerating loss
+&#8594; <strong>datagram</strong> (UDP), whose per-message delivery and lack of retransmission fit lossy, latest-value
+data. <code>AF_UNIX</code> makes the socket a <em>local</em> (same-host) channel — faster, and able to pass file
+descriptors — while <code>AF_INET</code> uses the same API to cross machines. <em>Tempting wrong answer:</em> "UDP is
+just faster TCP, always prefer it" — UDP drops reliability and ordering; choosing it means signing up to handle loss and
+reordering yourself. <strong>Feed-forward:</strong> §19.4.</div>
+
+<div class="solution" id="sol19.7"><span class="sol-label">19.7</span>
+(a) Through a pipe a byte is copied twice — sender &#8594; kernel buffer &#8594; receiver — plus system-call overhead;
+through shared memory it is copied <strong>zero</strong> times, because both processes read and write the same frames.
+Fewer copies and no per-message trap into the kernel make shared memory faster. (b) The 65536-byte buffer bounds how far
+ahead a writer can get: when it fills, the next <code>write</code> <em>blocks</em> until the reader drains it, so a fast
+producer is paced to the slow consumer — flow control (backpressure) for free. (c) The cost is that you must supply your
+own synchronization and a crash-recovery story: shared memory hands you unsynchronized concurrency, so you carry, by
+hand, the mutual exclusion and ordering the copying channels gave you automatically. <em>Tempting wrong answer:</em>
+"shared memory is strictly better because it is faster" — it trades the kernel's built-in serialization and flow control
+for engineering burden you now own. <strong>Feed-forward:</strong> §19.2, §19.3.</div>
+
+<div class="solution" id="sol19.8"><span class="sol-label">19.8</span>
+<strong>Step 4:</strong> The bug is a <strong>data race</strong> on the ring buffer's shared write index (and the slots):
+multiple producers perform an unsynchronized read–modify–write on the same index, so two can grab the same slot or
+advance the index inconsistently, garbling and duplicating lines. It appears only under load because the corruption
+requires two producers to touch the index at <em>overlapping</em> instants; light traffic rarely overlaps, heavy traffic
+overlaps constantly — the same schedule-dependent, "passes tests / breaks in production" pathology as any race. Fix 1
+(synchronize in the shared region): place a mutex or semaphore <em>inside</em> the shared memory (a process-shared
+<code>pthread_mutex</code> or a POSIX semaphore both processes map) and hold it while advancing the index — or make the
+index a lock-free atomic. Fix 2 (change the channel): give each producer its own pipe or socket to the consumer, so there
+is no shared write index to race on at all; the kernel serializes each channel for you. <em>Tempting wrong answer:</em>
+"add a lock in each producer's private memory" — a lock only excludes if all racers take the <em>same</em> lock, which
+must therefore live in the shared region. <strong>Feed-forward:</strong> §19.3, and Ch 15.</div>
+
+<div class="solution" id="sol19.9"><span class="sol-label">19.9</span>
+(a) <strong>Pipe/FIFO</strong> — a one-way local byte stream is exactly a pipe; the shell builds it with
+<code>fork</code>. (b) <strong>Shared memory</strong> — 60 large frames a second on one host demands zero-copy; a
+socket's per-frame copies would waste bandwidth. (c) <strong>Network socket</strong> — different machines rules out every
+local mechanism; only a socket reaches across the network. (d) <strong>Unix-domain socket</strong> — bidirectional local
+exchange plus descriptor passing (<code>SCM_RIGHTS</code>) is a capability only Unix-domain sockets offer.
+<em>Method-selection cue:</em> local one-way stream &#8594; pipe; local high-volume data &#8594; shared memory; crosses
+machines &#8594; network socket; local bidirectional or fd-passing &#8594; Unix-domain socket. <strong>Feed-forward:</strong>
+§19.1–§19.4.</div>
+
+<div class="solution" id="sol19.10"><span class="sol-label">19.10</span>
+(a) <strong>False</strong> — TCP is a byte stream with no message boundaries; a <code>send</code> may be split or
+coalesced, so you must frame. (b) <strong>False</strong> — the pointer is meaningless in the other private address space;
+pass data through IPC, not a pointer. (c) <strong>False</strong> — shared memory provides no synchronization; concurrent
+writes race. (d) <strong>False</strong> — a standard signal carries only its number (real-time signals add a small
+payload); it is a doorbell, not a data channel (Chapter 18). (e) <strong>True</strong> — a <code>read</code> returns 0
+once all write ends close, signalling end-of-file. <em>Tempting wrong answer:</em> calling (a) true because "TCP is
+reliable" — reliability (no loss, in order) is orthogonal to message framing; TCP is reliable <em>and</em> boundary-less.
+<strong>Feed-forward:</strong> §19.2, §19.4, and Ch 18.</div>
+
+<div class="solution" id="sol19.11"><span class="sol-label">19.11</span>
+(a) The producer fills the pipe's 65536-byte buffer, and its next <code>write</code> <strong>blocks</strong> until the
+consumer reads some out; it cannot run ahead or exhaust memory because the kernel buffer is bounded and a full pipe
+suspends the writer. It ends up waiting inside <code>write</code>. (b) This is <strong>backpressure</strong>: the slow
+stage throttles the fast one automatically. Over a raw shared-memory channel you get no such thing — you would have to
+build the bounded buffer and the block-when-full/block-when-empty logic yourself (which is precisely the producer–consumer
+problem of the next chapters). (c) When the consumer dies, all read ends close; the producer's next <code>write</code>
+raises <strong><code>SIGPIPE</code></strong> (default terminate) or, if ignored, returns <code>-1</code> with
+<code>errno == EPIPE</code>. The OS notifies rather than discards so the writer stops promptly instead of doing useless
+work forever pouring bytes to nobody. <em>Tempting wrong answer:</em> "the producer keeps buffering until it runs out of
+memory" — the bounded pipe blocks it long before that. <strong>Feed-forward:</strong> §19.2.</div>
+
+<div class="solution" id="sol19.12"><span class="sol-label">19.12</span>
+Machine-specific by design. A correct write-up reports: (a) one <code>read</code> after <code>"ABC"</code> and
+<code>"DEF"</code> returns six bytes, <code>"ABCDEF"</code>, showing the erased boundary. (b) The non-blocking pipe fills
+near <strong>65536</strong> bytes (on the book's machine, exactly 65536) before <code>write</code> returns
+<code>EAGAIN</code>; <code>fcntl(fd, F_SETPIPE_SZ, n)</code> changes the capacity. (c) With <code>MAP_SHARED</code> the
+parent sees the child's write (42); with <code>MAP_PRIVATE</code> it does not (0), because the private page is
+copy-on-write. Label compiler/kernel. <em>Tempting wrong answer:</em> "the two 3-byte writes should come back as two
+reads" — a stream erases the boundary; expecting message preservation is the classic framing bug. <strong>Feed-forward:</strong>
+§19.2, §19.3.</div>
+
+</section>

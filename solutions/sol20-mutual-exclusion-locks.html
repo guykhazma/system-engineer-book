@@ -1,0 +1,115 @@
+<section class="solutions" id="sol20">
+<h1>Chapter 20 — Solutions</h1>
+
+<div class="solution" id="sol20.1"><span class="sol-label">20.1</span>
+A <strong>critical section</strong> is a region of code that touches shared state and produces a wrong result if two
+threads execute it concurrently. <strong>Mutual exclusion</strong> is the property that at most one thread is inside such
+a region at any instant. <code>counter++</code> needs it because it is really load–add–store: without exclusion, two
+threads can load the same old value and each store back a value one greater, losing an update. <em>Tempting wrong answer:</em> "<code>counter++</code> is a single instruction, so it's atomic" — it compiles to several steps, and even a
+single instruction is not atomic across cores without special guarantees. <strong>Feed-forward:</strong> §20.1.</div>
+
+<div class="solution" id="sol20.2"><span class="sol-label">20.2</span>
+<strong>Lock</strong> (acquire) and <strong>unlock</strong> (release). Acquiring a mutex already held by another thread
+<strong>blocks</strong> the caller until the holder releases it, after which one waiter proceeds. <em>Tempting wrong answer:</em> "lock returns an error if the mutex is held" — a plain <code>lock</code> blocks; it is <code>trylock</code>
+that returns immediately without acquiring. <strong>Feed-forward:</strong> §20.2.</div>
+
+<div class="solution" id="sol20.3"><span class="sol-label">20.3</span>
+<strong>Mutual exclusion</strong>, <strong>hold-and-wait</strong>, <strong>no preemption</strong>, and <strong>circular
+wait</strong> — all four must hold. The most practical to break in application code is <strong>circular wait</strong>, by
+imposing a <em>global lock ordering</em> so every thread acquires multiple locks in the same sequence. <em>Tempting wrong answer:</em> "break mutual exclusion by not using locks" — you usually cannot drop exclusion without a race; ordering is
+the practical lever. <strong>Feed-forward:</strong> §20.4.</div>
+
+<div class="solution" id="sol20.4"><span class="sol-label">20.4</span>
+"If free, take it" is itself a read–modify–write: read the mutex's state, decide, write "held." Two threads can both read
+"free" before either writes "held," so both believe they acquired the lock and both enter the critical section — the exact
+data race of Chapter 15, now on the lock word itself. A hardware atomic (test-and-set, compare-and-swap, exchange)
+performs the read-and-conditional-write as one indivisible step no other core can split, so exactly one thread wins.
+Without it, the lock cannot be race-free, and a racy lock provides no exclusion. <em>Tempting wrong answer:</em>
+"disabling interrupts is enough" — that works on a uniprocessor for the kernel, but not across multiple cores in user
+space; you need the atomic. <strong>Feed-forward:</strong> §20.2, and Ch 15.</div>
+
+<div class="solution" id="sol20.5"><span class="sol-label">20.5</span>
+(a) Thread 1 locks A; thread 2 locks B; thread 1 tries to lock B (held by 2) and blocks; thread 2 tries to lock A (held by
+1) and blocks — permanent circular wait. (b) Making both acquire <code>A then B</code> removes <strong>circular
+wait</strong>: whoever gets A first will get B before releasing A, so no cycle of waiters can form. (c) It requires the two
+paths to interleave at just the wrong instant, which is rare under light test load but common under production
+concurrency — the schedule-dependent "passes tests / breaks in production" pathology. <em>Tempting wrong answer:</em>
+"add a timeout and retry" — <code>trylock</code>/back-off can help but risks livelock and masks the design flaw; a global
+lock order fixes it outright. <strong>Feed-forward:</strong> §20.4.</div>
+
+<div class="solution" id="sol20.6"><span class="sol-label">20.6</span>
+<strong>Exclusion:</strong> at most one thread runs the guarded code, so the load–add–store cannot interleave.
+<strong>Memory synchronization:</strong> the POSIX unlock in one thread and the next lock in another establish a
+happens-before ordering, so writes made under the lock are guaranteed visible, in order, to the next holder. The second
+role is what makes the non-atomic <code>counter++</code> <em>well-defined</em>: the C/C++ memory model calls an
+unsynchronized conflicting access a data race, which is undefined behavior; the lock's ordering removes the "conflicting,
+unsynchronized" property, so the access is legal. Without a lock (or atomics), a plain shared read–write is UB — the
+compiler and hardware may reorder and cache it freely. <em>Tempting wrong answer:</em> "exclusion alone makes it correct"
+— exclusion without the memory ordering still leaves visibility/reordering undefined; POSIX locks supply both, which is
+why they work. <strong>Feed-forward:</strong> §20.2, and Ch 15.</div>
+
+<div class="solution" id="sol20.7"><span class="sol-label">20.7</span>
+(a) The ~10&#215; is the atomic read-modify-write, the surrounding bookkeeping, and the memory-ordering fence the lock and
+unlock impose — each far more expensive than a bare register add. (b) Serialization (only one thread in the critical
+section), cache-line bouncing (the lock word and guarded data migrate between cores' caches, a cross-core miss per
+handoff), and context switches (a blocking mutex sleeps and wakes waiters via the scheduler). Cache-line bouncing tends to
+dominate when the critical section is tiny and threads spin/retry; context-switch cost dominates when threads actually
+sleep. (c) By Amdahl, the serial (locked) fraction caps speedup regardless of core count, so reducing the fraction of work
+under the lock lifts the ceiling more than shaving nanoseconds off each acquisition. <em>Tempting wrong answer:</em> "a
+faster lock implementation is the main win" — if a large fraction of work is serialized, no lock speed helps; shrink the
+critical section. <strong>Feed-forward:</strong> §20.3.</div>
+
+<div class="solution" id="sol20.8"><span class="sol-label">20.8</span>
+<strong>Step 4:</strong> The bug is a <strong>deadlock</strong> from inconsistent lock ordering: transfer
+<code>X&#8594;Y</code> and <code>Y&#8594;X</code> acquire the two account locks in opposite orders, so concurrent
+opposite-direction transfers form a circular wait and both threads block in <code>lock</code> forever. It is load- and
+timing-dependent because it needs the two transfers to start close enough in time to each grab one lock before the other
+grabs the second — rare in tests, common under production traffic. Fix: impose a <strong>global lock order</strong> on
+accounts — e.g. always lock the account with the smaller id first, regardless of transfer direction — so both a
+<code>X&#8594;Y</code> and a <code>Y&#8594;X</code> transfer lock the same account first and no cycle can form. This
+removes the <strong>circular-wait</strong> condition. <em>Tempting wrong answer:</em> "lock a single global bank mutex for
+every transfer" — correct but serializes all transfers, killing throughput; ordering per-account locks keeps concurrency.
+<strong>Feed-forward:</strong> §20.4.</div>
+
+<div class="solution" id="sol20.9"><span class="sol-label">20.9</span>
+(a) <strong>Single mutex</strong> — one shared counter, all threads contend on the same word; one lock suffices (or an
+atomic). (b) <strong>Fine-grained per-bucket mutexes</strong> — operations on different buckets are independent, so
+per-bucket locks let them proceed in parallel; one big lock would needlessly serialize them. (c) <strong>No lock</strong>
+— thread-local storage is not shared, so there is no race to prevent. (d) <strong>No lock (or a read-optimized scheme)</strong>
+— a rarely-written, frequently-read value can use no lock if updates are done safely (e.g. atomic pointer swap / RCU-style
+publish); a plain mutex on every read would serialize all requests. <em>Method-selection cue:</em> is the state shared and
+mutated? If not shared &#8594; no lock; if shared and independent partitions &#8594; fine-grained; if a single hot datum
+&#8594; one lock (or atomic). <strong>Feed-forward:</strong> §20.3.</div>
+
+<div class="solution" id="sol20.10"><span class="sol-label">20.10</span>
+(a) <strong>False</strong> — mutual exclusion requires racers to take the <em>same</em> lock; different locks do not
+exclude each other. (b) <strong>False</strong> — deadlocked threads are <em>blocked</em>, so CPU is near zero; 100% CPU is
+a spin/livelock, not a classic deadlock. (c) <strong>False</strong> — a mutex adds overhead and serializes; it makes code
+<em>correct</em>, not faster. (d) <strong>False</strong> — holding a lock longer increases contention and deadlock
+exposure; hold it for the smallest correct region. (e) <strong>False</strong> — Peterson/Dekker use only loads and stores
+but assume ordering guarantees; real, portable locks need a hardware atomic. <em>Tempting wrong answer:</em> calling (e)
+true by citing Peterson's algorithm — it is correct only under a memory model with sufficient ordering, which on real
+hardware you get via atomics/fences, so "no atomic at all" is misleading. <strong>Feed-forward:</strong> §20.2, §20.3,
+§20.4.</div>
+
+<div class="solution" id="sol20.11"><span class="sol-label">20.11</span>
+(a) <strong>Priority inversion</strong>: H is blocked on the lock L holds, so H can proceed only when L runs and releases
+it. (b) Under strict priority scheduling, medium M is runnable and higher priority than L, so it preempts L and never
+yields; L therefore never gets the CPU to release the lock, and H — though highest priority — waits behind both. (c)
+<strong>Priority inheritance</strong>: while L holds a lock a higher-priority thread (H) is waiting on, L temporarily
+inherits H's priority, so L now outranks M, runs, releases the lock, and H proceeds. It breaks the link where M starves L.
+(d) Holding a lock while doing unbounded work under real-time scheduling can stall higher-priority threads for that whole
+duration — bounded, minimal critical sections are essential when priorities are strict. <em>Tempting wrong answer:</em>
+"just raise H's priority" — H is already highest; the problem is L is too low to run, which inheritance, not H's priority,
+fixes. <strong>Feed-forward:</strong> §20.4, and Ch 16.</div>
+
+<div class="solution" id="sol20.12"><span class="sol-label">20.12</span>
+Machine-specific by design. A correct write-up reports: (a) the unlocked four-thread total is below 4,000,000 and differs
+each run (on the book's machine, e.g. 1,187,737 / 1,144,730 / 2,766,329), while the mutex version is exactly 4,000,000
+every run. (b) A lock+increment+unlock is roughly an order of magnitude slower than a bare increment (the book measured
+~1 ns vs ~12 ns, ~12&#215;) — illustrative and machine-dependent. (c) Opposite lock orders hang (a deadlock; kill it after
+a timeout), while a consistent order always completes. Label compiler/kernel. <em>Tempting wrong answer:</em> "re-running
+the unlocked version until it prints 4,000,000 proves it's fine" — a lucky correct run does not make a racing program
+correct; correctness must come from the rules. <strong>Feed-forward:</strong> §20.1, §20.3, §20.4.</div>
+
+</section>

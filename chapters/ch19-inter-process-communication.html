@@ -1,0 +1,404 @@
+<section class="chapter" id="ch19">
+<h1>Chapter 19 — Inter-Process Communication: Pipes, Shared Memory, and Sockets</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch14">Chapter 14</a> (<code>fork</code> gives each
+process its own <em>isolated</em> address space — this chapter is how those isolated processes talk), <a href="#ch17">Chapter
+17</a> (a shared mapping lets two page tables point at the same physical frame — that is the machinery under shared
+memory), <a href="#ch18">Chapter 18</a> (a signal is a doorbell, not a conversation — it notifies but carries no data).
+&nbsp;·&nbsp; Chapter 14 spent real effort keeping processes apart; this chapter is the controlled set of channels that
+let them exchange data <em>across</em> that isolation, and it is where Part III finishes.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch17">Chapter 17</a> — copy-on-write and shared mappings both rest on one
+fact about page tables; what lets two processes' page tables refer to the <em>same</em> physical frame? (2)
+<a href="#ch18">Chapter 18</a> — why did we call a signal a "doorbell, not a conversation," and what does that tell you
+it is bad at? (3) <em>Predict:</em> two related processes <code>mmap</code> the same page with <code>MAP_SHARED</code>;
+one writes the value 42 into it and exits, the other reads. Does the reader see 42? Now suppose the mapping had instead
+been <code>MAP_PRIVATE</code> — same question. Write down both guesses; we measure them in §19.3.</p>
+</aside>
+
+<p>A process is an island. Chapter 14 built that isolation deliberately: each process gets its own virtual address space,
+so a wild pointer in one cannot corrupt another, and Chapter 17 showed the page tables that enforce it. Isolation is a
+safety property you want — and an obstacle the moment two processes must cooperate. A shell pipeline
+(<code>sort | uniq</code>), a web server handing a request to a worker, a database client talking to a server: all need
+to move data between address spaces that, by construction, cannot see each other's memory. <strong>Inter-process
+communication</strong> (IPC) is the family of kernel-provided channels that bridge the gap. This chapter covers the three
+that matter most, along the axis of <em>what</em> they move and <em>how far</em>: <strong>pipes and FIFOs</strong>, the
+unidirectional byte stream that powers the shell (§19.2); <strong>shared memory</strong>, the fastest channel because it
+moves nothing — the processes map the same frames (§19.3); and <strong>sockets</strong>, the bidirectional channel that,
+unlike the others, also reaches <em>across machines</em> (§19.4). We start by placing them on a map (§19.1) and close by
+carrying the toolkit forward into concurrency and networking (§19.5). The through-line: every channel trades cost against
+reach against safety, and shared memory in particular gives you speed by handing back a hazard you have met before.</p>
+
+<h2>19.1 Why IPC exists, and the shape of the toolkit</h2>
+
+<p>Because address spaces are private, one process cannot simply pass a pointer to another: the same virtual address
+means different physical memory (or nothing) in the other process, so a raw pointer is meaningless across the boundary.
+Every IPC mechanism is therefore either a <strong>channel the kernel copies bytes through</strong> or an
+<strong>arrangement to share the same physical memory</strong>. That single distinction organizes the whole toolkit.
+A <em>copying</em> channel — a pipe, a FIFO, a socket — is safe and simple: the sender hands bytes to the kernel, the
+kernel buffers them, the receiver reads them out, and neither ever touches the other's memory. A <em>sharing</em>
+arrangement — shared memory — is fast because it skips the copy entirely: both processes map one region and read and
+write it directly, at memory speed, but they inherit the full burden of coordinating that concurrent access themselves.</p>
+
+<p>Cutting the other way is <strong>reach</strong>. Pipes, FIFOs, shared memory, and Unix-domain sockets are
+<em>same-machine</em> mechanisms: they rely on a shared kernel, so they cannot connect two processes on different
+computers. Network sockets (TCP/UDP) are the exception — the same socket API that talks to a process next door talks to
+one across the world, at the price of copies, protocol overhead, and the possibility of failure in between. And cutting a
+third way is <strong>message shape</strong>: some channels preserve the boundaries between writes (a datagram socket
+delivers each message whole), while others are pure byte streams that erase them (a pipe or a TCP connection). Keep those
+three axes — copy vs. share, local vs. remote, stream vs. message — in mind; every mechanism below is a point in that
+space, and choosing well is mostly a matter of locating your need on the map.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why can't one process simply pass a pointer to another and have it work? Name the single distinction that splits the
+IPC toolkit in two, and say which side "moves no data." (Answer after the next section.)</p>
+</aside>
+
+<h2>19.2 Pipes and FIFOs: the byte stream</h2>
+
+<p>A <strong>pipe</strong> is the oldest and simplest IPC channel: a unidirectional, in-kernel byte buffer with two file
+descriptors, a read end and a write end. The <code>pipe(fd)</code> system call fills <code>fd[0]</code> (read) and
+<code>fd[1]</code> (write); bytes written to <code>fd[1]</code> come out of <code>fd[0]</code> in order. On its own a
+pipe connects nothing — the trick is <code>fork</code>: a parent creates the pipe, forks, and now parent and child share
+both descriptors (file descriptors survive <code>fork</code>, Chapter 14), so one can close the read end and one the
+write end, leaving a one-way channel between relatives. That is exactly how the shell builds <code>a | b</code>: it pipes
+<code>a</code>'s standard output to <code>b</code>'s standard input. A <strong>FIFO</strong> (named pipe) is the same
+buffer given a <em>filesystem name</em> with <code>mkfifo</code>, so that <em>unrelated</em> processes — with no common
+ancestor to inherit descriptors from — can rendezvous by opening the same path.</p>
+
+<p>The defining property of a pipe is that it is a <strong>byte stream with no message boundaries</strong>. The kernel
+does not remember how many <code>write</code>s produced the bytes; it just concatenates them. Two writes of three bytes
+each are indistinguishable from one write of six. Here is that fact measured (gcc 11.4.0, Linux 6.18): write
+<code>"ABC"</code> then <code>"DEF"</code> to a pipe, then do a single <code>read</code>:</p>
+
+<pre><code>write(fd[1], "ABC", 3);
+write(fd[1], "DEF", 3);
+ssize_t n = read(fd[0], buf, sizeof buf);
+
+two writes of 3 bytes; one read got 6 bytes: "ABCDEF"</code></pre>
+
+<p>One read returned all six bytes at once: the boundary between the writes is gone. This is not a bug — it is what a
+stream <em>is</em> — but it means that if you need messages (records, requests), you must impose them yourself with
+<strong>framing</strong>: length prefixes, delimiters, or fixed-size records. (Small writes are still atomic up to a
+limit: POSIX guarantees a write of at most <code>PIPE_BUF</code> bytes — 4096 on Linux — will not be interleaved with
+another writer's, which is why the boundary-erasing above is about <em>your own</em> back-to-back writes, not
+corruption.) A pipe is also <strong>finite</strong>: it holds a bounded amount before a writer must wait. Filling a
+non-blocking pipe one byte at a time until it refuses shows the capacity:</p>
+
+<pre><code>while (write(fd[1], &amp;c, 1) == 1) total++;
+
+pipe full after 65536 bytes (errno=11 EAGAIN)</code></pre>
+
+<p>The kernel's pipe buffer is <strong>65536 bytes</strong> (16 pages of 4096) by default on Linux — matching the
+documented capacity in <code>pipe(7)</code>, adjustable with <code>fcntl</code>'s <code>F_SETPIPE_SZ</code>. This
+bound gives pipes their flow control: a fast writer <em>blocks</em> when the buffer is full until the reader drains it,
+and a reader <em>blocks</em> on an empty pipe until data arrives — so a pipeline naturally paces its stages to the
+slowest one. Two more behaviors complete the model. When <em>all</em> write ends are closed, a <code>read</code> returns
+<strong>0</strong> — end-of-file — which is how the reader learns the writer is done. And writing to a pipe whose
+<em>read</em> end is all closed raises <strong><code>SIGPIPE</code></strong> (default: terminate), or, if you ignore that
+signal, fails the <code>write</code> with <code>errno == EPIPE</code> — the kernel's way of telling a writer that nobody
+is listening, so it should stop rather than pour bytes into a void.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A pipe delivered six bytes from two three-byte writes as one read. What property of a pipe does that show, and what
+must you add on top if you need discrete messages? What does a <code>read</code> return when every write end is closed?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>19.3 Shared memory: the fastest channel moves nothing</h2>
+
+<p>Pipes and sockets copy: bytes go from the sender's memory into a kernel buffer and out again into the receiver's
+memory — two copies and a system call per exchange. <strong>Shared memory</strong> is the mechanism that removes the
+copy by removing the boundary. Two processes arrange for a region of their address spaces to be backed by the
+<em>same physical frames</em> — precisely the shared-mapping machinery of Chapter 17, where two page tables point at one
+frame — and thereafter one process's store to that region <em>is</em> the other's load. Nothing traverses the kernel per
+access; communication runs at the speed of memory. The arrangement comes in a few forms: an <em>anonymous</em>
+<code>mmap</code> with <code>MAP_SHARED</code> inherited across <code>fork</code> (for related processes); POSIX shared
+memory (<code>shm_open</code> to get a named object, then <code>mmap</code> it) for unrelated processes; and the older
+System V <code>shmget</code>/<code>shmat</code> interface. All reach the same end: one region, many mappers.</p>
+
+<p>The opener's prediction pins down what "shared" means and what it does not. Map one page
+<code>MAP_SHARED|MAP_ANONYMOUS</code> and another <code>MAP_PRIVATE|MAP_ANONYMOUS</code>, <code>fork</code>, let the
+child write 42 into both, and have the parent read them back:</p>
+
+<pre><code>int *shared  = mmap(NULL, 4096, ..., MAP_SHARED |MAP_ANONYMOUS, -1, 0);
+int *private = mmap(NULL, 4096, ..., MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+/* child: *shared = 42; *private = 42; exit */
+
+after child wrote 42: parent sees shared=42, private=0</code></pre>
+
+<p>The parent sees <code>shared == 42</code> but <code>private == 0</code>. The <code>MAP_SHARED</code> page is one
+frame both processes map, so the child's write is visible to the parent; the <code>MAP_PRIVATE</code> page is
+copy-on-write, so the child's write faulted a private copy the parent never sees (the same copy-on-write from
+<code>fork</code> in Chapter 14). Shared memory is <code>MAP_SHARED</code>: genuine sharing, zero copies. But here is the
+catch, and it is the whole reason concurrency is the next part of this book. Shared memory gives you the sharing and
+<em>nothing else</em> — no ordering, no mutual exclusion. Two processes writing the same shared counter with no
+coordination is <strong>exactly the data race of Chapter 15</strong>, now across process boundaries rather than threads.
+Measured with two processes each incrementing a shared counter a million times, no synchronization (gcc 11.4.0 at
+<code>-O0</code>, so each <code>++</code> is a real load–add–store):</p>
+
+<pre><code>two processes each +1000000 on a shared counter, no lock: final=1305815 (expected 2000000)</code></pre>
+
+<p>Roughly 700,000 updates vanished — the same lost-update interleaving as Chapter 15's threads, for the same reason:
+<code>counter++</code> is not atomic, and two flows of control raced through its load–add–store. Shared memory hands you
+raw, unsynchronized concurrency; making it correct needs the locks, condition variables, and atomics of the next part.
+The map's lesson is sharp: shared memory is the fastest channel and the most dangerous, because it is the only one that
+does not serialize access through the kernel for you.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: shared memory shares frames, not synchronization</span>
+<p><strong>1. In words.</strong> A <code>MAP_SHARED</code> region is backed by physical frames that appear in both
+processes' page tables, so a write by one is directly a read by the other — no copy, no kernel round-trip. What the kernel
+does <em>not</em> supply is any ordering or exclusion between those accesses; that is the caller's job.</p>
+<p><strong>2. As a picture.</strong> Figure 19.1: two page tables, both pointing at frame F (shared) — one write, both
+see it — versus two page tables pointing at private copies (copy-on-write), where a write splits them apart.</p>
+<p><strong>3. As numbers.</strong> <code>MAP_SHARED</code>: parent sees the child's 42. <code>MAP_PRIVATE</code>: parent
+still sees 0. And two processes racing a shared counter a million times each land at <code>1305815</code>, not
+<code>2000000</code> — sharing without synchronization is the Chapter 15 data race again.</p>
+</aside>
+
+<p><em>(Answer to the §19.1 quick check: a pointer is meaningless across the boundary because the same virtual address
+maps to different physical memory in each process's private address space. The toolkit splits into channels the kernel
+<strong>copies</strong> bytes through and arrangements that <strong>share</strong> the same physical memory; the sharing
+side — shared memory — moves no data.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">MAP_SHARED: two page tables, one frame — a write by either is seen by both.</text>
+<rect x="30" y="40" width="90" height="34" fill="#f5f8fb" stroke="#14406b"/><text x="42" y="61" font-size="10">Proc A PTE</text>
+<rect x="30" y="120" width="90" height="34" fill="#f5f8fb" stroke="#14406b"/><text x="42" y="141" font-size="10">Proc B PTE</text>
+<rect x="260" y="80" width="90" height="34" fill="#cfe8cf" stroke="#2e6b34"/><text x="278" y="101" font-size="10">frame F</text>
+<line x1="120" y1="57" x2="260" y2="93" stroke="#2e6b34"/><line x1="120" y1="137" x2="260" y2="101" stroke="#2e6b34"/>
+<text x="360" y="92" font-size="9" fill="#2e6b34">A writes 42 &#8594; B reads 42 (no copy)</text>
+<text x="20" y="180" fill="#8c3a1d">MAP_PRIVATE (copy-on-write): a write splits the mapping —</text>
+<rect x="360" y="150" width="70" height="26" fill="#fdeee6" stroke="#8c3a1d"/><text x="372" y="167" font-size="9">A's copy</text>
+<rect x="450" y="150" width="70" height="26" fill="#fdeee6" stroke="#8c3a1d"/><text x="462" y="167" font-size="9">B's copy</text>
+<text x="360" y="196" font-size="9" fill="#8c3a1d">A writes 42 &#8594; B still sees 0</text>
+</svg>
+<figcaption>Figure 19.1: Shared memory (<code>MAP_SHARED</code>) maps one physical frame into both processes, so a store
+by one is a load by the other with no copy. A private (copy-on-write) mapping instead gives each a separate copy on the
+first write, so changes do not cross. Sharing frames is not sharing synchronization — coordinating the concurrent access
+is still the program's job.</figcaption>
+</figure>
+
+<h2>19.4 Sockets: bidirectional channels that cross machines</h2>
+
+<p>Pipes are unidirectional and local; the moment you need two-way traffic, or need to reach a process on another host,
+you reach for a <strong>socket</strong>. A socket is a bidirectional endpoint, created with <code>socket()</code>, that
+comes in two dominant flavors distinguished by <em>message shape</em>. A <strong>stream socket</strong>
+(<code>SOCK_STREAM</code>, TCP over a network) is a reliable, ordered <em>byte stream</em> — like a pipe, it has
+<strong>no message boundaries</strong>, so the same framing burden applies. A <strong>datagram socket</strong>
+(<code>SOCK_DGRAM</code>, UDP) preserves <em>message boundaries</em> — each <code>send</code> is one <code>recv</code> —
+but drops the reliability and ordering guarantees, so datagrams can be lost, duplicated, or reordered. The same API spans
+reach: with the <code>AF_UNIX</code> address family a socket is a fast <strong>local</strong> channel (a Unix-domain
+socket, which can even pass open file descriptors between processes); with <code>AF_INET</code>/<code>AF_INET6</code> the
+identical call sequence talks <strong>across machines</strong>. That uniformity is the socket's great virtue: one
+programming model from "next door" to "across the world."</p>
+
+<p>What you buy with that reach is paid in copies and uncertainty. Every socket exchange, local or remote, passes bytes
+through kernel buffers — so, like a pipe, a socket <em>copies</em> rather than shares, and cannot match shared memory's
+zero-copy speed for two processes on one machine. And once the channel spans the network, the far end can vanish
+mid-conversation: a socket write can fail, a read can hang, a connection can reset. Those failure modes — and the
+epoll/io_uring machinery for handling thousands of them efficiently — are the subject of the low-level I/O and networking
+material later in this volume; here the point is placement. Use a pipe or FIFO for a local, one-way byte stream; shared
+memory when two local processes must exchange data at memory speed and you are prepared to synchronize; a Unix-domain
+socket for local bidirectional or descriptor-passing needs; and a network socket when the other process is on another
+machine and you accept the cost and the failure modes that come with distance.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: assuming a stream preserves your message boundaries</span>
+<p>The single most common IPC bug is treating a <strong>byte stream</strong> — a pipe, a FIFO, or a TCP connection — as
+if it preserved the boundaries of your <code>write</code>s. You <code>send</code> a 200-byte request in one call and
+assume the peer's one <code>recv</code> returns exactly those 200 bytes; it does not have to. The stream may coalesce two
+sends into one read (as we measured for pipes: two 3-byte writes came back as one 6-byte read) or split one send across
+two reads. Over TCP this is guaranteed to bite eventually, because the network fragments and recombines the stream at
+will, so the code that "worked on localhost" corrupts messages under real traffic — the same "passes the test, broken
+anyway" pathology as a data race, and just as schedule- and load-dependent. The fix is <strong>framing</strong>: agree
+on a length prefix or a delimiter and loop <code>read</code>ing until you have a full message. If you need discrete
+messages for free, use a <em>datagram</em> mechanism (a <code>SOCK_DGRAM</code> socket, which preserves boundaries) — but
+then handle loss and reordering. Never let "one write, one read" be an unstated assumption in stream code.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our two services run on the same box and swap a lot of data, so I'll skip the
+socket and just put everything in a big <code>MAP_SHARED</code> region — it's basically free, right? Both sides read and
+write the struct directly." Cover the paragraph and respond in three or four sentences, drawing on §19.3.</p>
+<p><em>Model answer.</em> "Shared memory is the right instinct for speed — it's the only local channel with no per-message
+copy, because both processes map the same frames, so it can be far faster than a socket for high-volume same-host
+exchange. But it is <em>not</em> free: it gives you the sharing and nothing else — no ordering, no mutual exclusion — so
+the instant both sides write the same fields concurrently you have the Chapter 15 data race, across processes now, and
+we measured that losing hundreds of thousands of updates. To use it you must add your own synchronization in the shared
+region — a mutex or semaphore both processes can see, or lock-free structures with atomics — and think about what happens
+if one side crashes mid-update and leaves the data half-written. So: shared memory for the throughput, plus explicit
+coordination, plus a recovery story — not 'basically free.'" Naming that shared memory buys speed by handing back the
+synchronization problem is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §19.2 quick check: the six-bytes-from-two-writes result shows a pipe is a <strong>byte stream with
+no message boundaries</strong> — the kernel concatenates writes — so to send discrete messages you must add framing
+(length prefixes, delimiters, or fixed records). A <code>read</code> returns <strong>0</strong> (end-of-file) once every
+write end is closed.)</em></p>
+
+<h2>19.5 What to carry forward</h2>
+
+<p>Processes are isolated by design, so <strong>inter-process communication</strong> is the kernel's set of channels
+across that isolation, and each channel is a point on three axes: <em>copy vs. share</em>, <em>local vs. remote</em>, and
+<em>stream vs. message</em>. A <strong>pipe</strong> is a unidirectional, in-kernel byte stream shared across
+<code>fork</code> (a <strong>FIFO</strong> is a pipe with a filesystem name for unrelated processes); it has no message
+boundaries — we watched two 3-byte writes return as one 6-byte read — is bounded (65536 bytes on Linux, giving flow
+control by blocking a full writer and an empty reader), signals end-of-file with a <code>read</code> of 0, and raises
+<code>SIGPIPE</code>/<code>EPIPE</code> when no reader remains. <strong>Shared memory</strong> (<code>MAP_SHARED</code>)
+is the fastest channel because it copies nothing — both processes map the same frames, the Chapter 17 machinery — but it
+supplies sharing without synchronization, so two processes racing a shared counter lost ~700,000 of two million updates,
+the Chapter 15 data race again. <strong>Sockets</strong> are bidirectional and, uniquely, cross machines: stream sockets
+(TCP) are boundary-less byte streams needing framing, datagram sockets (UDP) preserve message boundaries but drop
+reliability, and the same API spans a local Unix-domain socket to a worldwide connection, paying copies and failure modes
+for the reach.</p>
+
+<p>With this, Part III is complete. The operating system took one machine and multiplexed it: the system-call boundary
+(Chapter 13) is how a process asks the kernel for service; <code>fork</code>/<code>exec</code>/<code>wait</code>
+(Chapter 14) create and isolate processes; threads (Chapter 15) add flows of control inside one; scheduling (Chapter 16)
+shares the CPU in time; virtual memory (Chapter 17) shares physical memory across address spaces; signals (Chapter 18)
+let the kernel interrupt a process; and IPC (this chapter) opens controlled channels between the isolated processes the
+OS worked to keep apart. Two threads run out of this part. One points <em>forward in this volume</em>: shared memory just
+handed us unsynchronized concurrency across processes, and threads did the same within one — the data race is now a debt
+owed twice over. Making shared-memory concurrency <em>correct</em> — mutual exclusion with locks, waiting with condition
+variables and semaphores, ordering with atomics and the memory model, and the lock-free techniques that avoid locks
+entirely — is the concurrency-and-parallelism part that begins next. The other points toward <em>later volumes</em>:
+sockets, framing, and the cost of the kernel boundary are the substrate under every networked data system, and the
+efficient handling of many connections at once (epoll, io_uring, zero-copy) is the low-level I/O material this volume
+closes with. The channels are open; now we have to make the traffic on them correct.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a raw pointer cannot be passed between processes, and state the copy-vs-share distinction that organizes
+the IPC toolkit.</li>
+<li>Describe a pipe as a unidirectional byte stream, explain why it has no message boundaries, and say what framing is
+for.</li>
+<li>State a pipe's flow-control behavior (block on full/empty), what a <code>read</code> of 0 means, and when
+<code>SIGPIPE</code>/<code>EPIPE</code> fires.</li>
+<li>Explain why shared memory is the fastest channel, and why it is also the most dangerous — tie it to the Chapter 15
+data race.</li>
+<li>Contrast <code>MAP_SHARED</code> and <code>MAP_PRIVATE</code> across <code>fork</code> using the measured 42-vs-0
+result.</li>
+<li>Distinguish stream and datagram sockets by message shape, and say what sockets uniquely offer that the other channels
+do not.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is IPC for, and what are the three axes a channel sits on? (§19.1)</li>
+<li><strong>R2.</strong> What is a pipe, why does it have no message boundaries, and what is a FIFO? (§19.2)</li>
+<li><strong>R3.</strong> What is a pipe's capacity and flow-control behavior, and what does a <code>read</code> of 0
+mean? (§19.2)</li>
+<li><strong>R4.</strong> Why is shared memory the fastest channel, and what does it fail to provide? (§19.3)</li>
+<li><strong>R5.</strong> How do stream and datagram sockets differ, and what do sockets offer that pipes and shared
+memory cannot? (§19.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Stevens &amp; Rago, <em>Advanced Programming in the UNIX Environment</em>, 3rd ed. (2013), Chapters 15
+(Interprocess Communication), 16 (Network IPC: Sockets), and 17 (Advanced IPC).</strong> The canonical, thorough
+treatment of pipes, FIFOs, shared memory, and sockets, including Unix-domain sockets and descriptor passing.
+<code>[⚠ reference — not free]</code></li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 10
+(System-Level I/O) and Chapter 11 (Network Programming).</strong> Unix I/O and the sockets interface from the
+programmer's view — the reference for §19.2 and §19.4. <code>[⚠ reference — not free]</code>; the CMU 15-213 materials
+are free.</li>
+<li><strong>Beej's Guide to Network Programming</strong> (<code>beej.us</code>). Free. A practical, readable introduction
+to the sockets API, stream vs. datagram, and the framing you must add on top of TCP.</li>
+<li><strong>The Linux <code>pipe(2)</code>, <code>pipe(7)</code>, <code>mmap(2)</code>, <code>shm_overview(7)</code>,
+<code>unix(7)</code>, and <code>socket(2)</code> manual pages.</strong> Primary sources for the pipe capacity and
+<code>PIPE_BUF</code> atomicity, <code>MAP_SHARED</code> semantics, POSIX shared memory, Unix-domain sockets, and the
+socket types. Verify per kernel version.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex19.1"><span class="ex-label">19.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, name the copy-vs-share distinction and give one IPC mechanism on each side of it.</div>
+
+<div class="exercise" id="ex19.2"><span class="ex-label">19.2</span> <span class="ex-tag warm">warm-up</span>
+A pipe is unidirectional and only usefully connects processes created how? What does a FIFO add that lets unrelated
+processes use it?</div>
+
+<div class="exercise" id="ex19.3"><span class="ex-label">19.3</span> <span class="ex-tag warm">warm-up</span>
+What does a <code>read</code> on a pipe return when all write ends are closed, and what happens when you <code>write</code>
+to a pipe whose read ends are all closed?</div>
+
+<div class="exercise" id="ex19.4"><span class="ex-label">19.4</span> <span class="ex-tag core">core</span>
+Explain why a pipe has no message boundaries, using the measured "two 3-byte writes, one 6-byte read" result. If your
+protocol needs discrete messages over a pipe or a TCP stream, what must you add, and give two concrete framing schemes.</div>
+
+<div class="exercise" id="ex19.5"><span class="ex-label">19.5</span> <span class="ex-tag core">core</span>
+Explain why shared memory is the fastest local IPC channel <em>and</em> why it is the most hazardous. Contrast
+<code>MAP_SHARED</code> and <code>MAP_PRIVATE</code> across <code>fork</code> using the 42-vs-0 measurement, and tie the
+hazard back to Chapter 15.</div>
+
+<div class="exercise" id="ex19.6"><span class="ex-label">19.6</span> <span class="ex-tag core">core</span>
+Distinguish a stream socket from a datagram socket by message shape and by guarantees. For each of these, say which you
+would pick and why: (a) a reliable in-order request/response protocol; (b) low-latency telemetry where an occasional
+lost sample is fine. What does <code>AF_UNIX</code> change versus <code>AF_INET</code>?</div>
+
+<div class="exercise" id="ex19.7"><span class="ex-label">19.7</span> <span class="ex-tag complexity">cost</span>
+(a) Roughly how many copies does a byte make going from one process to another through a pipe versus through shared
+memory, and why does that make shared memory faster? (b) The pipe holds 65536 bytes before a writer blocks — explain how
+that bound provides flow control for a pipeline. (c) What is the cost you pay to get shared memory's zero copies, stated
+as an engineering burden rather than a number?</div>
+
+<div class="exercise" id="ex19.8"><span class="ex-label">19.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A logging service on one host receives log lines from many local producers.
+The team uses a single shared-memory ring buffer that all producers and the one consumer read and write directly, with no
+locks, "because shared memory is fast." Lines occasionally come out garbled or duplicated under load.
+<br><strong>Step 1 (given):</strong> Shared memory shares the frames but provides no mutual exclusion or ordering.
+<br><strong>Step 2 (given):</strong> Multiple producers advancing the ring's write index concurrently is a read–modify–write
+on shared state — a data race.
+<br><strong>Step 3 (given):</strong> The race only manifests when two producers hit the index at overlapping moments, so
+light load looks fine and heavy load corrupts.
+<br><strong>Step 4 (you):</strong> Name the bug precisely, explain why it appears only under load, and describe two
+fixes — one using a synchronization primitive placed in the shared region, and one that changes the channel choice to
+avoid the shared write index entirely.</div>
+
+<div class="exercise" id="ex19.9"><span class="ex-label">19.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, choose the best IPC mechanism (pipe/FIFO, shared memory, Unix-domain socket, or network socket) and justify
+in a line: (a) a shell pipeline <code>grep | sort</code>; (b) a video frame passed 60 times a second between two
+processes on the same GPU host; (c) a client on a laptop calling a service in a datacenter; (d) two local daemons that
+must exchange requests <em>and</em> pass an open file descriptor between them.</div>
+
+<div class="exercise" id="ex19.10"><span class="ex-label">19.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 14–19, classify each statement as <em>true</em> or <em>false</em> and fix the false ones: (a) "A TCP
+connection delivers each <code>send</code> as exactly one <code>recv</code>." (b) "Two processes can communicate by one
+passing the other a pointer into its heap." (c) "Shared memory needs no synchronization because it is just memory." (d)
+"A signal can carry a kilobyte of structured data from one process to another." (e) "Closing all write ends of a pipe is
+how the reader learns the stream is finished."</div>
+
+<div class="exercise" id="ex19.11"><span class="ex-label">19.11</span> <span class="ex-tag stretch">stretch</span>
+A pipeline <code>producer | consumer</code> runs with the producer far faster than the consumer. (a) Explain, using the
+65536-byte buffer and blocking semantics, why the producer does not run away and exhaust memory — where does it end up
+waiting? (b) How is this <em>backpressure</em> related to the flow control you would otherwise have to build by hand over
+a raw shared-memory channel? (c) Now the consumer dies. Trace what the producer observes on its next write, naming the
+signal and the errno, and explain why the OS designed it to notify the writer rather than silently discard the bytes.</div>
+
+<div class="exercise" id="ex19.12"><span class="ex-label">19.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a program that creates a pipe, writes <code>"ABC"</code> then <code>"DEF"</code>, and does
+one <code>read</code> — confirm you get six bytes with no boundary. (b) Fill a non-blocking pipe one byte at a time and
+print the capacity; confirm it near 65536 and try changing it with <code>fcntl(F_SETPIPE_SZ)</code>. (c) <code>mmap</code>
+one page <code>MAP_SHARED</code> and one <code>MAP_PRIVATE</code>, <code>fork</code>, have the child write both, and print
+what the parent sees — confirm shared changes cross and private ones do not. Label your compiler and kernel version.</div>
+
+</section>
+</section>

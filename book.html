@@ -258,7 +258,10 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch16">Chapter 16 — CPU Scheduling</a></li>
 <li class="toc-ch"><a href="#ch17">Chapter 17 — Virtual Memory: Demand Paging and Page Replacement</a></li>
 <li class="toc-ch"><a href="#ch18">Chapter 18 — Signals: Asynchronous Control Flow</a></li>
+<li class="toc-ch"><a href="#ch19">Chapter 19 — Inter-Process Communication: Pipes, Shared Memory, and Sockets</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part IV &mdash; Concurrency & Parallelism</li>
+<li class="toc-ch"><a href="#ch20">Chapter 20 — Mutual Exclusion: Locks and the Critical Section</a></li>
+<li class="toc-ch"><a href="#ch21">Chapter 21 — Coordinating Threads: Condition Variables and Semaphores</a></li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part V &mdash; Rust for Systems</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VI &mdash; Performance Engineering</li>
 <li class="toc-part">Vol 1 · Systems Programming & Performance · Part VII &mdash; I/O & Networking, Low-Level</li>
@@ -7856,7 +7859,1188 @@ terms of interrupted system calls and non-queuing standard signals. Label your c
 </section>
 </section>
 
+<section class="chapter" id="ch19">
+<h1>Chapter 19 — Inter-Process Communication: Pipes, Shared Memory, and Sockets</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch14">Chapter 14</a> (<code>fork</code> gives each
+process its own <em>isolated</em> address space — this chapter is how those isolated processes talk), <a href="#ch17">Chapter
+17</a> (a shared mapping lets two page tables point at the same physical frame — that is the machinery under shared
+memory), <a href="#ch18">Chapter 18</a> (a signal is a doorbell, not a conversation — it notifies but carries no data).
+&nbsp;·&nbsp; Chapter 14 spent real effort keeping processes apart; this chapter is the controlled set of channels that
+let them exchange data <em>across</em> that isolation, and it is where Part III finishes.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch17">Chapter 17</a> — copy-on-write and shared mappings both rest on one
+fact about page tables; what lets two processes' page tables refer to the <em>same</em> physical frame? (2)
+<a href="#ch18">Chapter 18</a> — why did we call a signal a "doorbell, not a conversation," and what does that tell you
+it is bad at? (3) <em>Predict:</em> two related processes <code>mmap</code> the same page with <code>MAP_SHARED</code>;
+one writes the value 42 into it and exits, the other reads. Does the reader see 42? Now suppose the mapping had instead
+been <code>MAP_PRIVATE</code> — same question. Write down both guesses; we measure them in §19.3.</p>
+</aside>
+
+<p>A process is an island. Chapter 14 built that isolation deliberately: each process gets its own virtual address space,
+so a wild pointer in one cannot corrupt another, and Chapter 17 showed the page tables that enforce it. Isolation is a
+safety property you want — and an obstacle the moment two processes must cooperate. A shell pipeline
+(<code>sort | uniq</code>), a web server handing a request to a worker, a database client talking to a server: all need
+to move data between address spaces that, by construction, cannot see each other's memory. <strong>Inter-process
+communication</strong> (IPC) is the family of kernel-provided channels that bridge the gap. This chapter covers the three
+that matter most, along the axis of <em>what</em> they move and <em>how far</em>: <strong>pipes and FIFOs</strong>, the
+unidirectional byte stream that powers the shell (§19.2); <strong>shared memory</strong>, the fastest channel because it
+moves nothing — the processes map the same frames (§19.3); and <strong>sockets</strong>, the bidirectional channel that,
+unlike the others, also reaches <em>across machines</em> (§19.4). We start by placing them on a map (§19.1) and close by
+carrying the toolkit forward into concurrency and networking (§19.5). The through-line: every channel trades cost against
+reach against safety, and shared memory in particular gives you speed by handing back a hazard you have met before.</p>
+
+<h2>19.1 Why IPC exists, and the shape of the toolkit</h2>
+
+<p>Because address spaces are private, one process cannot simply pass a pointer to another: the same virtual address
+means different physical memory (or nothing) in the other process, so a raw pointer is meaningless across the boundary.
+Every IPC mechanism is therefore either a <strong>channel the kernel copies bytes through</strong> or an
+<strong>arrangement to share the same physical memory</strong>. That single distinction organizes the whole toolkit.
+A <em>copying</em> channel — a pipe, a FIFO, a socket — is safe and simple: the sender hands bytes to the kernel, the
+kernel buffers them, the receiver reads them out, and neither ever touches the other's memory. A <em>sharing</em>
+arrangement — shared memory — is fast because it skips the copy entirely: both processes map one region and read and
+write it directly, at memory speed, but they inherit the full burden of coordinating that concurrent access themselves.</p>
+
+<p>Cutting the other way is <strong>reach</strong>. Pipes, FIFOs, shared memory, and Unix-domain sockets are
+<em>same-machine</em> mechanisms: they rely on a shared kernel, so they cannot connect two processes on different
+computers. Network sockets (TCP/UDP) are the exception — the same socket API that talks to a process next door talks to
+one across the world, at the price of copies, protocol overhead, and the possibility of failure in between. And cutting a
+third way is <strong>message shape</strong>: some channels preserve the boundaries between writes (a datagram socket
+delivers each message whole), while others are pure byte streams that erase them (a pipe or a TCP connection). Keep those
+three axes — copy vs. share, local vs. remote, stream vs. message — in mind; every mechanism below is a point in that
+space, and choosing well is mostly a matter of locating your need on the map.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why can't one process simply pass a pointer to another and have it work? Name the single distinction that splits the
+IPC toolkit in two, and say which side "moves no data." (Answer after the next section.)</p>
+</aside>
+
+<h2>19.2 Pipes and FIFOs: the byte stream</h2>
+
+<p>A <strong>pipe</strong> is the oldest and simplest IPC channel: a unidirectional, in-kernel byte buffer with two file
+descriptors, a read end and a write end. The <code>pipe(fd)</code> system call fills <code>fd[0]</code> (read) and
+<code>fd[1]</code> (write); bytes written to <code>fd[1]</code> come out of <code>fd[0]</code> in order. On its own a
+pipe connects nothing — the trick is <code>fork</code>: a parent creates the pipe, forks, and now parent and child share
+both descriptors (file descriptors survive <code>fork</code>, Chapter 14), so one can close the read end and one the
+write end, leaving a one-way channel between relatives. That is exactly how the shell builds <code>a | b</code>: it pipes
+<code>a</code>'s standard output to <code>b</code>'s standard input. A <strong>FIFO</strong> (named pipe) is the same
+buffer given a <em>filesystem name</em> with <code>mkfifo</code>, so that <em>unrelated</em> processes — with no common
+ancestor to inherit descriptors from — can rendezvous by opening the same path.</p>
+
+<p>The defining property of a pipe is that it is a <strong>byte stream with no message boundaries</strong>. The kernel
+does not remember how many <code>write</code>s produced the bytes; it just concatenates them. Two writes of three bytes
+each are indistinguishable from one write of six. Here is that fact measured (gcc 11.4.0, Linux 6.18): write
+<code>"ABC"</code> then <code>"DEF"</code> to a pipe, then do a single <code>read</code>:</p>
+
+<pre><code>write(fd[1], "ABC", 3);
+write(fd[1], "DEF", 3);
+ssize_t n = read(fd[0], buf, sizeof buf);
+
+two writes of 3 bytes; one read got 6 bytes: "ABCDEF"</code></pre>
+
+<p>One read returned all six bytes at once: the boundary between the writes is gone. This is not a bug — it is what a
+stream <em>is</em> — but it means that if you need messages (records, requests), you must impose them yourself with
+<strong>framing</strong>: length prefixes, delimiters, or fixed-size records. (Small writes are still atomic up to a
+limit: POSIX guarantees a write of at most <code>PIPE_BUF</code> bytes — 4096 on Linux — will not be interleaved with
+another writer's, which is why the boundary-erasing above is about <em>your own</em> back-to-back writes, not
+corruption.) A pipe is also <strong>finite</strong>: it holds a bounded amount before a writer must wait. Filling a
+non-blocking pipe one byte at a time until it refuses shows the capacity:</p>
+
+<pre><code>while (write(fd[1], &amp;c, 1) == 1) total++;
+
+pipe full after 65536 bytes (errno=11 EAGAIN)</code></pre>
+
+<p>The kernel's pipe buffer is <strong>65536 bytes</strong> (16 pages of 4096) by default on Linux — matching the
+documented capacity in <code>pipe(7)</code>, adjustable with <code>fcntl</code>'s <code>F_SETPIPE_SZ</code>. This
+bound gives pipes their flow control: a fast writer <em>blocks</em> when the buffer is full until the reader drains it,
+and a reader <em>blocks</em> on an empty pipe until data arrives — so a pipeline naturally paces its stages to the
+slowest one. Two more behaviors complete the model. When <em>all</em> write ends are closed, a <code>read</code> returns
+<strong>0</strong> — end-of-file — which is how the reader learns the writer is done. And writing to a pipe whose
+<em>read</em> end is all closed raises <strong><code>SIGPIPE</code></strong> (default: terminate), or, if you ignore that
+signal, fails the <code>write</code> with <code>errno == EPIPE</code> — the kernel's way of telling a writer that nobody
+is listening, so it should stop rather than pour bytes into a void.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A pipe delivered six bytes from two three-byte writes as one read. What property of a pipe does that show, and what
+must you add on top if you need discrete messages? What does a <code>read</code> return when every write end is closed?
+(Answer below the communicate box.)</p>
+</aside>
+
+<h2>19.3 Shared memory: the fastest channel moves nothing</h2>
+
+<p>Pipes and sockets copy: bytes go from the sender's memory into a kernel buffer and out again into the receiver's
+memory — two copies and a system call per exchange. <strong>Shared memory</strong> is the mechanism that removes the
+copy by removing the boundary. Two processes arrange for a region of their address spaces to be backed by the
+<em>same physical frames</em> — precisely the shared-mapping machinery of Chapter 17, where two page tables point at one
+frame — and thereafter one process's store to that region <em>is</em> the other's load. Nothing traverses the kernel per
+access; communication runs at the speed of memory. The arrangement comes in a few forms: an <em>anonymous</em>
+<code>mmap</code> with <code>MAP_SHARED</code> inherited across <code>fork</code> (for related processes); POSIX shared
+memory (<code>shm_open</code> to get a named object, then <code>mmap</code> it) for unrelated processes; and the older
+System V <code>shmget</code>/<code>shmat</code> interface. All reach the same end: one region, many mappers.</p>
+
+<p>The opener's prediction pins down what "shared" means and what it does not. Map one page
+<code>MAP_SHARED|MAP_ANONYMOUS</code> and another <code>MAP_PRIVATE|MAP_ANONYMOUS</code>, <code>fork</code>, let the
+child write 42 into both, and have the parent read them back:</p>
+
+<pre><code>int *shared  = mmap(NULL, 4096, ..., MAP_SHARED |MAP_ANONYMOUS, -1, 0);
+int *private = mmap(NULL, 4096, ..., MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+/* child: *shared = 42; *private = 42; exit */
+
+after child wrote 42: parent sees shared=42, private=0</code></pre>
+
+<p>The parent sees <code>shared == 42</code> but <code>private == 0</code>. The <code>MAP_SHARED</code> page is one
+frame both processes map, so the child's write is visible to the parent; the <code>MAP_PRIVATE</code> page is
+copy-on-write, so the child's write faulted a private copy the parent never sees (the same copy-on-write from
+<code>fork</code> in Chapter 14). Shared memory is <code>MAP_SHARED</code>: genuine sharing, zero copies. But here is the
+catch, and it is the whole reason concurrency is the next part of this book. Shared memory gives you the sharing and
+<em>nothing else</em> — no ordering, no mutual exclusion. Two processes writing the same shared counter with no
+coordination is <strong>exactly the data race of Chapter 15</strong>, now across process boundaries rather than threads.
+Measured with two processes each incrementing a shared counter a million times, no synchronization (gcc 11.4.0 at
+<code>-O0</code>, so each <code>++</code> is a real load–add–store):</p>
+
+<pre><code>two processes each +1000000 on a shared counter, no lock: final=1305815 (expected 2000000)</code></pre>
+
+<p>Roughly 700,000 updates vanished — the same lost-update interleaving as Chapter 15's threads, for the same reason:
+<code>counter++</code> is not atomic, and two flows of control raced through its load–add–store. Shared memory hands you
+raw, unsynchronized concurrency; making it correct needs the locks, condition variables, and atomics of the next part.
+The map's lesson is sharp: shared memory is the fastest channel and the most dangerous, because it is the only one that
+does not serialize access through the kernel for you.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: shared memory shares frames, not synchronization</span>
+<p><strong>1. In words.</strong> A <code>MAP_SHARED</code> region is backed by physical frames that appear in both
+processes' page tables, so a write by one is directly a read by the other — no copy, no kernel round-trip. What the kernel
+does <em>not</em> supply is any ordering or exclusion between those accesses; that is the caller's job.</p>
+<p><strong>2. As a picture.</strong> Figure 19.1: two page tables, both pointing at frame F (shared) — one write, both
+see it — versus two page tables pointing at private copies (copy-on-write), where a write splits them apart.</p>
+<p><strong>3. As numbers.</strong> <code>MAP_SHARED</code>: parent sees the child's 42. <code>MAP_PRIVATE</code>: parent
+still sees 0. And two processes racing a shared counter a million times each land at <code>1305815</code>, not
+<code>2000000</code> — sharing without synchronization is the Chapter 15 data race again.</p>
+</aside>
+
+<p><em>(Answer to the §19.1 quick check: a pointer is meaningless across the boundary because the same virtual address
+maps to different physical memory in each process's private address space. The toolkit splits into channels the kernel
+<strong>copies</strong> bytes through and arrangements that <strong>share</strong> the same physical memory; the sharing
+side — shared memory — moves no data.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">MAP_SHARED: two page tables, one frame — a write by either is seen by both.</text>
+<rect x="30" y="40" width="90" height="34" fill="#f5f8fb" stroke="#14406b"/><text x="42" y="61" font-size="10">Proc A PTE</text>
+<rect x="30" y="120" width="90" height="34" fill="#f5f8fb" stroke="#14406b"/><text x="42" y="141" font-size="10">Proc B PTE</text>
+<rect x="260" y="80" width="90" height="34" fill="#cfe8cf" stroke="#2e6b34"/><text x="278" y="101" font-size="10">frame F</text>
+<line x1="120" y1="57" x2="260" y2="93" stroke="#2e6b34"/><line x1="120" y1="137" x2="260" y2="101" stroke="#2e6b34"/>
+<text x="360" y="92" font-size="9" fill="#2e6b34">A writes 42 &#8594; B reads 42 (no copy)</text>
+<text x="20" y="180" fill="#8c3a1d">MAP_PRIVATE (copy-on-write): a write splits the mapping —</text>
+<rect x="360" y="150" width="70" height="26" fill="#fdeee6" stroke="#8c3a1d"/><text x="372" y="167" font-size="9">A's copy</text>
+<rect x="450" y="150" width="70" height="26" fill="#fdeee6" stroke="#8c3a1d"/><text x="462" y="167" font-size="9">B's copy</text>
+<text x="360" y="196" font-size="9" fill="#8c3a1d">A writes 42 &#8594; B still sees 0</text>
+</svg>
+<figcaption>Figure 19.1: Shared memory (<code>MAP_SHARED</code>) maps one physical frame into both processes, so a store
+by one is a load by the other with no copy. A private (copy-on-write) mapping instead gives each a separate copy on the
+first write, so changes do not cross. Sharing frames is not sharing synchronization — coordinating the concurrent access
+is still the program's job.</figcaption>
+</figure>
+
+<h2>19.4 Sockets: bidirectional channels that cross machines</h2>
+
+<p>Pipes are unidirectional and local; the moment you need two-way traffic, or need to reach a process on another host,
+you reach for a <strong>socket</strong>. A socket is a bidirectional endpoint, created with <code>socket()</code>, that
+comes in two dominant flavors distinguished by <em>message shape</em>. A <strong>stream socket</strong>
+(<code>SOCK_STREAM</code>, TCP over a network) is a reliable, ordered <em>byte stream</em> — like a pipe, it has
+<strong>no message boundaries</strong>, so the same framing burden applies. A <strong>datagram socket</strong>
+(<code>SOCK_DGRAM</code>, UDP) preserves <em>message boundaries</em> — each <code>send</code> is one <code>recv</code> —
+but drops the reliability and ordering guarantees, so datagrams can be lost, duplicated, or reordered. The same API spans
+reach: with the <code>AF_UNIX</code> address family a socket is a fast <strong>local</strong> channel (a Unix-domain
+socket, which can even pass open file descriptors between processes); with <code>AF_INET</code>/<code>AF_INET6</code> the
+identical call sequence talks <strong>across machines</strong>. That uniformity is the socket's great virtue: one
+programming model from "next door" to "across the world."</p>
+
+<p>What you buy with that reach is paid in copies and uncertainty. Every socket exchange, local or remote, passes bytes
+through kernel buffers — so, like a pipe, a socket <em>copies</em> rather than shares, and cannot match shared memory's
+zero-copy speed for two processes on one machine. And once the channel spans the network, the far end can vanish
+mid-conversation: a socket write can fail, a read can hang, a connection can reset. Those failure modes — and the
+epoll/io_uring machinery for handling thousands of them efficiently — are the subject of the low-level I/O and networking
+material later in this volume; here the point is placement. Use a pipe or FIFO for a local, one-way byte stream; shared
+memory when two local processes must exchange data at memory speed and you are prepared to synchronize; a Unix-domain
+socket for local bidirectional or descriptor-passing needs; and a network socket when the other process is on another
+machine and you accept the cost and the failure modes that come with distance.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: assuming a stream preserves your message boundaries</span>
+<p>The single most common IPC bug is treating a <strong>byte stream</strong> — a pipe, a FIFO, or a TCP connection — as
+if it preserved the boundaries of your <code>write</code>s. You <code>send</code> a 200-byte request in one call and
+assume the peer's one <code>recv</code> returns exactly those 200 bytes; it does not have to. The stream may coalesce two
+sends into one read (as we measured for pipes: two 3-byte writes came back as one 6-byte read) or split one send across
+two reads. Over TCP this is guaranteed to bite eventually, because the network fragments and recombines the stream at
+will, so the code that "worked on localhost" corrupts messages under real traffic — the same "passes the test, broken
+anyway" pathology as a data race, and just as schedule- and load-dependent. The fix is <strong>framing</strong>: agree
+on a length prefix or a delimiter and loop <code>read</code>ing until you have a full message. If you need discrete
+messages for free, use a <em>datagram</em> mechanism (a <code>SOCK_DGRAM</code> socket, which preserves boundaries) — but
+then handle loss and reordering. Never let "one write, one read" be an unstated assumption in stream code.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our two services run on the same box and swap a lot of data, so I'll skip the
+socket and just put everything in a big <code>MAP_SHARED</code> region — it's basically free, right? Both sides read and
+write the struct directly." Cover the paragraph and respond in three or four sentences, drawing on §19.3.</p>
+<p><em>Model answer.</em> "Shared memory is the right instinct for speed — it's the only local channel with no per-message
+copy, because both processes map the same frames, so it can be far faster than a socket for high-volume same-host
+exchange. But it is <em>not</em> free: it gives you the sharing and nothing else — no ordering, no mutual exclusion — so
+the instant both sides write the same fields concurrently you have the Chapter 15 data race, across processes now, and
+we measured that losing hundreds of thousands of updates. To use it you must add your own synchronization in the shared
+region — a mutex or semaphore both processes can see, or lock-free structures with atomics — and think about what happens
+if one side crashes mid-update and leaves the data half-written. So: shared memory for the throughput, plus explicit
+coordination, plus a recovery story — not 'basically free.'" Naming that shared memory buys speed by handing back the
+synchronization problem is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §19.2 quick check: the six-bytes-from-two-writes result shows a pipe is a <strong>byte stream with
+no message boundaries</strong> — the kernel concatenates writes — so to send discrete messages you must add framing
+(length prefixes, delimiters, or fixed records). A <code>read</code> returns <strong>0</strong> (end-of-file) once every
+write end is closed.)</em></p>
+
+<h2>19.5 What to carry forward</h2>
+
+<p>Processes are isolated by design, so <strong>inter-process communication</strong> is the kernel's set of channels
+across that isolation, and each channel is a point on three axes: <em>copy vs. share</em>, <em>local vs. remote</em>, and
+<em>stream vs. message</em>. A <strong>pipe</strong> is a unidirectional, in-kernel byte stream shared across
+<code>fork</code> (a <strong>FIFO</strong> is a pipe with a filesystem name for unrelated processes); it has no message
+boundaries — we watched two 3-byte writes return as one 6-byte read — is bounded (65536 bytes on Linux, giving flow
+control by blocking a full writer and an empty reader), signals end-of-file with a <code>read</code> of 0, and raises
+<code>SIGPIPE</code>/<code>EPIPE</code> when no reader remains. <strong>Shared memory</strong> (<code>MAP_SHARED</code>)
+is the fastest channel because it copies nothing — both processes map the same frames, the Chapter 17 machinery — but it
+supplies sharing without synchronization, so two processes racing a shared counter lost ~700,000 of two million updates,
+the Chapter 15 data race again. <strong>Sockets</strong> are bidirectional and, uniquely, cross machines: stream sockets
+(TCP) are boundary-less byte streams needing framing, datagram sockets (UDP) preserve message boundaries but drop
+reliability, and the same API spans a local Unix-domain socket to a worldwide connection, paying copies and failure modes
+for the reach.</p>
+
+<p>With this, Part III is complete. The operating system took one machine and multiplexed it: the system-call boundary
+(Chapter 13) is how a process asks the kernel for service; <code>fork</code>/<code>exec</code>/<code>wait</code>
+(Chapter 14) create and isolate processes; threads (Chapter 15) add flows of control inside one; scheduling (Chapter 16)
+shares the CPU in time; virtual memory (Chapter 17) shares physical memory across address spaces; signals (Chapter 18)
+let the kernel interrupt a process; and IPC (this chapter) opens controlled channels between the isolated processes the
+OS worked to keep apart. Two threads run out of this part. One points <em>forward in this volume</em>: shared memory just
+handed us unsynchronized concurrency across processes, and threads did the same within one — the data race is now a debt
+owed twice over. Making shared-memory concurrency <em>correct</em> — mutual exclusion with locks, waiting with condition
+variables and semaphores, ordering with atomics and the memory model, and the lock-free techniques that avoid locks
+entirely — is the concurrency-and-parallelism part that begins next. The other points toward <em>later volumes</em>:
+sockets, framing, and the cost of the kernel boundary are the substrate under every networked data system, and the
+efficient handling of many connections at once (epoll, io_uring, zero-copy) is the low-level I/O material this volume
+closes with. The channels are open; now we have to make the traffic on them correct.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Explain why a raw pointer cannot be passed between processes, and state the copy-vs-share distinction that organizes
+the IPC toolkit.</li>
+<li>Describe a pipe as a unidirectional byte stream, explain why it has no message boundaries, and say what framing is
+for.</li>
+<li>State a pipe's flow-control behavior (block on full/empty), what a <code>read</code> of 0 means, and when
+<code>SIGPIPE</code>/<code>EPIPE</code> fires.</li>
+<li>Explain why shared memory is the fastest channel, and why it is also the most dangerous — tie it to the Chapter 15
+data race.</li>
+<li>Contrast <code>MAP_SHARED</code> and <code>MAP_PRIVATE</code> across <code>fork</code> using the measured 42-vs-0
+result.</li>
+<li>Distinguish stream and datagram sockets by message shape, and say what sockets uniquely offer that the other channels
+do not.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is IPC for, and what are the three axes a channel sits on? (§19.1)</li>
+<li><strong>R2.</strong> What is a pipe, why does it have no message boundaries, and what is a FIFO? (§19.2)</li>
+<li><strong>R3.</strong> What is a pipe's capacity and flow-control behavior, and what does a <code>read</code> of 0
+mean? (§19.2)</li>
+<li><strong>R4.</strong> Why is shared memory the fastest channel, and what does it fail to provide? (§19.3)</li>
+<li><strong>R5.</strong> How do stream and datagram sockets differ, and what do sockets offer that pipes and shared
+memory cannot? (§19.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Stevens &amp; Rago, <em>Advanced Programming in the UNIX Environment</em>, 3rd ed. (2013), Chapters 15
+(Interprocess Communication), 16 (Network IPC: Sockets), and 17 (Advanced IPC).</strong> The canonical, thorough
+treatment of pipes, FIFOs, shared memory, and sockets, including Unix-domain sockets and descriptor passing.
+<code>[⚠ reference — not free]</code></li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 10
+(System-Level I/O) and Chapter 11 (Network Programming).</strong> Unix I/O and the sockets interface from the
+programmer's view — the reference for §19.2 and §19.4. <code>[⚠ reference — not free]</code>; the CMU 15-213 materials
+are free.</li>
+<li><strong>Beej's Guide to Network Programming</strong> (<code>beej.us</code>). Free. A practical, readable introduction
+to the sockets API, stream vs. datagram, and the framing you must add on top of TCP.</li>
+<li><strong>The Linux <code>pipe(2)</code>, <code>pipe(7)</code>, <code>mmap(2)</code>, <code>shm_overview(7)</code>,
+<code>unix(7)</code>, and <code>socket(2)</code> manual pages.</strong> Primary sources for the pipe capacity and
+<code>PIPE_BUF</code> atomicity, <code>MAP_SHARED</code> semantics, POSIX shared memory, Unix-domain sockets, and the
+socket types. Verify per kernel version.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex19.1"><span class="ex-label">19.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, name the copy-vs-share distinction and give one IPC mechanism on each side of it.</div>
+
+<div class="exercise" id="ex19.2"><span class="ex-label">19.2</span> <span class="ex-tag warm">warm-up</span>
+A pipe is unidirectional and only usefully connects processes created how? What does a FIFO add that lets unrelated
+processes use it?</div>
+
+<div class="exercise" id="ex19.3"><span class="ex-label">19.3</span> <span class="ex-tag warm">warm-up</span>
+What does a <code>read</code> on a pipe return when all write ends are closed, and what happens when you <code>write</code>
+to a pipe whose read ends are all closed?</div>
+
+<div class="exercise" id="ex19.4"><span class="ex-label">19.4</span> <span class="ex-tag core">core</span>
+Explain why a pipe has no message boundaries, using the measured "two 3-byte writes, one 6-byte read" result. If your
+protocol needs discrete messages over a pipe or a TCP stream, what must you add, and give two concrete framing schemes.</div>
+
+<div class="exercise" id="ex19.5"><span class="ex-label">19.5</span> <span class="ex-tag core">core</span>
+Explain why shared memory is the fastest local IPC channel <em>and</em> why it is the most hazardous. Contrast
+<code>MAP_SHARED</code> and <code>MAP_PRIVATE</code> across <code>fork</code> using the 42-vs-0 measurement, and tie the
+hazard back to Chapter 15.</div>
+
+<div class="exercise" id="ex19.6"><span class="ex-label">19.6</span> <span class="ex-tag core">core</span>
+Distinguish a stream socket from a datagram socket by message shape and by guarantees. For each of these, say which you
+would pick and why: (a) a reliable in-order request/response protocol; (b) low-latency telemetry where an occasional
+lost sample is fine. What does <code>AF_UNIX</code> change versus <code>AF_INET</code>?</div>
+
+<div class="exercise" id="ex19.7"><span class="ex-label">19.7</span> <span class="ex-tag complexity">cost</span>
+(a) Roughly how many copies does a byte make going from one process to another through a pipe versus through shared
+memory, and why does that make shared memory faster? (b) The pipe holds 65536 bytes before a writer blocks — explain how
+that bound provides flow control for a pipeline. (c) What is the cost you pay to get shared memory's zero copies, stated
+as an engineering burden rather than a number?</div>
+
+<div class="exercise" id="ex19.8"><span class="ex-label">19.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A logging service on one host receives log lines from many local producers.
+The team uses a single shared-memory ring buffer that all producers and the one consumer read and write directly, with no
+locks, "because shared memory is fast." Lines occasionally come out garbled or duplicated under load.
+<br><strong>Step 1 (given):</strong> Shared memory shares the frames but provides no mutual exclusion or ordering.
+<br><strong>Step 2 (given):</strong> Multiple producers advancing the ring's write index concurrently is a read–modify–write
+on shared state — a data race.
+<br><strong>Step 3 (given):</strong> The race only manifests when two producers hit the index at overlapping moments, so
+light load looks fine and heavy load corrupts.
+<br><strong>Step 4 (you):</strong> Name the bug precisely, explain why it appears only under load, and describe two
+fixes — one using a synchronization primitive placed in the shared region, and one that changes the channel choice to
+avoid the shared write index entirely.</div>
+
+<div class="exercise" id="ex19.9"><span class="ex-label">19.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, choose the best IPC mechanism (pipe/FIFO, shared memory, Unix-domain socket, or network socket) and justify
+in a line: (a) a shell pipeline <code>grep | sort</code>; (b) a video frame passed 60 times a second between two
+processes on the same GPU host; (c) a client on a laptop calling a service in a datacenter; (d) two local daemons that
+must exchange requests <em>and</em> pass an open file descriptor between them.</div>
+
+<div class="exercise" id="ex19.10"><span class="ex-label">19.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 14–19, classify each statement as <em>true</em> or <em>false</em> and fix the false ones: (a) "A TCP
+connection delivers each <code>send</code> as exactly one <code>recv</code>." (b) "Two processes can communicate by one
+passing the other a pointer into its heap." (c) "Shared memory needs no synchronization because it is just memory." (d)
+"A signal can carry a kilobyte of structured data from one process to another." (e) "Closing all write ends of a pipe is
+how the reader learns the stream is finished."</div>
+
+<div class="exercise" id="ex19.11"><span class="ex-label">19.11</span> <span class="ex-tag stretch">stretch</span>
+A pipeline <code>producer | consumer</code> runs with the producer far faster than the consumer. (a) Explain, using the
+65536-byte buffer and blocking semantics, why the producer does not run away and exhaust memory — where does it end up
+waiting? (b) How is this <em>backpressure</em> related to the flow control you would otherwise have to build by hand over
+a raw shared-memory channel? (c) Now the consumer dies. Trace what the producer observes on its next write, naming the
+signal and the errno, and explain why the OS designed it to notify the writer rather than silently discard the bytes.</div>
+
+<div class="exercise" id="ex19.12"><span class="ex-label">19.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a program that creates a pipe, writes <code>"ABC"</code> then <code>"DEF"</code>, and does
+one <code>read</code> — confirm you get six bytes with no boundary. (b) Fill a non-blocking pipe one byte at a time and
+print the capacity; confirm it near 65536 and try changing it with <code>fcntl(F_SETPIPE_SZ)</code>. (c) <code>mmap</code>
+one page <code>MAP_SHARED</code> and one <code>MAP_PRIVATE</code>, <code>fork</code>, have the child write both, and print
+what the parent sees — confirm shared changes cross and private ones do not. Label your compiler and kernel version.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part IV</div><h1>Concurrency & Parallelism</h1><p class='part-blurb'>Threads, locks and their hazards, lock-free techniques, atomics, and the memory model that makes concurrent code correct (or not).</p></div>
+<section class="chapter" id="ch20">
+<h1>Chapter 20 — Mutual Exclusion: Locks and the Critical Section</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch15">Chapter 15</a> (two threads incrementing a
+shared counter lost more than half their updates — the data race this chapter fixes), <a href="#ch19">Chapter 19</a>
+(shared memory gave two processes raw sharing with no synchronization — the same debt), <a href="#ch16">Chapter 16</a>
+(the scheduler can preempt a thread between <em>any</em> two instructions — which is why the race window is always open).
+&nbsp;·&nbsp; Part III showed how the OS creates concurrency; Part IV is how to make it <em>correct</em>, and it starts
+with the most basic tool: excluding all but one thread from a critical section.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch15">Chapter 15</a> — decompose <code>counter++</code> into the three
+machine steps it really is, and show one interleaving of two threads that loses an update. (2) <a href="#ch19">Chapter
+19</a> — shared memory gave two processes the sharing; what one thing did it <em>not</em> give them, that this chapter
+supplies? (3) <em>Predict:</em> wrapping a one-nanosecond increment in a lock and unlock, on an uncontended lock (no
+other thread competing), how much time do you think the lock and unlock add — about the same, ~10&#215;, ~1000&#215;?
+Write your guess; we measure it in §20.3.</p>
+</aside>
+
+<p>Chapter 15 left us with a debt and Chapter 19 doubled it: whenever two flows of control — threads in a process, or
+processes over shared memory — read and write the same memory without coordination, the result is a <strong>data
+race</strong>, which loses updates nondeterministically and is undefined behavior in C and C++. The fix has a name and a
+shape. The updates were lost because <code>counter++</code> is really <em>load, add, store</em>, and two threads
+interleaved those steps; the cure is to ensure that once a thread begins that sequence, no other thread may begin it
+until the first finishes — to make the sequence a <strong>critical section</strong> that runs with <strong>mutual
+exclusion</strong>. This chapter builds that guarantee: what a critical section is and why it needs mutual exclusion
+(§20.1), the <strong>mutex</strong> that provides it and what has to exist underneath (§20.2), the cost of locking —
+uncontended and contended (§20.3) — and the sharpest failure mode locks introduce, <strong>deadlock</strong>, with the
+four conditions that produce it (§20.4). We close by carrying locks forward to the coordination primitives of the next
+chapter (§20.5). A lock is the simplest correct answer to the data race, and every complication in this part is a reaction
+to a cost a lock imposes.</p>
+
+<h2>20.1 The critical section and mutual exclusion</h2>
+
+<p>A <strong>race condition</strong> is a situation where the correctness of a computation depends on the relative timing
+or interleaving of multiple flows of control. The specific race we keep meeting is on a shared read–modify–write:
+<code>counter++</code> loads the value, adds one, and stores it back, and if a second thread loads the same old value
+before the first stores, one increment is overwritten. The region of code that must not be interleaved — here, the
+load–add–store — is a <strong>critical section</strong>: code that touches shared state and produces a wrong answer if two
+threads execute it concurrently. The property we need over a critical section is <strong>mutual exclusion</strong>: at
+most one thread is inside it at any instant. Mutual exclusion turns "load–add–store" from a sequence three other threads
+can climb into the middle of into an <em>indivisible</em> step, restoring the intuition that <code>counter++</code> just
+adds one.</p>
+
+<p>Here is the debt and its repayment measured on the same workload — four threads, each incrementing a shared counter one
+million times, so the correct total is 4,000,000 (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>no lock:    counter=1187737 (expected 4000000)
+no lock:    counter=1144730 (expected 4000000)
+no lock:    counter=2766329 (expected 4000000)
+with mutex: counter=4000000 (expected 4000000)
+with mutex: counter=4000000 (expected 4000000)
+with mutex: counter=4000000 (expected 4000000)</code></pre>
+
+<p>Unsynchronized, the count is wrong and <em>different every run</em> — over half the updates lost in some runs,
+nondeterministically, because the interleaving depends on the scheduler. With a mutex guarding the increment, the count
+is exactly 4,000,000 every time. That determinism is the point of mutual exclusion: it does not make the program faster
+(it is slower, §20.3) — it makes it <em>correct</em>, and correct <em>reproducibly</em>, which no amount of re-running an
+unlocked version can achieve. As Chapter 15 warned, a racing program can even print the right answer by luck; mutual
+exclusion is how you stop depending on luck.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Define a critical section and the property (mutual exclusion) you need over it. Why does the unsynchronized counter
+give a <em>different</em> wrong answer each run, while the locked one is always exactly right? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>20.2 The mutex: how to lock, and what is underneath</h2>
+
+<p>The primitive that provides mutual exclusion is the <strong>mutex</strong> (mutual-exclusion lock). It has two
+operations: <strong>lock</strong> (acquire) and <strong>unlock</strong> (release). A mutex is either free or held by one
+thread; <code>lock</code> on a free mutex takes it and returns, <code>lock</code> on a held mutex <em>blocks</em> the
+caller until the holder unlocks. So the discipline is: lock before the critical section, unlock after, and only the one
+thread holding the lock runs the protected code. In POSIX threads:</p>
+
+<pre><code>pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_lock(&amp;m);      /* enter critical section — blocks if another thread holds m */
+counter++;                    /* protected: at most one thread here at a time */
+pthread_mutex_unlock(&amp;m);    /* leave; a waiting thread may now proceed */</code></pre>
+
+<p>Two disciplines matter beyond the mechanics. First, all threads that touch the shared state must lock the
+<em>same</em> mutex — a lock excludes only the threads that agree to take it; a critical section guarded by a lock one
+racer ignores is not guarded at all. Second, hold the lock for <em>as short a critical section as correctness allows</em>:
+while you hold it, every other thread that needs it is stalled, so the lock serializes exactly the code it covers (§20.3).
+There is a bonus the mutex delivers beyond exclusion: the POSIX lock and unlock operations also <strong>synchronize
+memory</strong>, establishing an ordering (a happens-before edge) between the unlock in one thread and the next lock in
+another. That is why the non-atomic <code>counter++</code> inside a critical section is not merely excluded but
+<em>well-defined</em> — the lock supplies the ordering the memory model otherwise denies a plain shared access (the
+memory model itself is a later chapter in this part).</p>
+
+<p>What has to exist under <code>lock</code> for it to work? The lock operation must itself be race-free — but "check if
+the mutex is free and take it" is a read–modify–write, the very thing we cannot do safely without help. The help comes
+from the <strong>hardware</strong>: CPUs provide atomic read-modify-write instructions — test-and-set, compare-and-swap,
+atomic exchange — that perform "read the old value and write a new one" as one indivisible step no other core can split.
+A mutex is built on one of these. (Pure-software mutual exclusion is possible — Dekker's and Peterson's algorithms
+achieve it with only ordinary loads and stores — but it is subtle and slow, and real locks use the hardware atomic; those
+atomics are a chapter of their own later in this part.) On Linux, a typical mutex takes the fast path entirely in user
+space with an atomic when uncontended, and only traps into the kernel — via the <code>futex</code> system call — to sleep
+when it must actually wait, which is why an uncontended lock is cheap but not free, the subject of §20.3.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What are the two operations on a mutex, and what does <code>lock</code> do when the mutex is already held? Why must a
+lock be built on a hardware atomic instruction rather than an ordinary "if free, take it"? (Answer below the communicate
+box.)</p>
+</aside>
+
+<h2>20.3 The cost of a lock: uncontended and contended</h2>
+
+<p>A lock is not free even when no one is competing for it. Measured single-threaded — a plain increment versus the same
+increment wrapped in an uncontended lock and unlock (gcc 11.4.0 <code>-O2</code>, Linux 6.18; illustrative, machine- and
+run-dependent):</p>
+
+<pre><code>plain increment:                    ~1.0 ns/op
+lock + increment + unlock:          ~12 ns/op
+ratio:                              ~12x</code></pre>
+
+<p>The uncontended lock adds roughly an order of magnitude to a trivial operation — a handful of nanoseconds for the
+atomic and the bookkeeping, answering the opener: not "about the same," and not 1000&#215;, but ~10&#215; on a bare
+increment. That overhead is the <em>floor</em>. The real cost arrives under <strong>contention</strong>, when threads
+actually compete, and it grows in three ways. (1) <strong>Serialization</strong>: the lock forces the critical section to
+run one thread at a time, so if a large fraction of the work is inside the lock, adding cores stops helping — this is
+Amdahl's law applied to a critical section, and it is why "hold the lock briefly" is a performance rule, not just style.
+(2) <strong>Cache-line bouncing</strong>: the lock word (and the data it guards) ping-pongs between cores' caches as
+ownership changes hands, and each transfer is a cross-core cache miss — the mechanical-sympathy cost from Part I, now paid
+per contended acquisition. (3) <strong>Context switches</strong>: when a blocking mutex makes a waiting thread sleep,
+acquiring the lock later means waking it, a scheduler round-trip (Chapter 16) far more expensive than the atomic itself.</p>
+
+<p>These costs drive the central design tension of locking: <strong>coarse-grained</strong> versus
+<strong>fine-grained</strong>. One big lock around a whole data structure is simple and easy to reason about, but it
+serializes all access, throttling concurrency. Many small locks — one per bucket, per node, per shard — let independent
+operations proceed in parallel, but they multiply the overhead, complicate the code, and, crucially, open the door to
+<strong>deadlock</strong> when a thread must hold more than one at a time (§20.4). There is no free lunch: you trade
+simplicity and safety against concurrency, and the right point depends on how contended the structure actually is —
+which, per Part I's discipline, you should <em>measure</em> before assuming.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a lock serializes a critical section</span>
+<p><strong>1. In words.</strong> A mutex admits one thread at a time to the critical section; others block at
+<code>lock</code> until the holder <code>unlock</code>s. That guarantees correctness (mutual exclusion) and imposes a
+cost (serialization plus per-acquisition overhead), so the lock should cover the smallest region that is still correct.</p>
+<p><strong>2. As a picture.</strong> Figure 20.1: two threads' timelines; thread B's <code>lock</code> blocks while A is
+inside the critical section, then proceeds after A's <code>unlock</code> — the protected region never overlaps.</p>
+<p><strong>3. As numbers.</strong> Uncontended, a lock+unlock turns a ~1 ns increment into ~12 ns (~10&#215;). Contended,
+the four-thread counter is <em>correct</em> (4,000,000 every run) but slower than the racing version — you buy
+determinism with throughput.</p>
+</aside>
+
+<p><em>(Answer to the §20.1 quick check: a critical section is code touching shared state that misbehaves if two threads
+run it concurrently; mutual exclusion means at most one thread is inside it at a time. The unlocked counter varies because
+the lost updates depend on the scheduler's interleaving, which differs each run; the locked counter is always exactly
+right because mutual exclusion makes the load–add–store indivisible, removing the interleaving entirely.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">A mutex admits one thread at a time; the other blocks at lock() until unlock().</text>
+<line x1="60" y1="36" x2="60" y2="180" stroke="#14406b"/><text x="30" y="40" font-size="9" fill="#14406b">A</text>
+<line x1="360" y1="36" x2="360" y2="180" stroke="#14406b"/><text x="332" y="40" font-size="9" fill="#14406b">B</text>
+<rect x="45" y="55" width="30" height="60" fill="#cfe8cf" stroke="#2e6b34"/><text x="80" y="80" font-size="9" fill="#2e6b34">A: lock &#8594; counter++ &#8594; unlock</text>
+<rect x="345" y="55" width="30" height="60" fill="#fdeee6" stroke="#8c3a1d"/><text x="388" y="88" font-size="9" fill="#8c3a1d">B: blocked in lock()</text>
+<line x1="75" y1="115" x2="345" y2="120" stroke="#8c3a1d" stroke-dasharray="3,2"/><text x="120" y="134" font-size="8" fill="#8c3a1d">A unlocks &#8594; B may now enter</text>
+<rect x="345" y="120" width="30" height="55" fill="#cfe8cf" stroke="#2e6b34"/><text x="388" y="150" font-size="9" fill="#2e6b34">B: lock &#8594; counter++ &#8594; unlock</text>
+<text x="20" y="194" font-size="9" fill="#8c3a1d">The critical sections never overlap — the cost of that guarantee is B's wait.</text>
+</svg>
+<figcaption>Figure 20.1: Mutual exclusion by a mutex. While thread A holds the lock, thread B blocks inside
+<code>lock()</code>; only after A's <code>unlock()</code> does B enter its critical section. The protected regions are
+serialized — that is the correctness guarantee and, simultaneously, the throughput cost.</figcaption>
+</figure>
+
+<h2>20.4 Deadlock and the four conditions</h2>
+
+<p>Fine-grained locking buys concurrency but introduces a new way to fail completely. When a thread must hold more than
+one lock at a time, two threads acquiring the same locks in <em>different orders</em> can each grab one and then wait
+forever for the other's — a <strong>deadlock</strong> (Dijkstra's "deadly embrace"). Here are two threads and two mutexes
+A and B: thread 1 locks A then B, thread 2 locks B then A. Run with opposite orders versus a consistent order (gcc
+11.4.0, Linux 6.18; the deadlocking run is killed after a 3-second timeout):</p>
+
+<pre><code>opposite lock order (t1: A,B ; t2: B,A):   hangs; killed after 3s (exit 124 = timed out)
+consistent lock order (both: A,B):         t1 got both; t2 got both; both threads finished</code></pre>
+
+<p>With opposite orders the program hangs: thread 1 holds A and waits for B while thread 2 holds B and waits for A —
+neither can proceed, forever. With a consistent order it always completes, because two threads wanting both locks can
+never form the cycle. That fix generalizes into the theory. Deadlock requires <strong>all four</strong> of the classic
+conditions (Coffman, Elphick &amp; Shoshani, 1971) to hold simultaneously: <strong>mutual exclusion</strong> (a resource
+is held exclusively), <strong>hold-and-wait</strong> (a thread holds one resource while requesting another), <strong>no
+preemption</strong> (a resource cannot be forcibly taken from its holder), and <strong>circular wait</strong> (a cycle of
+threads each waiting on the next). Break <em>any one</em> and deadlock is impossible. The most practical break is the
+last: impose a <strong>global lock order</strong> — always acquire locks in the same agreed sequence — and no circular
+wait can form, which is exactly what the consistent-order run did.</p>
+
+<p>Two relatives round out the failure family. <strong>Livelock</strong>: threads are not blocked but keep reacting to
+each other and make no progress (two people stepping aside in the same direction repeatedly). And <strong>priority
+inversion</strong>: a low-priority thread holds a lock a high-priority thread needs, and a medium-priority thread —
+runnable, so it preempts the low one under a strict-priority scheduler (Chapter 16's <code>SCHED_FIFO</code>) — keeps the
+low thread off the CPU, so it never releases the lock, and the high-priority thread is stuck behind both. (This is the
+mechanism famously diagnosed on the 1997 Mars Pathfinder mission; the standard cure is <em>priority inheritance</em>,
+where the lock holder temporarily inherits the priority of the highest waiter.) All three share a moral: locks compose
+badly, and the more locks you hold at once, the more carefully you must reason about the order and the priorities.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: inconsistent lock ordering (the deadly embrace)</span>
+<p>The classic deadlock bug is two code paths that acquire the same two locks in <em>opposite</em> orders — one
+<code>lock(A); lock(B)</code>, another <code>lock(B); lock(A)</code>. Each thread grabs its first lock, then blocks
+forever on the second, which the other holds: total, permanent stall. The bug is vicious for the usual reason — it needs
+the two paths to interleave at just the wrong moment, so it is <em>rare</em>: the code passes tests and every demo, then
+one day under load two requests hit the two paths simultaneously and the service freezes with no crash, no error, no log —
+just threads stuck in <code>lock()</code>. It is especially insidious when the two locks are acquired far apart in the
+call graph, or hidden inside library calls, so nobody sees both orders in one place. The discipline: define a
+<strong>global lock ordering</strong> and always acquire multiple locks in that order (break circular wait), hold as few
+locks as possible for as short a time as possible (attack hold-and-wait), and use <code>trylock</code> with a back-off if
+you truly cannot order them. If you ever write <code>lock(X)</code> while already holding <code>lock(Y)</code>, you owe
+yourself a proof that no other path ever takes them the other way.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "Our service froze in production — no crash, no error, CPU near zero, it just
+stopped serving. I restarted it and it was fine for a week, now it's frozen again. Must be a hardware glitch, right?"
+You have a thread dump showing several threads stuck in <code>pthread_mutex_lock</code>. Cover the paragraph and respond
+in four or five sentences, drawing on §20.4.</p>
+<p><em>Model answer.</em> "That is the signature of a <em>deadlock</em>, not hardware: CPU near zero (nobody is spinning,
+everyone is blocked), no crash or error (deadlock is a permanent wait, not a fault), and threads parked in
+<code>pthread_mutex_lock</code> — which the dump confirms. It reproduces rarely because it needs two code paths to acquire
+the same locks in opposite orders and to interleave at just the wrong instant, so it hides for a week and then, under the
+right concurrent load, forms a cycle: each thread holds one lock and waits on the other forever. The fix is to establish a
+<em>global lock ordering</em> so every path takes those locks in the same sequence — that breaks the circular-wait
+condition and makes the cycle impossible — plus shrink the critical sections so we hold fewer locks at once. Let's diff
+the two paths in the dump to find the inconsistent order, and add a lint or a runtime lock-order check so the next one
+fails loudly in testing instead of silently in production." Naming the deadlock from its fingerprint — blocked threads,
+zero CPU, no error — and prescribing a lock order is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the §20.2 quick check: the two operations are <code>lock</code> (acquire) and <code>unlock</code>
+(release); <code>lock</code> on a held mutex <strong>blocks</strong> the caller until the holder releases it. A lock must
+be built on a hardware atomic read-modify-write because "check if free, then take it" is itself a read–modify–write —
+without an indivisible instruction, two threads could both see the mutex free and both "take" it, which is the very race
+the lock is supposed to prevent.)</em></p>
+
+<h2>20.5 What to carry forward</h2>
+
+<p>A <strong>race condition</strong> is correctness that depends on interleaving; the region that must not interleave is a
+<strong>critical section</strong>; and the property that fixes it is <strong>mutual exclusion</strong> — at most one
+thread inside at a time. A <strong>mutex</strong> supplies it with <code>lock</code>/<code>unlock</code>: we watched a
+four-thread counter go from a nondeterministic ~1.1–2.8 million to exactly 4,000,000 every run. A lock also
+<em>synchronizes memory</em>, giving the ordering that makes the guarded non-atomic accesses well-defined, and it rests on
+a hardware atomic instruction because "if free, take it" is itself a race. Locks are not free: an uncontended lock is
+~10&#215; a bare increment, and under contention the costs are serialization (Amdahl on the critical section), cache-line
+bouncing between cores, and context switches when waiters sleep — which is why you hold the lock for the smallest correct
+region and choose coarse vs. fine granularity by measurement. And locks introduce <strong>deadlock</strong>: all four
+Coffman conditions (mutual exclusion, hold-and-wait, no preemption, circular wait) must hold, so breaking one — most
+practically by imposing a global lock order — prevents it, as the consistent-order run showed against the hanging
+opposite-order one.</p>
+
+<p>Locks give us <em>safety</em>: they keep threads out of each other's critical sections. What they do not give us is a
+way to <em>wait for a condition</em>. A consumer thread that needs data another thread has not yet produced cannot make
+progress by locking harder — and it must not sit spinning while holding the lock, since that both burns the CPU and keeps
+the producer out. What it needs is to <em>release the lock and sleep until the condition it is waiting for becomes true</em>,
+then wake and re-check — coordination, not just exclusion. That is the <strong>condition variable</strong>, and its
+counting cousin the <strong>semaphore</strong>: the next chapter builds the producer–consumer pattern on them, and shows
+why the wait must sit in a loop rather than an <code>if</code>. Mutual exclusion was the first half of shared-memory
+correctness; waiting and signalling is the second, and together they are the classical toolkit that everything lock-free
+and every memory-model rule later in this part is measured against.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Define race condition, critical section, and mutual exclusion, and say how they relate.</li>
+<li>Write a mutex-guarded critical section from memory, and explain why every racing thread must take the
+<em>same</em> lock.</li>
+<li>Explain why a mutex must rest on a hardware atomic, and what "if free, take it" gets wrong without one.</li>
+<li>State the uncontended lock cost (~10&#215; a bare op) and the three ways contention makes it worse.</li>
+<li>Explain the coarse- vs. fine-grained locking trade-off in terms of concurrency, overhead, and deadlock risk.</li>
+<li>List the four deadlock conditions and give the most practical one to break, with the fix that breaks it.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What is a critical section, and what property must hold over it? (§20.1)</li>
+<li><strong>R2.</strong> What are a mutex's two operations, and why must all racers take the same one? (§20.2)</li>
+<li><strong>R3.</strong> Why must a lock be built on a hardware atomic instruction? (§20.2)</li>
+<li><strong>R4.</strong> Name the three ways contention makes a lock expensive. (§20.3)</li>
+<li><strong>R5.</strong> List the four deadlock conditions and name the most practical one to break. (§20.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP), "Locks" and "Lock-based Concurrent
+Data Structures."</strong> Free (<code>pages.cs.wisc.edu/~remzi/OSTEP/</code>). Building a lock from hardware atomics
+(test-and-set, compare-and-swap), spin vs. sleeping locks, and locking real data structures — the reference for
+§20.1–§20.3.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 12
+(Concurrent Programming).</strong> Threads, shared variables, mutual exclusion, and synchronization from the programmer's
+view. <code>[⚠ reference — not free]</code>; CMU 15-213 materials free.</li>
+<li><strong>Coffman, Elphick &amp; Shoshani, "System Deadlocks," <em>ACM Computing Surveys</em> 3(2):67–78 (1971),
+DOI 10.1145/356586.356588.</strong> The primary source for the four necessary conditions for deadlock. Author/venue/year
+verified via the ACM Digital Library.</li>
+<li><strong>Dijkstra, "Cooperating Sequential Processes" (EWD123, 1965; published 1968).</strong> The origin of the
+critical-section and mutual-exclusion problem, the "deadly embrace" (deadlock), and the semaphore. Free via the E. W.
+Dijkstra Archive (<code>cs.utexas.edu/~EWD/</code>).</li>
+<li><strong>The Linux <code>pthread_mutex_lock(3)</code> and <code>futex(2)</code> manual pages.</strong> Primary sources
+for POSIX mutex semantics and the fast-user-space/kernel-sleep mechanism under a mutex. Verify per system.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex20.1"><span class="ex-label">20.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, define a critical section and mutual exclusion, and say why <code>counter++</code> needs the
+latter.</div>
+
+<div class="exercise" id="ex20.2"><span class="ex-label">20.2</span> <span class="ex-tag warm">warm-up</span>
+What are the two operations on a mutex, and what does the acquire operation do when the mutex is already held by another
+thread?</div>
+
+<div class="exercise" id="ex20.3"><span class="ex-label">20.3</span> <span class="ex-tag warm">warm-up</span>
+Name the four conditions that must all hold for deadlock, and give the one most practical to break in application code.</div>
+
+<div class="exercise" id="ex20.4"><span class="ex-label">20.4</span> <span class="ex-tag core">core</span>
+Explain why a mutex must be built on a hardware atomic read-modify-write instruction. Walk through what could go wrong if
+<code>lock</code> were implemented as "if the mutex is free, set it to held" with ordinary loads and stores, and connect
+that failure to the data race of Chapter 15.</div>
+
+<div class="exercise" id="ex20.5"><span class="ex-label">20.5</span> <span class="ex-tag core">core</span>
+Two threads each lock mutexes A and B, but thread 1 does <code>A then B</code> and thread 2 does <code>B then A</code>.
+(a) Show an interleaving that deadlocks. (b) Explain which of the four conditions your fix removes when you make both
+threads acquire in the order <code>A then B</code>. (c) Why does this bug typically pass tests and only appear in
+production?</div>
+
+<div class="exercise" id="ex20.6"><span class="ex-label">20.6</span> <span class="ex-tag core">core</span>
+A mutex both <em>excludes</em> other threads and <em>synchronizes memory</em>. Explain each role, and why the second is
+what makes a non-atomic <code>counter++</code> inside a critical section not just serialized but well-defined under the
+C/C++ memory model. Tie this to why a plain shared access without a lock is undefined behavior (Chapter 15).</div>
+
+<div class="exercise" id="ex20.7"><span class="ex-label">20.7</span> <span class="ex-tag complexity">cost</span>
+(a) An uncontended lock+unlock measured ~12 ns against a ~1 ns bare increment — explain where that ~10&#215; goes. (b)
+Under heavy contention the cost is far higher; name the three sources (serialization, cache-line bouncing, context
+switches) and say which dominates when the critical section is tiny versus when threads must sleep. (c) Using Amdahl's
+reasoning, explain why shrinking the critical section can matter more than making the lock itself faster.</div>
+
+<div class="exercise" id="ex20.8"><span class="ex-label">20.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A bank-transfer function locks the source account, then the destination
+account, then moves money. Under load the service occasionally freezes; a thread dump shows threads blocked in
+<code>lock</code>.
+<br><strong>Step 1 (given):</strong> Transfer <code>X&#8594;Y</code> locks X then Y; a concurrent transfer
+<code>Y&#8594;X</code> locks Y then X.
+<br><strong>Step 2 (given):</strong> If both start together, the first holds X and waits for Y; the second holds Y and
+waits for X.
+<br><strong>Step 3 (given):</strong> That is a circular wait — all four Coffman conditions now hold — so both threads
+block forever.
+<br><strong>Step 4 (you):</strong> Name the bug, explain why it is load- and timing-dependent, and give a concrete fix
+that imposes a global lock order on accounts (say, by account id) so no cycle can form — and state which condition your
+fix removes.</div>
+
+<div class="exercise" id="ex20.9"><span class="ex-label">20.9</span> <span class="ex-tag mixed">mixed</span>
+For each scenario, decide whether the right tool is (i) a single mutex, (ii) fine-grained per-item mutexes, or (iii) no
+lock at all because there is no sharing — and justify: (a) a global counter incremented by all threads; (b) a hash map
+where operations on different buckets are independent; (c) a value each thread keeps in its own thread-local storage; (d)
+a rarely-updated configuration read by everyone on every request.</div>
+
+<div class="exercise" id="ex20.10"><span class="ex-label">20.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 15–20, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "If two threads
+take different locks, they are safely mutually exclusive." (b) "A deadlocked program spins the CPU at 100%." (c) "A mutex
+makes the guarded code faster." (d) "Holding a lock longer is always safer." (e) "You can implement a correct lock with
+only ordinary loads and stores and no hardware atomic."</div>
+
+<div class="exercise" id="ex20.11"><span class="ex-label">20.11</span> <span class="ex-tag stretch">stretch</span>
+A strict priority scheduler (Chapter 16's <code>SCHED_FIFO</code>) runs three threads: low L holds a lock, high H needs
+it, medium M is CPU-bound and needs no lock. (a) Explain how H can end up blocked indefinitely even though it is the
+highest priority — name the phenomenon. (b) Why does M, not H, keep L off the CPU? (c) Describe priority inheritance and
+exactly which link in the chain it breaks. (d) Relate this to why holding a lock while doing unbounded work is dangerous
+under real-time scheduling.</div>
+
+<div class="exercise" id="ex20.12"><span class="ex-label">20.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) run four threads incrementing a shared counter one million times each, first with no lock, then
+with a mutex — confirm the unlocked total is wrong and varies while the locked total is exactly 4,000,000. (b) Time a
+plain increment versus a lock+increment+unlock in a tight loop and report the ratio (expect roughly an order of
+magnitude). (c) Write two threads that lock two mutexes in opposite orders and observe the hang; then fix the order and
+confirm it completes. Label your compiler and kernel version, and note that the timing numbers are illustrative.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch21">
+<h1>Chapter 21 — Coordinating Threads: Condition Variables and Semaphores</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch20">Chapter 20</a> (a mutex gives mutual exclusion
+over a critical section, but no way to <em>wait</em> for a condition), <a href="#ch16">Chapter 16</a> (a blocked thread is
+off the CPU; a runnable one competes for it — the difference between sleeping and spinning), <a href="#ch15">Chapter
+15</a> (threads share memory, so one can produce what another consumes). &nbsp;·&nbsp; Locks kept threads <em>out</em> of
+each other's way; this chapter is how one thread <em>waits</em> for another to make something true — coordination on top
+of exclusion.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch20">Chapter 20</a> — what does a mutex guarantee, and name one of the four
+conditions required for deadlock. (2) <a href="#ch16">Chapter 16</a> — a thread <em>spinning</em> in a loop checking a
+flag versus a thread <em>blocked</em> waiting: which one competes for the CPU, and what does that cost? (3)
+<em>Predict:</em> a consumer waits ~0.5 seconds for a producer, first by spinning in a loop that re-checks a flag under a
+lock, then by blocking on a proper wait primitive. How much CPU time do you think each consumes during that half-second?
+Write both guesses; we measure them in §21.1.</p>
+</aside>
+
+<p>A mutex answers "may I touch the shared state?" It does not answer "is the shared state <em>ready</em> yet?" Consider a
+bounded buffer between a producer and a consumer: the consumer must not dequeue from an empty buffer, and the producer
+must not enqueue into a full one. A lock protects the buffer's fields, but it cannot make a consumer <em>wait</em> for an
+item to appear — and the naive fix, spinning in a loop re-checking under the lock, is a disaster: it burns a whole CPU
+doing nothing and, worse, holds the lock the producer needs, so the very condition it waits for can never come true. What
+a waiting thread needs is to <strong>release the lock and sleep until signalled</strong>, then wake and re-check. This
+chapter builds that: why busy-waiting is wrong (§21.1); the <strong>condition variable</strong> — wait, signal,
+broadcast — and the non-negotiable rule that the wait sits in a <code>while</code> loop, not an <code>if</code> (§21.2);
+the <strong>semaphore</strong>, Dijkstra's counting primitive that <em>remembers</em> signals (§21.3); and the classic
+ways to get coordination wrong, plus the monitor discipline that packages it (§21.4). We close by carrying the blocking
+toolkit toward atomics and the memory model (§21.5). Exclusion was half of shared-memory correctness; waiting is the
+other half.</p>
+
+<h2>21.1 Waiting without wasting: why busy-waiting is wrong</h2>
+
+<p>The obvious way to wait for a condition is to loop until it holds — a <strong>busy-wait</strong>, or spin. It is
+almost always wrong for a thread that may wait more than a few instructions, for two reasons. First, a spinning thread is
+<em>runnable</em>, so the scheduler keeps giving it the CPU (Chapter 16) while it does no useful work — it burns a core.
+Second, and more insidious in the bounded-buffer case, if the spin holds the lock while re-checking, it locks out the very
+thread that would make the condition true, so the wait can never end: a self-inflicted deadlock. Here is the CPU cost
+measured — a thread waits ~0.5 s for a signal, first by busy-polling a flag under a lock, then by blocking on a condition
+variable (gcc 11.4.0, Linux 6.18; CPU time via <code>getrusage</code>):</p>
+
+<pre><code>busy-poll (spins):  waited ~0.5s wall, consumed 0.499 s CPU
+condvar (blocks):   waited ~0.5s wall, consumed 0.001 s CPU</code></pre>
+
+<p>The spinning waiter burned essentially a full core-second of CPU for half a second of wall-clock waiting — 100% of a
+core doing nothing — while the blocking waiter consumed a thousandth of that, because it was <em>off the CPU</em>, asleep,
+until woken. That five-hundred-fold difference answers the opener and states the whole motivation: a thread that must wait
+should <strong>sleep</strong>, not spin, so the CPU goes to threads with work to do. (Spinning is not always wrong — for a
+wait known to be shorter than a context switch, a brief spin, or a spinlock, can beat sleeping; the point is that
+unbounded or long waits must block.) The primitive that lets a thread sleep until a condition changes, without holding the
+lock while it sleeps, is the condition variable.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Give the two reasons busy-waiting is wrong for a thread that may wait a while, and say which one turns a spin-under-lock
+into a deadlock. Roughly how much CPU did the spinning waiter burn versus the blocking one? (Answer after the next
+section.)</p>
+</aside>
+
+<h2>21.2 Condition variables: wait, signal, and the <code>while</code> rule</h2>
+
+<p>A <strong>condition variable</strong> is a queue of threads waiting for some predicate over shared state to become
+true. It is always paired with a mutex (the one guarding that state) and has three operations. <code>wait(cv, m)</code>
+must be called with the mutex held; it <em>atomically</em> releases the mutex and puts the thread to sleep on the
+condition variable, and when the thread is later woken it <em>re-acquires the mutex</em> before returning — so the thread
+sleeps without holding the lock but wakes holding it again. <code>signal(cv)</code> wakes one waiting thread;
+<code>broadcast(cv)</code> wakes all of them. The atomic "release-and-sleep" is the crucial part: it closes the window in
+which a thread could check the predicate, decide to wait, and miss a signal that arrives before it actually sleeps.</p>
+
+<p>The rule that trips up everyone learning this is: <strong>always wait in a <code>while</code> loop that re-checks the
+predicate, never a bare <code>if</code></strong>. Here is the producer–consumer bounded buffer done correctly (gcc 11.4.0,
+Linux 6.18) — note the <code>while</code>:</p>
+
+<pre><code>/* consumer */
+pthread_mutex_lock(&amp;m);
+while (count == 0)                 /* while, NOT if */
+    pthread_cond_wait(&amp;not_empty, &amp;m);
+item = buf[out]; out = (out+1) % CAP; count--;
+pthread_cond_signal(&amp;not_full);
+pthread_mutex_unlock(&amp;m);
+
+produced sum=210 consumed sum=210 (1..20 sum=210); buffer never exceeded CAP=4</code></pre>
+
+<p>Producer and consumer agreed exactly (both sums 210, the sum of 1..20) and the buffer never exceeded its capacity of
+four — the coordination is correct. The <code>while</code> is mandatory for two independent reasons. (1)
+<strong>Spurious wakeups</strong>: POSIX explicitly permits <code>cond_wait</code> to return without any signal, so on
+waking you must re-verify the predicate actually holds. (2) <strong>Stolen conditions</strong>: even with a real signal,
+between the signal and this thread re-acquiring the mutex, <em>another</em> thread may have run and consumed the item, so
+the predicate you were signalled about may already be false again. In both cases the <code>while</code> simply re-checks
+and, if the predicate is still false, waits again — turning "I was woken" into "I woke <em>and</em> confirmed the
+condition," which is what correctness requires. An <code>if</code> assumes the wakeup means the predicate holds; under
+either hazard, that assumption is a bug.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: wait releases the lock, sleeps, re-checks in a loop</span>
+<p><strong>1. In words.</strong> <code>cond_wait</code> atomically releases the mutex and sleeps; a <code>signal</code>
+wakes a waiter, which re-acquires the mutex and — because the wakeup may be spurious or the condition already re-consumed
+— re-tests the predicate in a <code>while</code> loop, waiting again if it is still false.</p>
+<p><strong>2. As a picture.</strong> Figure 21.1: the consumer holds the mutex, finds <code>count == 0</code>, calls
+<code>wait</code> (drops the lock, sleeps); the producer locks, enqueues, <code>signal</code>s; the consumer wakes,
+re-acquires the lock, re-checks <code>count</code>, and proceeds.</p>
+<p><strong>3. As numbers.</strong> The bounded buffer with <code>while</code>-loops: produced and consumed sums both 210
+over items 1..20, buffer never above CAP = 4. Blocking on the condition variable cost 0.001 s CPU versus the spinner's
+0.499 s.</p>
+</aside>
+
+<p><em>(Answer to the §21.1 quick check: busy-waiting is wrong because a spinning thread stays runnable and burns a CPU
+doing no work, and — the deadlock case — if it spins while holding the lock, it locks out the thread that would make the
+condition true, so the wait never ends. The spinning waiter burned ~0.499 s of CPU for a ~0.5 s wait, roughly 500&#215;
+the ~0.001 s the blocking waiter used.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="20" y="16" fill="#14406b">cond_wait releases the lock and sleeps; signal wakes it; it re-acquires and re-checks.</text>
+<line x1="70" y1="34" x2="70" y2="184" stroke="#14406b"/><text x="24" y="38" font-size="9" fill="#14406b">consumer</text>
+<line x1="380" y1="34" x2="380" y2="184" stroke="#14406b"/><text x="336" y="38" font-size="9" fill="#14406b">producer</text>
+<rect x="55" y="48" width="30" height="28" fill="#f5f8fb" stroke="#14406b"/><text x="92" y="66" font-size="9">lock; count==0 &#8594; wait()</text>
+<rect x="55" y="82" width="30" height="40" fill="#fdeee6" stroke="#8c3a1d"/><text x="92" y="106" font-size="9" fill="#8c3a1d">asleep (lock released)</text>
+<rect x="365" y="70" width="30" height="30" fill="#cfe8cf" stroke="#2e6b34"/><text x="270" y="90" font-size="9" fill="#2e6b34">lock; enqueue; signal()</text>
+<line x1="365" y1="95" x2="85" y2="118" stroke="#2e6b34" stroke-dasharray="3,2"/>
+<rect x="55" y="128" width="30" height="46" fill="#cfe8cf" stroke="#2e6b34"/><text x="92" y="146" font-size="9">wake &#8594; re-acquire lock</text><text x="92" y="162" font-size="9">while re-checks count &gt; 0 &#8594; dequeue</text>
+<text x="20" y="200" font-size="9" fill="#8c3a1d">The while loop guards against spurious wakeups and a condition another thread already consumed.</text>
+</svg>
+<figcaption>Figure 21.1: A condition variable. The consumer, holding the mutex, finds the buffer empty and
+<code>wait</code>s — atomically releasing the lock and sleeping. The producer enqueues and <code>signal</code>s; the
+consumer wakes, re-acquires the mutex, and re-checks the predicate in its <code>while</code> loop before proceeding.</figcaption>
+</figure>
+
+<h2>21.3 Semaphores: counting permits that remember</h2>
+
+<p>A <strong>semaphore</strong> (Dijkstra, 1965) is an integer with two atomic operations and a waiting queue:
+<strong>wait</strong> (historically <em>P</em>; POSIX <code>sem_wait</code>) decrements the count, blocking if it is
+already zero, and <strong>post</strong> (historically <em>V</em>; POSIX <code>sem_post</code>) increments the count,
+waking a waiter if any. A <em>binary</em> semaphore (count 0 or 1) behaves much like a mutex; a <em>counting</em>
+semaphore initialized to N models a pool of N interchangeable permits. Ten threads competing for a semaphore initialized
+to three never exceed three inside the guarded section (gcc 11.4.0, Linux 6.18):</p>
+
+<pre><code>sem_init(&amp;slots, 0, 3);   /* three permits */
+/* each worker: sem_wait(&amp;slots) ... work ... sem_post(&amp;slots) */
+
+10 threads, semaphore initialized to 3: max concurrently in section = 3</code></pre>
+
+<p>The semaphore capped concurrency at exactly its initial count — the natural tool for "at most N at once" (a connection
+pool, a bounded worker set, N copies of a resource). The producer–consumer buffer has an elegant semaphore form too: a
+semaphore <code>empty</code> initialized to the buffer size counts free slots (the producer <code>wait</code>s it before
+enqueuing), and a semaphore <code>full</code> initialized to zero counts filled slots (the consumer <code>wait</code>s it
+before dequeuing), with a mutex protecting the buffer indices. The crucial property that distinguishes a semaphore from a
+condition variable is <strong>memory</strong>: a semaphore's count <em>remembers</em> posts. A <code>sem_post</code> with
+no waiter increments the count, so a later <code>sem_wait</code> succeeds immediately — the signal is not lost. A
+<code>cond_signal</code> with no waiter, by contrast, <em>vanishes</em>: it wakes no one and leaves no trace. That single
+difference is why a condition variable must always be paired with a shared-state predicate checked under the mutex (the
+state is the memory; the condition variable is only the wakeup), whereas a semaphore <em>is</em> its own state.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What do a semaphore's two operations do, and what does a counting semaphore initialized to N give you? State the one
+key difference between a semaphore and a condition variable regarding a signal sent with no one waiting. (Answer below the
+communicate box.)</p>
+</aside>
+
+<h2>21.4 Getting it wrong: lost wakeups, <code>if</code>-not-<code>while</code>, and the monitor</h2>
+
+<p>The coordination primitives are small, and the bugs cluster around a few classic mistakes — all versions of confusing
+"I was woken" with "the condition holds," or of signalling without the shared state to back it. The most common is using
+<code>if</code> where the rule demands <code>while</code>: a single check on waking, which a spurious wakeup or a
+condition consumed by another thread turns into acting on a false predicate — dequeuing from a now-empty buffer,
+proceeding on data that is not there. Its cousin is the <strong>lost wakeup</strong>: signalling a condition variable
+<em>without</em> updating (and holding the lock over) the shared state, so a waiter that has not yet slept misses the
+signal and a waiter that has slept is never woken. Because a condition variable does not remember signals (§21.3), the
+discipline is ironclad: change the shared state under the mutex, <em>then</em> signal; and always wait in a loop on a
+predicate over that state. A semaphore, which remembers, forgives the timing — but a semaphore misused as a mutex you
+forget to post, or posted the wrong number of times, deadlocks or over-admits just as badly.</p>
+
+<p>These patterns recur so reliably that they have a structuring discipline: the <strong>monitor</strong> (Hoare, 1974;
+Brinch Hansen). A monitor bundles shared state with the mutex that protects it and the condition variables threads wait on,
+so that all access goes through procedures that hold the lock and coordinate through the conditions — the programmer stops
+hand-wiring locks and signals and instead works with an object whose methods are automatically mutually exclusive. This is
+exactly what a Java object's <code>synchronized</code> methods with <code>wait</code>/<code>notify</code> package, and what
+higher-level constructs like a thread-safe blocking queue or a Go channel give you: the mutex, the condition variables, and
+the predicate discipline, wrapped so you cannot forget the <code>while</code> loop or the "signal under the lock" rule. The
+lesson to carry: prefer the highest-level correct abstraction available — a concurrent queue over hand-rolled condition
+variables, a monitor over raw locks and signals — and drop to the primitives only when you must, because the primitives are
+where the subtle bugs live.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: <code>if</code> instead of <code>while</code> around <code>cond_wait</code> (and signalling
+without the state)</span>
+<p>Two coupled mistakes cause most condition-variable bugs. The first is guarding <code>cond_wait</code> with an
+<code>if</code> instead of a <code>while</code>: you check the predicate once, wait, and on waking assume it holds — but
+POSIX permits <strong>spurious wakeups</strong> (waking with no signal), and even a real signal can be "stolen" by another
+thread that re-acquires the lock first and consumes the condition, so on waking the predicate may be false. Acting on it —
+dequeuing from an empty buffer, using data that is not there — corrupts state or crashes, and it is rare and
+load-dependent, so it survives testing. The second is the <strong>lost wakeup</strong>: because a condition variable does
+<em>not</em> remember a signal sent with no waiter (unlike a semaphore's count), if you signal without holding the lock and
+updating the shared state, a thread that is about-to-wait can miss the signal and sleep forever. The discipline that kills
+both: (1) always <code>while (!predicate) cond_wait(...)</code>, never <code>if</code>; (2) always update the shared state
+under the mutex and then signal. If you find yourself reasoning "the wakeup means the item is there," you have the
+<code>if</code>-not-<code>while</code> bug.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: "My worker waits for jobs like this: <code>if (queue_empty)
+pthread_cond_wait(&amp;cv, &amp;m);</code> then it pops a job. And to avoid missing wakeups I call
+<code>pthread_cond_signal</code> right before I take the lock to enqueue. Simple and fast — what could go wrong?" Cover
+the paragraph and respond in four or five sentences, drawing on §21.2 and §21.4.</p>
+<p><em>Model answer.</em> "Two bugs, both timing-dependent, so they'll pass your tests and fail in production. First, the
+<code>if</code> must be a <code>while</code>: <code>cond_wait</code> can return spuriously, and even on a real signal
+another worker may have popped the job before you re-acquire the lock, so on waking you must re-check
+<code>queue_empty</code> — with <code>if</code>, you'll pop from an empty queue. Second, signalling <em>before</em> taking
+the lock and enqueuing is a lost-wakeup race: a condition variable doesn't remember a signal sent with no waiter, so if
+the worker is between its check and its <code>cond_wait</code> when you signal, it misses it and may sleep forever with a
+job sitting in the queue. The fix is the standard discipline — enqueue under the mutex, <em>then</em> signal while still
+holding it (or right after), and have the worker loop <code>while (queue_empty) cond_wait(...)</code>. Honestly, I'd wrap
+this in a thread-safe blocking queue so nobody has to remember these rules per call site." Naming both the
+<code>if</code>-not-<code>while</code> and the lost-wakeup, and reaching for a higher-level abstraction, is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the §21.3 quick check: <code>wait</code>/P decrements the count, blocking if it is zero;
+<code>post</code>/V increments it, waking a waiter if any. A counting semaphore initialized to N admits at most N threads
+at once — a pool of N permits. The key difference from a condition variable: a semaphore <strong>remembers</strong> a post
+made with no waiter (the count rises, so a later wait succeeds), whereas a condition-variable signal with no waiter is
+lost.)</em></p>
+
+<h2>21.5 What to carry forward</h2>
+
+<p>Locks (Chapter 20) exclude; this chapter's primitives <strong>coordinate</strong>. A thread that must wait for a
+condition should <strong>sleep, not spin</strong> — we measured a busy-poll burning 0.499 s of CPU against a blocking
+waiter's 0.001 s for the same half-second wait. A <strong>condition variable</strong> lets a thread atomically release its
+mutex and sleep until <code>signal</code>/<code>broadcast</code> wakes it, whereupon it re-acquires the mutex; the wait
+<em>must</em> sit in a <code>while</code> loop re-checking the predicate, because wakeups can be spurious and the condition
+can be consumed by another thread first — our bounded buffer with <code>while</code>-loops kept producer and consumer in
+exact agreement (sums 210) and the buffer within capacity. A <strong>semaphore</strong> is a counting primitive whose
+<code>wait</code>/<code>post</code> (P/V) admit at most its initial count of threads — three permits capped ten threads at
+three — and, unlike a condition variable, it <em>remembers</em> posts sent with no waiter, which is why a condition
+variable must always pair with a predicate over shared state while a semaphore is its own state. The bugs cluster on
+<code>if</code>-not-<code>while</code> and lost wakeups; the <strong>monitor</strong> (and its descendants — Java
+<code>synchronized</code>/<code>wait</code>/<code>notify</code>, blocking queues, channels) packages the discipline so you
+need not rebuild it per call site.</p>
+
+<p>With locks, condition variables, and semaphores, you have the classical <em>blocking</em> synchronization toolkit —
+enough to write correct shared-memory concurrency. But it rests on assumptions this part must now examine directly. Every
+primitive here blocks a thread (a scheduler cost), and every one relies on the guarantee that memory operations become
+visible in a sensible order across cores — a guarantee that real multicore hardware does <em>not</em> provide for plain
+loads and stores, and that these primitives quietly supply through the same atomics that a lock is built on. The rest of
+this part opens that box: the hardware <strong>atomics</strong> (compare-and-swap and friends) that let you build
+synchronization — and lock-free data structures that avoid blocking entirely — and the <strong>memory model</strong> that
+states precisely what a concurrent program means, why a data race is undefined behavior, and what ordering you are and are
+not entitled to assume. The primitives you now know are the correct, comprehensible baseline; the chapters ahead show what
+they cost, how they work underneath, and when you can do without them.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Give the two reasons busy-waiting is wrong, and the CPU numbers that show a blocking wait beating a spin.</li>
+<li>Explain what <code>cond_wait</code> does atomically, and why that atomicity closes a missed-signal window.</li>
+<li>State the <code>while</code>-not-<code>if</code> rule and give both reasons it is mandatory (spurious wakeups; stolen
+condition).</li>
+<li>Describe a semaphore's <code>wait</code>/<code>post</code>, what a counting semaphore of N gives you, and that it
+remembers posts.</li>
+<li>State the one difference between a semaphore and a condition variable regarding a signal with no waiter.</li>
+<li>Explain the lost-wakeup bug and the two-part discipline (update-under-lock-then-signal; wait in a loop) that prevents
+it.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why is busy-waiting wrong, and which failure makes a spin-under-lock a deadlock? (§21.1)</li>
+<li><strong>R2.</strong> What does <code>cond_wait</code> do, and why must the wait be in a <code>while</code> loop?
+(§21.2)</li>
+<li><strong>R3.</strong> What do a semaphore's two operations do, and what does an initial count of N mean? (§21.3)</li>
+<li><strong>R4.</strong> How does a semaphore differ from a condition variable when a signal is sent with no waiter?
+(§21.3)</li>
+<li><strong>R5.</strong> What is a lost wakeup, and what discipline prevents it? (§21.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em> (OSTEP), "Condition Variables," "Semaphores,"
+and "Common Concurrency Problems."</strong> Free (<code>pages.cs.wisc.edu/~remzi/OSTEP/</code>). The
+<code>while</code>-loop rule, the producer–consumer and reader–writer problems, semaphores, and the taxonomy of
+concurrency bugs — the reference for §21.1–§21.4.</li>
+<li><strong>Bryant &amp; O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em> (CS:APP), Chapter 12
+(Concurrent Programming), §12.5 (synchronizing threads with semaphores).</strong> Semaphores, mutual exclusion, and
+producer–consumer from the programmer's view. <code>[⚠ reference — not free]</code>; CMU 15-213 materials free.</li>
+<li><strong>Dijkstra, "Cooperating Sequential Processes" (EWD123, 1965; published 1968).</strong> The origin of the
+semaphore and its P/V operations. Free via the E. W. Dijkstra Archive (<code>cs.utexas.edu/~EWD/</code>).</li>
+<li><strong>Hoare, "Monitors: An Operating System Structuring Concept," <em>Communications of the ACM</em> 17(10):549–557
+(1974), DOI 10.1145/355620.361161.</strong> The primary source for monitors, with the bounded buffer and reader–writer
+examples. Author/venue/year verified via the ACM Digital Library.</li>
+<li><strong>The Linux <code>pthread_cond_wait(3)</code> and <code>sem_overview(7)</code> manual pages.</strong> Primary
+sources for POSIX condition-variable semantics (including permitted spurious wakeups) and POSIX semaphores. Verify per
+system.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex21.1"><span class="ex-label">21.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, why should a thread that may wait a while <em>sleep</em> rather than <em>spin</em>?</div>
+
+<div class="exercise" id="ex21.2"><span class="ex-label">21.2</span> <span class="ex-tag warm">warm-up</span>
+What three operations does a condition variable have, and what does <code>wait</code> do to the mutex when it is
+called?</div>
+
+<div class="exercise" id="ex21.3"><span class="ex-label">21.3</span> <span class="ex-tag warm">warm-up</span>
+What does a counting semaphore initialized to N guarantee about how many threads can be inside the section it guards?</div>
+
+<div class="exercise" id="ex21.4"><span class="ex-label">21.4</span> <span class="ex-tag core">core</span>
+Explain why <code>cond_wait</code> must be called inside a <code>while</code> loop that re-checks the predicate, not an
+<code>if</code>. Give the two independent reasons (spurious wakeups and a condition consumed by another thread) and show,
+with a two-consumer example, how an <code>if</code> leads to acting on a false predicate.</div>
+
+<div class="exercise" id="ex21.5"><span class="ex-label">21.5</span> <span class="ex-tag core">core</span>
+A condition variable does not remember a signal sent with no waiter, but a semaphore's count does. (a) Explain the
+lost-wakeup bug this creates for condition variables. (b) State the discipline (update shared state under the lock, then
+signal; wait in a loop) that prevents it. (c) Why does a semaphore not need this discipline for the "signal arrives before
+the waiter sleeps" case?</div>
+
+<div class="exercise" id="ex21.6"><span class="ex-label">21.6</span> <span class="ex-tag core">core</span>
+Implement (in pseudocode) a bounded buffer with a mutex and two condition variables (<code>not_full</code>,
+<code>not_empty</code>). Show the producer and consumer, mark where each waits and signals, and explain why the buffer can
+never overflow or underflow and why the loops are necessary.</div>
+
+<div class="exercise" id="ex21.7"><span class="ex-label">21.7</span> <span class="ex-tag complexity">cost</span>
+(a) A busy-poll waiter burned ~0.499 s of CPU for a ~0.5 s wait while a blocking waiter used ~0.001 s — explain the ~500&#215;
+gap in terms of runnable-vs-blocked (Chapter 16). (b) When is a short spin actually <em>cheaper</em> than blocking, and
+what is the crossover quantity? (c) What does <code>cond_wait</code> cost that a spin does not (name the two scheduler
+events on the sleep/wake path), and why is it still the right default for a long wait?</div>
+
+<div class="exercise" id="ex21.8"><span class="ex-label">21.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A thread pool's workers wait for tasks. Each worker does
+<code>if (queue.empty()) cond_wait(&amp;cv, &amp;m);</code> then pops. Occasionally, under load, a worker pops from an
+empty queue and crashes; occasionally a submitted task is never picked up though workers are idle.
+<br><strong>Step 1 (given):</strong> The <code>if</code> checks the predicate only once; on waking (spuriously, or after
+another worker took the task) the queue may be empty.
+<br><strong>Step 2 (given):</strong> If the producer signals without holding the lock and updating the queue, a
+not-yet-sleeping worker can miss the signal.
+<br><strong>Step 3 (given):</strong> A condition variable does not remember a signal with no waiter, so the missed signal
+is gone and the task waits with no one woken.
+<br><strong>Step 4 (you):</strong> Name both bugs precisely, explain why each is intermittent and load-dependent, and give
+the corrected worker and producer (the <code>while</code> loop and the enqueue-under-lock-then-signal order), stating which
+bug each change fixes.</div>
+
+<div class="exercise" id="ex21.9"><span class="ex-label">21.9</span> <span class="ex-tag mixed">mixed</span>
+For each need, choose the best primitive (a plain mutex, a condition variable + mutex, or a counting semaphore) and
+justify in a line: (a) protect a single shared counter; (b) let at most 5 requests use a resource pool at once; (c) have a
+consumer block until a producer makes an item available; (d) signal "shutdown requested" to many waiting threads at
+once.</div>
+
+<div class="exercise" id="ex21.10"><span class="ex-label">21.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 18–21, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) "A
+<code>cond_signal</code> with no thread waiting is remembered and delivered to the next waiter." (b) "<code>cond_wait</code>
+keeps holding the mutex while it sleeps." (c) "A binary semaphore behaves much like a mutex." (d) "You can safely replace
+the <code>while</code> around <code>cond_wait</code> with an <code>if</code> if your platform has no spurious wakeups." (e)
+"A blocking mutex, like a signal handler flag, is a way to coordinate two flows of control over shared memory."</div>
+
+<div class="exercise" id="ex21.11"><span class="ex-label">21.11</span> <span class="ex-tag stretch">stretch</span>
+A monitor bundles shared state, its mutex, and its condition variables. (a) Explain what discipline a monitor enforces
+that raw locks-and-signals leave to the programmer, and how that eliminates the <code>if</code>-not-<code>while</code> and
+lost-wakeup traps at the call site. (b) A Java object's <code>synchronized</code> methods with <code>wait</code>/
+<code>notify</code>, and a thread-safe blocking queue, are both monitors — explain what each hides. (c) Argue for
+"prefer the highest-level correct abstraction" using the fact that the primitives are where the subtle bugs live, and give
+one case where you would still drop to raw condition variables.</div>
+
+<div class="exercise" id="ex21.12"><span class="ex-label">21.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) write a waiter that blocks ~0.5 s two ways — busy-polling a flag under a lock, and blocking on a
+condition variable — and measure CPU time with <code>getrusage</code>; confirm the spinner burns ~100% of a core and the
+blocker ~0. (b) Build a producer–consumer bounded buffer with a mutex and two condition variables (using <code>while</code>
+loops); confirm produced and consumed totals match and the buffer never exceeds its capacity. (c) Run ten threads against
+a semaphore initialized to three and confirm at most three are ever in the section at once. Label your compiler and kernel
+version, and note the CPU numbers are illustrative.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part V</div><h1>Rust for Systems</h1><p class='part-blurb'>Ownership, borrowing, and lifetimes — memory safety without a GC, and how the type system encodes the invariants the previous parts made you prove by hand.</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VI</div><h1>Performance Engineering</h1><p class='part-blurb'>Measure before you optimize: profiling, benchmarking, cache-aware and data-oriented design, SIMD, and reasoning about where time actually goes.</p></div>
 <div class="part-page"><div class="part-num">Vol 1 · Systems Programming & Performance · Part VII</div><h1>I/O & Networking, Low-Level</h1><p class='part-blurb'>Files, sockets, blocking vs async, epoll/io_uring, zero-copy — the systems substrate under every data pipeline and service.</p></div>
@@ -10045,6 +11229,376 @@ restart the <code>read</code> so it keeps blocking (no <code>EINTR</code> surfac
 interrupts a blocking call; the second shows standard signals do not queue. Label compiler/kernel. <em>Tempting wrong
 answer:</em> "the handler should run five times" — non-queuing standard signals collapse the repeats. <strong>Feed-
 forward:</strong> §18.3, §18.4.</div>
+
+</section>
+
+<section class="solutions" id="sol19">
+<h1>Chapter 19 — Solutions</h1>
+
+<div class="solution" id="sol19.1"><span class="sol-label">19.1</span>
+The toolkit splits into channels the kernel <strong>copies</strong> bytes through and arrangements that
+<strong>share</strong> the same physical memory. Copy side: a <strong>pipe</strong> (or FIFO, or socket) — bytes go
+sender &#8594; kernel buffer &#8594; receiver. Share side: <strong>shared memory</strong> (<code>MAP_SHARED</code>) —
+both processes map the same frames and touch them directly, moving no data. <em>Tempting wrong answer:</em> "sockets are
+the sharing mechanism" — a socket copies through the kernel like a pipe; only shared memory truly shares.
+<strong>Feed-forward:</strong> §19.1.</div>
+
+<div class="solution" id="sol19.2"><span class="sol-label">19.2</span>
+A bare pipe usefully connects processes that share its descriptors, which happens because file descriptors survive
+<code>fork</code> — so a parent creates the pipe and forks, and parent and child inherit the ends. A <strong>FIFO</strong>
+(named pipe, made with <code>mkfifo</code>) adds a <em>filesystem name</em>, so <em>unrelated</em> processes with no
+common ancestor can meet by opening the same path. <em>Tempting wrong answer:</em> "two unrelated processes can just call
+<code>pipe()</code> and connect" — a plain pipe's descriptors are private to the creator and its descendants; unrelated
+processes need a FIFO (or a socket). <strong>Feed-forward:</strong> §19.2.</div>
+
+<div class="solution" id="sol19.3"><span class="sol-label">19.3</span>
+When all write ends are closed, a <code>read</code> returns <strong>0</strong> — end-of-file — which is how the reader
+learns the writer is done. Writing to a pipe whose read ends are all closed raises <strong><code>SIGPIPE</code></strong>
+(default: terminate the writer), or, if that signal is ignored, fails the <code>write</code> with
+<code>errno == EPIPE</code>. <em>Tempting wrong answer:</em> "<code>read</code> blocks forever when the writer is gone" —
+it returns 0; it blocks only while a writer still holds the write end but has sent nothing. <strong>Feed-forward:</strong>
+§19.2.</div>
+
+<div class="solution" id="sol19.4"><span class="sol-label">19.4</span>
+A pipe is a byte stream: the kernel concatenates all writes and does not record how many <code>write</code>s produced the
+bytes, so two 3-byte writes are indistinguishable from one 6-byte write — measured as one <code>read</code> returning
+<code>"ABCDEF"</code>. For discrete messages you must add <strong>framing</strong>. Two schemes: (1) a fixed-size
+<strong>length prefix</strong> before each message (read the prefix, then read exactly that many bytes); (2) a
+<strong>delimiter</strong> (e.g. newline-terminated records), reading until the delimiter. <em>Tempting wrong answer:</em>
+"just do one <code>write</code> per message and one <code>read</code> per message" — the stream may coalesce or split
+regardless of how you wrote it, so the boundary is not preserved. <strong>Feed-forward:</strong> §19.2, §19.4.</div>
+
+<div class="solution" id="sol19.5"><span class="sol-label">19.5</span>
+Fastest because it <strong>copies nothing</strong>: both processes map the same physical frames (Chapter 17's shared
+mapping), so a store by one is a load by the other with no kernel round-trip. Most hazardous because it provides sharing
+and <em>nothing else</em> — no ordering, no mutual exclusion. <code>MAP_SHARED</code>: the child's write of 42 is visible
+to the parent (<code>shared == 42</code>). <code>MAP_PRIVATE</code>: copy-on-write splits the page on the child's write,
+so the parent still sees 0 (<code>private == 0</code>). Two processes racing a shared counter lost ~700,000 of two
+million updates — the Chapter 15 data race across processes. <em>Tempting wrong answer:</em> "shared memory is safe
+because there is only one copy of the data" — one copy is exactly why concurrent unsynchronized writes corrupt it.
+<strong>Feed-forward:</strong> §19.3, and Ch 15.</div>
+
+<div class="solution" id="sol19.6"><span class="sol-label">19.6</span>
+A <strong>stream socket</strong> (<code>SOCK_STREAM</code>, TCP) is a reliable, ordered byte stream with no message
+boundaries; a <strong>datagram socket</strong> (<code>SOCK_DGRAM</code>, UDP) preserves message boundaries but may lose,
+duplicate, or reorder datagrams. (a) reliable in-order request/response &#8594; <strong>stream</strong> (TCP), which gives
+you reliability and ordering for free (add framing for message boundaries). (b) low-latency telemetry tolerating loss
+&#8594; <strong>datagram</strong> (UDP), whose per-message delivery and lack of retransmission fit lossy, latest-value
+data. <code>AF_UNIX</code> makes the socket a <em>local</em> (same-host) channel — faster, and able to pass file
+descriptors — while <code>AF_INET</code> uses the same API to cross machines. <em>Tempting wrong answer:</em> "UDP is
+just faster TCP, always prefer it" — UDP drops reliability and ordering; choosing it means signing up to handle loss and
+reordering yourself. <strong>Feed-forward:</strong> §19.4.</div>
+
+<div class="solution" id="sol19.7"><span class="sol-label">19.7</span>
+(a) Through a pipe a byte is copied twice — sender &#8594; kernel buffer &#8594; receiver — plus system-call overhead;
+through shared memory it is copied <strong>zero</strong> times, because both processes read and write the same frames.
+Fewer copies and no per-message trap into the kernel make shared memory faster. (b) The 65536-byte buffer bounds how far
+ahead a writer can get: when it fills, the next <code>write</code> <em>blocks</em> until the reader drains it, so a fast
+producer is paced to the slow consumer — flow control (backpressure) for free. (c) The cost is that you must supply your
+own synchronization and a crash-recovery story: shared memory hands you unsynchronized concurrency, so you carry, by
+hand, the mutual exclusion and ordering the copying channels gave you automatically. <em>Tempting wrong answer:</em>
+"shared memory is strictly better because it is faster" — it trades the kernel's built-in serialization and flow control
+for engineering burden you now own. <strong>Feed-forward:</strong> §19.2, §19.3.</div>
+
+<div class="solution" id="sol19.8"><span class="sol-label">19.8</span>
+<strong>Step 4:</strong> The bug is a <strong>data race</strong> on the ring buffer's shared write index (and the slots):
+multiple producers perform an unsynchronized read–modify–write on the same index, so two can grab the same slot or
+advance the index inconsistently, garbling and duplicating lines. It appears only under load because the corruption
+requires two producers to touch the index at <em>overlapping</em> instants; light traffic rarely overlaps, heavy traffic
+overlaps constantly — the same schedule-dependent, "passes tests / breaks in production" pathology as any race. Fix 1
+(synchronize in the shared region): place a mutex or semaphore <em>inside</em> the shared memory (a process-shared
+<code>pthread_mutex</code> or a POSIX semaphore both processes map) and hold it while advancing the index — or make the
+index a lock-free atomic. Fix 2 (change the channel): give each producer its own pipe or socket to the consumer, so there
+is no shared write index to race on at all; the kernel serializes each channel for you. <em>Tempting wrong answer:</em>
+"add a lock in each producer's private memory" — a lock only excludes if all racers take the <em>same</em> lock, which
+must therefore live in the shared region. <strong>Feed-forward:</strong> §19.3, and Ch 15.</div>
+
+<div class="solution" id="sol19.9"><span class="sol-label">19.9</span>
+(a) <strong>Pipe/FIFO</strong> — a one-way local byte stream is exactly a pipe; the shell builds it with
+<code>fork</code>. (b) <strong>Shared memory</strong> — 60 large frames a second on one host demands zero-copy; a
+socket's per-frame copies would waste bandwidth. (c) <strong>Network socket</strong> — different machines rules out every
+local mechanism; only a socket reaches across the network. (d) <strong>Unix-domain socket</strong> — bidirectional local
+exchange plus descriptor passing (<code>SCM_RIGHTS</code>) is a capability only Unix-domain sockets offer.
+<em>Method-selection cue:</em> local one-way stream &#8594; pipe; local high-volume data &#8594; shared memory; crosses
+machines &#8594; network socket; local bidirectional or fd-passing &#8594; Unix-domain socket. <strong>Feed-forward:</strong>
+§19.1–§19.4.</div>
+
+<div class="solution" id="sol19.10"><span class="sol-label">19.10</span>
+(a) <strong>False</strong> — TCP is a byte stream with no message boundaries; a <code>send</code> may be split or
+coalesced, so you must frame. (b) <strong>False</strong> — the pointer is meaningless in the other private address space;
+pass data through IPC, not a pointer. (c) <strong>False</strong> — shared memory provides no synchronization; concurrent
+writes race. (d) <strong>False</strong> — a standard signal carries only its number (real-time signals add a small
+payload); it is a doorbell, not a data channel (Chapter 18). (e) <strong>True</strong> — a <code>read</code> returns 0
+once all write ends close, signalling end-of-file. <em>Tempting wrong answer:</em> calling (a) true because "TCP is
+reliable" — reliability (no loss, in order) is orthogonal to message framing; TCP is reliable <em>and</em> boundary-less.
+<strong>Feed-forward:</strong> §19.2, §19.4, and Ch 18.</div>
+
+<div class="solution" id="sol19.11"><span class="sol-label">19.11</span>
+(a) The producer fills the pipe's 65536-byte buffer, and its next <code>write</code> <strong>blocks</strong> until the
+consumer reads some out; it cannot run ahead or exhaust memory because the kernel buffer is bounded and a full pipe
+suspends the writer. It ends up waiting inside <code>write</code>. (b) This is <strong>backpressure</strong>: the slow
+stage throttles the fast one automatically. Over a raw shared-memory channel you get no such thing — you would have to
+build the bounded buffer and the block-when-full/block-when-empty logic yourself (which is precisely the producer–consumer
+problem of the next chapters). (c) When the consumer dies, all read ends close; the producer's next <code>write</code>
+raises <strong><code>SIGPIPE</code></strong> (default terminate) or, if ignored, returns <code>-1</code> with
+<code>errno == EPIPE</code>. The OS notifies rather than discards so the writer stops promptly instead of doing useless
+work forever pouring bytes to nobody. <em>Tempting wrong answer:</em> "the producer keeps buffering until it runs out of
+memory" — the bounded pipe blocks it long before that. <strong>Feed-forward:</strong> §19.2.</div>
+
+<div class="solution" id="sol19.12"><span class="sol-label">19.12</span>
+Machine-specific by design. A correct write-up reports: (a) one <code>read</code> after <code>"ABC"</code> and
+<code>"DEF"</code> returns six bytes, <code>"ABCDEF"</code>, showing the erased boundary. (b) The non-blocking pipe fills
+near <strong>65536</strong> bytes (on the book's machine, exactly 65536) before <code>write</code> returns
+<code>EAGAIN</code>; <code>fcntl(fd, F_SETPIPE_SZ, n)</code> changes the capacity. (c) With <code>MAP_SHARED</code> the
+parent sees the child's write (42); with <code>MAP_PRIVATE</code> it does not (0), because the private page is
+copy-on-write. Label compiler/kernel. <em>Tempting wrong answer:</em> "the two 3-byte writes should come back as two
+reads" — a stream erases the boundary; expecting message preservation is the classic framing bug. <strong>Feed-forward:</strong>
+§19.2, §19.3.</div>
+
+</section>
+
+<section class="solutions" id="sol20">
+<h1>Chapter 20 — Solutions</h1>
+
+<div class="solution" id="sol20.1"><span class="sol-label">20.1</span>
+A <strong>critical section</strong> is a region of code that touches shared state and produces a wrong result if two
+threads execute it concurrently. <strong>Mutual exclusion</strong> is the property that at most one thread is inside such
+a region at any instant. <code>counter++</code> needs it because it is really load–add–store: without exclusion, two
+threads can load the same old value and each store back a value one greater, losing an update. <em>Tempting wrong answer:</em> "<code>counter++</code> is a single instruction, so it's atomic" — it compiles to several steps, and even a
+single instruction is not atomic across cores without special guarantees. <strong>Feed-forward:</strong> §20.1.</div>
+
+<div class="solution" id="sol20.2"><span class="sol-label">20.2</span>
+<strong>Lock</strong> (acquire) and <strong>unlock</strong> (release). Acquiring a mutex already held by another thread
+<strong>blocks</strong> the caller until the holder releases it, after which one waiter proceeds. <em>Tempting wrong answer:</em> "lock returns an error if the mutex is held" — a plain <code>lock</code> blocks; it is <code>trylock</code>
+that returns immediately without acquiring. <strong>Feed-forward:</strong> §20.2.</div>
+
+<div class="solution" id="sol20.3"><span class="sol-label">20.3</span>
+<strong>Mutual exclusion</strong>, <strong>hold-and-wait</strong>, <strong>no preemption</strong>, and <strong>circular
+wait</strong> — all four must hold. The most practical to break in application code is <strong>circular wait</strong>, by
+imposing a <em>global lock ordering</em> so every thread acquires multiple locks in the same sequence. <em>Tempting wrong answer:</em> "break mutual exclusion by not using locks" — you usually cannot drop exclusion without a race; ordering is
+the practical lever. <strong>Feed-forward:</strong> §20.4.</div>
+
+<div class="solution" id="sol20.4"><span class="sol-label">20.4</span>
+"If free, take it" is itself a read–modify–write: read the mutex's state, decide, write "held." Two threads can both read
+"free" before either writes "held," so both believe they acquired the lock and both enter the critical section — the exact
+data race of Chapter 15, now on the lock word itself. A hardware atomic (test-and-set, compare-and-swap, exchange)
+performs the read-and-conditional-write as one indivisible step no other core can split, so exactly one thread wins.
+Without it, the lock cannot be race-free, and a racy lock provides no exclusion. <em>Tempting wrong answer:</em>
+"disabling interrupts is enough" — that works on a uniprocessor for the kernel, but not across multiple cores in user
+space; you need the atomic. <strong>Feed-forward:</strong> §20.2, and Ch 15.</div>
+
+<div class="solution" id="sol20.5"><span class="sol-label">20.5</span>
+(a) Thread 1 locks A; thread 2 locks B; thread 1 tries to lock B (held by 2) and blocks; thread 2 tries to lock A (held by
+1) and blocks — permanent circular wait. (b) Making both acquire <code>A then B</code> removes <strong>circular
+wait</strong>: whoever gets A first will get B before releasing A, so no cycle of waiters can form. (c) It requires the two
+paths to interleave at just the wrong instant, which is rare under light test load but common under production
+concurrency — the schedule-dependent "passes tests / breaks in production" pathology. <em>Tempting wrong answer:</em>
+"add a timeout and retry" — <code>trylock</code>/back-off can help but risks livelock and masks the design flaw; a global
+lock order fixes it outright. <strong>Feed-forward:</strong> §20.4.</div>
+
+<div class="solution" id="sol20.6"><span class="sol-label">20.6</span>
+<strong>Exclusion:</strong> at most one thread runs the guarded code, so the load–add–store cannot interleave.
+<strong>Memory synchronization:</strong> the POSIX unlock in one thread and the next lock in another establish a
+happens-before ordering, so writes made under the lock are guaranteed visible, in order, to the next holder. The second
+role is what makes the non-atomic <code>counter++</code> <em>well-defined</em>: the C/C++ memory model calls an
+unsynchronized conflicting access a data race, which is undefined behavior; the lock's ordering removes the "conflicting,
+unsynchronized" property, so the access is legal. Without a lock (or atomics), a plain shared read–write is UB — the
+compiler and hardware may reorder and cache it freely. <em>Tempting wrong answer:</em> "exclusion alone makes it correct"
+— exclusion without the memory ordering still leaves visibility/reordering undefined; POSIX locks supply both, which is
+why they work. <strong>Feed-forward:</strong> §20.2, and Ch 15.</div>
+
+<div class="solution" id="sol20.7"><span class="sol-label">20.7</span>
+(a) The ~10&#215; is the atomic read-modify-write, the surrounding bookkeeping, and the memory-ordering fence the lock and
+unlock impose — each far more expensive than a bare register add. (b) Serialization (only one thread in the critical
+section), cache-line bouncing (the lock word and guarded data migrate between cores' caches, a cross-core miss per
+handoff), and context switches (a blocking mutex sleeps and wakes waiters via the scheduler). Cache-line bouncing tends to
+dominate when the critical section is tiny and threads spin/retry; context-switch cost dominates when threads actually
+sleep. (c) By Amdahl, the serial (locked) fraction caps speedup regardless of core count, so reducing the fraction of work
+under the lock lifts the ceiling more than shaving nanoseconds off each acquisition. <em>Tempting wrong answer:</em> "a
+faster lock implementation is the main win" — if a large fraction of work is serialized, no lock speed helps; shrink the
+critical section. <strong>Feed-forward:</strong> §20.3.</div>
+
+<div class="solution" id="sol20.8"><span class="sol-label">20.8</span>
+<strong>Step 4:</strong> The bug is a <strong>deadlock</strong> from inconsistent lock ordering: transfer
+<code>X&#8594;Y</code> and <code>Y&#8594;X</code> acquire the two account locks in opposite orders, so concurrent
+opposite-direction transfers form a circular wait and both threads block in <code>lock</code> forever. It is load- and
+timing-dependent because it needs the two transfers to start close enough in time to each grab one lock before the other
+grabs the second — rare in tests, common under production traffic. Fix: impose a <strong>global lock order</strong> on
+accounts — e.g. always lock the account with the smaller id first, regardless of transfer direction — so both a
+<code>X&#8594;Y</code> and a <code>Y&#8594;X</code> transfer lock the same account first and no cycle can form. This
+removes the <strong>circular-wait</strong> condition. <em>Tempting wrong answer:</em> "lock a single global bank mutex for
+every transfer" — correct but serializes all transfers, killing throughput; ordering per-account locks keeps concurrency.
+<strong>Feed-forward:</strong> §20.4.</div>
+
+<div class="solution" id="sol20.9"><span class="sol-label">20.9</span>
+(a) <strong>Single mutex</strong> — one shared counter, all threads contend on the same word; one lock suffices (or an
+atomic). (b) <strong>Fine-grained per-bucket mutexes</strong> — operations on different buckets are independent, so
+per-bucket locks let them proceed in parallel; one big lock would needlessly serialize them. (c) <strong>No lock</strong>
+— thread-local storage is not shared, so there is no race to prevent. (d) <strong>No lock (or a read-optimized scheme)</strong>
+— a rarely-written, frequently-read value can use no lock if updates are done safely (e.g. atomic pointer swap / RCU-style
+publish); a plain mutex on every read would serialize all requests. <em>Method-selection cue:</em> is the state shared and
+mutated? If not shared &#8594; no lock; if shared and independent partitions &#8594; fine-grained; if a single hot datum
+&#8594; one lock (or atomic). <strong>Feed-forward:</strong> §20.3.</div>
+
+<div class="solution" id="sol20.10"><span class="sol-label">20.10</span>
+(a) <strong>False</strong> — mutual exclusion requires racers to take the <em>same</em> lock; different locks do not
+exclude each other. (b) <strong>False</strong> — deadlocked threads are <em>blocked</em>, so CPU is near zero; 100% CPU is
+a spin/livelock, not a classic deadlock. (c) <strong>False</strong> — a mutex adds overhead and serializes; it makes code
+<em>correct</em>, not faster. (d) <strong>False</strong> — holding a lock longer increases contention and deadlock
+exposure; hold it for the smallest correct region. (e) <strong>False</strong> — Peterson/Dekker use only loads and stores
+but assume ordering guarantees; real, portable locks need a hardware atomic. <em>Tempting wrong answer:</em> calling (e)
+true by citing Peterson's algorithm — it is correct only under a memory model with sufficient ordering, which on real
+hardware you get via atomics/fences, so "no atomic at all" is misleading. <strong>Feed-forward:</strong> §20.2, §20.3,
+§20.4.</div>
+
+<div class="solution" id="sol20.11"><span class="sol-label">20.11</span>
+(a) <strong>Priority inversion</strong>: H is blocked on the lock L holds, so H can proceed only when L runs and releases
+it. (b) Under strict priority scheduling, medium M is runnable and higher priority than L, so it preempts L and never
+yields; L therefore never gets the CPU to release the lock, and H — though highest priority — waits behind both. (c)
+<strong>Priority inheritance</strong>: while L holds a lock a higher-priority thread (H) is waiting on, L temporarily
+inherits H's priority, so L now outranks M, runs, releases the lock, and H proceeds. It breaks the link where M starves L.
+(d) Holding a lock while doing unbounded work under real-time scheduling can stall higher-priority threads for that whole
+duration — bounded, minimal critical sections are essential when priorities are strict. <em>Tempting wrong answer:</em>
+"just raise H's priority" — H is already highest; the problem is L is too low to run, which inheritance, not H's priority,
+fixes. <strong>Feed-forward:</strong> §20.4, and Ch 16.</div>
+
+<div class="solution" id="sol20.12"><span class="sol-label">20.12</span>
+Machine-specific by design. A correct write-up reports: (a) the unlocked four-thread total is below 4,000,000 and differs
+each run (on the book's machine, e.g. 1,187,737 / 1,144,730 / 2,766,329), while the mutex version is exactly 4,000,000
+every run. (b) A lock+increment+unlock is roughly an order of magnitude slower than a bare increment (the book measured
+~1 ns vs ~12 ns, ~12&#215;) — illustrative and machine-dependent. (c) Opposite lock orders hang (a deadlock; kill it after
+a timeout), while a consistent order always completes. Label compiler/kernel. <em>Tempting wrong answer:</em> "re-running
+the unlocked version until it prints 4,000,000 proves it's fine" — a lucky correct run does not make a racing program
+correct; correctness must come from the rules. <strong>Feed-forward:</strong> §20.1, §20.3, §20.4.</div>
+
+</section>
+
+<section class="solutions" id="sol21">
+<h1>Chapter 21 — Solutions</h1>
+
+<div class="solution" id="sol21.1"><span class="sol-label">21.1</span>
+Because a spinning thread stays <em>runnable</em>, so the scheduler keeps giving it a CPU while it does no useful work —
+it burns a core (and, if it spins holding the lock, prevents the very progress it waits for). A blocking wait takes the
+thread <em>off</em> the CPU until it is woken, freeing the core for threads with work. <em>Tempting wrong answer:</em>
+"spinning is faster because there's no context switch" — true only for waits shorter than a context switch; for any
+appreciable wait, spinning wastes a whole core. <strong>Feed-forward:</strong> §21.1.</div>
+
+<div class="solution" id="sol21.2"><span class="sol-label">21.2</span>
+<code>wait</code>, <code>signal</code>, and <code>broadcast</code>. <code>wait</code> (called with the mutex held)
+<strong>atomically releases the mutex and sleeps</strong>; when later woken it re-acquires the mutex before returning.
+<code>signal</code> wakes one waiter; <code>broadcast</code> wakes all. <em>Tempting wrong answer:</em> "<code>wait</code>
+keeps the mutex so no one else can interfere" — it must release it, or the signalling thread could never acquire the lock
+to change the state. <strong>Feed-forward:</strong> §21.2.</div>
+
+<div class="solution" id="sol21.3"><span class="sol-label">21.3</span>
+At most <strong>N</strong> threads can be inside the guarded section at once: the semaphore starts with N permits, each
+<code>wait</code> takes one (blocking at zero), each <code>post</code> returns one. <em>Tempting wrong answer:</em> "it
+lets exactly N threads run and blocks the rest forever" — blocked threads proceed as permits are posted back; N is a
+concurrency cap, not a hard total. <strong>Feed-forward:</strong> §21.3.</div>
+
+<div class="solution" id="sol21.4"><span class="sol-label">21.4</span>
+Two reasons. (1) <strong>Spurious wakeups</strong>: POSIX permits <code>cond_wait</code> to return with no signal, so the
+predicate may not hold on waking. (2) <strong>Stolen condition</strong>: even after a real signal, between the signal and
+this thread re-acquiring the mutex, another thread can run and consume the item, so the predicate is false again.
+Two-consumer example: buffer has one item; producer signals; consumer C1 and C2 both were waiting; C1 wakes, re-acquires,
+pops the item; C2 wakes next, re-acquires — with <code>if</code> it does not re-check and pops from the now-empty buffer,
+reading garbage or crashing. With <code>while</code>, C2 re-tests <code>count == 0</code> and waits again.
+<em>Tempting wrong answer:</em> "one signal per item means one wakeup per item, so <code>if</code> is fine" — spurious
+wakeups and stolen conditions both break that count. <strong>Feed-forward:</strong> §21.2, §21.4.</div>
+
+<div class="solution" id="sol21.5"><span class="sol-label">21.5</span>
+(a) A condition variable's <code>signal</code> with no waiter is lost — it wakes no one and leaves no trace. So if a
+producer signals in the window after a consumer checked the predicate but before it called <code>cond_wait</code>, the
+consumer misses the signal and sleeps forever though the item is present. (b) Discipline: update the shared state
+<em>under the mutex</em> and then signal (still holding, or immediately after, the lock), and have the waiter loop
+<code>while (!predicate) cond_wait(...)</code>; holding the lock means the waiter cannot be mid-check-and-not-yet-asleep
+when you signal, and the loop re-checks the state on waking. (c) A semaphore's count <em>remembers</em> the post: a
+<code>sem_post</code> with no waiter increments the count, so a later <code>sem_wait</code> succeeds immediately — the
+"signal before wait" ordering is harmless. <em>Tempting wrong answer:</em> "signal before locking to be fast" — that is
+exactly the lost-wakeup race. <strong>Feed-forward:</strong> §21.3, §21.4.</div>
+
+<div class="solution" id="sol21.6"><span class="sol-label">21.6</span>
+<pre><code>producer(x):                          consumer():
+  lock(m)                               lock(m)
+  while (count == CAP)                  while (count == 0)
+    wait(not_full, m)                     wait(not_empty, m)
+  buf[in]=x; in=(in+1)%CAP; count++     x=buf[out]; out=(out+1)%CAP; count--
+  signal(not_empty)                     signal(not_full)
+  unlock(m)                             unlock(m)</code></pre>
+It cannot overflow because the producer waits on <code>not_full</code> while <code>count == CAP</code>, so it never
+enqueues into a full buffer; it cannot underflow because the consumer waits on <code>not_empty</code> while
+<code>count == 0</code>. The loops are necessary because a wakeup may be spurious or the slot/item may have been taken by
+another producer/consumer before this thread re-acquires the mutex, so the predicate must be re-checked.
+<em>Method-selection cue:</em> "wait until a condition over shared state, then act" is precisely mutex + condition
+variable in a loop. <strong>Feed-forward:</strong> §21.2.</div>
+
+<div class="solution" id="sol21.7"><span class="sol-label">21.7</span>
+(a) The spinner stays runnable, so the scheduler keeps it on a CPU for the whole ~0.5 s (≈100% of a core = ~0.5 s CPU),
+while the blocker is off the CPU (blocked state) the entire time, waking only at the end (~0.001 s CPU). (b) A short spin
+beats blocking when the expected wait is <em>shorter than the cost of a context switch pair</em> (sleep + wake); the
+crossover quantity is that context-switch cost — below it, spinning avoids two scheduler round-trips. (c)
+<code>cond_wait</code> costs a context switch to sleep and another to wake (plus scheduler bookkeeping); it is still right
+for a long wait because it frees the core for real work, and the two switches are negligible against a long wait.
+<em>Tempting wrong answer:</em> "blocking is always cheaper" — for sub-microsecond waits the two context switches can cost
+more than a brief spin. <strong>Feed-forward:</strong> §21.1, and Ch 16.</div>
+
+<div class="solution" id="sol21.8"><span class="sol-label">21.8</span>
+<strong>Step 4:</strong> Bug 1 is <code>if</code>-not-<code>while</code>: a worker checks the queue once, waits, and on a
+spurious wakeup (or after another worker took the task) pops from an empty queue and crashes. Bug 2 is a <strong>lost
+wakeup</strong>: the producer signals without holding the lock and enqueuing under it, so a worker between its check and
+its <code>cond_wait</code> misses the signal, and since the condition variable does not remember it, the task sits with no
+one woken. Both are intermittent and load-dependent because each needs a specific interleaving that is rare under light
+load and common under heavy concurrency. Corrected:
+<pre><code>worker:                     producer(task):
+  lock(m)                     lock(m)
+  while (queue.empty())       queue.push(task)
+    cond_wait(cv, m)          cond_signal(cv)      // under the lock, after enqueue
+  t = queue.pop()             unlock(m)
+  unlock(m); run(t)</code></pre>
+The <code>while</code> fixes bug 1 (re-check on wake); enqueue-under-lock-then-signal fixes bug 2 (no window to miss the
+signal). <em>Tempting wrong answer:</em> "signal before locking so the worker wakes sooner" — that reintroduces the lost
+wakeup. <strong>Feed-forward:</strong> §21.2, §21.4.</div>
+
+<div class="solution" id="sol21.9"><span class="sol-label">21.9</span>
+(a) <strong>Plain mutex</strong> — a single shared counter needs exclusion, not waiting. (b) <strong>Counting
+semaphore</strong> initialized to 5 — "at most 5 at once" is exactly a permit pool. (c) <strong>Condition variable +
+mutex</strong> — "block until a predicate over shared state (an item exists) becomes true" is the condition-variable
+pattern. (d) <strong>Condition variable + mutex, using <code>broadcast</code></strong> — a one-shot event to <em>many</em>
+waiters wants a broadcast (or a latch); a single <code>signal</code> would wake only one. <em>Method-selection cue:</em>
+just exclude &#8594; mutex; cap concurrency at N &#8594; counting semaphore; wait for a state predicate &#8594; condition
+variable (broadcast to wake all). <strong>Feed-forward:</strong> §21.2, §21.3.</div>
+
+<div class="solution" id="sol21.10"><span class="sol-label">21.10</span>
+(a) <strong>False</strong> — a <code>cond_signal</code> with no waiter is lost, not remembered (that is a semaphore's
+property). (b) <strong>False</strong> — <code>cond_wait</code> releases the mutex while it sleeps and re-acquires it on
+waking. (c) <strong>True</strong> — a binary semaphore (0/1) behaves much like a mutex (with caveats about ownership).
+(d) <strong>False</strong> — even without spurious wakeups, a stolen condition (another thread consumes it first) still
+requires the <code>while</code>; keep the loop. (e) <strong>True</strong> — a mutex, like a signal-handler flag, is a
+mechanism for coordinating two flows of control over shared memory (Chapter 18's single-threaded concurrency generalizes).
+<em>Tempting wrong answer:</em> calling (d) true because "spurious wakeups are the only reason for the loop" — the stolen
+condition is a second, independent reason. <strong>Feed-forward:</strong> §21.2, §21.3, and Ch 18.</div>
+
+<div class="solution" id="sol21.11"><span class="sol-label">21.11</span>
+(a) A monitor enforces that all access to the shared state goes through procedures that automatically hold the monitor's
+mutex and coordinate via its condition variables, so the "lock before touching state," "signal under the lock," and
+"wait in a loop" rules are built into the structure rather than re-implemented (and forgotten) at each call site. (b) Java
+<code>synchronized</code>/<code>wait</code>/<code>notify</code> hides the mutex and condition variable behind object
+methods; a thread-safe blocking queue hides the mutex, the two condition variables, and the predicate discipline behind
+<code>put</code>/<code>take</code>. (c) Because the primitives are where the subtle, load-dependent bugs live
+(<code>if</code>-not-<code>while</code>, lost wakeups, lock ordering), using a vetted higher-level abstraction removes
+whole bug classes; you would still drop to raw condition variables for a custom waiting policy the high-level type does not
+express (e.g. priority-ordered wakeups, or waiting on a compound predicate over several structures). <em>Tempting wrong answer:</em> "always hand-roll for performance" — the abstraction's overhead is usually negligible against the cost of a
+concurrency bug in production. <strong>Feed-forward:</strong> §21.4.</div>
+
+<div class="solution" id="sol21.12"><span class="sol-label">21.12</span>
+Machine-specific by design. A correct write-up reports: (a) the busy-poll waiter consumes ~100% of a core for the wait
+(on the book's machine ~0.499 s CPU for a ~0.5 s wait) while the condition-variable waiter consumes almost none (~0.001 s),
+because it is blocked, not runnable. (b) The bounded buffer's produced and consumed totals match (e.g. both 210 for items
+1..20) and the buffer never exceeds its capacity, confirming correct coordination via the <code>while</code>-loops. (c)
+With a semaphore initialized to three, at most three of the ten threads are ever in the guarded section simultaneously.
+Label compiler/kernel; the CPU figures are illustrative. <em>Tempting wrong answer:</em> "the spinner is fine, it got the
+same result" — it wasted a core to do so; correctness plus efficiency both matter. <strong>Feed-forward:</strong> §21.1,
+§21.2, §21.3.</div>
 
 </section>
 </body></html>

@@ -300,7 +300,10 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch52">Chapter 52 — The B-Tree in Practice: Deletion, Occupancy, and Concurrency</a></li>
 <li class="toc-ch"><a href="#ch53">Chapter 53 — The Log-Structured Merge-Tree: Trading Reads for Writes</a></li>
 <li class="toc-ch"><a href="#ch54">Chapter 54 — Compaction and Amplification: Tuning the LSM-Tree</a></li>
+<li class="toc-ch"><a href="#ch55">Chapter 55 — Bloom Filters: Making the LSM Read Path Cheap</a></li>
+<li class="toc-ch"><a href="#ch56">Chapter 56 — Choosing a Storage Engine: B-Tree or LSM, and at What Settings</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part X &mdash; Durability & Recovery</li>
+<li class="toc-ch"><a href="#ch57">Chapter 57 — Write-Ahead Logging: The Durability Contract</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XI &mdash; Transactions & Concurrency Control</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XII &mdash; Query Processing & Execution</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part XIII &mdash; Query Optimization</li>
@@ -21523,7 +21526,1071 @@ figures are exact arithmetic of a model — neither a wall-clock timing.</div>
 </section>
 </section>
 
+<section class="chapter" id="ch55">
+<h1>Chapter 55 — Bloom Filters: Making the LSM Read Path Cheap</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (a random device access ~19&nbsp;MB/s versus sequential
+~916&nbsp;MB/s — the point-read probe a Bloom filter saves is a random access, the expensive kind), <a href="#ch48">Chapter 48</a> (the buffer pool
+the filter lives in, and the reads it stops from evicting useful pages), <a href="#ch53">Chapter 53</a> (the LSM read path — a lookup probes the
+memtable and every SSTable, the read amplification this chapter attacks), <a href="#ch54">Chapter 54</a> (compaction bounds the run count but does not
+eliminate it; a point read still touches several runs, and the RUM read cost this chapter buys down). &nbsp;·&nbsp; Chapter 54 bounded the LSM-tree's read
+amplification but left it above one: a point read — above all a point <em>miss</em> — still probes several sorted runs, each a random device access. This
+chapter is the read-side companion to compaction: the <strong>Bloom filter</strong>, a tiny in-memory structure that lets a read skip runs that provably
+cannot hold the key, driving the probes per lookup back toward one.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch53">Chapter 53</a> — an LSM point read that finds nothing must touch how many of the on-disk runs, and what is that cost
+called? (2) <a href="#ch54">Chapter 54</a> — compaction lowered the run count, but did it drive read amplification to one, and why not? (3) <em>Predict:</em>
+suppose each run carried a small in-memory summary that could answer &ldquo;is key <var>x</var> definitely <em>not</em> here?&rdquo; cheaply, but was
+allowed to sometimes answer &ldquo;maybe&rdquo; when the key is actually absent. How much memory (guess: bytes per key) would you expect to need to make
+the &ldquo;maybe when actually absent&rdquo; mistake rare — say one in a hundred — and could such a summary ever say &ldquo;not here&rdquo; about a key
+that <em>is</em> present? Write your guess; &sect;55.2&ndash;&sect;55.3 answer it.</p>
+</aside>
+
+<p>Compaction (Chapter 54) bounded how many sorted runs an LSM-tree accumulates, but a point lookup still has to consult them: it checks the memtable,
+then each run from newest to oldest, and only a run whose key range and index say the key <em>could</em> be present is worth a device access. For a key
+that is present this usually resolves in the first run or two. For a key that is <strong>absent</strong> — a miss, which in real workloads is common (an
+existence check, an insert-if-not-present, a lookup for a deleted or never-written key) — there is nothing to short-circuit the search, and the read pays
+a random device access at run after run only to find the key in none of them. That is read amplification at its worst, and it is exactly the cost the
+<strong>Bloom filter</strong> was built to cut. A Bloom filter is a small bit array plus a handful of hash functions that answers one question about a set
+— <em>is <var>x</var> a member?</em> — with a deliberate asymmetry: it can say <strong>&ldquo;definitely not&rdquo;</strong> with certainty, or
+<strong>&ldquo;possibly yes&rdquo;</strong> with a small, tunable error. Put one in front of each SSTable and a point read consults the filters first,
+skipping every run whose filter says &ldquo;definitely not&rdquo; without touching the disk at all. This chapter builds it from the bits up: why an LSM
+point miss is the costly case (&sect;55.1); the structure and its one-sided error, invented by Bloom in 1970 (&sect;55.2); the false-positive-rate
+arithmetic — the closed-form formula, the optimal number of hashes, the bits-per-element for a target error — reproduced against a working filter on real
+runs (&sect;55.3); how filters slot into the LSM read path, what they cost, and the one thing they cannot help — the range scan (&sect;55.4); and what
+this completes about the LSM read path (&sect;55.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) in three
+parts. First a <strong>working Bloom filter</strong> — a bit array with double hashing — into which 100,000 keys are inserted; it is then probed with
+100,000 <em>absent</em> keys and the measured false-positive rate is compared, at several memory budgets, against the closed-form prediction
+(1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k. Second a <strong>design table</strong>: the bits-per-element and optimal hash count for a range of target
+false-positive rates, from the same closed-form arithmetic. Third an <strong>LSM read-amplification model</strong>: how many runs a point miss actually
+probes with filters at a given error rate versus without. The empirical false-positive numbers are measured on this machine and labeled empirical; the
+formula, the bits-per-element, and the run-probe figures are exact arithmetic of the model, labeled analytical. No wall-clock timings appear
+(a hardware-counter profiler, <code>perf</code>, is not installed on this machine); the point of the chapter is the error rate and the memory, both of
+which are hardware-independent.</p>
+
+<h2>55.1 The read the LSM still pays: the point miss</h2>
+
+<p>Recall the LSM read path from Chapter 53. To look up a key, the engine checks the in-memory memtable, then walks the on-disk sorted runs from newest
+to oldest; within a run, a sparse index and the run's key range tell it whether the key <em>could</em> be inside and, if so, which block to fetch. For a
+key that is <strong>present</strong>, the search usually stops early — the value is likely in the memtable or a recent run — so a hit is cheap. The
+punishing case is the <strong>point miss</strong>: a lookup for a key that is in <em>none</em> of the runs. Nothing stops the search early, because no run
+can prove the key's absence from its key range alone (the missing key may fall squarely inside a run's minimum-to-maximum span), so the read fetches a
+block from run after run, each a random device access at Chapter 46's slow ~19&nbsp;MB/s, and finds nothing every time. With compaction holding the tree
+at, say, ten runs, a single miss can cost ten random reads to answer &ldquo;no.&rdquo; And misses are not rare: existence checks, insert-if-absent,
+lookups of keys that were deleted or never written — all are misses, and all pay full read amplification. Compaction (Chapter 54) bounded the number of
+runs but could not drive it to one without paying ruinous write amplification, so the read cost of the miss is real and structural. What is needed is a
+way to answer &ldquo;this key is definitely not in this run&rdquo; <em>without</em> touching the run — a per-run membership summary small enough to keep in
+memory for every run at once. That is the Bloom filter.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is a point <em>miss</em> the most expensive case for an LSM read, and why can a run's key range alone not rule the key out? Roughly how many
+random device accesses does a miss cost in a ten-run tree, and what kind of per-run summary would cut that toward one? (Answer in &sect;55.2.)</p>
+</aside>
+
+<h2>55.2 The Bloom filter: k hashes, m bits, one-sided error</h2>
+
+<p>A <strong>Bloom filter</strong> for a set of <var>n</var> keys is an array of <var>m</var> bits, all initially zero, together with <var>k</var>
+independent hash functions, each mapping a key to one of the <var>m</var> bit positions. To <strong>insert</strong> a key, hash it with all <var>k</var>
+functions and set the <var>k</var> bits they name to one. To <strong>test</strong> a key, hash it the same way and look at those <var>k</var> bits: if
+<em>any</em> one of them is zero, the key was certainly never inserted — setting bits is the only thing insertion does, so a present key would have set all
+<var>k</var> — and the filter answers <strong>&ldquo;definitely not a member.&rdquo;</strong> If all <var>k</var> bits are one, the filter answers
+<strong>&ldquo;possibly a member,&rdquo;</strong> because those bits might all have been set by <em>other</em> keys whose hashes happened to overlap this
+one's. That is the filter's defining <strong>one-sided error</strong>: it never produces a <strong>false negative</strong> (it never says &ldquo;not
+present&rdquo; about a key that is present), but it may produce a <strong>false positive</strong> (say &ldquo;possibly present&rdquo; about a key that is
+absent). The asymmetry is exactly what an LSM read needs — a &ldquo;definitely not&rdquo; lets the read skip the run with certainty, and a false
+&ldquo;possibly&rdquo; costs only a wasted device access that finds nothing, degrading gracefully to the no-filter behavior rather than returning a wrong
+answer. This is the structure Burton Bloom introduced in 1970, in a paper whose title names the bargain precisely: a space/time trade-off in hash coding
+<em>with allowable errors</em> — accept a small, controlled error rate and buy a large reduction in space and probes.</p>
+
+<p>Answering the opener's second question directly: <strong>no</strong>, such a summary can never say &ldquo;not here&rdquo; about a key that is present.
+The whole point of the one-sided error is that &ldquo;definitely not&rdquo; is always trustworthy; only &ldquo;possibly&rdquo; can be wrong. That is what
+makes it safe to put in front of an authoritative store — a &ldquo;definitely not&rdquo; skips the run correctly every time, and a false &ldquo;possibly&rdquo;
+merely wastes one probe that the store then resolves. <em>(Answer to the &sect;55.1 quick check: a point miss is worst because nothing short-circuits the
+search — no run can rule the key out from its key range, so the read fetches a block from every run, ~ten random accesses in a ten-run tree, to answer
+&ldquo;no.&rdquo; The summary that cuts that toward one is a per-run membership filter that can cheaply answer &ldquo;definitely not in this run.&rdquo;)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a Bloom filter is one-sided membership in a shared bit array</span>
+<p><strong>1. In words.</strong> Insertion sets <var>k</var> hashed bits; a test that finds any of a key's <var>k</var> bits still zero proves the key was
+never inserted (&ldquo;definitely not&rdquo;), while all-ones means &ldquo;possibly&rdquo; — the bits may be borrowed from other keys. Absence is certain;
+presence is a guess. So the filter never has a false negative, only a false positive.</p>
+<p><strong>2. As a picture.</strong> Figure 55.1: one bit array; key <var>A</var>'s three arrows land on three positions and set them; a query for absent
+key <var>Z</var> whose three arrows include a still-zero cell is rejected outright, while a query for absent key <var>Y</var> whose three cells all happen
+to be one is a false positive — a &ldquo;maybe&rdquo; the store will disprove.</p>
+<p><strong>3. As numbers.</strong> At 10&nbsp;bits per key with the optimal <var>k</var>=7 hashes, the measured false-positive rate on 100,000 inserted and
+100,000 absent keys is about 0.9% (&sect;55.3) — under one wasted probe in a hundred misses, for ten bits of memory per key and zero risk of a wrong
+&ldquo;no.&rdquo;</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A Bloom filter: insert sets k hashed bits; a test finding any zero bit proves absence. All-ones is only &#8220;maybe.&#8221;</text>
+<g font-size="10">
+<rect x="40" y="70" width="34" height="26" fill="#dce7f3" stroke="#14406b"/><text x="52" y="87">0</text>
+<rect x="74" y="70" width="34" height="26" fill="#8fc98f" stroke="#14406b"/><text x="86" y="87">1</text>
+<rect x="108" y="70" width="34" height="26" fill="#dce7f3" stroke="#14406b"/><text x="120" y="87">0</text>
+<rect x="142" y="70" width="34" height="26" fill="#8fc98f" stroke="#14406b"/><text x="154" y="87">1</text>
+<rect x="176" y="70" width="34" height="26" fill="#8fc98f" stroke="#14406b"/><text x="188" y="87">1</text>
+<rect x="210" y="70" width="34" height="26" fill="#dce7f3" stroke="#14406b"/><text x="222" y="87">0</text>
+<rect x="244" y="70" width="34" height="26" fill="#8fc98f" stroke="#14406b"/><text x="256" y="87">1</text>
+<rect x="278" y="70" width="34" height="26" fill="#dce7f3" stroke="#14406b"/><text x="290" y="87">0</text>
+</g>
+<text x="40" y="55" font-size="9" fill="#2f7d32">insert A &#8594; set bits 1, 3, 4, 6</text>
+<text x="360" y="66" font-size="9" fill="#8c3a1d">test Z: bit 0 is zero &#8594; DEFINITELY NOT (correct, no disk access)</text>
+<text x="360" y="86" font-size="9" fill="#8c3a1d">test Y: bits 1,4,6 all one &#8594; &#8220;possibly&#8221; (false positive: one wasted probe)</text>
+<text x="360" y="106" font-size="9" fill="#14406b">present key: all k bits set &#8594; &#8220;possibly&#8221; (always &#8212; never a false negative)</text>
+<text x="40" y="130" font-size="9" fill="#333">absence is proof; presence is a guess. One-sided error is what makes the filter safe in front of an authoritative store.</text>
+</svg>
+<figcaption>Figure 55.1: the Bloom filter's one-sided error. A test that meets a zero bit rejects with certainty (no device access); all-ones is only
+&ldquo;possibly present.&rdquo; A false positive costs one wasted probe; a false negative — which cannot occur — would cost correctness.</figcaption>
+</figure>
+
+<h2>55.3 The false-positive rate: formula, optimal k, and bits per element</h2>
+
+<p>How often does the filter say &ldquo;possibly&rdquo; about an absent key? After inserting <var>n</var> keys into <var>m</var> bits with <var>k</var>
+hashes, the probability that any one bit is still zero is (1&nbsp;&minus;&nbsp;1/<var>m</var>) raised to the <var>kn</var> power, which for the sizes that
+matter is very close to e^(&minus;kn/m). A false positive requires all <var>k</var> of a query's bits to be one, so the <strong>false-positive
+rate</strong> is approximately <var>p</var>&nbsp;&asymp;&nbsp;(1&nbsp;&minus;&nbsp;e^(&minus;kn/m)) raised to the <var>k</var> power. Two design facts
+fall out of that formula. First, for a fixed memory ratio <var>m</var>/<var>n</var> there is an <strong>optimal number of hashes</strong> that minimizes
+<var>p</var>: <var>k</var>* = (<var>m</var>/<var>n</var>)&nbsp;ln&nbsp;2 — too few hashes and each test checks too little; too many and the bits fill up too
+fast. Second, at that optimum the error falls <em>exponentially</em> in the bits per element: to hit a target rate <var>p</var> you need
+<var>m</var>/<var>n</var> = &minus;ln&nbsp;<var>p</var> / (ln&nbsp;2) squared bits per key — a fixed budget per key, independent of how many keys there are.
+The first part of the program builds a real filter (double hashing to synthesize <var>k</var> indices from one hash), inserts 100,000 keys, probes 100,000
+absent keys, and lays the measured rate beside the formula:</p>
+
+<pre><code>empirical FPR vs formula  (n=100000 inserted, 100000 absent probes)
+  bits/elem   k    formula FPR    empirical FPR
+     4      3       0.14689       0.14654
+     8      6       0.02158       0.02103
+    10      7       0.00819       0.00875
+    12      8       0.00314       0.00320
+    16     11       0.00046       0.00055
+</code></pre>
+
+<p>The measured false-positive rate tracks the closed-form (1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k across two orders of magnitude — at 10&nbsp;bits per
+key the formula predicts 0.82% and the filter delivers 0.88%; the small gaps are ordinary sampling noise over 100,000 probes, not a modelling error. The
+shape is the whole story: <strong>each additional handful of bits per key cuts the error by roughly a constant factor</strong>, because the error decays
+exponentially in <var>m</var>/<var>n</var>. That is why a filter can be so cheap — you do not pay per stored value, only a fixed few bits per key, and a
+little memory buys a lot of certainty. The design table makes the budget explicit, computed from the two closed forms above:</p>
+
+<pre><code>design table: bits/element and optimal k for a target FPR
+  target FPR   bits/elem (m/n)   optimal k
+    0.1000          4.79           3.32
+    0.0500          6.24           4.32
+    0.0100          9.59           6.64
+    0.0010         14.38           9.97
+    0.0001         19.17          13.29
+</code></pre>
+
+<p>Read the table as a price list. A 1% false-positive rate — one wasted probe per hundred misses — costs about <strong>9.6&nbsp;bits per key</strong>,
+call it a byte and change; a ten-times-stricter 0.1% costs about 14.4&nbsp;bits, and each further factor of ten adds a near-constant ~4.8&nbsp;bits
+(that is 1/(ln&nbsp;2) squared bits per decade). For an LSM-tree holding a billion keys, a 1% filter is roughly 1.2&nbsp;GB of memory spread across the
+runs — small enough to keep resident, and the reason production engines attach a Bloom filter to every SSTable by default. The optimal <var>k</var> is not
+a free parameter to guess: it is fixed by the memory you spend, and the table's values (7 hashes at 10&nbsp;bits, matching the empirical run above) are
+where the error is least for that budget.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: a Bloom filter never lies about absence &mdash; but that is the <em>only</em> promise it makes</span>
+<p>The one-sided error is so clean that it invites three overreaches, each a real production bug. First, <strong>&ldquo;false positives don't matter, they
+just cost one probe.&rdquo;</strong> They cost one probe <em>each</em>, and at the wrong error rate that adds up: a filter sized for 10% false positives in
+front of a ten-run tree still lets roughly one miss in ten fall through to a wasted run probe, and across a firehose of existence checks that is a large
+fraction of the read work the filter was supposed to remove — the error rate is a capacity decision, not a detail. Second, <strong>&ldquo;a Bloom filter
+can tell me the key is present.&rdquo;</strong> It cannot: &ldquo;possibly&rdquo; is never a yes. Any read that treats a filter hit as a confirmed
+membership — skipping the authoritative lookup — will occasionally return a value for a key that was never stored, which is data corruption, not a
+performance bug. The filter <em>guards</em> the store; it never <em>replaces</em> it. Third, <strong>&ldquo;I'll just delete keys from the filter by
+clearing their bits.&rdquo;</strong> A standard Bloom filter cannot support deletion — clearing a key's <var>k</var> bits may clear bits another key relies
+on, which would create a <strong>false negative</strong> and break the one promise the structure makes; deletion needs a counting Bloom filter or a
+different structure such as the cuckoo filter (Fan et&nbsp;al. 2014), which supports deletes at comparable space. The honest posture: a Bloom filter
+proves absence and only suggests presence, its error rate is a memory-budget decision you make deliberately, and you never mutate it in ways that could
+manufacture a false negative — because the instant it can say &ldquo;not present&rdquo; about a present key, it is worse than useless in front of a store
+that must be correct.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Our LSM point lookups are slow on misses. Let's add a Bloom filter with, say, 4&nbsp;bits per key to
+keep the memory tiny — and while we're at it, we can skip the SSTable read entirely when the filter says the key is present, since the filter already
+told us it's there.&rdquo; Cover the paragraph and answer in four or five sentences, drawing on &sect;55.2&ndash;&sect;55.3.</p>
+<p><em>Model answer.</em> &ldquo;A Bloom filter is exactly the right fix for slow misses — it turns most miss probes into an in-memory &lsquo;definitely
+not&rsquo; and never risks a wrong answer, because it has no false negatives. But two of the specifics are off. Four bits per key gives about a 14%
+false-positive rate, so roughly one miss in seven still pays a wasted run probe; if misses are our pain, we want ~10&nbsp;bits per key for about 1%, which
+is still only a bit over a gigabyte for a billion keys. And we can't skip the SSTable read on a filter hit: &lsquo;possibly present&rsquo; is never a
+confirmed yes, so trusting it would let us return values for keys that were never stored — a correctness bug, not a speed-up. The filter's job is to skip
+runs that are <strong>definitely absent</strong>; every &lsquo;maybe&rsquo; still goes to the store. So: yes to the filter, size it for ~1% not tiny, and
+keep the authoritative read on every hit.&rdquo; Naming the false-negative-free asymmetry, the bits-per-element cost of the target rate, and the
+&ldquo;guard not replace&rdquo; rule is the senior register.</p>
+</aside>
+
+<h2>55.4 Filters in the LSM: skipping runs, and the range-scan gap</h2>
+
+<p>Now put a filter in front of each SSTable and rerun the point-miss path of &sect;55.1. The read consults each run's Bloom filter first; a
+&ldquo;definitely not&rdquo; skips that run with no device access, and only a &ldquo;possibly&rdquo; — a genuine hit or a false positive — triggers the
+block fetch. For a true miss, every run's filter <em>should</em> say &ldquo;definitely not,&rdquo; and does except for the false-positive fraction
+<var>p</var>, so the expected number of runs actually probed collapses from <var>L</var> to about <var>L</var>&times;<var>p</var>. The third part of the
+model tabulates it:</p>
+
+<pre><code>LSM point-read miss: runs actually probed (L levels), Bloom at FPR p
+  levels L   no filter   with Bloom p=0.01   with Bloom p=0.001
+     4          4               0.040               0.004
+     7          7               0.070               0.007
+    10         10               0.100               0.010
+  (expected wasted probes = L*p; a true miss with p=0.01, L=10 => ~0.1 disk probes vs 10)
+</code></pre>
+
+<p>The point miss that cost ten random device accesses now costs, in expectation, about <em>one tenth of one</em> access at a 1% filter — read
+amplification for the miss falls by two orders of magnitude, and with it the read half of the RUM trade the LSM-tree pays. This is why the Bloom filter is
+the standard companion to compaction: compaction bounds how many runs exist, and the filter makes the point read pay for only the runs that might
+actually contain the key. It also sharpens Chapter 54's whole picture — with filters, an LSM-tree's point-read amplification is near the B-tree's, so the
+remaining gap between the families narrows to range scans and the write/space trade. One subtlety is worth the senior engineer's attention, and it is the
+insight behind the <strong>Monkey</strong> design of Dayan and colleagues (2017): the total false-positive cost of a lookup is the <em>sum</em> of the
+per-run false-positive rates, so spending the same memory <em>unevenly</em> — more bits per key on the larger, more numerous lower levels and fewer on the
+small upper ones — minimizes the expected wasted probes for a fixed memory budget, rather than giving every run the same bits per key. The tuning of the
+filter is itself part of the LSM's read/memory trade.</p>
+
+<p>There is one read the filter cannot help at all, and naming it is half of understanding filters: the <strong>range scan</strong>. A Bloom filter
+answers only <em>point</em> membership — &ldquo;is this exact key present?&rdquo; — and says nothing about which keys fall in an interval, because hashing
+destroys order. A query for all keys between <var>a</var> and <var>b</var> must still open every run whose key range overlaps &#91;<var>a</var>,&nbsp;<var>b</var>&#93;
+and merge their contents; the filter offers no skip, because a run may hold <em>some</em> key in the range even when it holds none of the specific keys you
+might name. This is the structural reason the B-tree keeps its edge on range-heavy workloads even after the LSM-tree gets Bloom filters: the filter buys
+back point-read amplification but not scan amplification, and the range scan is where sorted, clustered, in-place storage still wins. (Structures that
+<em>do</em> summarize ranges, such as the prefix or succinct range filters that extend this idea, exist, but the plain Bloom filter is a point-membership
+structure, full stop.)</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>With a 1% Bloom filter on every run, about how many runs does a point <em>miss</em> probe in a ten-run tree, versus without? Why does the same filter do
+<em>nothing</em> for a range scan? (Answer below.)</p>
+</aside>
+
+<h2>55.5 What to carry forward</h2>
+
+<p>The <strong>Bloom filter</strong> is a small in-memory bit array with <var>k</var> hash functions that answers set membership with a deliberate
+<strong>one-sided error</strong>: <em>definitely not a member</em> is always correct, <em>possibly a member</em> may be a false positive, and a false
+negative never occurs (&sect;55.2). Its <strong>false-positive rate</strong> is <var>p</var>&nbsp;&asymp;&nbsp;(1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k,
+minimized at <var>k</var>* = (<var>m</var>/<var>n</var>)&nbsp;ln&nbsp;2, and reaching a target <var>p</var> costs a fixed
+<var>m</var>/<var>n</var> = &minus;ln&nbsp;<var>p</var>/(ln&nbsp;2)&nbsp;squared bits per key — about 10&nbsp;bits for 1%, verified against a working
+filter whose measured rate matched the formula across two orders of magnitude (&sect;55.3). Placed in front of every SSTable, a filter lets a point read
+skip runs that are definitely absent, cutting a point miss from <var>L</var> probes to about <var>L</var>&times;<var>p</var> — ten random accesses down to
+~0.1 at 1% (&sect;55.4). The named trap: a Bloom filter proves absence but only suggests presence, so it guards the store and never replaces it, its error
+rate is a memory-budget decision, and it cannot be safely deleted from — nor can it help a <strong>range scan</strong>, which needs order the hash
+destroys (&sect;55.3&ndash;&sect;55.4).</p>
+
+<p>With the Bloom filter the LSM read path is complete. Chapter 53 built it, Chapter 54 bounded its amplification with compaction, and this chapter drove
+the point-miss cost back toward one — so the LSM-tree now offers cheap sequential writes, tunable write/space amplification, <em>and</em> point reads
+competitive with a B-tree, with only the range scan and the write/space cost left as genuine differences between the families. That is exactly the
+comparison the part has been building toward, and it is now fully in hand: two storage engines, each measured on read, write, and space; a shared
+amplification vocabulary; the compaction dial; and the Bloom filter that closes the read gap. The part's final chapter spends this vocabulary on the
+question every database designer eventually faces — <em>given a concrete workload, B-tree or LSM-tree, and at what settings?</em> — turning the whole part
+into a decision procedure. Everything since Chapter 46 has been assembling the terms of that decision; next we make it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Explain why an LSM point <em>miss</em> is the expensive read, and what a per-run filter changes.</li>
+<li>State the Bloom filter's one-sided error: which mistake it can make and which it never can, and why.</li>
+<li>Write the false-positive-rate formula and the optimal-<var>k</var> rule, and say why error falls exponentially in bits per key.</li>
+<li>Give the bits per key for a 1% false-positive rate and explain why it is independent of the number of keys.</li>
+<li>Explain how a filter cuts a point miss from <var>L</var> probes to ~<var>L</var>&times;<var>p</var>.</li>
+<li>State the two things a Bloom filter cannot do: confirm presence, and help a range scan.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Describe insert and test for a Bloom filter, and state which of false positive / false negative it can produce. (&sect;55.2)</li>
+<li><strong>R2.</strong> Write the false-positive-rate formula and the optimal number of hashes for a given <var>m</var>/<var>n</var>. (&sect;55.3)</li>
+<li><strong>R3.</strong> About how many bits per key does a 1% false-positive rate cost, and why does adding bits cut the error exponentially? (&sect;55.3)</li>
+<li><strong>R4.</strong> How does a per-run filter change the number of runs a point miss probes, and by what factor? (&sect;55.4)</li>
+<li><strong>R5.</strong> Give two things a standard Bloom filter cannot do, and why each would break correctness or is impossible. (&sect;55.3&ndash;&sect;55.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Burton H. Bloom, &ldquo;Space/Time Trade-offs in Hash Coding with Allowable Errors,&rdquo; <em>Communications of the ACM</em> 13(7), 1970,
+pp. 422&ndash;426, DOI 10.1145/362686.362692.</strong> The original: the bit array, the <var>k</var> hashes, and the one-sided error whose
+&ldquo;allowable errors&rdquo; buy the space. First author Burton H. Bloom; venue, volume, issue, pages, year, and DOI verified via the ACM Digital
+Library and DBLP.</li>
+<li><strong>Andrei Broder &amp; Michael Mitzenmacher, &ldquo;Network Applications of Bloom Filters: A Survey,&rdquo; <em>Internet Mathematics</em> 1(4),
+2004, pp. 485&ndash;509, DOI 10.1080/15427951.2004.10129096.</strong> The clearest derivation of the false-positive formula, the optimal <var>k</var>,
+and the bits-per-element rule this chapter reproduces. First author Andrei Broder; venue, volume, issue, pages, year, and DOI verified via Taylor &amp;
+Francis and Project Euclid.</li>
+<li><strong>Bin Fan, Dave G. Andersen, Michael Kaminsky &amp; Michael D. Mitzenmacher, &ldquo;Cuckoo Filter: Practically Better Than Bloom,&rdquo;
+<em>Proc. 10th ACM Int'l Conf. on Emerging Networking Experiments and Technologies (CoNEXT&nbsp;2014)</em>, pp. 75&ndash;88, DOI 10.1145/2674005.2674994.</strong>
+The approximate-membership structure that adds deletion at comparable space — the answer to &ldquo;how do I delete from a filter?&rdquo; First author
+Bin Fan; venue, year, pages, and DOI verified via the ACM Digital Library and the authors' CMU/Harvard copies.</li>
+<li><strong>Niv Dayan, Manos Athanassoulis &amp; Stratos Idreos, &ldquo;Monkey: Optimal Navigable Key-Value Store,&rdquo; <em>Proc. 2017 ACM SIGMOD
+Int'l Conf. on Management of Data</em>, pp. 79&ndash;94, DOI 10.1145/3035918.3064054.</strong> Shows that a lookup's cost is the sum of the per-run
+false-positive rates, so allocating filter bits unevenly across levels minimizes read cost for a fixed memory budget (&sect;55.4). First author Niv Dayan;
+venue, year, pages, and DOI verified via the ACM Digital Library and DBLP.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex55.1"><span class="ex-label">55.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: what does a Bloom filter do on insert, and what does it do on test?</div>
+
+<div class="exercise" id="ex55.2"><span class="ex-label">55.2</span> <span class="ex-tag warm">warm-up</span>
+Which error can a Bloom filter make — false positive or false negative — and which can it never make? State the one-line reason.</div>
+
+<div class="exercise" id="ex55.3"><span class="ex-label">55.3</span> <span class="ex-tag warm">warm-up</span>
+Why is a point <em>miss</em>, not a point hit, the LSM read that a Bloom filter most helps?</div>
+
+<div class="exercise" id="ex55.4"><span class="ex-label">55.4</span> <span class="ex-tag core">core</span>
+The one-sided error. (a) Explain why a test that finds any of a key's <var>k</var> bits zero proves the key was never inserted. (b) Explain why all-ones
+does <em>not</em> prove the key is present. (c) Argue why this asymmetry is exactly what makes a filter safe to place in front of an authoritative store,
+and what would go wrong if it could produce a false negative.</div>
+
+<div class="exercise" id="ex55.5"><span class="ex-label">55.5</span> <span class="ex-tag core">core</span>
+The formula. (a) State the false-positive-rate formula <var>p</var> as a function of <var>k</var>, <var>n</var>, and <var>m</var>. (b) The model measured
+0.88% at 10&nbsp;bits per key with <var>k</var>=7 against a predicted 0.82%; explain why the two differ slightly and why that is not a modelling error.
+(c) Explain why raising bits per key cuts the error by a roughly constant <em>factor</em> rather than a constant amount.</div>
+
+<div class="exercise" id="ex55.6"><span class="ex-label">55.6</span> <span class="ex-tag core">core</span>
+Sizing. (a) State the optimal-<var>k</var> rule and the bits-per-element rule for a target <var>p</var>. (b) From the design table, how many bits per key
+buy a 1% false-positive rate, and roughly how much memory is that for a billion-key store? (c) Explain why the bits-per-key budget does not grow with the
+number of keys.</div>
+
+<div class="exercise" id="ex55.7"><span class="ex-label">55.7</span> <span class="ex-tag complexity">cost</span>
+Read amplification. Using the LSM model (a true miss probes ~<var>L</var>&times;<var>p</var> runs): (a) for a ten-run tree, how many runs does a miss
+probe with no filter, with a 1% filter, and with a 0.1% filter? (b) A workload is 90% existence-check misses; explain, in one or two sentences, how much
+of the miss read work a 1% filter removes. (c) Why does the filter do nothing to speed up a range scan over the same ten runs?</div>
+
+<div class="exercise" id="ex55.8"><span class="ex-label">55.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team adds a Bloom filter to each SSTable and, to &ldquo;save a read,&rdquo; changes the lookup to return
+&ldquo;key exists&rdquo; whenever the filter says &ldquo;possibly present,&rdquo; without opening the run.
+<br><strong>Step 1 (given):</strong> the filter has a 1% false-positive rate, so 1% of absent-key lookups get a &ldquo;possibly present.&rdquo;
+<br><strong>Step 2 (given):</strong> those lookups now return &ldquo;key exists&rdquo; and, for a value, whatever the caller defaults to.
+<br><strong>Step 3 (given):</strong> occasionally the system reports a value for a key that was never written.
+<br><strong>Step 4 (you):</strong> Name the class of bug this is (performance or correctness), explain which Bloom filter promise was misused, and give
+the one-line rule that would have prevented it.</div>
+
+<div class="exercise" id="ex55.9"><span class="ex-label">55.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>false positive</em>, <em>false negative</em>, <em>optimal k</em>, <em>bits per element</em>, or
+<em>range scan</em> — and why: (a) the mistake a Bloom filter can never make; (b) the wasted run probe a filter occasionally allows; (c) the quantity fixed
+by the memory budget that minimizes the error; (d) the read a Bloom filter cannot accelerate; (e) the fixed per-key cost that sets the target error rate.</div>
+
+<div class="exercise" id="ex55.10"><span class="ex-label">55.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A Bloom filter can confirm that a key is present.&rdquo; (b)
+&ldquo;A Bloom filter never produces a false negative.&rdquo; (c) &ldquo;Doubling the bits per element roughly halves the false-positive rate.&rdquo;
+(d) &ldquo;You can delete a key from a standard Bloom filter by clearing its bits.&rdquo; (e) &ldquo;A Bloom filter lets an LSM range scan skip runs.&rdquo;</div>
+
+<div class="exercise" id="ex55.11"><span class="ex-label">55.11</span> <span class="ex-tag stretch">stretch</span>
+The whole read path. (a) Trace an LSM point miss on key <var>x</var> in a ten-run tree with 1% filters: what happens at each run, and how many device
+accesses in expectation? (b) Explain why, with filters, an LSM-tree's point-read amplification is near a B-tree's while its range-scan amplification is
+not. (c) Summarize the Monkey insight: why does spending the same total filter memory <em>unevenly</em> across levels beat spending it evenly, and what
+quantity does it minimize?</div>
+
+<div class="exercise" id="ex55.12"><span class="ex-label">55.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Implement a Bloom filter (a bit array with <var>k</var> hash indices; double hashing is fine), insert
+<var>n</var> keys, probe <var>n</var> absent keys, and report the empirical false-positive rate at several bits-per-element budgets. (b) For each budget,
+compute the closed-form (1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k with the optimal <var>k</var> and lay it beside your measurement. (c) State your toolchain
+and explain why the false-positive rate is a hardware-independent property of <var>k</var>, <var>m</var>, and <var>n</var> — a structural rate, not a
+wall-clock timing — and why your empirical numbers differ from the formula only by sampling noise.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch56">
+<h1>Chapter 56 — Choosing a Storage Engine: B-Tree or LSM, and at What Settings</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (sequential ~916&nbsp;MB/s versus random ~19&nbsp;MB/s — the
+~48&times; gap that makes a B-tree's in-place write expensive and the LSM's sequential write cheap, the single number that drives this chapter's model),
+<a href="#ch51">Chapter 51</a> and <a href="#ch52">Chapter 52</a> (the B-tree: one point on the trade — good reads and range scans, random in-place
+writes, ~69% space), <a href="#ch53">Chapter 53</a> and <a href="#ch54">Chapter 54</a> (the LSM-tree, compaction, and the three amplifications with the
+RUM tension), <a href="#ch55">Chapter 55</a> (Bloom filters, which pull LSM point-read amplification back near the B-tree's, so the surviving differences
+are range scans and the write/space trade). &nbsp;·&nbsp; The part has built two storage engines and a full vocabulary — read, write, and space
+amplification; sequential versus random; compaction families; Bloom filters — for comparing them. This capstone spends that vocabulary on the one
+question a database designer cannot avoid: <strong>given a concrete workload, B-tree or LSM-tree, and at what settings?</strong></p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch54">Chapter 54</a> — name the three amplifications an LSM-tree trades among and state the RUM tension in one line.
+(2) <a href="#ch46">Chapter 46</a> and <a href="#ch53">Chapter 53</a> — a B-tree's writes are random and in place; an LSM-tree's are sequential appends.
+Which of Chapter 46's two bandwidths does each pay, and roughly what is the ratio between them? (3) <em>Predict:</em> you must pick one engine for each of
+three stores — a read-mostly key-value cache, an analytics table scanned in ranges, and a metrics firehose ingesting millions of points a second. Write
+your pick for each and one reason; &sect;56.3&ndash;&sect;56.4 score them against a model and check your intuition.</p>
+</aside>
+
+<p>Everything since Chapter 46 has been assembling the terms of a single decision. Two engines are now fully drawn. The <strong>B-tree</strong> keeps data
+sorted on disk and updates it in place: excellent point reads and unbeatable range scans, but every write is a <em>random</em> device access at Chapter
+46's slow side, and it occupies one fixed point on the read/write/space trade at about 69% space utilization. The <strong>LSM-tree</strong> keeps data
+sorted in memory and appends immutable sorted runs, compacting in the background: <em>sequential</em> writes at the fast side, point reads pulled back
+near the B-tree's by Bloom filters (Chapter 55), but read and space costs paid through amplification — and, through the compaction family and size ratio,
+a whole tunable <em>curve</em> of balances rather than a single point. The choice between them is not a matter of which is &ldquo;better&rdquo;; it is a
+matter of which cost a given workload can most afford to spend, which is the RUM conjecture (Chapter 54) restated as a decision. This chapter makes that
+decision concrete: what the question actually is and why it has no workload-independent answer (&sect;56.1); the three engines' <em>cost vectors</em> —
+exactly what each charges on point reads, range scans, writes, and space (&sect;56.2); a small analytical model that scores the three against named
+workloads, reproduced on real runs (&sect;56.3); how to read the model's verdicts — and, just as important, where the model lies and measurement must take
+over (&sect;56.4); and what this completes about storage engines as the part closes and durability begins (&sect;56.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) that builds an
+<strong>analytical cost model</strong>, not a benchmark. It assigns each engine a cost vector — point-read accesses, range-scan run-touches, a write cost,
+and a space amplification — using the amplification arithmetic of Chapter 54 (leveled ~<var>T</var>&times;<var>L</var> write / ~<var>L</var> read /
+~1 space; size-tiered the reverse), the Chapter 55 result that Bloom filters make point reads ~1 run, and one hardware-anchored constant: Chapter 46's
+sequential-to-random bandwidth ratio (~916/19&nbsp;&asymp;&nbsp;48), applied to the B-tree's random writes so its in-place update is charged the random
+penalty the LSM avoids. It then scores three named workloads by a transparent weighted sum and reports the winner. Every number is exact model arithmetic
+of parameters stated in the code — hardware-independent except for the one cited Chapter 46 ratio — and is labeled a model, not a measurement; no
+wall-clock timing is taken (<code>perf</code> is not installed here), because the chapter's claim is about <em>relative</em> cost structure, which the
+model captures and a single machine's benchmark would only obscure.</p>
+
+<h2>56.1 The decision, and why it has no workload-free answer</h2>
+
+<p>The question &ldquo;B-tree or LSM-tree?&rdquo; feels like it should have a best answer, and it does not — for the same reason the RUM conjecture
+(Chapter 54) says no access method minimizes read, update, and space at once. An engine is a <em>point or a curve</em> in that three-dimensional cost
+space, and &ldquo;best&rdquo; is only defined once you say how much you weight each axis, which is a property of the <strong>workload</strong>, not of the
+engine. A read-mostly store that almost never writes barely feels the B-tree's random-write cost and enjoys its cheap reads and tight space; a
+write-saturated firehose feels that same random-write cost as its dominant expense and is desperate for the LSM's sequential appends, whatever it must
+pay back in read and space amplification. Neither engine is wrong; they are tuned for different points, and the workload decides which point it is
+standing on. This is why the honest form of the question is not &ldquo;which engine is better&rdquo; but <em>&ldquo;which amplification can this workload
+most afford to spend, and which engine (at which settings) spends that one?&rdquo;</em> — and why every serious storage system ships the choice as
+configuration. To answer it for a concrete workload you need two things: the <strong>cost vector</strong> of each engine (what it charges on each kind of
+operation) and the <strong>weights</strong> of the workload (how much of each kind it does, and how much it values space). Multiply and sum, and the
+&ldquo;best&rdquo; engine is simply the one with the lowest weighted cost — for <em>that</em> workload. The next two sections build exactly that.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why does &ldquo;which storage engine is best?&rdquo; have no answer without a workload? What two ingredients — one per engine, one per workload — do
+you need to turn the vague question into an arithmetic one? (Answer in &sect;56.2.)</p>
+</aside>
+
+<h2>56.2 The three cost vectors: what each engine charges</h2>
+
+<p>Reduce each engine to what it costs on four things: a point read, a range scan, a write, and the space it occupies — the cost vector of &sect;56.1.
+The numbers come straight from the part. <strong>Point read:</strong> a B-tree fetches ~1 leaf; a leveled LSM with Bloom filters (Chapter 55) touches ~1
+run; a size-tiered LSM with filters also resolves a hit in ~1 run — so all three are about 1 on point reads, which is the Bloom filter's gift.
+<strong>Range scan:</strong> a B-tree scans one clustered, sorted run; a leveled LSM must merge ~<var>L</var> runs (one per level); a size-tiered LSM must
+merge up to ~<var>T</var>&times;<var>L</var> runs — and the filter cannot help, because order is what a scan needs and hashing destroys it (Chapter 55).
+<strong>Write:</strong> here the sequential-versus-random distinction of Chapter 46 is decisive. A B-tree's write amplification is ~1 <em>but random</em>,
+so it pays the slow ~19&nbsp;MB/s side; a leveled LSM's write amplification is ~<var>T</var>&times;<var>L</var> but <em>sequential</em>, at ~916&nbsp;MB/s;
+a size-tiered LSM's is only ~<var>L</var> and sequential. To compare them we charge the B-tree's random write a penalty equal to Chapter 46's bandwidth
+ratio (~48&times;), which is why a &ldquo;write amplification of 1&rdquo; is not cheap when it is random. <strong>Space:</strong> a B-tree sits near 1.45&times;
+live data (~69% fill); leveled ~1.10; size-tiered ~<var>T</var> (here 10). The model prints the vector:</p>
+
+<pre><code>per-engine cost vector (T=10, L=5, rho=48.2):
+  engine            point-rd   range(runs)   write-cost(=WA*rho?)   space-amp
+  B-tree              1.00          1.0              48.2             1.45
+  LSM leveled         1.00          5.0              50.0             1.10
+  LSM size-tiered     1.00         50.0               5.0            10.00
+</code></pre>
+
+<p>Read the vector across and the two families' personalities are exact. All three are equal on point reads — the Bloom filter erased that difference.
+The B-tree owns the <strong>range scan</strong> (1 versus 5 or 50) because its data is clustered and sorted in one place. The B-tree's <strong>write
+cost</strong> (48) is high not because it writes much but because it writes <em>randomly</em>; leveled LSM's is about the same (50) because it rewrites a
+lot even though sequentially; size-tiered LSM's is the lowest by far (5) because it writes little and sequentially. And <strong>space</strong> splits the
+LSM family in two: leveled is tightest of all (1.10), size-tiered the loosest (10). No engine wins every column — that is the RUM tension made into a
+table — so the winner depends entirely on which columns the workload weights, which the model computes next.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: the engine choice is a weighted sum, not a verdict</span>
+<p><strong>1. In words.</strong> Each engine has a cost vector (point read, range scan, write, space); each workload has weights (how much of each it
+does). The best engine is the one with the lowest weighted sum for <em>that</em> workload — so the answer is a function of the workload, not a fixed
+ranking of engines.</p>
+<p><strong>2. As a picture.</strong> Figure 56.1: three bars per workload (B-tree, leveled, size-tiered), heights the weighted cost; the shortest bar
+changes from workload to workload — B-tree shortest under range-heavy, size-tiered shortest under write-heavy, B-tree and leveled tied under read-heavy.</p>
+<p><strong>3. As numbers.</strong> At the weights modeled here: read-heavy &rarr; B-tree 8.5, leveled 8.7 (a near tie, the Bloom filter's doing);
+range-heavy &rarr; B-tree 6.2 beats leveled 9.2 and size-tiered 49.6; write-heavy firehose &rarr; size-tiered 14.2 beats B-tree 38.9 and leveled 40.8.
+Same three engines, three different winners.</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Weighted cost per op by workload (lower is better). The shortest bar &#8212; the best engine &#8212; changes with the workload.</text>
+<line x1="60" y1="180" x2="620" y2="180" stroke="#333"/>
+<g font-size="8" fill="#333">
+<text x="70" y="195">read-heavy</text>
+<text x="270" y="195">range-scan heavy</text>
+<text x="480" y="195">write firehose</text>
+</g>
+<!-- read-heavy: Bt 8.5, lev 8.7, st 13.1 (scale x3) -->
+<rect x="70"  y="154" width="24" height="26" fill="#14406b"/><text x="72" y="150" font-size="8" fill="#14406b">8.5</text>
+<rect x="98"  y="154" width="24" height="26" fill="#3f74b0"/><text x="100" y="150" font-size="8" fill="#3f74b0">8.7</text>
+<rect x="126" y="141" width="24" height="39" fill="#8c3a1d"/><text x="128" y="137" font-size="8" fill="#8c3a1d">13</text>
+<!-- range-heavy: Bt 6.2, lev 9.2, st 49.6 -->
+<rect x="275" y="161" width="24" height="19" fill="#14406b"/><text x="277" y="157" font-size="8" fill="#14406b">6.2</text>
+<rect x="303" y="152" width="24" height="28" fill="#3f74b0"/><text x="305" y="148" font-size="8" fill="#3f74b0">9.2</text>
+<rect x="331" y="31"  width="24" height="149" fill="#8c3a1d"/><text x="331" y="27" font-size="8" fill="#8c3a1d">49.6</text>
+<!-- write firehose: Bt 38.9, lev 40.8, st 14.2 -->
+<rect x="485" y="63"  width="24" height="117" fill="#14406b"/><text x="483" y="59" font-size="8" fill="#14406b">38.9</text>
+<rect x="513" y="58"  width="24" height="122" fill="#3f74b0"/><text x="513" y="54" font-size="8" fill="#3f74b0">40.8</text>
+<rect x="541" y="137" width="24" height="43" fill="#2f7d32"/><text x="541" y="133" font-size="8" fill="#2f7d32">14.2</text>
+<text x="360" y="120" font-size="8" fill="#333">dark blue = B-tree, mid blue = leveled LSM, brown/green = size-tiered LSM (green where it wins)</text>
+</svg>
+<figcaption>Figure 56.1: the same three engines score differently per workload (modeled, <var>T</var>=10, <var>L</var>=5). The B-tree wins read- and
+range-heavy work; the size-tiered LSM wins the write firehose; read-heavy is a near tie because Bloom filters equalize point reads. The best engine is a
+property of the workload, not a fixed ranking.</figcaption>
+</figure>
+
+<h2>56.3 The model: scoring engines against workloads</h2>
+
+<p>Give each workload three operation weights (point read, range scan, write) and a space sensitivity, multiply by the cost vectors of &sect;56.2, and the
+lowest weighted sum names the engine to pick. The model runs three named workloads: a <strong>read-heavy point-lookup</strong> store (80% point reads,
+15% writes, 5% ranges), a <strong>range-scan-heavy analytics</strong> table (80% ranges), and a <strong>write-heavy metrics firehose</strong> (80%
+writes, and — because it lives on cheap disk — a low space sensitivity of 0.3):</p>
+
+<pre><code>weighted cost per op (lower=better); space penalty=(space_amp-1)*space_weight:
+  workload                          B-tree   leveled   size-tiered   winner
+  read-heavy point lookups            8.5      8.7        13.1      B-tree
+  analytics range-scan heavy          6.2      9.2        49.6      B-tree
+  metrics/event ingest firehose      38.9     40.8        14.2      LSM size-tiered
+</code></pre>
+
+<p>Three workloads, three verdicts, and each is the RUM tension resolved by the weights. The <strong>read-heavy</strong> store is nearly a tie
+(B-tree&nbsp;8.5, leveled&nbsp;8.7): with Bloom filters the leveled LSM's point reads match the B-tree's, and its tight ~1.10 space is close too, so the
+B-tree wins only by a hair on the small write and range fractions — a real result, and a reminder that a read-optimized LSM is a perfectly respectable
+choice for a read-heavy store, not a mistake. The <strong>range-scan analytics</strong> table is a clear B-tree win (6.2 versus 9.2 and 49.6): clustered
+sorted storage scans one run where the LSMs merge many, and no Bloom filter closes that gap. The <strong>write firehose</strong> flips hard to
+<strong>size-tiered</strong> (14.2 versus 38.9 and 40.8): 80% of its work is writes, so the engine that writes least and sequentially wins decisively,
+and it does not care that its space is 10&times; because it is on cheap disk. Notice that leveled LSM loses the firehose to <em>both</em> others — its
+write cost (~50) is as high as the B-tree's random write, because rewriting <var>T</var>&times;<var>L</var> bytes sequentially can cost as much as writing
+1 byte randomly; leveled is the read-optimized LSM, not the write-optimized one. The model has no engine that wins everywhere, which is the whole point:
+the winner is a function of the weights.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: &ldquo;we benchmarked it and X won&rdquo; &mdash; the benchmark that measured the wrong workload</span>
+<p>The most expensive storage-engine mistakes come not from bad engines but from good benchmarks run on the wrong workload, and the trap has three faces.
+First, <strong>the synthetic benchmark that isn't your workload</strong>: a uniform-random point-read benchmark will make an LSM with Bloom filters look
+equal to a B-tree and hide the range-scan gap entirely, so a team that range-scans in production picks the LSM on a benchmark that never scanned — the
+model above shows the range column (1 versus 5 versus 50) that the point-read benchmark erased. Second, <strong>the write benchmark that outran
+compaction, or didn't</strong>: a short write benchmark may finish before compaction's write amplification and write stalls (Chapter 54) ever appear, so
+the LSM looks free; a long one on an undersized device shows the opposite — the same engine &ldquo;wins&rdquo; or &ldquo;loses&rdquo; depending on
+duration and provisioning, not merit. Third, <strong>&ldquo;modern engines make the choice moot&rdquo;</strong>: they do not — RocksDB, WiredTiger, and
+their peers still expose the compaction family, the size ratio, and the filter bits precisely because the RUM tension (Chapter 54) is a law, not an
+implementation gap, and a default tuned for someone else's workload is still the wrong point for yours. The counter-trap is equal and opposite: do
+<em>not</em> over-trust the tidy model of this chapter either — its cost vector is illustrative arithmetic with one hardware constant, and real values move
+with key size, value size, cache hit rate, concurrency, and the device, none of which the model captures. The honest posture is to use the model to
+<em>reason</em> about which amplification your workload spends, then <em>measure</em> the candidate engines on a benchmark that reproduces your real
+read/write/range mix, at production scale and duration, on the real device — and to distrust any benchmark whose workload you cannot map onto your own.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Let's standardize the whole platform on one storage engine to cut operational complexity — and since
+our biggest service is a write-heavy event pipeline, let's make it a write-optimized LSM everywhere, including the analytics warehouse and the config
+store.&rdquo; Cover the paragraph and answer in four or five sentences, drawing on &sect;56.2&ndash;&sect;56.4.</p>
+<p><em>Model answer.</em> &ldquo;Standardizing on an LSM is right for the event pipeline — 80% writes means it wants the cheapest sequential write, and a
+size-tiered LSM beats a B-tree there by roughly 2.5&times; in our model. But applying it everywhere spends the wrong amplification for the other two
+stores. The analytics warehouse is range-scan heavy, and an LSM merges many runs where a B-tree scans one clustered run — a gap Bloom filters can't close,
+so we'd pay several times the scan cost. The config store is read-heavy and small; a leveled LSM would be fine, but it's a near tie with a B-tree, so
+we'd gain little and inherit compaction tuning we don't need. The operational-simplicity goal is legitimate, but the honest version is per-store, not
+one-size: size-tiered LSM for the firehose, a B-tree (or a range-friendly engine) for analytics, and either for the config store — and we should confirm
+each on a benchmark that matches its real read/write/range mix, not the pipeline's.&rdquo; Naming the per-workload amplification, the range-scan gap the
+filter can't close, and the measure-your-own-mix rule is the senior register.</p>
+</aside>
+
+<h2>56.4 Reading the verdicts — and where the model lies</h2>
+
+<p>The model earns its keep as a <em>reasoning</em> tool: it forces you to name your workload's weights and then makes the RUM trade arithmetic, which is
+worth more than any single verdict. But a competent engineer knows exactly where it is a lie by omission. It charges a single number per operation, but
+real cost depends on <strong>key and value size</strong> (large values make write amplification hurt more and space amplification dominate), on
+<strong>cache hit rate</strong> (a hot working set served from the buffer pool erases most read amplification for both engines), on
+<strong>concurrency</strong> (the B-tree's latch contention and the LSM's compaction threads compete differently under load), and on the
+<strong>device</strong> (the ~48&times; sequential/random ratio is one machine's; on some NVMe it is smaller, on spinning disk far larger, and the whole
+balance shifts with it). It also treats the LSM as two fixed points when it is really a <em>curve</em>: the size ratio <var>T</var> and the filter bits
+slide it continuously between the leveled and size-tiered corners (Chapters 54&ndash;55), so &ldquo;LSM&rdquo; is a family to tune, not a single choice.
+And it ignores everything above the storage engine — durability, transactions, the query layer — which can dominate the real decision. So the discipline
+is two-step: use the model to decide <em>which amplification your workload spends</em> and therefore which region of the design space to shortlist, then
+<strong>measure</strong> the shortlisted engines on a benchmark that reproduces your true read/write/range mix, value sizes, working-set hit rate, and
+concurrency, at production scale and duration, on the real device. The model narrows the field to the right corner; measurement picks the point within it.
+That two-step — reason with the trade, then measure the candidates — is the whole of storage-engine judgment, and it is exactly why production engines ship
+the choice as a knob rather than a default.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In the model, why is the read-heavy workload nearly a tie between the B-tree and the leveled LSM, while the range-heavy one is a clear B-tree win? Name
+two factors the model omits that could change a real decision. (Answer below.)</p>
+</aside>
+
+<h2>56.5 What to carry forward</h2>
+
+<p>The storage-engine choice has no workload-free answer, for the same reason the RUM conjecture has none: an engine is a point (the B-tree) or a curve
+(the LSM family) in read/write/space cost space, and &ldquo;best&rdquo; is defined only once the workload supplies the weights (&sect;56.1). Reduced to a
+<strong>cost vector</strong> — point read, range scan, write, space — the three engines have exact personalities: all tie on point reads (the Bloom filter's
+gift); the B-tree owns the range scan; size-tiered LSM writes cheapest (little and sequential) while leveled writes as dearly as a B-tree's random write;
+and space runs from leveled's ~1.1 to size-tiered's ~10 (&sect;56.2). Weighting those vectors by a workload's operation mix (&sect;56.3) picks the engine:
+the model gives the B-tree to read- and range-heavy stores, the size-tiered LSM to the write firehose, and a near tie on the read-heavy store — three
+workloads, three winners, the RUM tension resolved by the weights. And the named trap is the benchmark run on the wrong workload: use the model to reason
+about which amplification you spend, then measure the shortlist on your <em>real</em> mix, scale, and device, because the model omits key/value size, cache
+hit rate, concurrency, and the device ratio, and treats the tunable LSM as two fixed points (&sect;56.4).</p>
+
+<p>This closes the storage engines. Across six chapters the part built two families from the device up — the B-tree's sorted, in-place pages (Chapters
+51&ndash;52) and the LSM-tree's memtable, immutable runs, compaction, and Bloom filters (Chapters 53&ndash;55) — and this chapter turned them into a
+decision procedure grounded in one honest law: you cannot minimize read, write, and space at once, so you choose which to spend. That is the deliverable
+of the whole part: not a favorite engine, but the judgment to pick and tune one for a workload. Yet every engine here has quietly assumed something we
+have not paid for. The B-tree updates a page in place and the LSM-tree flushes a memtable and compacts runs — and all of it lives, until the moment it
+reaches the disk, in the volatile buffer pool and memtable of Chapters 48 and 53. <em>What happens when the machine loses power mid-write?</em> A B-tree
+page half-updated, a memtable of acknowledged writes never flushed, a compaction interrupted — every structure the part built can be left inconsistent or
+simply gone by a crash we have so far pretended never happens. The next part confronts it head-on: <strong>durability and recovery</strong> — the
+write-ahead log, checkpoints, and the recovery algorithm that let a database promise a write survives a crash and prove it keeps that promise. The engines
+store the data; durability is how they keep it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Explain why &ldquo;B-tree or LSM?&rdquo; has no answer without a workload, tying it to the RUM conjecture.</li>
+<li>Give the three engines' cost vectors on point read, range scan, write, and space, with the reason for each.</li>
+<li>Explain why the B-tree's write cost is high despite write amplification ~1, and why leveled LSM's is high too.</li>
+<li>Name the winning engine for a read-heavy, a range-heavy, and a write-heavy workload, and why.</li>
+<li>State the benchmark trap and the two-step discipline (reason with the model, then measure).</li>
+<li>List three factors the model omits that could change a real decision.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why is there no workload-independent &ldquo;best&rdquo; storage engine? (&sect;56.1)</li>
+<li><strong>R2.</strong> Give each engine's cost on a point read and a range scan, and why they differ. (&sect;56.2)</li>
+<li><strong>R3.</strong> Why is a B-tree's write charged ~48&times; despite writing only ~1 byte per byte? (&sect;56.2)</li>
+<li><strong>R4.</strong> Which engine wins a write-heavy firehose, and why does leveled LSM lose it too? (&sect;56.3)</li>
+<li><strong>R5.</strong> Name three factors the model omits, and state the reason-then-measure discipline. (&sect;56.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Manos Athanassoulis, Michael S. Kester, Lukas M. Maas, Radu Stoica, Stratos Idreos, Anastasia Ailamaki &amp; Mark Callaghan,
+&ldquo;Designing Access Methods: The RUM Conjecture,&rdquo; <em>19th International Conference on Extending Database Technology (EDBT&nbsp;2016)</em>,
+pp. 461&ndash;466, DOI 10.5441/002/edbt.2016.42.</strong> The read/update/memory trilemma that makes the engine choice a trade rather than a ranking.
+First author Manos Athanassoulis; venue, year, pages, and DOI verified via the EDBT proceedings and DBLP.</li>
+<li><strong>Chen Luo &amp; Michael J. Carey, &ldquo;LSM-based storage techniques: a survey,&rdquo; <em>The VLDB Journal</em> 29(1), 2020, pp. 393&ndash;418,
+DOI 10.1007/s00778-019-00555-y.</strong> The modern survey of the write/read/space amplification framing and the compaction and filter knobs this
+chapter's model reduces to a cost vector. First author Chen Luo; venue, volume, pages, year, and DOI verified via SpringerLink and the ACM Digital
+Library.</li>
+<li><strong>Niv Dayan, Manos Athanassoulis &amp; Stratos Idreos, &ldquo;Monkey: Optimal Navigable Key-Value Store,&rdquo; <em>Proc. 2017 ACM SIGMOD
+Int'l Conf. on Management of Data</em>, pp. 79&ndash;94, DOI 10.1145/3035918.3064054.</strong> Treats an LSM engine as a continuum to be tuned (filter
+bits, size ratio) rather than a fixed point — the &ldquo;LSM is a curve&rdquo; view of &sect;56.4. First author Niv Dayan; venue, year, pages, and DOI
+verified via the ACM Digital Library and DBLP.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003, ISBN 978-0-07-246563-1.</strong>
+A standard reference for tree-structured and log-structured access methods and the workload-driven choice between them. Authors and edition verified via
+the McGraw-Hill catalog and the Library of Congress record.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex56.1"><span class="ex-label">56.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, why does the question &ldquo;B-tree or LSM-tree?&rdquo; have no answer until you name the workload?</div>
+
+<div class="exercise" id="ex56.2"><span class="ex-label">56.2</span> <span class="ex-tag warm">warm-up</span>
+What two ingredients — one about the engine, one about the workload — do you multiply and sum to pick an engine?</div>
+
+<div class="exercise" id="ex56.3"><span class="ex-label">56.3</span> <span class="ex-tag warm">warm-up</span>
+On which single operation do all three engines cost about the same in the model, and what feature (from Chapter 55) makes that true?</div>
+
+<div class="exercise" id="ex56.4"><span class="ex-label">56.4</span> <span class="ex-tag core">core</span>
+The cost vector. (a) Give each engine's range-scan cost (in run-touches) and explain why the B-tree's is 1 while the LSMs' are ~<var>L</var> and
+~<var>T</var>&times;<var>L</var>. (b) Explain why the B-tree's write cost in the model is ~48 despite a write amplification of only 1. (c) Explain why
+leveled LSM's write cost (~50) is about the same as the B-tree's even though it writes sequentially.</div>
+
+<div class="exercise" id="ex56.5"><span class="ex-label">56.5</span> <span class="ex-tag core">core</span>
+The verdicts. Using the scored table: (a) why is the read-heavy workload nearly a tie between B-tree and leveled LSM? (b) why is the range-heavy workload
+a clear B-tree win? (c) why does the write firehose go to size-tiered, and why does leveled LSM lose it too?</div>
+
+<div class="exercise" id="ex56.6"><span class="ex-label">56.6</span> <span class="ex-tag core">core</span>
+Space. (a) Give each engine's space amplification and its one-line cause. (b) The firehose weights space at only 0.3; explain how that weight changes the
+size-tiered LSM's competitiveness there. (c) For a store on expensive fast storage where space is precious, which engine's space column matters most, and
+which engine does it favor?</div>
+
+<div class="exercise" id="ex56.7"><span class="ex-label">56.7</span> <span class="ex-tag complexity">cost</span>
+Sensitivity. The model's write penalty is Chapter 46's ~48&times; sequential/random ratio. (a) On a device where that ratio is only ~5&times; (a fast
+NVMe), qualitatively how does the B-tree's write cost change, and who benefits? (b) On spinning disk where the ratio is far larger, who benefits?
+(c) What does this say about copying another team's engine choice made on different hardware?</div>
+
+<div class="exercise" id="ex56.8"><span class="ex-label">56.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team benchmarks a B-tree and an LSM with a uniform-random point-read-only load; the LSM (with Bloom
+filters) ties the B-tree, so they choose the LSM for their analytics warehouse.
+<br><strong>Step 1 (given):</strong> the benchmark issued only point reads, no range scans.
+<br><strong>Step 2 (given):</strong> Bloom filters make LSM point reads ~1 run, matching the B-tree — so the benchmark shows a tie.
+<br><strong>Step 3 (given):</strong> in production the warehouse is dominated by range scans, not point reads.
+<br><strong>Step 4 (you):</strong> Explain what the benchmark failed to measure, which cost-vector column it hid, and what the model predicts will happen
+to the warehouse's scan latency.</div>
+
+<div class="exercise" id="ex56.9"><span class="ex-label">56.9</span> <span class="ex-tag mixed">mixed</span>
+For each workload, name the engine the model picks and the dominant reason: (a) a metrics firehose on cheap disk; (b) an analytics table scanned in wide
+ranges; (c) a read-mostly small config store; (d) a store on expensive SSD where write amplification and space both matter; (e) an event log ingested far
+faster than it is read.</div>
+
+<div class="exercise" id="ex56.10"><span class="ex-label">56.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;With Bloom filters, an LSM's range scans are as cheap as a
+B-tree's.&rdquo; (b) &ldquo;A leveled LSM is the write-optimized member of the LSM family.&rdquo; (c) &ldquo;Modern engines have made the B-tree-vs-LSM
+choice irrelevant.&rdquo; (d) &ldquo;A B-tree's write is cheap because its write amplification is 1.&rdquo; (e) &ldquo;The best engine depends on the
+workload's operation mix.&rdquo;</div>
+
+<div class="exercise" id="ex56.11"><span class="ex-label">56.11</span> <span class="ex-tag stretch">stretch</span>
+The whole part. (a) Place B-tree, leveled LSM, and size-tiered LSM as points in read/write/space space and justify each coordinate from its mechanism.
+(b) Argue that the LSM family is a <em>curve</em> and the B-tree essentially a point, and why that makes the LSM tunable but not automatically better.
+(c) Design a two-step procedure — reason, then measure — for choosing an engine for a new service, and state one thing at each step that the model alone
+cannot decide.</div>
+
+<div class="exercise" id="ex56.12"><span class="ex-label">56.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build the cost model — assign each engine a vector (point read, range-scan run-touches, write amplification with a
+random/sequential penalty, space amplification) from the Chapter 54&ndash;55 arithmetic. (b) Score three workloads of your own weights and report the
+winner for each. (c) State your toolchain, identify which single input is hardware-dependent (the sequential/random ratio) and where you sourced it, and
+explain why the verdicts are a model of relative cost structure — not a wall-clock benchmark — and what you would measure to confirm one in production.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part X</div><h1>Durability & Recovery</h1><p class='part-blurb'>Write-ahead logging, ARIES, checkpoints, and crash recovery — how a database keeps its promises across failures.</p></div>
+<section class="chapter" id="ch57">
+<h1>Chapter 57 — Write-Ahead Logging: The Durability Contract</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch41">Chapter 41</a> (<code>fsync</code>, the page cache, and what it actually takes
+to force bytes to the device — the primitive the log's durability rests on), <a href="#ch46">Chapter 46</a> (sequential ~916&nbsp;MB/s versus random
+~19&nbsp;MB/s — why appending to a log is cheap and flushing scattered data pages is not), <a href="#ch48">Chapter 48</a> (the buffer pool: dirty pages
+that live in volatile memory until written back — the state a crash erases), <a href="#ch53">Chapter 53</a> (the LSM memtable: acknowledged writes held
+in memory before the flush — the same exposure). &nbsp;·&nbsp; The storage engines of the last part all keep freshly written data in volatile memory — the
+buffer pool's dirty pages, the LSM's memtable — until it reaches disk. This part confronts the failure they all assumed away: the machine loses power
+mid-write. The <strong>write-ahead log</strong> is the first and deepest answer — the mechanism by which a database can promise a committed write survives
+a crash, and prove it.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch48">Chapter 48</a> and <a href="#ch53">Chapter 53</a> — when a write is acknowledged to a client, where does the new data
+actually live for a while before it reaches the disk, and what happens to it if the power fails right then? (2) <a href="#ch41">Chapter 41</a> — writing
+bytes with <code>write()</code> does not make them durable; what call forces them to the device, and why is it slow? (3) <em>Predict:</em> to make a
+committed write survive a crash without flushing the whole (large, scattered) data structure to disk on every commit, what small, cheap-to-write record
+could you force to disk instead, and how would you use it after a crash to rebuild the state you lost? Write your guess; &sect;57.2&ndash;&sect;57.3 answer
+it.</p>
+</aside>
+
+<p>Every storage engine in the last part shares a quiet assumption: that the machine keeps running. A B-tree update lands first in a buffer-pool page that
+is <strong>dirty</strong> — modified in memory, not yet written back (Chapter 48) — and an LSM write lands in the in-memory <strong>memtable</strong>,
+acknowledged to the client but not yet flushed to an SSTable (Chapter 53). In both, there is a window — often a long one, because writing back is deferred
+precisely to batch it — in which the database has <em>told the client the write succeeded</em> while the only copy lives in volatile memory. Pull the
+power in that window and the write is simply gone: the buffer page never reached disk, the memtable evaporated, a half-finished compaction left the files
+inconsistent. This is the <strong>durability</strong> problem, the D of ACID, and it is not a rare edge case — power fails, kernels panic, processes are
+killed — so a database that means its acknowledgments must have an answer. The naive answer, <em>flush everything to disk before acknowledging</em>, is
+correct but ruinous: it turns every commit into scattered random writes of large data structures at Chapter 46's slow ~19&nbsp;MB/s, destroying the very
+write performance the engines were built for. The <strong>write-ahead log</strong> is the answer that keeps both durability and speed. Before applying a
+change to the volatile data structure, the database first appends a small record describing the change to a <em>log</em> — a single sequential file — and
+forces <em>that</em> to disk; the large data structure is written back lazily, whenever convenient. If a crash intervenes, recovery replays the log to
+reconstruct exactly the state that was lost. This chapter builds the idea from the failure up: what a crash actually destroys and why every engine is
+exposed (&sect;57.1); the durability contract and the force-versus-log dilemma it creates (&sect;57.2); write-ahead logging itself — log the intent,
+apply lazily, replay to recover — reproduced on a working store that survives a simulated crash (&sect;57.3); the <strong>write-ahead rule</strong> that
+makes it correct and the sequential append that makes it cheap (&sect;57.4); and what this opens for the rest of the part (&sect;57.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) that builds a
+tiny key-value store whose only durable artifact is an append-only <strong>redo log</strong>. It applies a deterministic workload of 1,000 operations
+(puts, overwrites, deletes) — appending and <code>fsync</code>-ing a log record <em>before</em> mutating the in-memory map each time — then simulates a
+crash by discarding the in-memory state entirely, and finally <strong>recovers</strong> by replaying the log from the start. It reports the live key count
+before the crash, after the crash, and after recovery, and checks that the recovered state <em>exactly</em> equals the pre-crash state. This is a
+deterministic, structural demonstration — the recovered state either matches or it does not, and it does — not a wall-clock timing (<code>perf</code> is
+not installed on this machine, and the point is correctness of recovery, not its speed). The one performance fact used, that a sequential append is far
+cheaper than flushing scattered data pages, is Chapter 46's measured figure, cited, not re-measured.</p>
+
+<h2>57.1 The crash: what volatile state a failure destroys</h2>
+
+<p>Start with what is actually lost when the power fails. A running database holds most of its recent work in <strong>volatile memory</strong> — memory
+whose contents vanish when power does. The buffer pool (Chapter 48) caches data pages, and a page that has been modified but not yet written back is
+<strong>dirty</strong>: its new contents exist only in RAM. The LSM memtable (Chapter 53) holds writes that were acknowledged to the client but not yet
+flushed to an immutable SSTable: again, only in RAM. Both designs defer the write to disk <em>on purpose</em> — to batch many changes into few large
+sequential writes rather than many small random ones — which means the volatile window is not an accident but a deliberate, and often lengthy, part of
+how the engine earns its performance. The consequence is stark: at any instant, some set of <em>acknowledged</em> writes exists nowhere but in memory. A
+crash in that window destroys them with no trace — the client was told &ldquo;committed,&rdquo; but after reboot the data is gone, a broken promise. Worse
+than lost writes is <strong>inconsistency</strong>: a crash can strike halfway through a multi-page update (a B-tree node split that wrote one page but not
+its sibling) or a compaction (Chapter 54) that wrote some output but not all, leaving the on-disk structure not merely stale but <em>corrupt</em> — a tree
+with a dangling pointer, an index that disagrees with its table. So a crash threatens two distinct things: <strong>durability</strong> (acknowledged
+writes must survive) and <strong>consistency</strong> (the on-disk structure must never be left in a state no valid sequence of operations could produce).
+Any recovery mechanism must deliver both, and it must do so knowing it can be interrupted <em>again</em> at any point, including during recovery itself.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the two places acknowledged-but-not-yet-persisted writes live in the engines of the last part, and say why the engines keep data there on purpose.
+Beyond losing writes, what second, worse thing can a mid-update crash do to an on-disk structure? (Answer in &sect;57.2.)</p>
+</aside>
+
+<h2>57.2 The durability contract, and the force-versus-log dilemma</h2>
+
+<p><strong>Durability</strong> is a contract: once the database acknowledges a write as committed, that write must survive any subsequent crash. Stated
+so plainly it seems to force an obvious implementation — before acknowledging, write the new data all the way to disk with <code>fsync</code> (Chapter 41)
+so it is truly durable, then reply. This is the <strong>force</strong> policy, and it is correct but catastrophic for performance, for exactly the reason
+the storage engines deferred writes in the first place: the data structure is large and its changed pages are <em>scattered</em>, so forcing them on every
+commit means many small <strong>random</strong> writes at Chapter 46's slow ~19&nbsp;MB/s, plus an expensive <code>fsync</code> each time — it throws away
+the batching that made the engine fast and caps commit throughput at the device's random-write rate. The way out is to separate the two things the force
+policy conflated: <em>durability of the change</em> and <em>placement of the data in its final structure</em>. You do not need the data in its final
+scattered home to make it durable; you only need <em>enough information to reconstruct it</em> saved somewhere cheap. That somewhere is the
+<strong>log</strong>: a single, append-only file to which you write a small record describing each change — <em>&ldquo;key <var>k</var> was set to
+<var>v</var>&rdquo;</em> — and force <em>that</em> to disk before acknowledging. Because the log is append-only, every write to it is
+<strong>sequential</strong>, at Chapter 46's fast ~916&nbsp;MB/s, and each commit forces one small record at the end of one file instead of scattering
+writes across a large structure. The large data structure itself is written back <strong>lazily</strong>, whenever convenient, because its durability is
+already guaranteed by the log. This is the answer to the opener: the small cheap record is a <strong>log record</strong>, forced to disk in place of the
+whole structure, and after a crash you replay those records to rebuild the lost state. The policy has a name — <strong>no-force</strong> (do not force the
+data pages on commit) with logging — and it is the foundation of every durable database.</p>
+
+<p><em>(Answer to the &sect;57.1 quick check: acknowledged-but-unpersisted writes live in the buffer pool's dirty pages and the LSM's memtable; the
+engines keep data there on purpose to batch many small changes into few large sequential writes rather than paying a random write per change. Beyond
+losing writes, a mid-update crash can leave the on-disk structure <strong>inconsistent</strong> — corrupt, like a tree with a half-written node split —
+a state no valid operation sequence could produce.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: log the intent before you apply it, replay to recover</span>
+<p><strong>1. In words.</strong> Before changing the volatile data structure, append a small record of the change to a sequential log and force it to
+disk; acknowledge only after the log record is durable, and write the data structure back lazily. After a crash, replay the log from the start to
+reconstruct every acknowledged change — the durable log <em>is</em> the source of truth.</p>
+<p><strong>2. As a picture.</strong> Figure 57.1: two lanes. The top lane is the append-only log growing rightward, each commit forcing one record to
+disk; the bottom lane is the large data structure, written back occasionally and lazily. A lightning bolt (crash) erases the bottom lane's in-memory
+part; a replay arrow reads the top lane back into the bottom to restore it.</p>
+<p><strong>3. As numbers.</strong> The working store applies 1,000 operations, forcing 1,000 log records; a crash drops all in-memory state (163 live
+keys &rarr; 0); replaying the 1,000 records restores exactly 163 keys, and the recovered map equals the pre-crash map — <em>True</em> (&sect;57.3).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Write-ahead logging: force a small log record (cheap, sequential); write the big data structure back lazily.</text>
+<text x="12" y="44" font-size="9" fill="#2f7d32">LOG (append-only, forced each commit)</text>
+<g>
+<rect x="30" y="52" width="46" height="22" fill="#dff0df" stroke="#2f7d32"/><text x="34" y="67" font-size="8">PUT k1</text>
+<rect x="78" y="52" width="46" height="22" fill="#dff0df" stroke="#2f7d32"/><text x="82" y="67" font-size="8">PUT k2</text>
+<rect x="126" y="52" width="46" height="22" fill="#dff0df" stroke="#2f7d32"/><text x="130" y="67" font-size="8">DEL k1</text>
+<rect x="174" y="52" width="46" height="22" fill="#dff0df" stroke="#2f7d32"/><text x="178" y="67" font-size="8">PUT k3</text>
+<text x="228" y="67" font-size="14" fill="#2f7d32">&#8594;</text>
+</g>
+<text x="12" y="104" font-size="9" fill="#8c3a1d">DATA STRUCTURE (volatile buffer pool / memtable; written back lazily)</text>
+<rect x="30" y="112" width="190" height="30" fill="#f7ece6" stroke="#8c3a1d"/><text x="40" y="131" font-size="9" fill="#8c3a1d">k2=..., k3=...  (in memory)</text>
+<text x="250" y="131" font-size="22" fill="#b23">&#9889;</text>
+<text x="278" y="126" font-size="9" fill="#333">crash erases the in-memory data...</text>
+<path d="M 120 150 C 120 180, 360 180, 360 150" fill="none" stroke="#14406b" stroke-dasharray="4 3"/>
+<text x="300" y="176" font-size="9" fill="#14406b">replay the log &#8594; rebuild exactly the lost state</text>
+<rect x="420" y="112" width="190" height="30" fill="#eef3f9" stroke="#14406b"/><text x="430" y="131" font-size="9" fill="#14406b">recovered: k2, k3  (== pre-crash)</text>
+</svg>
+<figcaption>Figure 57.1: the write-ahead log separates durability (force a small sequential log record on commit) from placement (write the big data
+structure back lazily). A crash erases the volatile data; replaying the durable log reconstructs exactly the acknowledged state.</figcaption>
+</figure>
+
+<h2>57.3 Write-ahead logging: log the intent, apply lazily, replay to recover</h2>
+
+<p>The working store makes the mechanism concrete. Its only durable artifact is an append-only <strong>redo log</strong> of records like
+<code>PUT k v</code> and <code>DEL k</code>. Every operation does two things in a fixed order: first it <em>appends and forces</em> the log record
+(<code>write</code> then <code>fsync</code>, Chapter 41), then it applies the change to an in-memory dictionary — the volatile &ldquo;data structure&rdquo;
+standing in for a buffer pool or memtable. After 1,000 operations we simulate a crash by throwing the dictionary away — modelling the power loss that
+erases all volatile state — and then recover by replaying the log from the beginning, re-applying each record to a fresh dictionary:</p>
+
+<pre><code>write-ahead logging: crash + redo recovery
+  operations applied: 1000   live keys before crash: 163
+  log records on disk: 1000
+  after crash, in-memory keys: 0   (volatile state gone)
+  no-log store would recover: 0 keys (state was only in memory)
+  replayed 1000 log records
+  live keys after recovery: 163
+  recovered state EXACTLY matches pre-crash state: True
+</code></pre>
+
+<p>The three-line arc is the whole idea. <strong>Before the crash</strong>, 1,000 operations left 163 live keys in memory and, crucially, 1,000 records
+on disk — the log holds the complete history of acknowledged changes, durably, even though the data structure itself was never written back. <strong>The
+crash</strong> takes the in-memory dictionary to zero keys; a store with <em>no</em> log would recover nothing, because its only copy was the volatile one
+— exactly the exposure of &sect;57.1. <strong>Recovery</strong> replays all 1,000 records into a fresh dictionary and reconstructs precisely 163 live keys,
+and the recovered map equals the pre-crash map exactly — <em>True</em>. That equality is the durability contract kept: every acknowledged write survived,
+because every acknowledged write was preceded by a forced log record, and the log outlived the crash. Notice what recovery is: a deterministic
+<strong>redo</strong>, re-applying the logged changes in order to a clean slate — overwrites and deletes replay to the same final state because the log
+preserved their order. Notice too what the store never did: it never wrote the dictionary to disk at all. All its durability came from the small
+sequential log, not from persisting the large structure — which is the no-force payoff of &sect;57.2 in action, and why real engines can acknowledge a
+commit at the speed of one sequential append rather than one scattered flush.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the log you wrote but never forced &mdash; buffered &ldquo;durability&rdquo; that a crash erases</span>
+<p>The write-ahead log is only as durable as the <code>fsync</code> behind it, and the most common recovery bug is a log that was <em>written</em> but
+never truly <em>forced</em> — durability theater that works in every test except a real power loss. It has three faces. First,
+<strong>the missing <code>fsync</code></strong>: calling <code>write()</code> on the log copies bytes into the OS page cache and returns, but the bytes
+may sit in RAM for seconds before the kernel flushes them (Chapter 41); crash in that window and the &ldquo;durable&rdquo; log record is as gone as the
+data it was meant to protect. A log write must be followed by <code>fsync</code> (or opened with the right synchronous flags) <em>before</em> the commit is
+acknowledged, or the contract is a lie. Second, <strong>ordering — the write-ahead rule itself</strong>: if the data page reaches disk <em>before</em> its
+log record (say the OS flushes the big structure while the small log record still sits buffered), a crash can leave a change in the data with no log entry
+to explain or undo it — the log must be forced <em>ahead of</em> the data it describes, which is the rule the whole scheme is named for (&sect;57.4).
+Third, <strong>&ldquo;the disk said it's written&rdquo;</strong>: some devices and volatile write caches acknowledge an <code>fsync</code> before the bytes
+hit stable media, so a crash loses supposedly-forced records; a database that means its durability must ensure the flush reaches truly stable storage
+(barriers, disabled volatile caches, or battery-backed ones). The counter-trap is over-forcing — <code>fsync</code>-ing on every tiny operation when a
+<strong>group commit</strong> could force one batch of records for many concurrent transactions at once, recovering throughput without weakening the
+contract. The honest posture: durability equals a forced log record <em>ahead of</em> the data change and <em>ahead of</em> the acknowledgment, all the
+way to stable media — anything short of that is a log that looks durable until the one crash that matters.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Our commits are slow because we <code>fsync</code> the whole data file on every write. Let's stop
+doing that and just keep the data in memory, writing it to disk once a minute — the OS buffers our log writes anyway, so we won't lose anything.&rdquo;
+Cover the paragraph and answer in four or five sentences, drawing on &sect;57.2&ndash;&sect;57.4.</p>
+<p><em>Model answer.</em> &ldquo;You're right that forcing the whole data file per commit is the wrong cost — that's the force policy, and it's exactly what
+write-ahead logging avoids. The fix is to stop forcing the <em>data</em> and instead force a small, sequential <strong>log record</strong> per commit, then
+write the data structure back lazily; that keeps durability at the price of one append, not one scattered flush. But two parts of the plan break the
+contract. Keeping data in memory and flushing once a minute with <em>no forced log</em> means a crash loses up to a minute of acknowledged writes — the
+durability we're promising clients. And &lsquo;the OS buffers our log writes anyway&rsquo; is the trap: a buffered <code>write()</code> isn't durable until
+<code>fsync</code> reaches stable media, so we must force the log record — ahead of the data and ahead of the ack — every commit, or batch them with group
+commit. So: yes to no-force on the data, but only <em>with</em> a forced write-ahead log; the log is what lets us defer the data safely.&rdquo; Naming
+no-force, the write-ahead rule, and the <code>fsync</code>/group-commit reality is the senior register.</p>
+</aside>
+
+<h2>57.4 The write-ahead rule, and why the log is cheap and correct</h2>
+
+<p>The scheme has one inviolable ordering constraint, and it is the rule the technique is named for. The <strong>write-ahead rule</strong>: the log record
+describing a change must reach stable storage <em>before</em> the change itself is allowed to reach the data on disk, and before the commit is acknowledged
+to the client. The reason is symmetric to the two failures of &sect;57.1. If a data page were allowed to hit disk <em>before</em> its log record, a crash
+in between would leave a change in the durable data with no log entry to record it — recovery could neither redo it consistently nor undo it, and the
+on-disk structure could be left inconsistent with no way to repair it. Forcing the log <em>first</em> guarantees that the durable log is always at least as
+new as the durable data: anything that made it into the data is described in the log, so recovery can always reconstruct or roll back to a consistent
+state by reading the log alone. This is why the log is the single source of truth and why its ordering, not merely its existence, is what makes recovery
+correct. And the reason the whole scheme is <em>affordable</em> is Chapter 46: the log is one append-only file, so forcing it is a <strong>sequential</strong>
+write at ~916&nbsp;MB/s, whereas forcing the scattered data structure would be <strong>random</strong> writes at ~19&nbsp;MB/s — roughly a 48&times;
+difference. Write-ahead logging converts the durability cost from many random writes of a large structure into one sequential append of a small record,
+which is the same sequential-beats-random insight that powered the LSM-tree, now applied to durability. Correct because the log leads the data; cheap
+because the log is sequential — those two properties, ordering and sequentiality, are the whole of why write-ahead logging works.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the write-ahead rule in one sentence, and give the specific bad outcome it prevents. Why is forcing the log so much cheaper than forcing the data
+structure, and which Chapter 46 figures set the ratio? (Answer below.)</p>
+</aside>
+
+<h2>57.5 What to carry forward</h2>
+
+<p>A crash destroys <strong>volatile</strong> state — the buffer pool's dirty pages and the LSM's memtable — so at any instant some acknowledged writes
+exist only in memory, and a mid-update crash can also leave the on-disk structure <strong>inconsistent</strong> (&sect;57.1). <strong>Durability</strong>
+requires that acknowledged writes survive, but the naive <strong>force</strong> policy — flush the scattered data structure on every commit — caps
+throughput at the device's random-write rate; the way out is <strong>no-force with logging</strong>: force a small, sequential <strong>log record</strong>
+per commit and write the data back lazily (&sect;57.2). A <strong>write-ahead log</strong> appends a redo record before applying each change and replays
+the log after a crash to reconstruct the lost state — demonstrated on a store that lost all 163 in-memory keys to a crash and recovered them <em>exactly</em>
+by replaying 1,000 forced records (&sect;57.3). Correctness rests on the <strong>write-ahead rule</strong> — the log record must reach stable storage
+before the data it describes and before the acknowledgment — which keeps the durable log at least as new as the durable data; affordability rests on the
+log being sequential (~916 vs ~19&nbsp;MB/s, Chapter 46). The named trap: a log <code>write()</code>-n but not <code>fsync</code>-ed, or forced after the
+data, is durability theater a real crash erases (&sect;57.3&ndash;&sect;57.4).</p>
+
+<p>This chapter established the contract and the mechanism, but it left the recovery deliberately simple — replay the entire log from the beginning into
+an empty store — and that simplicity hides the questions the rest of the part must answer. Replaying <em>all</em> history is fine for a thousand records
+and impossible for a log that has grown for months; the fix is the <strong>checkpoint</strong>, a periodic marker that lets recovery start near the end of
+the log instead of the beginning. Our store logged only <em>redo</em> records and every logged change had been acknowledged; a real database must also
+handle <em>uncommitted</em> changes that reached the log or the data before a transaction aborted or a crash struck mid-transaction, which requires
+<strong>undo</strong> as well as redo, and a disciplined story about what state the data pages can be in at crash time. And the whole apparatus — redo,
+undo, checkpoints, and the exact protocol that makes recovery correct even when the crash lands <em>during recovery</em> — was worked out in one landmark
+algorithm, <strong>ARIES</strong> (Mohan et&nbsp;al. 1992), which the next chapters build up to. Write-ahead logging is the load-bearing idea beneath all
+of it: log the intent before the act, force the log ahead of the data, and a database can promise durability across a crash and prove it. The engines of
+the last part store the data; the log is how they keep their word.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Name the volatile state a crash destroys and the two threats (lost writes, inconsistency) it poses.</li>
+<li>Explain the force policy and why it is correct but too slow, tying it to random writes.</li>
+<li>State the no-force-with-logging idea: force a small sequential log record, write data back lazily.</li>
+<li>Describe redo recovery: replay the log into a clean store to reconstruct acknowledged state.</li>
+<li>State the write-ahead rule and the specific inconsistency it prevents.</li>
+<li>Explain why a <code>write()</code> without <code>fsync</code> is not durable, and what group commit buys.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What volatile state does a crash erase, and why do engines keep acknowledged writes there? (&sect;57.1)</li>
+<li><strong>R2.</strong> Contrast the force policy with no-force-plus-logging on correctness and cost. (&sect;57.2)</li>
+<li><strong>R3.</strong> Walk through redo recovery on the store: what was lost, what was replayed, what was restored. (&sect;57.3)</li>
+<li><strong>R4.</strong> State the write-ahead rule and the failure it prevents. (&sect;57.4)</li>
+<li><strong>R5.</strong> Why is forcing the log cheap while forcing the data structure is not? (&sect;57.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh &amp; Peter Schwarz, &ldquo;ARIES: A Transaction Recovery Method Supporting
+Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging,&rdquo; <em>ACM Transactions on Database Systems</em> 17(1), 1992, pp.
+94&ndash;162, DOI 10.1145/128765.128770.</strong> The landmark recovery algorithm built on write-ahead logging — redo, undo, and checkpoints — that the
+next chapters develop. First author C. Mohan; venue, volume, issue, pages, year, and DOI verified via the ACM Digital Library and DBLP.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, pp. 141&ndash;259, DOI 10.1561/1900000002.</strong> A concise modern account of the logging and recovery subsystem
+and where write-ahead logging sits in a full engine. First author Joseph M. Hellerstein; venue, volume, issue, pages, year, and DOI verified via now
+publishers and the ACM Digital Library.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992, ISBN 978-1-55860-190-1.</strong>
+The definitive treatment of durability, logging, and recovery — the force/no-force and steal/no-steal policy space this chapter opens. Authors, publisher,
+year, and ISBN verified via the publisher listing and the Library of Congress record.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003, ISBN 978-0-07-246563-1.</strong>
+A clear textbook development of write-ahead logging and crash recovery for the reader who wants the full ARIES treatment step by step. Authors and edition
+verified via the McGraw-Hill catalog and the Library of Congress record.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex57.1"><span class="ex-label">57.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what volatile state does a crash destroy, and why is that a problem for a write the database already acknowledged?</div>
+
+<div class="exercise" id="ex57.2"><span class="ex-label">57.2</span> <span class="ex-tag warm">warm-up</span>
+Define the durability (D of ACID) contract in one sentence.</div>
+
+<div class="exercise" id="ex57.3"><span class="ex-label">57.3</span> <span class="ex-tag warm">warm-up</span>
+State the write-ahead rule: what must reach stable storage before what?</div>
+
+<div class="exercise" id="ex57.4"><span class="ex-label">57.4</span> <span class="ex-tag core">core</span>
+Force versus log. (a) Describe the force policy and why it is correct. (b) Explain why it is slow, in terms of random writes and <code>fsync</code>. (c)
+Explain how forcing a small sequential log record instead achieves the same durability at far lower cost, and what &ldquo;no-force&rdquo; means for the
+data pages.</div>
+
+<div class="exercise" id="ex57.5"><span class="ex-label">57.5</span> <span class="ex-tag core">core</span>
+Redo recovery on the store. Using the run (163 live keys before the crash, 1,000 records logged, 0 keys after the crash, 163 after recovery): (a) why did
+a store with no log recover 0 keys? (b) why does replaying overwrites and deletes in order reproduce exactly the pre-crash state? (c) what did the store
+notably <em>never</em> do, and why was durability still guaranteed?</div>
+
+<div class="exercise" id="ex57.6"><span class="ex-label">57.6</span> <span class="ex-tag core">core</span>
+The write-ahead rule. (a) Explain the bad outcome if a data page reaches disk before its log record. (b) Explain how forcing the log first keeps the
+durable log at least as new as the durable data. (c) Why does this let recovery restore a consistent state by reading the log alone?</div>
+
+<div class="exercise" id="ex57.7"><span class="ex-label">57.7</span> <span class="ex-tag complexity">cost</span>
+Cost. (a) Using Chapter 46's ~916&nbsp;MB/s sequential and ~19&nbsp;MB/s random figures, roughly how many times cheaper is forcing a sequential log
+append than forcing scattered data pages? (b) Why does group commit reduce the per-commit <code>fsync</code> cost without weakening durability? (c) Why
+does the sequential-beats-random insight here echo the one behind the LSM-tree?</div>
+
+<div class="exercise" id="ex57.8"><span class="ex-label">57.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team ships a write-ahead log but, to speed up commits, replaces the per-commit <code>fsync</code> on the log
+with a plain <code>write()</code>, trusting the OS to flush the page cache eventually.
+<br><strong>Step 1 (given):</strong> <code>write()</code> copies the log record into the OS page cache and returns; the bytes may sit in RAM for seconds.
+<br><strong>Step 2 (given):</strong> the commit is acknowledged to the client as soon as <code>write()</code> returns.
+<br><strong>Step 3 (given):</strong> the power fails while the record is still buffered, before the kernel flushes it.
+<br><strong>Step 4 (you):</strong> Explain what is lost, which specific promise was broken, and the one-line fix — and name what they should use instead
+if per-commit <code>fsync</code> is too slow.</div>
+
+<div class="exercise" id="ex57.9"><span class="ex-label">57.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>durability</em>, <em>force policy</em>, <em>no-force logging</em>, <em>write-ahead rule</em>, or
+<em>redo recovery</em> — and why: (a) flushing the whole data file on every commit; (b) replaying the log into a clean store after a crash; (c) forcing
+the log record before the data page; (d) the contract that an acknowledged write survives a crash; (e) forcing a small log record and writing data pages
+back lazily.</div>
+
+<div class="exercise" id="ex57.10"><span class="ex-label">57.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A <code>write()</code> to the log makes the record durable.&rdquo;
+(b) &ldquo;The write-ahead rule says the data page must reach disk before its log record.&rdquo; (c) &ldquo;No-force means the data pages are never written
+to disk.&rdquo; (d) &ldquo;Forcing a sequential log append is much cheaper than forcing scattered data pages.&rdquo; (e) &ldquo;Redo recovery replays
+logged changes in order to reconstruct the lost state.&rdquo;</div>
+
+<div class="exercise" id="ex57.11"><span class="ex-label">57.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) The store replayed the entire log from the beginning; explain why that does not scale and what a <em>checkpoint</em> would change.
+(b) The store logged only acknowledged (committed) changes; explain why a real database also needs <em>undo</em>, and give an example of a change that
+must be undone after a crash. (c) Explain why recovery must itself be safe to interrupt — what could go wrong if a crash struck <em>during</em> replay, and
+why redo's re-application must be idempotent.</div>
+
+<div class="exercise" id="ex57.12"><span class="ex-label">57.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build a key-value store whose only durable artifact is an append-only log; on each operation, append and
+<code>fsync</code> a record <em>before</em> mutating the in-memory map. (b) Apply a workload, discard the in-memory map to simulate a crash, replay the log
+into a fresh map, and assert the recovered state equals the pre-crash state. (c) State your toolchain and explain why this is a deterministic,
+structural demonstration of durability — the recovered state matches or it does not — rather than a wall-clock timing, and why moving the
+<code>fsync</code> after the mutation (or removing it) would break the guarantee.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XI</div><h1>Transactions & Concurrency Control</h1><p class='part-blurb'>ACID, isolation levels and their anomalies, 2PL, MVCC, and OCC — correctness under concurrency, implemented.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XII</div><h1>Query Processing & Execution</h1><p class='part-blurb'>Parser, planner, physical operators, and execution models (Volcano/vectorized/codegen) — turning SQL into work.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part XIII</div><h1>Query Optimization</h1><p class='part-blurb'>Statistics, cardinality estimation, cost models, and join ordering — the optimizer, honestly.</p></div>
@@ -27594,6 +28661,270 @@ amplification for leveled (~<var>T</var>&times;<var>L</var> / ~<var>L</var> / ~1
 amplification figures are exact model arithmetic — reproducible and hardware-independent, neither a wall-clock timing. <em>Tempting wrong answer:</em>
 reporting the amplification numbers as measured device throughput — they are a model of the structure, not a benchmark. <strong>Feed-forward:</strong>
 &sect;54.3.</div>
+
+</section>
+
+<section class="solutions" id="sol55">
+<h1>Chapter 55 — Solutions</h1>
+
+<div class="solution" id="sol55.1"><span class="sol-label">55.1</span>
+On insert, it hashes the key with <var>k</var> functions and sets the <var>k</var> named bits to one; on test, it hashes the key the same way and answers
+&ldquo;definitely not&rdquo; if any of those bits is zero, &ldquo;possibly&rdquo; if all are one. <em>Tempting wrong answer:</em> &ldquo;on test it
+returns yes/no&rdquo; — it returns &ldquo;definitely not&rdquo; or &ldquo;possibly,&rdquo; never a confirmed yes. <strong>Feed-forward:</strong> &sect;55.2.</div>
+
+<div class="solution" id="sol55.2"><span class="sol-label">55.2</span>
+It can make a false positive (say &ldquo;possibly&rdquo; about an absent key, because that key's bits were set by others) and can never make a false
+negative (insertion only sets bits, so a present key always has all <var>k</var> bits set). <em>Tempting wrong answer:</em> &ldquo;it can miss a present
+key&rdquo; — that is a false negative, which is impossible. <strong>Feed-forward:</strong> &sect;55.2.</div>
+
+<div class="solution" id="sol55.3"><span class="sol-label">55.3</span>
+A hit usually resolves in the memtable or a recent run, so it stops early; a miss has nothing to short-circuit it and would otherwise probe every run, so
+the filter's &ldquo;definitely not&rdquo; is what removes those wasted probes. <em>Tempting wrong answer:</em> &ldquo;the filter speeds up hits&rdquo; — a
+present key still triggers the authoritative read; the win is on misses. <strong>Feed-forward:</strong> &sect;55.1&ndash;&sect;55.4.</div>
+
+<div class="solution" id="sol55.4"><span class="sol-label">55.4</span>
+(a) Insertion sets all <var>k</var> of a key's bits, so if any is still zero the key was never inserted — the proof of absence is exact. (b) All-ones can
+arise from other keys' bits overlapping this one's, so it does not prove insertion — only &ldquo;possibly.&rdquo; (c) The store is authoritative, so a
+&ldquo;definitely not&rdquo; skips a run correctly every time and a false &ldquo;possibly&rdquo; costs only one wasted probe the store then resolves; a
+false negative, by contrast, would skip a run that <em>does</em> hold the key and return a wrong &ldquo;not found&rdquo; — a correctness bug. <em>Tempting
+wrong answer:</em> &ldquo;a false positive is the dangerous error&rdquo; — a false positive only wastes a probe; the false negative (impossible here) is
+the one that breaks correctness. <strong>Feed-forward:</strong> &sect;55.2.</div>
+
+<div class="solution" id="sol55.5"><span class="sol-label">55.5</span>
+(a) <var>p</var>&nbsp;&asymp;&nbsp;(1&nbsp;&minus;&nbsp;e^(&minus;kn/m)) raised to the <var>k</var> power. (b) The formula is an expectation; the 0.88%
+is one measured outcome over 100,000 probes, so it differs from 0.82% by ordinary sampling noise, not a wrong model. (c) Because the error decays
+exponentially in <var>m</var>/<var>n</var>, so a fixed <em>additive</em> increase in bits per key multiplies the error by a roughly constant factor rather
+than subtracting a constant. <em>Tempting wrong answer:</em> &ldquo;the gap means the formula is wrong&rdquo; — it is within sampling noise and the two
+track across two orders of magnitude. <strong>Feed-forward:</strong> &sect;55.3.</div>
+
+<div class="solution" id="sol55.6"><span class="sol-label">55.6</span>
+(a) Optimal <var>k</var>* = (<var>m</var>/<var>n</var>)&nbsp;ln&nbsp;2; bits per key <var>m</var>/<var>n</var> = &minus;ln&nbsp;<var>p</var> / (ln&nbsp;2)
+squared. (b) ~9.6&nbsp;bits per key for 1%, which for a billion keys is about 1.2&nbsp;GB. (c) The rule fixes bits <em>per key</em>, so total memory scales
+linearly with key count but the per-key budget for a given error rate is constant. <em>Tempting wrong answer:</em> &ldquo;more keys need more bits per
+key&rdquo; — more keys need more total bits, but the per-key budget for a target <var>p</var> is fixed. <strong>Feed-forward:</strong> &sect;55.3.</div>
+
+<div class="solution" id="sol55.7"><span class="sol-label">55.7</span>
+(a) No filter: ~10 runs; 1% filter: ~0.1 runs; 0.1% filter: ~0.01 runs (expected probes = <var>L</var>&times;<var>p</var>). (b) A 1% filter removes about
+99% of the miss read work — nearly all of it, since almost every miss now resolves in memory. (c) A range scan needs keys in an interval, but hashing
+destroys order, so the filter cannot say which runs hold keys in &#91;<var>a</var>,&nbsp;<var>b</var>&#93; and no run can be skipped. <em>Tempting wrong
+answer:</em> &ldquo;the filter halves range-scan cost too&rdquo; — it does nothing for ranges; it is a point-membership structure. <strong>Feed-forward:</strong>
+&sect;55.4.</div>
+
+<div class="solution" id="sol55.8"><span class="sol-label">55.8</span>
+<strong>Step 4:</strong> This is a <strong>correctness</strong> bug, not a performance one. The misused promise is that &ldquo;possibly present&rdquo; is
+a confirmed membership — it is not; a Bloom filter has false positives, so ~1% of absent keys report &ldquo;possibly&rdquo; and the code then invents a
+value for a key that was never stored. The one-line rule: a filter <em>guards</em> the store and never <em>replaces</em> it — every &ldquo;possibly&rdquo;
+must still go to the authoritative read. <em>Tempting wrong answer:</em> &ldquo;raise the bits per key to fix it&rdquo; — a lower false-positive rate makes
+the bug rarer, not gone; only doing the real lookup on every hit is correct. <strong>Feed-forward:</strong> &sect;55.3.</div>
+
+<div class="solution" id="sol55.9"><span class="sol-label">55.9</span>
+(a) <strong>False negative</strong> — the mistake it can never make. (b) <strong>False positive</strong> — the occasional wasted run probe. (c)
+<strong>Optimal k</strong> — fixed by the memory budget to minimize the error. (d) <strong>Range scan</strong> — the read it cannot accelerate. (e)
+<strong>Bits per element</strong> — the fixed per-key cost that sets the target rate. <em>Tempting wrong answer:</em> swapping (a) and (b) — absence is
+certain (no false negative), presence is a guess (false positive). <strong>Feed-forward:</strong> &sect;55.2&ndash;&sect;55.4.</div>
+
+<div class="solution" id="sol55.10"><span class="sol-label">55.10</span>
+(a) <strong>False</strong> — a filter can only say &ldquo;possibly present,&rdquo; never confirm presence. (b) <strong>True</strong> — insertion sets all
+<var>k</var> bits, so a present key is never rejected. (c) <strong>False</strong> — the error falls exponentially, so doubling bits per key cuts it by far
+more than half; adding a constant number of bits multiplies it by a constant factor. (d) <strong>False</strong> — clearing bits may clear ones another key
+needs, creating a false negative; use a counting or cuckoo filter to delete. (e) <strong>False</strong> — hashing destroys order, so a filter cannot skip
+runs for a range scan. <em>Tempting wrong answer:</em> marking (c) true because &ldquo;more bits, less error&rdquo; sounds linear — the relationship is
+exponential. <strong>Feed-forward:</strong> &sect;55.2&ndash;&sect;55.4.</div>
+
+<div class="solution" id="sol55.11"><span class="sol-label">55.11</span>
+(a) At each of the ten runs the read consults the filter; for a true miss each says &ldquo;definitely not&rdquo; except the 1% false-positive fraction, so
+in expectation about 10&times;0.01&nbsp;=&nbsp;0.1 runs are actually opened — roughly one device access every ten misses. (b) The filter removes almost all
+point-miss probes, bringing point-read amplification near the B-tree's ~1; but it summarizes only exact keys, so range scans still open every overlapping
+run and stay above the B-tree's clustered single scan. (c) Monkey: a lookup's expected cost is the <em>sum</em> of the per-run false-positive rates, so
+for a fixed total memory it is better to give more bits per key to the larger, more numerous lower levels and fewer to the small upper ones — minimizing
+the summed false-positive probability rather than equalizing bits per key. <em>Tempting wrong answer:</em> &ldquo;filters close the range-scan gap
+too&rdquo; — they close only the point-read gap. <strong>Feed-forward:</strong> &sect;55.4.</div>
+
+<div class="solution" id="sol55.12"><span class="sol-label">55.12</span>
+Open-ended and platform-specific. A correct write-up: (a) implements a bit-array filter with <var>k</var> hash indices, inserts <var>n</var> keys, probes
+<var>n</var> absent keys, and reports the empirical false-positive rate at several bits-per-element budgets (this chapter: ~0.88% at 10&nbsp;bits,
+<var>k</var>=7); (b) lays the closed-form (1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k beside each measurement and finds them within sampling noise; (c) states
+toolchain and notes the false-positive rate is a hardware-independent function of <var>k</var>, <var>m</var>, <var>n</var> — a structural rate reproducible
+anywhere, differing from the formula only by sampling noise, not a wall-clock timing. <em>Tempting wrong answer:</em> reporting the false-positive rate as
+a device throughput measurement — it is a property of the structure, not a benchmark. <strong>Feed-forward:</strong> &sect;55.3.</div>
+
+</section>
+
+<section class="solutions" id="sol56">
+<h1>Chapter 56 — Solutions</h1>
+
+<div class="solution" id="sol56.1"><span class="sol-label">56.1</span>
+Because an engine is a point or a curve in read/write/space cost space and &ldquo;best&rdquo; is defined only once the workload says how much to weight
+each axis, which is a property of the workload, not the engine. <em>Tempting wrong answer:</em> &ldquo;the LSM is always better because it's tunable&rdquo;
+— tunable means it can be set badly too; it wins only where the workload wants a corner the B-tree can't reach. <strong>Feed-forward:</strong> &sect;56.1.</div>
+
+<div class="solution" id="sol56.2"><span class="sol-label">56.2</span>
+The engine's cost vector (its charge per operation) and the workload's weights (how much of each operation it does, plus space sensitivity); multiply and
+sum for each engine and pick the lowest. <em>Tempting wrong answer:</em> &ldquo;just the engine's benchmark score&rdquo; — a score with no workload weights
+is a score for someone else's workload. <strong>Feed-forward:</strong> &sect;56.1&ndash;&sect;56.3.</div>
+
+<div class="solution" id="sol56.3"><span class="sol-label">56.3</span>
+The point read — all three cost ~1 — because Bloom filters (Chapter 55) let an LSM point read touch ~1 run, matching the B-tree's single leaf.
+<em>Tempting wrong answer:</em> &ldquo;the range scan&rdquo; — that is where they differ most (1 versus <var>L</var> versus <var>T</var>&times;<var>L</var>).
+<strong>Feed-forward:</strong> &sect;56.2.</div>
+
+<div class="solution" id="sol56.4"><span class="sol-label">56.4</span>
+(a) B-tree scans one clustered, sorted run (1); leveled LSM merges one run per level (~<var>L</var>); size-tiered merges up to <var>T</var> runs per level
+(~<var>T</var>&times;<var>L</var>), and no filter helps because a scan needs order. (b) Its write amplification is 1 but the write is <em>random</em>, so it
+pays Chapter 46's slow ~19&nbsp;MB/s side; charging the ~48&times; sequential/random ratio gives ~48. (c) Leveled rewrites ~<var>T</var>&times;<var>L</var>
+bytes per byte, and even at the fast sequential rate that volume costs about as much as writing 1 byte randomly. <em>Tempting wrong answer:</em>
+&ldquo;random versus sequential doesn't matter, only the byte count&rdquo; — the ~48&times; gap is the whole reason the LSM exists.
+<strong>Feed-forward:</strong> &sect;56.2.</div>
+
+<div class="solution" id="sol56.5"><span class="sol-label">56.5</span>
+(a) Read-heavy is nearly tied (8.5 vs 8.7) because Bloom filters equalize point reads and leveled's space (~1.10) is tight, so the B-tree wins only on the
+small write and range fractions. (b) Range-heavy is a clear B-tree win (6.2 vs 9.2 vs 49.6) because it scans one clustered run where the LSMs merge many
+and no filter closes the gap. (c) The firehose is 80% writes, so size-tiered (writes least and sequentially) wins at 14.2; leveled loses at 40.8 because
+its ~<var>T</var>&times;<var>L</var> rewrite makes its write cost as high as the B-tree's random write. <em>Tempting wrong answer:</em> &ldquo;all LSMs are
+write-optimized&rdquo; — leveled is the read-optimized LSM and loses the write firehose. <strong>Feed-forward:</strong> &sect;56.3.</div>
+
+<div class="solution" id="sol56.6"><span class="sol-label">56.6</span>
+(a) B-tree ~1.45 (~69% page fill); leveled ~1.10 (one run per level squeezes dead data out fast); size-tiered ~10 (a level's worth of dead versions
+lingers until the bulk merge). (b) A low space weight (0.3) shrinks the size-tiered LSM's biggest penalty, so on cheap disk its 10&times; space barely
+counts and its cheap writes dominate — which is why it wins the firehose. (c) On expensive fast storage, space is heavily weighted, favoring the tightest
+engines — leveled LSM (~1.10) or the B-tree (~1.45) — and penalizing size-tiered's 10&times;. <em>Tempting wrong answer:</em> &ldquo;space amplification is
+always a tie-breaker&rdquo; — its impact scales with how much the workload weights space. <strong>Feed-forward:</strong> &sect;56.2&ndash;&sect;56.3.</div>
+
+<div class="solution" id="sol56.7"><span class="sol-label">56.7</span>
+(a) At ~5&times;, the B-tree's random write is charged ~5 instead of ~48, so its write cost collapses and it benefits — becoming competitive even on
+write-heavier workloads. (b) On spinning disk the ratio is far larger, so random writes are punished harder and the LSM's sequential writes benefit
+most. (c) An engine choice is partly a property of the device: copying a choice made on different hardware can be wrong, because the sequential/random
+ratio that drives the write column changed. <em>Tempting wrong answer:</em> &ldquo;the engine ranking is hardware-independent&rdquo; — the write column
+moves with the device. <strong>Feed-forward:</strong> &sect;56.2&ndash;&sect;56.4.</div>
+
+<div class="solution" id="sol56.8"><span class="sol-label">56.8</span>
+<strong>Step 4:</strong> The benchmark measured only point reads, so it never exercised the range-scan column — exactly the column where the engines
+differ most (B-tree 1 versus LSM ~<var>L</var> or ~<var>T</var>&times;<var>L</var> run-touches). Bloom filters made point reads tie, hiding the gap. The
+model predicts the warehouse's range scans will be several times slower on the LSM than a B-tree would have been, because the LSM must merge many runs and
+no filter can skip them. <em>Tempting wrong answer:</em> &ldquo;the tie proves the engines are equivalent&rdquo; — they are equivalent only on the one
+operation the benchmark ran. <strong>Feed-forward:</strong> &sect;56.3&ndash;&sect;56.4.</div>
+
+<div class="solution" id="sol56.9"><span class="sol-label">56.9</span>
+(a) <strong>Size-tiered LSM</strong> — cheapest sequential write dominates, and cheap disk makes its space irrelevant. (b) <strong>B-tree</strong> —
+clustered single-run range scans. (c) <strong>B-tree</strong> (or a leveled LSM in a near tie) — reads dominate and space is small. (d)
+<strong>Leveled LSM</strong> (or B-tree) — tight space and read-friendly, at the cost of write amplification the SSD can bear better than space waste.
+(e) <strong>Size-tiered LSM</strong> — write-dominated, read and space cost affordable. <em>Tempting wrong answer:</em> giving the analytics table to an
+LSM because it &ldquo;scales writes&rdquo; — it is range-read-bound, so the B-tree wins. <strong>Feed-forward:</strong> &sect;56.3.</div>
+
+<div class="solution" id="sol56.10"><span class="sol-label">56.10</span>
+(a) <strong>False</strong> — filters help point reads only; range scans still merge every overlapping run. (b) <strong>False</strong> — leveled is the
+read-optimized LSM (tight space, high write amplification); size-tiered is the write-optimized one. (c) <strong>False</strong> — engines still expose the
+compaction family, size ratio, and filter bits because the RUM tension is a law, not an implementation gap. (d) <strong>False</strong> — its write is
+random, so even amplification 1 costs the ~48&times; random penalty. (e) <strong>True</strong> — the winner is the lowest weighted sum, which depends on
+the operation mix. <em>Tempting wrong answer:</em> marking (c) true because engines are &ldquo;good enough now&rdquo; — defaults tuned for another workload
+are still the wrong point for yours. <strong>Feed-forward:</strong> &sect;56.2&ndash;&sect;56.4.</div>
+
+<div class="solution" id="sol56.11"><span class="sol-label">56.11</span>
+(a) B-tree: low read, high (random) write, tight space (~1.45) — one point, set by in-place update. Leveled LSM: low read, high (sequential) write, tightest
+space (~1.10). Size-tiered LSM: high range-read, low write, loose space (~10). Each coordinate follows from the mechanism (in-place; one-run-per-level;
+many-runs-per-level). (b) Varying the size ratio <var>T</var> and filter bits slides the LSM continuously between the leveled and size-tiered corners, so
+it is a curve; the B-tree's in-place discipline fixes it near one point. Tunable is not automatically better — it can be tuned wrong, and it wins only
+where the workload wants a corner the B-tree can't reach. (c) Step 1 (reason): name the workload's read/write/range weights and space sensitivity, use the
+model to pick the corner — but the model can't decide the right size ratio or filter bits precisely. Step 2 (measure): benchmark the shortlist on the real
+mix, value sizes, cache hit rate, and device at production scale — the model can't decide the effect of concurrency or large values. <em>Tempting wrong
+answer:</em> &ldquo;the model alone is enough&rdquo; — it narrows the field but omits key/value size, caching, concurrency, and the device. <strong>Feed-forward:</strong>
+&sect;56.1&ndash;&sect;56.4.</div>
+
+<div class="solution" id="sol56.12"><span class="sol-label">56.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a cost vector per engine from the Chapter 54&ndash;55 arithmetic with a random/sequential
+write penalty; (b) scores three workloads by weighted sum and names a winner each (this chapter: B-tree for read- and range-heavy, size-tiered LSM for the
+write firehose); (c) states toolchain, identifies the sequential/random ratio as the one hardware-dependent input (sourced from Chapter 46's ~916 vs
+~19&nbsp;MB/s), and notes the verdicts model relative cost structure — not a wall-clock benchmark — so confirming one in production means measuring the real
+read/write/range mix, value sizes, hit rate, and concurrency on the real device. <em>Tempting wrong answer:</em> presenting the weighted scores as measured
+latencies — they are model arithmetic, not a benchmark. <strong>Feed-forward:</strong> &sect;56.3&ndash;&sect;56.4.</div>
+
+</section>
+
+<section class="solutions" id="sol57">
+<h1>Chapter 57 — Solutions</h1>
+
+<div class="solution" id="sol57.1"><span class="sol-label">57.1</span>
+A crash erases volatile memory — the buffer pool's dirty pages and the LSM memtable — so any acknowledged write that lived only there is lost, breaking
+the promise the database made when it said &ldquo;committed.&rdquo; <em>Tempting wrong answer:</em> &ldquo;nothing is lost because the data is on disk&rdquo;
+— the whole point is that acknowledged writes are deferred and may not have reached disk yet. <strong>Feed-forward:</strong> &sect;57.1.</div>
+
+<div class="solution" id="sol57.2"><span class="sol-label">57.2</span>
+Durability: once the database acknowledges a write as committed, that write survives any subsequent crash. <em>Tempting wrong answer:</em> &ldquo;durability
+means the data is never lost&rdquo; — it is specifically about <em>acknowledged</em> writes surviving a crash, not an absolute guarantee against all loss.
+<strong>Feed-forward:</strong> &sect;57.2.</div>
+
+<div class="solution" id="sol57.3"><span class="sol-label">57.3</span>
+The log record describing a change must reach stable storage before the change reaches the data on disk (and before the commit is acknowledged).
+<em>Tempting wrong answer:</em> &ldquo;the data must be written before the log&rdquo; — that is backwards and defeats recovery. <strong>Feed-forward:</strong>
+&sect;57.4.</div>
+
+<div class="solution" id="sol57.4"><span class="sol-label">57.4</span>
+(a) The force policy flushes the changed data all the way to disk with <code>fsync</code> before acknowledging, so an acknowledged write is truly durable
+— correct by construction. (b) It is slow because the data structure is large and its changed pages are scattered, so each commit does many small
+<em>random</em> writes (~19&nbsp;MB/s) plus an expensive <code>fsync</code>, capping throughput at the random-write rate. (c) Forcing a small
+<em>sequential</em> log record instead makes the change durable at the cost of one append, and no-force means the data pages are written back lazily, later,
+because the log already guarantees their durability. <em>Tempting wrong answer:</em> &ldquo;no-force means the data is never persisted&rdquo; — it is
+persisted lazily, just not on the commit path. <strong>Feed-forward:</strong> &sect;57.2.</div>
+
+<div class="solution" id="sol57.5"><span class="sol-label">57.5</span>
+(a) Its only copy of the data was the volatile in-memory map, which the crash erased, so with nothing durable to replay it recovered 0 keys. (b) The log
+preserved the exact order of operations, so replaying overwrites and deletes in that order lands on the same final value per key — 163 live keys. (c) It
+never wrote the data structure (the map) to disk at all; durability still held because every acknowledged change was preceded by a forced log record, and
+the log survived the crash. <em>Tempting wrong answer:</em> &ldquo;recovery worked because the map was flushed periodically&rdquo; — it was never flushed;
+the log alone restored the state. <strong>Feed-forward:</strong> &sect;57.3.</div>
+
+<div class="solution" id="sol57.6"><span class="sol-label">57.6</span>
+(a) A crash between the data page hitting disk and its log record being forced leaves a durable change with no log entry — recovery can neither redo it
+consistently nor undo it, so the structure may stay inconsistent. (b) Forcing the log first means anything that reached the durable data is already
+described in the durable log, so the log is always at least as new as the data. (c) Because the log records every change that could be on disk, recovery
+can reconstruct or roll back to a consistent state from the log alone, without trusting the possibly-torn data. <em>Tempting wrong answer:</em> &ldquo;the
+order doesn't matter as long as both are written&rdquo; — the ordering is exactly what makes recovery correct. <strong>Feed-forward:</strong> &sect;57.4.</div>
+
+<div class="solution" id="sol57.7"><span class="sol-label">57.7</span>
+(a) About 48&times; cheaper (916/19), since the log append is sequential and the data flush is random. (b) Group commit forces one <code>fsync</code> for
+a batch of many transactions' log records at once, amortizing the flush cost across commits while still forcing every record before its acknowledgment —
+so durability is unchanged. (c) Both convert scattered random writes into sequential ones: the LSM-tree for the data path, write-ahead logging for the
+durability path — same insight, different subsystem. <em>Tempting wrong answer:</em> &ldquo;group commit weakens durability&rdquo; — it only batches the
+flush; every record is still forced before its commit is acknowledged. <strong>Feed-forward:</strong> &sect;57.4.</div>
+
+<div class="solution" id="sol57.8"><span class="sol-label">57.8</span>
+<strong>Step 4:</strong> The buffered log records are lost with the volatile state, so every write acknowledged since the last kernel flush is gone —
+breaking the durability promise that an acknowledged write survives a crash. The one-line fix: <code>fsync</code> (or open with synchronous flags) the log
+record and confirm it reached stable media <em>before</em> acknowledging the commit. If per-commit <code>fsync</code> is too slow, use <strong>group
+commit</strong> — batch many transactions' records into one forced flush — rather than dropping the force. <em>Tempting wrong answer:</em> &ldquo;flush the
+data file more often to compensate&rdquo; — the gap is the unforced <em>log</em>; flushing data does not restore the lost acknowledged writes.
+<strong>Feed-forward:</strong> &sect;57.3&ndash;&sect;57.4.</div>
+
+<div class="solution" id="sol57.9"><span class="sol-label">57.9</span>
+(a) <strong>Force policy</strong> — flush the whole data on commit. (b) <strong>Redo recovery</strong> — replay the log into a clean store. (c)
+<strong>Write-ahead rule</strong> — log record before data page. (d) <strong>Durability</strong> — acknowledged writes survive a crash. (e)
+<strong>No-force logging</strong> — force a small log record, write data lazily. <em>Tempting wrong answer:</em> confusing (a) force with (e) no-force —
+force flushes the data on commit; no-force defers it and relies on the log. <strong>Feed-forward:</strong> &sect;57.2&ndash;&sect;57.4.</div>
+
+<div class="solution" id="sol57.10"><span class="sol-label">57.10</span>
+(a) <strong>False</strong> — a <code>write()</code> only reaches the OS page cache; durability needs <code>fsync</code> to stable media. (b)
+<strong>False</strong> — the rule is the reverse: the log record must reach disk before the data page. (c) <strong>False</strong> — no-force means data
+pages are not forced <em>on commit</em>; they are still written back lazily. (d) <strong>True</strong> — sequential ~916&nbsp;MB/s versus random
+~19&nbsp;MB/s. (e) <strong>True</strong> — redo replays logged changes in order to reconstruct the lost state. <em>Tempting wrong answer:</em> marking (c)
+true because &ldquo;no-force&rdquo; sounds like &ldquo;never persist&rdquo; — the data is persisted lazily, off the commit path. <strong>Feed-forward:</strong>
+&sect;57.2&ndash;&sect;57.4.</div>
+
+<div class="solution" id="sol57.11"><span class="sol-label">57.11</span>
+(a) Replaying all history costs time proportional to the whole log, which grows without bound; a <strong>checkpoint</strong> periodically records that
+everything up to some point is safely in the data on disk, so recovery can start near the end of the log instead of the beginning. (b) A real database
+lets changes from <em>uncommitted</em> transactions reach the log or data before an abort or crash; <strong>undo</strong> rolls those back — e.g., a
+transaction that updated a row and then crashed before commit must have that update undone so its effect does not persist. (c) A crash during replay must
+be recoverable, so redo must be <strong>idempotent</strong> — re-applying a logged change that was already applied must reach the same state — otherwise a
+second recovery pass could double-apply changes and corrupt the store. <em>Tempting wrong answer:</em> &ldquo;committed-only redo is enough for a real
+database&rdquo; — uncommitted changes that reached disk need undo too. <strong>Feed-forward:</strong> &sect;57.5.</div>
+
+<div class="solution" id="sol57.12"><span class="sol-label">57.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a store whose only durable artifact is an append-only log and appends plus
+<code>fsync</code>s a record before each in-memory mutation; (b) applies a workload, discards the in-memory map to simulate a crash, replays the log, and
+asserts the recovered state equals the pre-crash state (this chapter: 163 keys lost and restored exactly from 1,000 records); (c) states toolchain and
+notes this is a deterministic, structural demonstration — the recovered state matches or it does not — not a wall-clock timing, and that moving the
+<code>fsync</code> after the mutation (or removing it) breaks the write-ahead rule and lets a crash lose acknowledged writes. <em>Tempting wrong answer:</em>
+&ldquo;report the recovery time as the result&rdquo; — the result is the correctness of recovery, not its speed. <strong>Feed-forward:</strong> &sect;57.3.</div>
 
 </section>
 </body></html>

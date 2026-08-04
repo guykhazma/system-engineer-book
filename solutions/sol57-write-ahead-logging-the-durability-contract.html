@@ -1,0 +1,87 @@
+<section class="solutions" id="sol57">
+<h1>Chapter 57 — Solutions</h1>
+
+<div class="solution" id="sol57.1"><span class="sol-label">57.1</span>
+A crash erases volatile memory — the buffer pool's dirty pages and the LSM memtable — so any acknowledged write that lived only there is lost, breaking
+the promise the database made when it said &ldquo;committed.&rdquo; <em>Tempting wrong answer:</em> &ldquo;nothing is lost because the data is on disk&rdquo;
+— the whole point is that acknowledged writes are deferred and may not have reached disk yet. <strong>Feed-forward:</strong> &sect;57.1.</div>
+
+<div class="solution" id="sol57.2"><span class="sol-label">57.2</span>
+Durability: once the database acknowledges a write as committed, that write survives any subsequent crash. <em>Tempting wrong answer:</em> &ldquo;durability
+means the data is never lost&rdquo; — it is specifically about <em>acknowledged</em> writes surviving a crash, not an absolute guarantee against all loss.
+<strong>Feed-forward:</strong> &sect;57.2.</div>
+
+<div class="solution" id="sol57.3"><span class="sol-label">57.3</span>
+The log record describing a change must reach stable storage before the change reaches the data on disk (and before the commit is acknowledged).
+<em>Tempting wrong answer:</em> &ldquo;the data must be written before the log&rdquo; — that is backwards and defeats recovery. <strong>Feed-forward:</strong>
+&sect;57.4.</div>
+
+<div class="solution" id="sol57.4"><span class="sol-label">57.4</span>
+(a) The force policy flushes the changed data all the way to disk with <code>fsync</code> before acknowledging, so an acknowledged write is truly durable
+— correct by construction. (b) It is slow because the data structure is large and its changed pages are scattered, so each commit does many small
+<em>random</em> writes (~19&nbsp;MB/s) plus an expensive <code>fsync</code>, capping throughput at the random-write rate. (c) Forcing a small
+<em>sequential</em> log record instead makes the change durable at the cost of one append, and no-force means the data pages are written back lazily, later,
+because the log already guarantees their durability. <em>Tempting wrong answer:</em> &ldquo;no-force means the data is never persisted&rdquo; — it is
+persisted lazily, just not on the commit path. <strong>Feed-forward:</strong> &sect;57.2.</div>
+
+<div class="solution" id="sol57.5"><span class="sol-label">57.5</span>
+(a) Its only copy of the data was the volatile in-memory map, which the crash erased, so with nothing durable to replay it recovered 0 keys. (b) The log
+preserved the exact order of operations, so replaying overwrites and deletes in that order lands on the same final value per key — 163 live keys. (c) It
+never wrote the data structure (the map) to disk at all; durability still held because every acknowledged change was preceded by a forced log record, and
+the log survived the crash. <em>Tempting wrong answer:</em> &ldquo;recovery worked because the map was flushed periodically&rdquo; — it was never flushed;
+the log alone restored the state. <strong>Feed-forward:</strong> &sect;57.3.</div>
+
+<div class="solution" id="sol57.6"><span class="sol-label">57.6</span>
+(a) A crash between the data page hitting disk and its log record being forced leaves a durable change with no log entry — recovery can neither redo it
+consistently nor undo it, so the structure may stay inconsistent. (b) Forcing the log first means anything that reached the durable data is already
+described in the durable log, so the log is always at least as new as the data. (c) Because the log records every change that could be on disk, recovery
+can reconstruct or roll back to a consistent state from the log alone, without trusting the possibly-torn data. <em>Tempting wrong answer:</em> &ldquo;the
+order doesn't matter as long as both are written&rdquo; — the ordering is exactly what makes recovery correct. <strong>Feed-forward:</strong> &sect;57.4.</div>
+
+<div class="solution" id="sol57.7"><span class="sol-label">57.7</span>
+(a) About 48&times; cheaper (916/19), since the log append is sequential and the data flush is random. (b) Group commit forces one <code>fsync</code> for
+a batch of many transactions' log records at once, amortizing the flush cost across commits while still forcing every record before its acknowledgment —
+so durability is unchanged. (c) Both convert scattered random writes into sequential ones: the LSM-tree for the data path, write-ahead logging for the
+durability path — same insight, different subsystem. <em>Tempting wrong answer:</em> &ldquo;group commit weakens durability&rdquo; — it only batches the
+flush; every record is still forced before its commit is acknowledged. <strong>Feed-forward:</strong> &sect;57.4.</div>
+
+<div class="solution" id="sol57.8"><span class="sol-label">57.8</span>
+<strong>Step 4:</strong> The buffered log records are lost with the volatile state, so every write acknowledged since the last kernel flush is gone —
+breaking the durability promise that an acknowledged write survives a crash. The one-line fix: <code>fsync</code> (or open with synchronous flags) the log
+record and confirm it reached stable media <em>before</em> acknowledging the commit. If per-commit <code>fsync</code> is too slow, use <strong>group
+commit</strong> — batch many transactions' records into one forced flush — rather than dropping the force. <em>Tempting wrong answer:</em> &ldquo;flush the
+data file more often to compensate&rdquo; — the gap is the unforced <em>log</em>; flushing data does not restore the lost acknowledged writes.
+<strong>Feed-forward:</strong> &sect;57.3&ndash;&sect;57.4.</div>
+
+<div class="solution" id="sol57.9"><span class="sol-label">57.9</span>
+(a) <strong>Force policy</strong> — flush the whole data on commit. (b) <strong>Redo recovery</strong> — replay the log into a clean store. (c)
+<strong>Write-ahead rule</strong> — log record before data page. (d) <strong>Durability</strong> — acknowledged writes survive a crash. (e)
+<strong>No-force logging</strong> — force a small log record, write data lazily. <em>Tempting wrong answer:</em> confusing (a) force with (e) no-force —
+force flushes the data on commit; no-force defers it and relies on the log. <strong>Feed-forward:</strong> &sect;57.2&ndash;&sect;57.4.</div>
+
+<div class="solution" id="sol57.10"><span class="sol-label">57.10</span>
+(a) <strong>False</strong> — a <code>write()</code> only reaches the OS page cache; durability needs <code>fsync</code> to stable media. (b)
+<strong>False</strong> — the rule is the reverse: the log record must reach disk before the data page. (c) <strong>False</strong> — no-force means data
+pages are not forced <em>on commit</em>; they are still written back lazily. (d) <strong>True</strong> — sequential ~916&nbsp;MB/s versus random
+~19&nbsp;MB/s. (e) <strong>True</strong> — redo replays logged changes in order to reconstruct the lost state. <em>Tempting wrong answer:</em> marking (c)
+true because &ldquo;no-force&rdquo; sounds like &ldquo;never persist&rdquo; — the data is persisted lazily, off the commit path. <strong>Feed-forward:</strong>
+&sect;57.2&ndash;&sect;57.4.</div>
+
+<div class="solution" id="sol57.11"><span class="sol-label">57.11</span>
+(a) Replaying all history costs time proportional to the whole log, which grows without bound; a <strong>checkpoint</strong> periodically records that
+everything up to some point is safely in the data on disk, so recovery can start near the end of the log instead of the beginning. (b) A real database
+lets changes from <em>uncommitted</em> transactions reach the log or data before an abort or crash; <strong>undo</strong> rolls those back — e.g., a
+transaction that updated a row and then crashed before commit must have that update undone so its effect does not persist. (c) A crash during replay must
+be recoverable, so redo must be <strong>idempotent</strong> — re-applying a logged change that was already applied must reach the same state — otherwise a
+second recovery pass could double-apply changes and corrupt the store. <em>Tempting wrong answer:</em> &ldquo;committed-only redo is enough for a real
+database&rdquo; — uncommitted changes that reached disk need undo too. <strong>Feed-forward:</strong> &sect;57.5.</div>
+
+<div class="solution" id="sol57.12"><span class="sol-label">57.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a store whose only durable artifact is an append-only log and appends plus
+<code>fsync</code>s a record before each in-memory mutation; (b) applies a workload, discards the in-memory map to simulate a crash, replays the log, and
+asserts the recovered state equals the pre-crash state (this chapter: 163 keys lost and restored exactly from 1,000 records); (c) states toolchain and
+notes this is a deterministic, structural demonstration — the recovered state matches or it does not — not a wall-clock timing, and that moving the
+<code>fsync</code> after the mutation (or removing it) breaks the write-ahead rule and lets a crash lose acknowledged writes. <em>Tempting wrong answer:</em>
+&ldquo;report the recovery time as the result&rdquo; — the result is the correctness of recovery, not its speed. <strong>Feed-forward:</strong> &sect;57.3.</div>
+
+</section>

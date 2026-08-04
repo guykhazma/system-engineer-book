@@ -1,0 +1,89 @@
+<section class="solutions" id="sol56">
+<h1>Chapter 56 — Solutions</h1>
+
+<div class="solution" id="sol56.1"><span class="sol-label">56.1</span>
+Because an engine is a point or a curve in read/write/space cost space and &ldquo;best&rdquo; is defined only once the workload says how much to weight
+each axis, which is a property of the workload, not the engine. <em>Tempting wrong answer:</em> &ldquo;the LSM is always better because it's tunable&rdquo;
+— tunable means it can be set badly too; it wins only where the workload wants a corner the B-tree can't reach. <strong>Feed-forward:</strong> &sect;56.1.</div>
+
+<div class="solution" id="sol56.2"><span class="sol-label">56.2</span>
+The engine's cost vector (its charge per operation) and the workload's weights (how much of each operation it does, plus space sensitivity); multiply and
+sum for each engine and pick the lowest. <em>Tempting wrong answer:</em> &ldquo;just the engine's benchmark score&rdquo; — a score with no workload weights
+is a score for someone else's workload. <strong>Feed-forward:</strong> &sect;56.1&ndash;&sect;56.3.</div>
+
+<div class="solution" id="sol56.3"><span class="sol-label">56.3</span>
+The point read — all three cost ~1 — because Bloom filters (Chapter 55) let an LSM point read touch ~1 run, matching the B-tree's single leaf.
+<em>Tempting wrong answer:</em> &ldquo;the range scan&rdquo; — that is where they differ most (1 versus <var>L</var> versus <var>T</var>&times;<var>L</var>).
+<strong>Feed-forward:</strong> &sect;56.2.</div>
+
+<div class="solution" id="sol56.4"><span class="sol-label">56.4</span>
+(a) B-tree scans one clustered, sorted run (1); leveled LSM merges one run per level (~<var>L</var>); size-tiered merges up to <var>T</var> runs per level
+(~<var>T</var>&times;<var>L</var>), and no filter helps because a scan needs order. (b) Its write amplification is 1 but the write is <em>random</em>, so it
+pays Chapter 46's slow ~19&nbsp;MB/s side; charging the ~48&times; sequential/random ratio gives ~48. (c) Leveled rewrites ~<var>T</var>&times;<var>L</var>
+bytes per byte, and even at the fast sequential rate that volume costs about as much as writing 1 byte randomly. <em>Tempting wrong answer:</em>
+&ldquo;random versus sequential doesn't matter, only the byte count&rdquo; — the ~48&times; gap is the whole reason the LSM exists.
+<strong>Feed-forward:</strong> &sect;56.2.</div>
+
+<div class="solution" id="sol56.5"><span class="sol-label">56.5</span>
+(a) Read-heavy is nearly tied (8.5 vs 8.7) because Bloom filters equalize point reads and leveled's space (~1.10) is tight, so the B-tree wins only on the
+small write and range fractions. (b) Range-heavy is a clear B-tree win (6.2 vs 9.2 vs 49.6) because it scans one clustered run where the LSMs merge many
+and no filter closes the gap. (c) The firehose is 80% writes, so size-tiered (writes least and sequentially) wins at 14.2; leveled loses at 40.8 because
+its ~<var>T</var>&times;<var>L</var> rewrite makes its write cost as high as the B-tree's random write. <em>Tempting wrong answer:</em> &ldquo;all LSMs are
+write-optimized&rdquo; — leveled is the read-optimized LSM and loses the write firehose. <strong>Feed-forward:</strong> &sect;56.3.</div>
+
+<div class="solution" id="sol56.6"><span class="sol-label">56.6</span>
+(a) B-tree ~1.45 (~69% page fill); leveled ~1.10 (one run per level squeezes dead data out fast); size-tiered ~10 (a level's worth of dead versions
+lingers until the bulk merge). (b) A low space weight (0.3) shrinks the size-tiered LSM's biggest penalty, so on cheap disk its 10&times; space barely
+counts and its cheap writes dominate — which is why it wins the firehose. (c) On expensive fast storage, space is heavily weighted, favoring the tightest
+engines — leveled LSM (~1.10) or the B-tree (~1.45) — and penalizing size-tiered's 10&times;. <em>Tempting wrong answer:</em> &ldquo;space amplification is
+always a tie-breaker&rdquo; — its impact scales with how much the workload weights space. <strong>Feed-forward:</strong> &sect;56.2&ndash;&sect;56.3.</div>
+
+<div class="solution" id="sol56.7"><span class="sol-label">56.7</span>
+(a) At ~5&times;, the B-tree's random write is charged ~5 instead of ~48, so its write cost collapses and it benefits — becoming competitive even on
+write-heavier workloads. (b) On spinning disk the ratio is far larger, so random writes are punished harder and the LSM's sequential writes benefit
+most. (c) An engine choice is partly a property of the device: copying a choice made on different hardware can be wrong, because the sequential/random
+ratio that drives the write column changed. <em>Tempting wrong answer:</em> &ldquo;the engine ranking is hardware-independent&rdquo; — the write column
+moves with the device. <strong>Feed-forward:</strong> &sect;56.2&ndash;&sect;56.4.</div>
+
+<div class="solution" id="sol56.8"><span class="sol-label">56.8</span>
+<strong>Step 4:</strong> The benchmark measured only point reads, so it never exercised the range-scan column — exactly the column where the engines
+differ most (B-tree 1 versus LSM ~<var>L</var> or ~<var>T</var>&times;<var>L</var> run-touches). Bloom filters made point reads tie, hiding the gap. The
+model predicts the warehouse's range scans will be several times slower on the LSM than a B-tree would have been, because the LSM must merge many runs and
+no filter can skip them. <em>Tempting wrong answer:</em> &ldquo;the tie proves the engines are equivalent&rdquo; — they are equivalent only on the one
+operation the benchmark ran. <strong>Feed-forward:</strong> &sect;56.3&ndash;&sect;56.4.</div>
+
+<div class="solution" id="sol56.9"><span class="sol-label">56.9</span>
+(a) <strong>Size-tiered LSM</strong> — cheapest sequential write dominates, and cheap disk makes its space irrelevant. (b) <strong>B-tree</strong> —
+clustered single-run range scans. (c) <strong>B-tree</strong> (or a leveled LSM in a near tie) — reads dominate and space is small. (d)
+<strong>Leveled LSM</strong> (or B-tree) — tight space and read-friendly, at the cost of write amplification the SSD can bear better than space waste.
+(e) <strong>Size-tiered LSM</strong> — write-dominated, read and space cost affordable. <em>Tempting wrong answer:</em> giving the analytics table to an
+LSM because it &ldquo;scales writes&rdquo; — it is range-read-bound, so the B-tree wins. <strong>Feed-forward:</strong> &sect;56.3.</div>
+
+<div class="solution" id="sol56.10"><span class="sol-label">56.10</span>
+(a) <strong>False</strong> — filters help point reads only; range scans still merge every overlapping run. (b) <strong>False</strong> — leveled is the
+read-optimized LSM (tight space, high write amplification); size-tiered is the write-optimized one. (c) <strong>False</strong> — engines still expose the
+compaction family, size ratio, and filter bits because the RUM tension is a law, not an implementation gap. (d) <strong>False</strong> — its write is
+random, so even amplification 1 costs the ~48&times; random penalty. (e) <strong>True</strong> — the winner is the lowest weighted sum, which depends on
+the operation mix. <em>Tempting wrong answer:</em> marking (c) true because engines are &ldquo;good enough now&rdquo; — defaults tuned for another workload
+are still the wrong point for yours. <strong>Feed-forward:</strong> &sect;56.2&ndash;&sect;56.4.</div>
+
+<div class="solution" id="sol56.11"><span class="sol-label">56.11</span>
+(a) B-tree: low read, high (random) write, tight space (~1.45) — one point, set by in-place update. Leveled LSM: low read, high (sequential) write, tightest
+space (~1.10). Size-tiered LSM: high range-read, low write, loose space (~10). Each coordinate follows from the mechanism (in-place; one-run-per-level;
+many-runs-per-level). (b) Varying the size ratio <var>T</var> and filter bits slides the LSM continuously between the leveled and size-tiered corners, so
+it is a curve; the B-tree's in-place discipline fixes it near one point. Tunable is not automatically better — it can be tuned wrong, and it wins only
+where the workload wants a corner the B-tree can't reach. (c) Step 1 (reason): name the workload's read/write/range weights and space sensitivity, use the
+model to pick the corner — but the model can't decide the right size ratio or filter bits precisely. Step 2 (measure): benchmark the shortlist on the real
+mix, value sizes, cache hit rate, and device at production scale — the model can't decide the effect of concurrency or large values. <em>Tempting wrong
+answer:</em> &ldquo;the model alone is enough&rdquo; — it narrows the field but omits key/value size, caching, concurrency, and the device. <strong>Feed-forward:</strong>
+&sect;56.1&ndash;&sect;56.4.</div>
+
+<div class="solution" id="sol56.12"><span class="sol-label">56.12</span>
+Open-ended and platform-specific. A correct write-up: (a) builds a cost vector per engine from the Chapter 54&ndash;55 arithmetic with a random/sequential
+write penalty; (b) scores three workloads by weighted sum and names a winner each (this chapter: B-tree for read- and range-heavy, size-tiered LSM for the
+write firehose); (c) states toolchain, identifies the sequential/random ratio as the one hardware-dependent input (sourced from Chapter 46's ~916 vs
+~19&nbsp;MB/s), and notes the verdicts model relative cost structure — not a wall-clock benchmark — so confirming one in production means measuring the real
+read/write/range mix, value sizes, hit rate, and concurrency on the real device. <em>Tempting wrong answer:</em> presenting the weighted scores as measured
+latencies — they are model arithmetic, not a benchmark. <strong>Feed-forward:</strong> &sect;56.3&ndash;&sect;56.4.</div>
+
+</section>

@@ -1,0 +1,344 @@
+<section class="chapter" id="ch57">
+<h1>Chapter 57 — Write-Ahead Logging: The Durability Contract</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch41">Chapter 41</a> (<code>fsync</code>, the page cache, and what it actually takes
+to force bytes to the device — the primitive the log's durability rests on), <a href="#ch46">Chapter 46</a> (sequential ~916&nbsp;MB/s versus random
+~19&nbsp;MB/s — why appending to a log is cheap and flushing scattered data pages is not), <a href="#ch48">Chapter 48</a> (the buffer pool: dirty pages
+that live in volatile memory until written back — the state a crash erases), <a href="#ch53">Chapter 53</a> (the LSM memtable: acknowledged writes held
+in memory before the flush — the same exposure). &nbsp;·&nbsp; The storage engines of the last part all keep freshly written data in volatile memory — the
+buffer pool's dirty pages, the LSM's memtable — until it reaches disk. This part confronts the failure they all assumed away: the machine loses power
+mid-write. The <strong>write-ahead log</strong> is the first and deepest answer — the mechanism by which a database can promise a committed write survives
+a crash, and prove it.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch48">Chapter 48</a> and <a href="#ch53">Chapter 53</a> — when a write is acknowledged to a client, where does the new data
+actually live for a while before it reaches the disk, and what happens to it if the power fails right then? (2) <a href="#ch41">Chapter 41</a> — writing
+bytes with <code>write()</code> does not make them durable; what call forces them to the device, and why is it slow? (3) <em>Predict:</em> to make a
+committed write survive a crash without flushing the whole (large, scattered) data structure to disk on every commit, what small, cheap-to-write record
+could you force to disk instead, and how would you use it after a crash to rebuild the state you lost? Write your guess; &sect;57.2&ndash;&sect;57.3 answer
+it.</p>
+</aside>
+
+<p>Every storage engine in the last part shares a quiet assumption: that the machine keeps running. A B-tree update lands first in a buffer-pool page that
+is <strong>dirty</strong> — modified in memory, not yet written back (Chapter 48) — and an LSM write lands in the in-memory <strong>memtable</strong>,
+acknowledged to the client but not yet flushed to an SSTable (Chapter 53). In both, there is a window — often a long one, because writing back is deferred
+precisely to batch it — in which the database has <em>told the client the write succeeded</em> while the only copy lives in volatile memory. Pull the
+power in that window and the write is simply gone: the buffer page never reached disk, the memtable evaporated, a half-finished compaction left the files
+inconsistent. This is the <strong>durability</strong> problem, the D of ACID, and it is not a rare edge case — power fails, kernels panic, processes are
+killed — so a database that means its acknowledgments must have an answer. The naive answer, <em>flush everything to disk before acknowledging</em>, is
+correct but ruinous: it turns every commit into scattered random writes of large data structures at Chapter 46's slow ~19&nbsp;MB/s, destroying the very
+write performance the engines were built for. The <strong>write-ahead log</strong> is the answer that keeps both durability and speed. Before applying a
+change to the volatile data structure, the database first appends a small record describing the change to a <em>log</em> — a single sequential file — and
+forces <em>that</em> to disk; the large data structure is written back lazily, whenever convenient. If a crash intervenes, recovery replays the log to
+reconstruct exactly the state that was lost. This chapter builds the idea from the failure up: what a crash actually destroys and why every engine is
+exposed (&sect;57.1); the durability contract and the force-versus-log dilemma it creates (&sect;57.2); write-ahead logging itself — log the intent,
+apply lazily, replay to recover — reproduced on a working store that survives a simulated crash (&sect;57.3); the <strong>write-ahead rule</strong> that
+makes it correct and the sequential append that makes it cheap (&sect;57.4); and what this opens for the rest of the part (&sect;57.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) that builds a
+tiny key-value store whose only durable artifact is an append-only <strong>redo log</strong>. It applies a deterministic workload of 1,000 operations
+(puts, overwrites, deletes) — appending and <code>fsync</code>-ing a log record <em>before</em> mutating the in-memory map each time — then simulates a
+crash by discarding the in-memory state entirely, and finally <strong>recovers</strong> by replaying the log from the start. It reports the live key count
+before the crash, after the crash, and after recovery, and checks that the recovered state <em>exactly</em> equals the pre-crash state. This is a
+deterministic, structural demonstration — the recovered state either matches or it does not, and it does — not a wall-clock timing (<code>perf</code> is
+not installed on this machine, and the point is correctness of recovery, not its speed). The one performance fact used, that a sequential append is far
+cheaper than flushing scattered data pages, is Chapter 46's measured figure, cited, not re-measured.</p>
+
+<h2>57.1 The crash: what volatile state a failure destroys</h2>
+
+<p>Start with what is actually lost when the power fails. A running database holds most of its recent work in <strong>volatile memory</strong> — memory
+whose contents vanish when power does. The buffer pool (Chapter 48) caches data pages, and a page that has been modified but not yet written back is
+<strong>dirty</strong>: its new contents exist only in RAM. The LSM memtable (Chapter 53) holds writes that were acknowledged to the client but not yet
+flushed to an immutable SSTable: again, only in RAM. Both designs defer the write to disk <em>on purpose</em> — to batch many changes into few large
+sequential writes rather than many small random ones — which means the volatile window is not an accident but a deliberate, and often lengthy, part of
+how the engine earns its performance. The consequence is stark: at any instant, some set of <em>acknowledged</em> writes exists nowhere but in memory. A
+crash in that window destroys them with no trace — the client was told &ldquo;committed,&rdquo; but after reboot the data is gone, a broken promise. Worse
+than lost writes is <strong>inconsistency</strong>: a crash can strike halfway through a multi-page update (a B-tree node split that wrote one page but not
+its sibling) or a compaction (Chapter 54) that wrote some output but not all, leaving the on-disk structure not merely stale but <em>corrupt</em> — a tree
+with a dangling pointer, an index that disagrees with its table. So a crash threatens two distinct things: <strong>durability</strong> (acknowledged
+writes must survive) and <strong>consistency</strong> (the on-disk structure must never be left in a state no valid sequence of operations could produce).
+Any recovery mechanism must deliver both, and it must do so knowing it can be interrupted <em>again</em> at any point, including during recovery itself.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the two places acknowledged-but-not-yet-persisted writes live in the engines of the last part, and say why the engines keep data there on purpose.
+Beyond losing writes, what second, worse thing can a mid-update crash do to an on-disk structure? (Answer in &sect;57.2.)</p>
+</aside>
+
+<h2>57.2 The durability contract, and the force-versus-log dilemma</h2>
+
+<p><strong>Durability</strong> is a contract: once the database acknowledges a write as committed, that write must survive any subsequent crash. Stated
+so plainly it seems to force an obvious implementation — before acknowledging, write the new data all the way to disk with <code>fsync</code> (Chapter 41)
+so it is truly durable, then reply. This is the <strong>force</strong> policy, and it is correct but catastrophic for performance, for exactly the reason
+the storage engines deferred writes in the first place: the data structure is large and its changed pages are <em>scattered</em>, so forcing them on every
+commit means many small <strong>random</strong> writes at Chapter 46's slow ~19&nbsp;MB/s, plus an expensive <code>fsync</code> each time — it throws away
+the batching that made the engine fast and caps commit throughput at the device's random-write rate. The way out is to separate the two things the force
+policy conflated: <em>durability of the change</em> and <em>placement of the data in its final structure</em>. You do not need the data in its final
+scattered home to make it durable; you only need <em>enough information to reconstruct it</em> saved somewhere cheap. That somewhere is the
+<strong>log</strong>: a single, append-only file to which you write a small record describing each change — <em>&ldquo;key <var>k</var> was set to
+<var>v</var>&rdquo;</em> — and force <em>that</em> to disk before acknowledging. Because the log is append-only, every write to it is
+<strong>sequential</strong>, at Chapter 46's fast ~916&nbsp;MB/s, and each commit forces one small record at the end of one file instead of scattering
+writes across a large structure. The large data structure itself is written back <strong>lazily</strong>, whenever convenient, because its durability is
+already guaranteed by the log. This is the answer to the opener: the small cheap record is a <strong>log record</strong>, forced to disk in place of the
+whole structure, and after a crash you replay those records to rebuild the lost state. The policy has a name — <strong>no-force</strong> (do not force the
+data pages on commit) with logging — and it is the foundation of every durable database.</p>
+
+<p><em>(Answer to the &sect;57.1 quick check: acknowledged-but-unpersisted writes live in the buffer pool's dirty pages and the LSM's memtable; the
+engines keep data there on purpose to batch many small changes into few large sequential writes rather than paying a random write per change. Beyond
+losing writes, a mid-update crash can leave the on-disk structure <strong>inconsistent</strong> — corrupt, like a tree with a half-written node split —
+a state no valid operation sequence could produce.)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: log the intent before you apply it, replay to recover</span>
+<p><strong>1. In words.</strong> Before changing the volatile data structure, append a small record of the change to a sequential log and force it to
+disk; acknowledge only after the log record is durable, and write the data structure back lazily. After a crash, replay the log from the start to
+reconstruct every acknowledged change — the durable log <em>is</em> the source of truth.</p>
+<p><strong>2. As a picture.</strong> Figure 57.1: two lanes. The top lane is the append-only log growing rightward, each commit forcing one record to
+disk; the bottom lane is the large data structure, written back occasionally and lazily. A lightning bolt (crash) erases the bottom lane's in-memory
+part; a replay arrow reads the top lane back into the bottom to restore it.</p>
+<p><strong>3. As numbers.</strong> The working store applies 1,000 operations, forcing 1,000 log records; a crash drops all in-memory state (163 live
+keys &rarr; 0); replaying the 1,000 records restores exactly 163 keys, and the recovered map equals the pre-crash map — <em>True</em> (&sect;57.3).</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Write-ahead logging: force a small log record (cheap, sequential); write the big data structure back lazily.</text>
+<text x="12" y="44" font-size="9" fill="#2f7d32">LOG (append-only, forced each commit)</text>
+<g>
+<rect x="30" y="52" width="46" height="22" fill="#dff0df" stroke="#2f7d32"/><text x="34" y="67" font-size="8">PUT k1</text>
+<rect x="78" y="52" width="46" height="22" fill="#dff0df" stroke="#2f7d32"/><text x="82" y="67" font-size="8">PUT k2</text>
+<rect x="126" y="52" width="46" height="22" fill="#dff0df" stroke="#2f7d32"/><text x="130" y="67" font-size="8">DEL k1</text>
+<rect x="174" y="52" width="46" height="22" fill="#dff0df" stroke="#2f7d32"/><text x="178" y="67" font-size="8">PUT k3</text>
+<text x="228" y="67" font-size="14" fill="#2f7d32">&#8594;</text>
+</g>
+<text x="12" y="104" font-size="9" fill="#8c3a1d">DATA STRUCTURE (volatile buffer pool / memtable; written back lazily)</text>
+<rect x="30" y="112" width="190" height="30" fill="#f7ece6" stroke="#8c3a1d"/><text x="40" y="131" font-size="9" fill="#8c3a1d">k2=..., k3=...  (in memory)</text>
+<text x="250" y="131" font-size="22" fill="#b23">&#9889;</text>
+<text x="278" y="126" font-size="9" fill="#333">crash erases the in-memory data...</text>
+<path d="M 120 150 C 120 180, 360 180, 360 150" fill="none" stroke="#14406b" stroke-dasharray="4 3"/>
+<text x="300" y="176" font-size="9" fill="#14406b">replay the log &#8594; rebuild exactly the lost state</text>
+<rect x="420" y="112" width="190" height="30" fill="#eef3f9" stroke="#14406b"/><text x="430" y="131" font-size="9" fill="#14406b">recovered: k2, k3  (== pre-crash)</text>
+</svg>
+<figcaption>Figure 57.1: the write-ahead log separates durability (force a small sequential log record on commit) from placement (write the big data
+structure back lazily). A crash erases the volatile data; replaying the durable log reconstructs exactly the acknowledged state.</figcaption>
+</figure>
+
+<h2>57.3 Write-ahead logging: log the intent, apply lazily, replay to recover</h2>
+
+<p>The working store makes the mechanism concrete. Its only durable artifact is an append-only <strong>redo log</strong> of records like
+<code>PUT k v</code> and <code>DEL k</code>. Every operation does two things in a fixed order: first it <em>appends and forces</em> the log record
+(<code>write</code> then <code>fsync</code>, Chapter 41), then it applies the change to an in-memory dictionary — the volatile &ldquo;data structure&rdquo;
+standing in for a buffer pool or memtable. After 1,000 operations we simulate a crash by throwing the dictionary away — modelling the power loss that
+erases all volatile state — and then recover by replaying the log from the beginning, re-applying each record to a fresh dictionary:</p>
+
+<pre><code>write-ahead logging: crash + redo recovery
+  operations applied: 1000   live keys before crash: 163
+  log records on disk: 1000
+  after crash, in-memory keys: 0   (volatile state gone)
+  no-log store would recover: 0 keys (state was only in memory)
+  replayed 1000 log records
+  live keys after recovery: 163
+  recovered state EXACTLY matches pre-crash state: True
+</code></pre>
+
+<p>The three-line arc is the whole idea. <strong>Before the crash</strong>, 1,000 operations left 163 live keys in memory and, crucially, 1,000 records
+on disk — the log holds the complete history of acknowledged changes, durably, even though the data structure itself was never written back. <strong>The
+crash</strong> takes the in-memory dictionary to zero keys; a store with <em>no</em> log would recover nothing, because its only copy was the volatile one
+— exactly the exposure of &sect;57.1. <strong>Recovery</strong> replays all 1,000 records into a fresh dictionary and reconstructs precisely 163 live keys,
+and the recovered map equals the pre-crash map exactly — <em>True</em>. That equality is the durability contract kept: every acknowledged write survived,
+because every acknowledged write was preceded by a forced log record, and the log outlived the crash. Notice what recovery is: a deterministic
+<strong>redo</strong>, re-applying the logged changes in order to a clean slate — overwrites and deletes replay to the same final state because the log
+preserved their order. Notice too what the store never did: it never wrote the dictionary to disk at all. All its durability came from the small
+sequential log, not from persisting the large structure — which is the no-force payoff of &sect;57.2 in action, and why real engines can acknowledge a
+commit at the speed of one sequential append rather than one scattered flush.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the log you wrote but never forced &mdash; buffered &ldquo;durability&rdquo; that a crash erases</span>
+<p>The write-ahead log is only as durable as the <code>fsync</code> behind it, and the most common recovery bug is a log that was <em>written</em> but
+never truly <em>forced</em> — durability theater that works in every test except a real power loss. It has three faces. First,
+<strong>the missing <code>fsync</code></strong>: calling <code>write()</code> on the log copies bytes into the OS page cache and returns, but the bytes
+may sit in RAM for seconds before the kernel flushes them (Chapter 41); crash in that window and the &ldquo;durable&rdquo; log record is as gone as the
+data it was meant to protect. A log write must be followed by <code>fsync</code> (or opened with the right synchronous flags) <em>before</em> the commit is
+acknowledged, or the contract is a lie. Second, <strong>ordering — the write-ahead rule itself</strong>: if the data page reaches disk <em>before</em> its
+log record (say the OS flushes the big structure while the small log record still sits buffered), a crash can leave a change in the data with no log entry
+to explain or undo it — the log must be forced <em>ahead of</em> the data it describes, which is the rule the whole scheme is named for (&sect;57.4).
+Third, <strong>&ldquo;the disk said it's written&rdquo;</strong>: some devices and volatile write caches acknowledge an <code>fsync</code> before the bytes
+hit stable media, so a crash loses supposedly-forced records; a database that means its durability must ensure the flush reaches truly stable storage
+(barriers, disabled volatile caches, or battery-backed ones). The counter-trap is over-forcing — <code>fsync</code>-ing on every tiny operation when a
+<strong>group commit</strong> could force one batch of records for many concurrent transactions at once, recovering throughput without weakening the
+contract. The honest posture: durability equals a forced log record <em>ahead of</em> the data change and <em>ahead of</em> the acknowledgment, all the
+way to stable media — anything short of that is a log that looks durable until the one crash that matters.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Our commits are slow because we <code>fsync</code> the whole data file on every write. Let's stop
+doing that and just keep the data in memory, writing it to disk once a minute — the OS buffers our log writes anyway, so we won't lose anything.&rdquo;
+Cover the paragraph and answer in four or five sentences, drawing on &sect;57.2&ndash;&sect;57.4.</p>
+<p><em>Model answer.</em> &ldquo;You're right that forcing the whole data file per commit is the wrong cost — that's the force policy, and it's exactly what
+write-ahead logging avoids. The fix is to stop forcing the <em>data</em> and instead force a small, sequential <strong>log record</strong> per commit, then
+write the data structure back lazily; that keeps durability at the price of one append, not one scattered flush. But two parts of the plan break the
+contract. Keeping data in memory and flushing once a minute with <em>no forced log</em> means a crash loses up to a minute of acknowledged writes — the
+durability we're promising clients. And &lsquo;the OS buffers our log writes anyway&rsquo; is the trap: a buffered <code>write()</code> isn't durable until
+<code>fsync</code> reaches stable media, so we must force the log record — ahead of the data and ahead of the ack — every commit, or batch them with group
+commit. So: yes to no-force on the data, but only <em>with</em> a forced write-ahead log; the log is what lets us defer the data safely.&rdquo; Naming
+no-force, the write-ahead rule, and the <code>fsync</code>/group-commit reality is the senior register.</p>
+</aside>
+
+<h2>57.4 The write-ahead rule, and why the log is cheap and correct</h2>
+
+<p>The scheme has one inviolable ordering constraint, and it is the rule the technique is named for. The <strong>write-ahead rule</strong>: the log record
+describing a change must reach stable storage <em>before</em> the change itself is allowed to reach the data on disk, and before the commit is acknowledged
+to the client. The reason is symmetric to the two failures of &sect;57.1. If a data page were allowed to hit disk <em>before</em> its log record, a crash
+in between would leave a change in the durable data with no log entry to record it — recovery could neither redo it consistently nor undo it, and the
+on-disk structure could be left inconsistent with no way to repair it. Forcing the log <em>first</em> guarantees that the durable log is always at least as
+new as the durable data: anything that made it into the data is described in the log, so recovery can always reconstruct or roll back to a consistent
+state by reading the log alone. This is why the log is the single source of truth and why its ordering, not merely its existence, is what makes recovery
+correct. And the reason the whole scheme is <em>affordable</em> is Chapter 46: the log is one append-only file, so forcing it is a <strong>sequential</strong>
+write at ~916&nbsp;MB/s, whereas forcing the scattered data structure would be <strong>random</strong> writes at ~19&nbsp;MB/s — roughly a 48&times;
+difference. Write-ahead logging converts the durability cost from many random writes of a large structure into one sequential append of a small record,
+which is the same sequential-beats-random insight that powered the LSM-tree, now applied to durability. Correct because the log leads the data; cheap
+because the log is sequential — those two properties, ordering and sequentiality, are the whole of why write-ahead logging works.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>State the write-ahead rule in one sentence, and give the specific bad outcome it prevents. Why is forcing the log so much cheaper than forcing the data
+structure, and which Chapter 46 figures set the ratio? (Answer below.)</p>
+</aside>
+
+<h2>57.5 What to carry forward</h2>
+
+<p>A crash destroys <strong>volatile</strong> state — the buffer pool's dirty pages and the LSM's memtable — so at any instant some acknowledged writes
+exist only in memory, and a mid-update crash can also leave the on-disk structure <strong>inconsistent</strong> (&sect;57.1). <strong>Durability</strong>
+requires that acknowledged writes survive, but the naive <strong>force</strong> policy — flush the scattered data structure on every commit — caps
+throughput at the device's random-write rate; the way out is <strong>no-force with logging</strong>: force a small, sequential <strong>log record</strong>
+per commit and write the data back lazily (&sect;57.2). A <strong>write-ahead log</strong> appends a redo record before applying each change and replays
+the log after a crash to reconstruct the lost state — demonstrated on a store that lost all 163 in-memory keys to a crash and recovered them <em>exactly</em>
+by replaying 1,000 forced records (&sect;57.3). Correctness rests on the <strong>write-ahead rule</strong> — the log record must reach stable storage
+before the data it describes and before the acknowledgment — which keeps the durable log at least as new as the durable data; affordability rests on the
+log being sequential (~916 vs ~19&nbsp;MB/s, Chapter 46). The named trap: a log <code>write()</code>-n but not <code>fsync</code>-ed, or forced after the
+data, is durability theater a real crash erases (&sect;57.3&ndash;&sect;57.4).</p>
+
+<p>This chapter established the contract and the mechanism, but it left the recovery deliberately simple — replay the entire log from the beginning into
+an empty store — and that simplicity hides the questions the rest of the part must answer. Replaying <em>all</em> history is fine for a thousand records
+and impossible for a log that has grown for months; the fix is the <strong>checkpoint</strong>, a periodic marker that lets recovery start near the end of
+the log instead of the beginning. Our store logged only <em>redo</em> records and every logged change had been acknowledged; a real database must also
+handle <em>uncommitted</em> changes that reached the log or the data before a transaction aborted or a crash struck mid-transaction, which requires
+<strong>undo</strong> as well as redo, and a disciplined story about what state the data pages can be in at crash time. And the whole apparatus — redo,
+undo, checkpoints, and the exact protocol that makes recovery correct even when the crash lands <em>during recovery</em> — was worked out in one landmark
+algorithm, <strong>ARIES</strong> (Mohan et&nbsp;al. 1992), which the next chapters build up to. Write-ahead logging is the load-bearing idea beneath all
+of it: log the intent before the act, force the log ahead of the data, and a database can promise durability across a crash and prove it. The engines of
+the last part store the data; the log is how they keep their word.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Name the volatile state a crash destroys and the two threats (lost writes, inconsistency) it poses.</li>
+<li>Explain the force policy and why it is correct but too slow, tying it to random writes.</li>
+<li>State the no-force-with-logging idea: force a small sequential log record, write data back lazily.</li>
+<li>Describe redo recovery: replay the log into a clean store to reconstruct acknowledged state.</li>
+<li>State the write-ahead rule and the specific inconsistency it prevents.</li>
+<li>Explain why a <code>write()</code> without <code>fsync</code> is not durable, and what group commit buys.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What volatile state does a crash erase, and why do engines keep acknowledged writes there? (&sect;57.1)</li>
+<li><strong>R2.</strong> Contrast the force policy with no-force-plus-logging on correctness and cost. (&sect;57.2)</li>
+<li><strong>R3.</strong> Walk through redo recovery on the store: what was lost, what was replayed, what was restored. (&sect;57.3)</li>
+<li><strong>R4.</strong> State the write-ahead rule and the failure it prevents. (&sect;57.4)</li>
+<li><strong>R5.</strong> Why is forcing the log cheap while forcing the data structure is not? (&sect;57.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh &amp; Peter Schwarz, &ldquo;ARIES: A Transaction Recovery Method Supporting
+Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging,&rdquo; <em>ACM Transactions on Database Systems</em> 17(1), 1992, pp.
+94&ndash;162, DOI 10.1145/128765.128770.</strong> The landmark recovery algorithm built on write-ahead logging — redo, undo, and checkpoints — that the
+next chapters develop. First author C. Mohan; venue, volume, issue, pages, year, and DOI verified via the ACM Digital Library and DBLP.</li>
+<li><strong>Joseph M. Hellerstein, Michael Stonebraker &amp; James Hamilton, &ldquo;Architecture of a Database System,&rdquo; <em>Foundations and
+Trends in Databases</em> 1(2), 2007, pp. 141&ndash;259, DOI 10.1561/1900000002.</strong> A concise modern account of the logging and recovery subsystem
+and where write-ahead logging sits in a full engine. First author Joseph M. Hellerstein; venue, volume, issue, pages, year, and DOI verified via now
+publishers and the ACM Digital Library.</li>
+<li><strong>Jim Gray &amp; Andreas Reuter, <em>Transaction Processing: Concepts and Techniques</em>, Morgan Kaufmann, 1992, ISBN 978-1-55860-190-1.</strong>
+The definitive treatment of durability, logging, and recovery — the force/no-force and steal/no-steal policy space this chapter opens. Authors, publisher,
+year, and ISBN verified via the publisher listing and the Library of Congress record.</li>
+<li><strong>Raghu Ramakrishnan &amp; Johannes Gehrke, <em>Database Management Systems</em>, 3rd ed., McGraw-Hill, 2003, ISBN 978-0-07-246563-1.</strong>
+A clear textbook development of write-ahead logging and crash recovery for the reader who wants the full ARIES treatment step by step. Authors and edition
+verified via the McGraw-Hill catalog and the Library of Congress record.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex57.1"><span class="ex-label">57.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what volatile state does a crash destroy, and why is that a problem for a write the database already acknowledged?</div>
+
+<div class="exercise" id="ex57.2"><span class="ex-label">57.2</span> <span class="ex-tag warm">warm-up</span>
+Define the durability (D of ACID) contract in one sentence.</div>
+
+<div class="exercise" id="ex57.3"><span class="ex-label">57.3</span> <span class="ex-tag warm">warm-up</span>
+State the write-ahead rule: what must reach stable storage before what?</div>
+
+<div class="exercise" id="ex57.4"><span class="ex-label">57.4</span> <span class="ex-tag core">core</span>
+Force versus log. (a) Describe the force policy and why it is correct. (b) Explain why it is slow, in terms of random writes and <code>fsync</code>. (c)
+Explain how forcing a small sequential log record instead achieves the same durability at far lower cost, and what &ldquo;no-force&rdquo; means for the
+data pages.</div>
+
+<div class="exercise" id="ex57.5"><span class="ex-label">57.5</span> <span class="ex-tag core">core</span>
+Redo recovery on the store. Using the run (163 live keys before the crash, 1,000 records logged, 0 keys after the crash, 163 after recovery): (a) why did
+a store with no log recover 0 keys? (b) why does replaying overwrites and deletes in order reproduce exactly the pre-crash state? (c) what did the store
+notably <em>never</em> do, and why was durability still guaranteed?</div>
+
+<div class="exercise" id="ex57.6"><span class="ex-label">57.6</span> <span class="ex-tag core">core</span>
+The write-ahead rule. (a) Explain the bad outcome if a data page reaches disk before its log record. (b) Explain how forcing the log first keeps the
+durable log at least as new as the durable data. (c) Why does this let recovery restore a consistent state by reading the log alone?</div>
+
+<div class="exercise" id="ex57.7"><span class="ex-label">57.7</span> <span class="ex-tag complexity">cost</span>
+Cost. (a) Using Chapter 46's ~916&nbsp;MB/s sequential and ~19&nbsp;MB/s random figures, roughly how many times cheaper is forcing a sequential log
+append than forcing scattered data pages? (b) Why does group commit reduce the per-commit <code>fsync</code> cost without weakening durability? (c) Why
+does the sequential-beats-random insight here echo the one behind the LSM-tree?</div>
+
+<div class="exercise" id="ex57.8"><span class="ex-label">57.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team ships a write-ahead log but, to speed up commits, replaces the per-commit <code>fsync</code> on the log
+with a plain <code>write()</code>, trusting the OS to flush the page cache eventually.
+<br><strong>Step 1 (given):</strong> <code>write()</code> copies the log record into the OS page cache and returns; the bytes may sit in RAM for seconds.
+<br><strong>Step 2 (given):</strong> the commit is acknowledged to the client as soon as <code>write()</code> returns.
+<br><strong>Step 3 (given):</strong> the power fails while the record is still buffered, before the kernel flushes it.
+<br><strong>Step 4 (you):</strong> Explain what is lost, which specific promise was broken, and the one-line fix — and name what they should use instead
+if per-commit <code>fsync</code> is too slow.</div>
+
+<div class="exercise" id="ex57.9"><span class="ex-label">57.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>durability</em>, <em>force policy</em>, <em>no-force logging</em>, <em>write-ahead rule</em>, or
+<em>redo recovery</em> — and why: (a) flushing the whole data file on every commit; (b) replaying the log into a clean store after a crash; (c) forcing
+the log record before the data page; (d) the contract that an acknowledged write survives a crash; (e) forcing a small log record and writing data pages
+back lazily.</div>
+
+<div class="exercise" id="ex57.10"><span class="ex-label">57.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A <code>write()</code> to the log makes the record durable.&rdquo;
+(b) &ldquo;The write-ahead rule says the data page must reach disk before its log record.&rdquo; (c) &ldquo;No-force means the data pages are never written
+to disk.&rdquo; (d) &ldquo;Forcing a sequential log append is much cheaper than forcing scattered data pages.&rdquo; (e) &ldquo;Redo recovery replays
+logged changes in order to reconstruct the lost state.&rdquo;</div>
+
+<div class="exercise" id="ex57.11"><span class="ex-label">57.11</span> <span class="ex-tag stretch">stretch</span>
+Beyond this chapter. (a) The store replayed the entire log from the beginning; explain why that does not scale and what a <em>checkpoint</em> would change.
+(b) The store logged only acknowledged (committed) changes; explain why a real database also needs <em>undo</em>, and give an example of a change that
+must be undone after a crash. (c) Explain why recovery must itself be safe to interrupt — what could go wrong if a crash struck <em>during</em> replay, and
+why redo's re-application must be idempotent.</div>
+
+<div class="exercise" id="ex57.12"><span class="ex-label">57.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Build a key-value store whose only durable artifact is an append-only log; on each operation, append and
+<code>fsync</code> a record <em>before</em> mutating the in-memory map. (b) Apply a workload, discard the in-memory map to simulate a crash, replay the log
+into a fresh map, and assert the recovered state equals the pre-crash state. (c) State your toolchain and explain why this is a deterministic,
+structural demonstration of durability — the recovered state matches or it does not — rather than a wall-clock timing, and why moving the
+<code>fsync</code> after the mutation (or removing it) would break the guarantee.</div>
+
+</section>
+</section>

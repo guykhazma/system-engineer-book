@@ -1,0 +1,85 @@
+<section class="solutions" id="sol55">
+<h1>Chapter 55 — Solutions</h1>
+
+<div class="solution" id="sol55.1"><span class="sol-label">55.1</span>
+On insert, it hashes the key with <var>k</var> functions and sets the <var>k</var> named bits to one; on test, it hashes the key the same way and answers
+&ldquo;definitely not&rdquo; if any of those bits is zero, &ldquo;possibly&rdquo; if all are one. <em>Tempting wrong answer:</em> &ldquo;on test it
+returns yes/no&rdquo; — it returns &ldquo;definitely not&rdquo; or &ldquo;possibly,&rdquo; never a confirmed yes. <strong>Feed-forward:</strong> &sect;55.2.</div>
+
+<div class="solution" id="sol55.2"><span class="sol-label">55.2</span>
+It can make a false positive (say &ldquo;possibly&rdquo; about an absent key, because that key's bits were set by others) and can never make a false
+negative (insertion only sets bits, so a present key always has all <var>k</var> bits set). <em>Tempting wrong answer:</em> &ldquo;it can miss a present
+key&rdquo; — that is a false negative, which is impossible. <strong>Feed-forward:</strong> &sect;55.2.</div>
+
+<div class="solution" id="sol55.3"><span class="sol-label">55.3</span>
+A hit usually resolves in the memtable or a recent run, so it stops early; a miss has nothing to short-circuit it and would otherwise probe every run, so
+the filter's &ldquo;definitely not&rdquo; is what removes those wasted probes. <em>Tempting wrong answer:</em> &ldquo;the filter speeds up hits&rdquo; — a
+present key still triggers the authoritative read; the win is on misses. <strong>Feed-forward:</strong> &sect;55.1&ndash;&sect;55.4.</div>
+
+<div class="solution" id="sol55.4"><span class="sol-label">55.4</span>
+(a) Insertion sets all <var>k</var> of a key's bits, so if any is still zero the key was never inserted — the proof of absence is exact. (b) All-ones can
+arise from other keys' bits overlapping this one's, so it does not prove insertion — only &ldquo;possibly.&rdquo; (c) The store is authoritative, so a
+&ldquo;definitely not&rdquo; skips a run correctly every time and a false &ldquo;possibly&rdquo; costs only one wasted probe the store then resolves; a
+false negative, by contrast, would skip a run that <em>does</em> hold the key and return a wrong &ldquo;not found&rdquo; — a correctness bug. <em>Tempting
+wrong answer:</em> &ldquo;a false positive is the dangerous error&rdquo; — a false positive only wastes a probe; the false negative (impossible here) is
+the one that breaks correctness. <strong>Feed-forward:</strong> &sect;55.2.</div>
+
+<div class="solution" id="sol55.5"><span class="sol-label">55.5</span>
+(a) <var>p</var>&nbsp;&asymp;&nbsp;(1&nbsp;&minus;&nbsp;e^(&minus;kn/m)) raised to the <var>k</var> power. (b) The formula is an expectation; the 0.88%
+is one measured outcome over 100,000 probes, so it differs from 0.82% by ordinary sampling noise, not a wrong model. (c) Because the error decays
+exponentially in <var>m</var>/<var>n</var>, so a fixed <em>additive</em> increase in bits per key multiplies the error by a roughly constant factor rather
+than subtracting a constant. <em>Tempting wrong answer:</em> &ldquo;the gap means the formula is wrong&rdquo; — it is within sampling noise and the two
+track across two orders of magnitude. <strong>Feed-forward:</strong> &sect;55.3.</div>
+
+<div class="solution" id="sol55.6"><span class="sol-label">55.6</span>
+(a) Optimal <var>k</var>* = (<var>m</var>/<var>n</var>)&nbsp;ln&nbsp;2; bits per key <var>m</var>/<var>n</var> = &minus;ln&nbsp;<var>p</var> / (ln&nbsp;2)
+squared. (b) ~9.6&nbsp;bits per key for 1%, which for a billion keys is about 1.2&nbsp;GB. (c) The rule fixes bits <em>per key</em>, so total memory scales
+linearly with key count but the per-key budget for a given error rate is constant. <em>Tempting wrong answer:</em> &ldquo;more keys need more bits per
+key&rdquo; — more keys need more total bits, but the per-key budget for a target <var>p</var> is fixed. <strong>Feed-forward:</strong> &sect;55.3.</div>
+
+<div class="solution" id="sol55.7"><span class="sol-label">55.7</span>
+(a) No filter: ~10 runs; 1% filter: ~0.1 runs; 0.1% filter: ~0.01 runs (expected probes = <var>L</var>&times;<var>p</var>). (b) A 1% filter removes about
+99% of the miss read work — nearly all of it, since almost every miss now resolves in memory. (c) A range scan needs keys in an interval, but hashing
+destroys order, so the filter cannot say which runs hold keys in &#91;<var>a</var>,&nbsp;<var>b</var>&#93; and no run can be skipped. <em>Tempting wrong
+answer:</em> &ldquo;the filter halves range-scan cost too&rdquo; — it does nothing for ranges; it is a point-membership structure. <strong>Feed-forward:</strong>
+&sect;55.4.</div>
+
+<div class="solution" id="sol55.8"><span class="sol-label">55.8</span>
+<strong>Step 4:</strong> This is a <strong>correctness</strong> bug, not a performance one. The misused promise is that &ldquo;possibly present&rdquo; is
+a confirmed membership — it is not; a Bloom filter has false positives, so ~1% of absent keys report &ldquo;possibly&rdquo; and the code then invents a
+value for a key that was never stored. The one-line rule: a filter <em>guards</em> the store and never <em>replaces</em> it — every &ldquo;possibly&rdquo;
+must still go to the authoritative read. <em>Tempting wrong answer:</em> &ldquo;raise the bits per key to fix it&rdquo; — a lower false-positive rate makes
+the bug rarer, not gone; only doing the real lookup on every hit is correct. <strong>Feed-forward:</strong> &sect;55.3.</div>
+
+<div class="solution" id="sol55.9"><span class="sol-label">55.9</span>
+(a) <strong>False negative</strong> — the mistake it can never make. (b) <strong>False positive</strong> — the occasional wasted run probe. (c)
+<strong>Optimal k</strong> — fixed by the memory budget to minimize the error. (d) <strong>Range scan</strong> — the read it cannot accelerate. (e)
+<strong>Bits per element</strong> — the fixed per-key cost that sets the target rate. <em>Tempting wrong answer:</em> swapping (a) and (b) — absence is
+certain (no false negative), presence is a guess (false positive). <strong>Feed-forward:</strong> &sect;55.2&ndash;&sect;55.4.</div>
+
+<div class="solution" id="sol55.10"><span class="sol-label">55.10</span>
+(a) <strong>False</strong> — a filter can only say &ldquo;possibly present,&rdquo; never confirm presence. (b) <strong>True</strong> — insertion sets all
+<var>k</var> bits, so a present key is never rejected. (c) <strong>False</strong> — the error falls exponentially, so doubling bits per key cuts it by far
+more than half; adding a constant number of bits multiplies it by a constant factor. (d) <strong>False</strong> — clearing bits may clear ones another key
+needs, creating a false negative; use a counting or cuckoo filter to delete. (e) <strong>False</strong> — hashing destroys order, so a filter cannot skip
+runs for a range scan. <em>Tempting wrong answer:</em> marking (c) true because &ldquo;more bits, less error&rdquo; sounds linear — the relationship is
+exponential. <strong>Feed-forward:</strong> &sect;55.2&ndash;&sect;55.4.</div>
+
+<div class="solution" id="sol55.11"><span class="sol-label">55.11</span>
+(a) At each of the ten runs the read consults the filter; for a true miss each says &ldquo;definitely not&rdquo; except the 1% false-positive fraction, so
+in expectation about 10&times;0.01&nbsp;=&nbsp;0.1 runs are actually opened — roughly one device access every ten misses. (b) The filter removes almost all
+point-miss probes, bringing point-read amplification near the B-tree's ~1; but it summarizes only exact keys, so range scans still open every overlapping
+run and stay above the B-tree's clustered single scan. (c) Monkey: a lookup's expected cost is the <em>sum</em> of the per-run false-positive rates, so
+for a fixed total memory it is better to give more bits per key to the larger, more numerous lower levels and fewer to the small upper ones — minimizing
+the summed false-positive probability rather than equalizing bits per key. <em>Tempting wrong answer:</em> &ldquo;filters close the range-scan gap
+too&rdquo; — they close only the point-read gap. <strong>Feed-forward:</strong> &sect;55.4.</div>
+
+<div class="solution" id="sol55.12"><span class="sol-label">55.12</span>
+Open-ended and platform-specific. A correct write-up: (a) implements a bit-array filter with <var>k</var> hash indices, inserts <var>n</var> keys, probes
+<var>n</var> absent keys, and reports the empirical false-positive rate at several bits-per-element budgets (this chapter: ~0.88% at 10&nbsp;bits,
+<var>k</var>=7); (b) lays the closed-form (1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k beside each measurement and finds them within sampling noise; (c) states
+toolchain and notes the false-positive rate is a hardware-independent function of <var>k</var>, <var>m</var>, <var>n</var> — a structural rate reproducible
+anywhere, differing from the formula only by sampling noise, not a wall-clock timing. <em>Tempting wrong answer:</em> reporting the false-positive rate as
+a device throughput measurement — it is a property of the structure, not a benchmark. <strong>Feed-forward:</strong> &sect;55.3.</div>
+
+</section>

@@ -1,0 +1,374 @@
+<section class="chapter" id="ch55">
+<h1>Chapter 55 — Bloom Filters: Making the LSM Read Path Cheap</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch46">Chapter 46</a> (a random device access ~19&nbsp;MB/s versus sequential
+~916&nbsp;MB/s — the point-read probe a Bloom filter saves is a random access, the expensive kind), <a href="#ch48">Chapter 48</a> (the buffer pool
+the filter lives in, and the reads it stops from evicting useful pages), <a href="#ch53">Chapter 53</a> (the LSM read path — a lookup probes the
+memtable and every SSTable, the read amplification this chapter attacks), <a href="#ch54">Chapter 54</a> (compaction bounds the run count but does not
+eliminate it; a point read still touches several runs, and the RUM read cost this chapter buys down). &nbsp;·&nbsp; Chapter 54 bounded the LSM-tree's read
+amplification but left it above one: a point read — above all a point <em>miss</em> — still probes several sorted runs, each a random device access. This
+chapter is the read-side companion to compaction: the <strong>Bloom filter</strong>, a tiny in-memory structure that lets a read skip runs that provably
+cannot hold the key, driving the probes per lookup back toward one.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch53">Chapter 53</a> — an LSM point read that finds nothing must touch how many of the on-disk runs, and what is that cost
+called? (2) <a href="#ch54">Chapter 54</a> — compaction lowered the run count, but did it drive read amplification to one, and why not? (3) <em>Predict:</em>
+suppose each run carried a small in-memory summary that could answer &ldquo;is key <var>x</var> definitely <em>not</em> here?&rdquo; cheaply, but was
+allowed to sometimes answer &ldquo;maybe&rdquo; when the key is actually absent. How much memory (guess: bytes per key) would you expect to need to make
+the &ldquo;maybe when actually absent&rdquo; mistake rare — say one in a hundred — and could such a summary ever say &ldquo;not here&rdquo; about a key
+that <em>is</em> present? Write your guess; &sect;55.2&ndash;&sect;55.3 answer it.</p>
+</aside>
+
+<p>Compaction (Chapter 54) bounded how many sorted runs an LSM-tree accumulates, but a point lookup still has to consult them: it checks the memtable,
+then each run from newest to oldest, and only a run whose key range and index say the key <em>could</em> be present is worth a device access. For a key
+that is present this usually resolves in the first run or two. For a key that is <strong>absent</strong> — a miss, which in real workloads is common (an
+existence check, an insert-if-not-present, a lookup for a deleted or never-written key) — there is nothing to short-circuit the search, and the read pays
+a random device access at run after run only to find the key in none of them. That is read amplification at its worst, and it is exactly the cost the
+<strong>Bloom filter</strong> was built to cut. A Bloom filter is a small bit array plus a handful of hash functions that answers one question about a set
+— <em>is <var>x</var> a member?</em> — with a deliberate asymmetry: it can say <strong>&ldquo;definitely not&rdquo;</strong> with certainty, or
+<strong>&ldquo;possibly yes&rdquo;</strong> with a small, tunable error. Put one in front of each SSTable and a point read consults the filters first,
+skipping every run whose filter says &ldquo;definitely not&rdquo; without touching the disk at all. This chapter builds it from the bits up: why an LSM
+point miss is the costly case (&sect;55.1); the structure and its one-sided error, invented by Bloom in 1970 (&sect;55.2); the false-positive-rate
+arithmetic — the closed-form formula, the optimal number of hashes, the bits-per-element for a target error — reproduced against a working filter on real
+runs (&sect;55.3); how filters slot into the LSM read path, what they cost, and the one thing they cannot help — the range scan (&sect;55.4); and what
+this completes about the LSM read path (&sect;55.5).</p>
+
+<p><strong>On the code in this chapter.</strong> One Python program (CPython 3.10.12 on this machine's 12th&nbsp;Gen Intel Core i7-12700H) in three
+parts. First a <strong>working Bloom filter</strong> — a bit array with double hashing — into which 100,000 keys are inserted; it is then probed with
+100,000 <em>absent</em> keys and the measured false-positive rate is compared, at several memory budgets, against the closed-form prediction
+(1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k. Second a <strong>design table</strong>: the bits-per-element and optimal hash count for a range of target
+false-positive rates, from the same closed-form arithmetic. Third an <strong>LSM read-amplification model</strong>: how many runs a point miss actually
+probes with filters at a given error rate versus without. The empirical false-positive numbers are measured on this machine and labeled empirical; the
+formula, the bits-per-element, and the run-probe figures are exact arithmetic of the model, labeled analytical. No wall-clock timings appear
+(a hardware-counter profiler, <code>perf</code>, is not installed on this machine); the point of the chapter is the error rate and the memory, both of
+which are hardware-independent.</p>
+
+<h2>55.1 The read the LSM still pays: the point miss</h2>
+
+<p>Recall the LSM read path from Chapter 53. To look up a key, the engine checks the in-memory memtable, then walks the on-disk sorted runs from newest
+to oldest; within a run, a sparse index and the run's key range tell it whether the key <em>could</em> be inside and, if so, which block to fetch. For a
+key that is <strong>present</strong>, the search usually stops early — the value is likely in the memtable or a recent run — so a hit is cheap. The
+punishing case is the <strong>point miss</strong>: a lookup for a key that is in <em>none</em> of the runs. Nothing stops the search early, because no run
+can prove the key's absence from its key range alone (the missing key may fall squarely inside a run's minimum-to-maximum span), so the read fetches a
+block from run after run, each a random device access at Chapter 46's slow ~19&nbsp;MB/s, and finds nothing every time. With compaction holding the tree
+at, say, ten runs, a single miss can cost ten random reads to answer &ldquo;no.&rdquo; And misses are not rare: existence checks, insert-if-absent,
+lookups of keys that were deleted or never written — all are misses, and all pay full read amplification. Compaction (Chapter 54) bounded the number of
+runs but could not drive it to one without paying ruinous write amplification, so the read cost of the miss is real and structural. What is needed is a
+way to answer &ldquo;this key is definitely not in this run&rdquo; <em>without</em> touching the run — a per-run membership summary small enough to keep in
+memory for every run at once. That is the Bloom filter.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is a point <em>miss</em> the most expensive case for an LSM read, and why can a run's key range alone not rule the key out? Roughly how many
+random device accesses does a miss cost in a ten-run tree, and what kind of per-run summary would cut that toward one? (Answer in &sect;55.2.)</p>
+</aside>
+
+<h2>55.2 The Bloom filter: k hashes, m bits, one-sided error</h2>
+
+<p>A <strong>Bloom filter</strong> for a set of <var>n</var> keys is an array of <var>m</var> bits, all initially zero, together with <var>k</var>
+independent hash functions, each mapping a key to one of the <var>m</var> bit positions. To <strong>insert</strong> a key, hash it with all <var>k</var>
+functions and set the <var>k</var> bits they name to one. To <strong>test</strong> a key, hash it the same way and look at those <var>k</var> bits: if
+<em>any</em> one of them is zero, the key was certainly never inserted — setting bits is the only thing insertion does, so a present key would have set all
+<var>k</var> — and the filter answers <strong>&ldquo;definitely not a member.&rdquo;</strong> If all <var>k</var> bits are one, the filter answers
+<strong>&ldquo;possibly a member,&rdquo;</strong> because those bits might all have been set by <em>other</em> keys whose hashes happened to overlap this
+one's. That is the filter's defining <strong>one-sided error</strong>: it never produces a <strong>false negative</strong> (it never says &ldquo;not
+present&rdquo; about a key that is present), but it may produce a <strong>false positive</strong> (say &ldquo;possibly present&rdquo; about a key that is
+absent). The asymmetry is exactly what an LSM read needs — a &ldquo;definitely not&rdquo; lets the read skip the run with certainty, and a false
+&ldquo;possibly&rdquo; costs only a wasted device access that finds nothing, degrading gracefully to the no-filter behavior rather than returning a wrong
+answer. This is the structure Burton Bloom introduced in 1970, in a paper whose title names the bargain precisely: a space/time trade-off in hash coding
+<em>with allowable errors</em> — accept a small, controlled error rate and buy a large reduction in space and probes.</p>
+
+<p>Answering the opener's second question directly: <strong>no</strong>, such a summary can never say &ldquo;not here&rdquo; about a key that is present.
+The whole point of the one-sided error is that &ldquo;definitely not&rdquo; is always trustworthy; only &ldquo;possibly&rdquo; can be wrong. That is what
+makes it safe to put in front of an authoritative store — a &ldquo;definitely not&rdquo; skips the run correctly every time, and a false &ldquo;possibly&rdquo;
+merely wastes one probe that the store then resolves. <em>(Answer to the &sect;55.1 quick check: a point miss is worst because nothing short-circuits the
+search — no run can rule the key out from its key range, so the read fetches a block from every run, ~ten random accesses in a ten-run tree, to answer
+&ldquo;no.&rdquo; The summary that cuts that toward one is a per-run membership filter that can cheaply answer &ldquo;definitely not in this run.&rdquo;)</em></p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a Bloom filter is one-sided membership in a shared bit array</span>
+<p><strong>1. In words.</strong> Insertion sets <var>k</var> hashed bits; a test that finds any of a key's <var>k</var> bits still zero proves the key was
+never inserted (&ldquo;definitely not&rdquo;), while all-ones means &ldquo;possibly&rdquo; — the bits may be borrowed from other keys. Absence is certain;
+presence is a guess. So the filter never has a false negative, only a false positive.</p>
+<p><strong>2. As a picture.</strong> Figure 55.1: one bit array; key <var>A</var>'s three arrows land on three positions and set them; a query for absent
+key <var>Z</var> whose three arrows include a still-zero cell is rejected outright, while a query for absent key <var>Y</var> whose three cells all happen
+to be one is a false positive — a &ldquo;maybe&rdquo; the store will disprove.</p>
+<p><strong>3. As numbers.</strong> At 10&nbsp;bits per key with the optimal <var>k</var>=7 hashes, the measured false-positive rate on 100,000 inserted and
+100,000 absent keys is about 0.9% (&sect;55.3) — under one wasted probe in a hundred misses, for ten bits of memory per key and zero risk of a wrong
+&ldquo;no.&rdquo;</p>
+</aside>
+
+<figure>
+<svg viewBox="0 0 640 200" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">A Bloom filter: insert sets k hashed bits; a test finding any zero bit proves absence. All-ones is only &#8220;maybe.&#8221;</text>
+<g font-size="10">
+<rect x="40" y="70" width="34" height="26" fill="#dce7f3" stroke="#14406b"/><text x="52" y="87">0</text>
+<rect x="74" y="70" width="34" height="26" fill="#8fc98f" stroke="#14406b"/><text x="86" y="87">1</text>
+<rect x="108" y="70" width="34" height="26" fill="#dce7f3" stroke="#14406b"/><text x="120" y="87">0</text>
+<rect x="142" y="70" width="34" height="26" fill="#8fc98f" stroke="#14406b"/><text x="154" y="87">1</text>
+<rect x="176" y="70" width="34" height="26" fill="#8fc98f" stroke="#14406b"/><text x="188" y="87">1</text>
+<rect x="210" y="70" width="34" height="26" fill="#dce7f3" stroke="#14406b"/><text x="222" y="87">0</text>
+<rect x="244" y="70" width="34" height="26" fill="#8fc98f" stroke="#14406b"/><text x="256" y="87">1</text>
+<rect x="278" y="70" width="34" height="26" fill="#dce7f3" stroke="#14406b"/><text x="290" y="87">0</text>
+</g>
+<text x="40" y="55" font-size="9" fill="#2f7d32">insert A &#8594; set bits 1, 3, 4, 6</text>
+<text x="360" y="66" font-size="9" fill="#8c3a1d">test Z: bit 0 is zero &#8594; DEFINITELY NOT (correct, no disk access)</text>
+<text x="360" y="86" font-size="9" fill="#8c3a1d">test Y: bits 1,4,6 all one &#8594; &#8220;possibly&#8221; (false positive: one wasted probe)</text>
+<text x="360" y="106" font-size="9" fill="#14406b">present key: all k bits set &#8594; &#8220;possibly&#8221; (always &#8212; never a false negative)</text>
+<text x="40" y="130" font-size="9" fill="#333">absence is proof; presence is a guess. One-sided error is what makes the filter safe in front of an authoritative store.</text>
+</svg>
+<figcaption>Figure 55.1: the Bloom filter's one-sided error. A test that meets a zero bit rejects with certainty (no device access); all-ones is only
+&ldquo;possibly present.&rdquo; A false positive costs one wasted probe; a false negative — which cannot occur — would cost correctness.</figcaption>
+</figure>
+
+<h2>55.3 The false-positive rate: formula, optimal k, and bits per element</h2>
+
+<p>How often does the filter say &ldquo;possibly&rdquo; about an absent key? After inserting <var>n</var> keys into <var>m</var> bits with <var>k</var>
+hashes, the probability that any one bit is still zero is (1&nbsp;&minus;&nbsp;1/<var>m</var>) raised to the <var>kn</var> power, which for the sizes that
+matter is very close to e^(&minus;kn/m). A false positive requires all <var>k</var> of a query's bits to be one, so the <strong>false-positive
+rate</strong> is approximately <var>p</var>&nbsp;&asymp;&nbsp;(1&nbsp;&minus;&nbsp;e^(&minus;kn/m)) raised to the <var>k</var> power. Two design facts
+fall out of that formula. First, for a fixed memory ratio <var>m</var>/<var>n</var> there is an <strong>optimal number of hashes</strong> that minimizes
+<var>p</var>: <var>k</var>* = (<var>m</var>/<var>n</var>)&nbsp;ln&nbsp;2 — too few hashes and each test checks too little; too many and the bits fill up too
+fast. Second, at that optimum the error falls <em>exponentially</em> in the bits per element: to hit a target rate <var>p</var> you need
+<var>m</var>/<var>n</var> = &minus;ln&nbsp;<var>p</var> / (ln&nbsp;2) squared bits per key — a fixed budget per key, independent of how many keys there are.
+The first part of the program builds a real filter (double hashing to synthesize <var>k</var> indices from one hash), inserts 100,000 keys, probes 100,000
+absent keys, and lays the measured rate beside the formula:</p>
+
+<pre><code>empirical FPR vs formula  (n=100000 inserted, 100000 absent probes)
+  bits/elem   k    formula FPR    empirical FPR
+     4      3       0.14689       0.14654
+     8      6       0.02158       0.02103
+    10      7       0.00819       0.00875
+    12      8       0.00314       0.00320
+    16     11       0.00046       0.00055
+</code></pre>
+
+<p>The measured false-positive rate tracks the closed-form (1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k across two orders of magnitude — at 10&nbsp;bits per
+key the formula predicts 0.82% and the filter delivers 0.88%; the small gaps are ordinary sampling noise over 100,000 probes, not a modelling error. The
+shape is the whole story: <strong>each additional handful of bits per key cuts the error by roughly a constant factor</strong>, because the error decays
+exponentially in <var>m</var>/<var>n</var>. That is why a filter can be so cheap — you do not pay per stored value, only a fixed few bits per key, and a
+little memory buys a lot of certainty. The design table makes the budget explicit, computed from the two closed forms above:</p>
+
+<pre><code>design table: bits/element and optimal k for a target FPR
+  target FPR   bits/elem (m/n)   optimal k
+    0.1000          4.79           3.32
+    0.0500          6.24           4.32
+    0.0100          9.59           6.64
+    0.0010         14.38           9.97
+    0.0001         19.17          13.29
+</code></pre>
+
+<p>Read the table as a price list. A 1% false-positive rate — one wasted probe per hundred misses — costs about <strong>9.6&nbsp;bits per key</strong>,
+call it a byte and change; a ten-times-stricter 0.1% costs about 14.4&nbsp;bits, and each further factor of ten adds a near-constant ~4.8&nbsp;bits
+(that is 1/(ln&nbsp;2) squared bits per decade). For an LSM-tree holding a billion keys, a 1% filter is roughly 1.2&nbsp;GB of memory spread across the
+runs — small enough to keep resident, and the reason production engines attach a Bloom filter to every SSTable by default. The optimal <var>k</var> is not
+a free parameter to guess: it is fixed by the memory you spend, and the table's values (7 hashes at 10&nbsp;bits, matching the empirical run above) are
+where the error is least for that budget.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: a Bloom filter never lies about absence &mdash; but that is the <em>only</em> promise it makes</span>
+<p>The one-sided error is so clean that it invites three overreaches, each a real production bug. First, <strong>&ldquo;false positives don't matter, they
+just cost one probe.&rdquo;</strong> They cost one probe <em>each</em>, and at the wrong error rate that adds up: a filter sized for 10% false positives in
+front of a ten-run tree still lets roughly one miss in ten fall through to a wasted run probe, and across a firehose of existence checks that is a large
+fraction of the read work the filter was supposed to remove — the error rate is a capacity decision, not a detail. Second, <strong>&ldquo;a Bloom filter
+can tell me the key is present.&rdquo;</strong> It cannot: &ldquo;possibly&rdquo; is never a yes. Any read that treats a filter hit as a confirmed
+membership — skipping the authoritative lookup — will occasionally return a value for a key that was never stored, which is data corruption, not a
+performance bug. The filter <em>guards</em> the store; it never <em>replaces</em> it. Third, <strong>&ldquo;I'll just delete keys from the filter by
+clearing their bits.&rdquo;</strong> A standard Bloom filter cannot support deletion — clearing a key's <var>k</var> bits may clear bits another key relies
+on, which would create a <strong>false negative</strong> and break the one promise the structure makes; deletion needs a counting Bloom filter or a
+different structure such as the cuckoo filter (Fan et&nbsp;al. 2014), which supports deletes at comparable space. The honest posture: a Bloom filter
+proves absence and only suggests presence, its error rate is a memory-budget decision you make deliberately, and you never mutate it in ways that could
+manufacture a false negative — because the instant it can say &ldquo;not present&rdquo; about a present key, it is worse than useless in front of a store
+that must be correct.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Our LSM point lookups are slow on misses. Let's add a Bloom filter with, say, 4&nbsp;bits per key to
+keep the memory tiny — and while we're at it, we can skip the SSTable read entirely when the filter says the key is present, since the filter already
+told us it's there.&rdquo; Cover the paragraph and answer in four or five sentences, drawing on &sect;55.2&ndash;&sect;55.3.</p>
+<p><em>Model answer.</em> &ldquo;A Bloom filter is exactly the right fix for slow misses — it turns most miss probes into an in-memory &lsquo;definitely
+not&rsquo; and never risks a wrong answer, because it has no false negatives. But two of the specifics are off. Four bits per key gives about a 14%
+false-positive rate, so roughly one miss in seven still pays a wasted run probe; if misses are our pain, we want ~10&nbsp;bits per key for about 1%, which
+is still only a bit over a gigabyte for a billion keys. And we can't skip the SSTable read on a filter hit: &lsquo;possibly present&rsquo; is never a
+confirmed yes, so trusting it would let us return values for keys that were never stored — a correctness bug, not a speed-up. The filter's job is to skip
+runs that are <strong>definitely absent</strong>; every &lsquo;maybe&rsquo; still goes to the store. So: yes to the filter, size it for ~1% not tiny, and
+keep the authoritative read on every hit.&rdquo; Naming the false-negative-free asymmetry, the bits-per-element cost of the target rate, and the
+&ldquo;guard not replace&rdquo; rule is the senior register.</p>
+</aside>
+
+<h2>55.4 Filters in the LSM: skipping runs, and the range-scan gap</h2>
+
+<p>Now put a filter in front of each SSTable and rerun the point-miss path of &sect;55.1. The read consults each run's Bloom filter first; a
+&ldquo;definitely not&rdquo; skips that run with no device access, and only a &ldquo;possibly&rdquo; — a genuine hit or a false positive — triggers the
+block fetch. For a true miss, every run's filter <em>should</em> say &ldquo;definitely not,&rdquo; and does except for the false-positive fraction
+<var>p</var>, so the expected number of runs actually probed collapses from <var>L</var> to about <var>L</var>&times;<var>p</var>. The third part of the
+model tabulates it:</p>
+
+<pre><code>LSM point-read miss: runs actually probed (L levels), Bloom at FPR p
+  levels L   no filter   with Bloom p=0.01   with Bloom p=0.001
+     4          4               0.040               0.004
+     7          7               0.070               0.007
+    10         10               0.100               0.010
+  (expected wasted probes = L*p; a true miss with p=0.01, L=10 => ~0.1 disk probes vs 10)
+</code></pre>
+
+<p>The point miss that cost ten random device accesses now costs, in expectation, about <em>one tenth of one</em> access at a 1% filter — read
+amplification for the miss falls by two orders of magnitude, and with it the read half of the RUM trade the LSM-tree pays. This is why the Bloom filter is
+the standard companion to compaction: compaction bounds how many runs exist, and the filter makes the point read pay for only the runs that might
+actually contain the key. It also sharpens Chapter 54's whole picture — with filters, an LSM-tree's point-read amplification is near the B-tree's, so the
+remaining gap between the families narrows to range scans and the write/space trade. One subtlety is worth the senior engineer's attention, and it is the
+insight behind the <strong>Monkey</strong> design of Dayan and colleagues (2017): the total false-positive cost of a lookup is the <em>sum</em> of the
+per-run false-positive rates, so spending the same memory <em>unevenly</em> — more bits per key on the larger, more numerous lower levels and fewer on the
+small upper ones — minimizes the expected wasted probes for a fixed memory budget, rather than giving every run the same bits per key. The tuning of the
+filter is itself part of the LSM's read/memory trade.</p>
+
+<p>There is one read the filter cannot help at all, and naming it is half of understanding filters: the <strong>range scan</strong>. A Bloom filter
+answers only <em>point</em> membership — &ldquo;is this exact key present?&rdquo; — and says nothing about which keys fall in an interval, because hashing
+destroys order. A query for all keys between <var>a</var> and <var>b</var> must still open every run whose key range overlaps &#91;<var>a</var>,&nbsp;<var>b</var>&#93;
+and merge their contents; the filter offers no skip, because a run may hold <em>some</em> key in the range even when it holds none of the specific keys you
+might name. This is the structural reason the B-tree keeps its edge on range-heavy workloads even after the LSM-tree gets Bloom filters: the filter buys
+back point-read amplification but not scan amplification, and the range scan is where sorted, clustered, in-place storage still wins. (Structures that
+<em>do</em> summarize ranges, such as the prefix or succinct range filters that extend this idea, exist, but the plain Bloom filter is a point-membership
+structure, full stop.)</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>With a 1% Bloom filter on every run, about how many runs does a point <em>miss</em> probe in a ten-run tree, versus without? Why does the same filter do
+<em>nothing</em> for a range scan? (Answer below.)</p>
+</aside>
+
+<h2>55.5 What to carry forward</h2>
+
+<p>The <strong>Bloom filter</strong> is a small in-memory bit array with <var>k</var> hash functions that answers set membership with a deliberate
+<strong>one-sided error</strong>: <em>definitely not a member</em> is always correct, <em>possibly a member</em> may be a false positive, and a false
+negative never occurs (&sect;55.2). Its <strong>false-positive rate</strong> is <var>p</var>&nbsp;&asymp;&nbsp;(1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k,
+minimized at <var>k</var>* = (<var>m</var>/<var>n</var>)&nbsp;ln&nbsp;2, and reaching a target <var>p</var> costs a fixed
+<var>m</var>/<var>n</var> = &minus;ln&nbsp;<var>p</var>/(ln&nbsp;2)&nbsp;squared bits per key — about 10&nbsp;bits for 1%, verified against a working
+filter whose measured rate matched the formula across two orders of magnitude (&sect;55.3). Placed in front of every SSTable, a filter lets a point read
+skip runs that are definitely absent, cutting a point miss from <var>L</var> probes to about <var>L</var>&times;<var>p</var> — ten random accesses down to
+~0.1 at 1% (&sect;55.4). The named trap: a Bloom filter proves absence but only suggests presence, so it guards the store and never replaces it, its error
+rate is a memory-budget decision, and it cannot be safely deleted from — nor can it help a <strong>range scan</strong>, which needs order the hash
+destroys (&sect;55.3&ndash;&sect;55.4).</p>
+
+<p>With the Bloom filter the LSM read path is complete. Chapter 53 built it, Chapter 54 bounded its amplification with compaction, and this chapter drove
+the point-miss cost back toward one — so the LSM-tree now offers cheap sequential writes, tunable write/space amplification, <em>and</em> point reads
+competitive with a B-tree, with only the range scan and the write/space cost left as genuine differences between the families. That is exactly the
+comparison the part has been building toward, and it is now fully in hand: two storage engines, each measured on read, write, and space; a shared
+amplification vocabulary; the compaction dial; and the Bloom filter that closes the read gap. The part's final chapter spends this vocabulary on the
+question every database designer eventually faces — <em>given a concrete workload, B-tree or LSM-tree, and at what settings?</em> — turning the whole part
+into a decision procedure. Everything since Chapter 46 has been assembling the terms of that decision; next we make it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you&hellip; without looking?</span>
+<ul>
+<li>Explain why an LSM point <em>miss</em> is the expensive read, and what a per-run filter changes.</li>
+<li>State the Bloom filter's one-sided error: which mistake it can make and which it never can, and why.</li>
+<li>Write the false-positive-rate formula and the optimal-<var>k</var> rule, and say why error falls exponentially in bits per key.</li>
+<li>Give the bits per key for a 1% false-positive rate and explain why it is independent of the number of keys.</li>
+<li>Explain how a filter cuts a point miss from <var>L</var> probes to ~<var>L</var>&times;<var>p</var>.</li>
+<li>State the two things a Bloom filter cannot do: confirm presence, and help a range scan.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Describe insert and test for a Bloom filter, and state which of false positive / false negative it can produce. (&sect;55.2)</li>
+<li><strong>R2.</strong> Write the false-positive-rate formula and the optimal number of hashes for a given <var>m</var>/<var>n</var>. (&sect;55.3)</li>
+<li><strong>R3.</strong> About how many bits per key does a 1% false-positive rate cost, and why does adding bits cut the error exponentially? (&sect;55.3)</li>
+<li><strong>R4.</strong> How does a per-run filter change the number of runs a point miss probes, and by what factor? (&sect;55.4)</li>
+<li><strong>R5.</strong> Give two things a standard Bloom filter cannot do, and why each would break correctness or is impossible. (&sect;55.3&ndash;&sect;55.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Burton H. Bloom, &ldquo;Space/Time Trade-offs in Hash Coding with Allowable Errors,&rdquo; <em>Communications of the ACM</em> 13(7), 1970,
+pp. 422&ndash;426, DOI 10.1145/362686.362692.</strong> The original: the bit array, the <var>k</var> hashes, and the one-sided error whose
+&ldquo;allowable errors&rdquo; buy the space. First author Burton H. Bloom; venue, volume, issue, pages, year, and DOI verified via the ACM Digital
+Library and DBLP.</li>
+<li><strong>Andrei Broder &amp; Michael Mitzenmacher, &ldquo;Network Applications of Bloom Filters: A Survey,&rdquo; <em>Internet Mathematics</em> 1(4),
+2004, pp. 485&ndash;509, DOI 10.1080/15427951.2004.10129096.</strong> The clearest derivation of the false-positive formula, the optimal <var>k</var>,
+and the bits-per-element rule this chapter reproduces. First author Andrei Broder; venue, volume, issue, pages, year, and DOI verified via Taylor &amp;
+Francis and Project Euclid.</li>
+<li><strong>Bin Fan, Dave G. Andersen, Michael Kaminsky &amp; Michael D. Mitzenmacher, &ldquo;Cuckoo Filter: Practically Better Than Bloom,&rdquo;
+<em>Proc. 10th ACM Int'l Conf. on Emerging Networking Experiments and Technologies (CoNEXT&nbsp;2014)</em>, pp. 75&ndash;88, DOI 10.1145/2674005.2674994.</strong>
+The approximate-membership structure that adds deletion at comparable space — the answer to &ldquo;how do I delete from a filter?&rdquo; First author
+Bin Fan; venue, year, pages, and DOI verified via the ACM Digital Library and the authors' CMU/Harvard copies.</li>
+<li><strong>Niv Dayan, Manos Athanassoulis &amp; Stratos Idreos, &ldquo;Monkey: Optimal Navigable Key-Value Store,&rdquo; <em>Proc. 2017 ACM SIGMOD
+Int'l Conf. on Management of Data</em>, pp. 79&ndash;94, DOI 10.1145/3035918.3064054.</strong> Shows that a lookup's cost is the sum of the per-run
+false-positive rates, so allocating filter bits unevenly across levels minimizes read cost for a fixed memory budget (&sect;55.4). First author Niv Dayan;
+venue, year, pages, and DOI verified via the ACM Digital Library and DBLP.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex55.1"><span class="ex-label">55.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each: what does a Bloom filter do on insert, and what does it do on test?</div>
+
+<div class="exercise" id="ex55.2"><span class="ex-label">55.2</span> <span class="ex-tag warm">warm-up</span>
+Which error can a Bloom filter make — false positive or false negative — and which can it never make? State the one-line reason.</div>
+
+<div class="exercise" id="ex55.3"><span class="ex-label">55.3</span> <span class="ex-tag warm">warm-up</span>
+Why is a point <em>miss</em>, not a point hit, the LSM read that a Bloom filter most helps?</div>
+
+<div class="exercise" id="ex55.4"><span class="ex-label">55.4</span> <span class="ex-tag core">core</span>
+The one-sided error. (a) Explain why a test that finds any of a key's <var>k</var> bits zero proves the key was never inserted. (b) Explain why all-ones
+does <em>not</em> prove the key is present. (c) Argue why this asymmetry is exactly what makes a filter safe to place in front of an authoritative store,
+and what would go wrong if it could produce a false negative.</div>
+
+<div class="exercise" id="ex55.5"><span class="ex-label">55.5</span> <span class="ex-tag core">core</span>
+The formula. (a) State the false-positive-rate formula <var>p</var> as a function of <var>k</var>, <var>n</var>, and <var>m</var>. (b) The model measured
+0.88% at 10&nbsp;bits per key with <var>k</var>=7 against a predicted 0.82%; explain why the two differ slightly and why that is not a modelling error.
+(c) Explain why raising bits per key cuts the error by a roughly constant <em>factor</em> rather than a constant amount.</div>
+
+<div class="exercise" id="ex55.6"><span class="ex-label">55.6</span> <span class="ex-tag core">core</span>
+Sizing. (a) State the optimal-<var>k</var> rule and the bits-per-element rule for a target <var>p</var>. (b) From the design table, how many bits per key
+buy a 1% false-positive rate, and roughly how much memory is that for a billion-key store? (c) Explain why the bits-per-key budget does not grow with the
+number of keys.</div>
+
+<div class="exercise" id="ex55.7"><span class="ex-label">55.7</span> <span class="ex-tag complexity">cost</span>
+Read amplification. Using the LSM model (a true miss probes ~<var>L</var>&times;<var>p</var> runs): (a) for a ten-run tree, how many runs does a miss
+probe with no filter, with a 1% filter, and with a 0.1% filter? (b) A workload is 90% existence-check misses; explain, in one or two sentences, how much
+of the miss read work a 1% filter removes. (c) Why does the filter do nothing to speed up a range scan over the same ten runs?</div>
+
+<div class="exercise" id="ex55.8"><span class="ex-label">55.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team adds a Bloom filter to each SSTable and, to &ldquo;save a read,&rdquo; changes the lookup to return
+&ldquo;key exists&rdquo; whenever the filter says &ldquo;possibly present,&rdquo; without opening the run.
+<br><strong>Step 1 (given):</strong> the filter has a 1% false-positive rate, so 1% of absent-key lookups get a &ldquo;possibly present.&rdquo;
+<br><strong>Step 2 (given):</strong> those lookups now return &ldquo;key exists&rdquo; and, for a value, whatever the caller defaults to.
+<br><strong>Step 3 (given):</strong> occasionally the system reports a value for a key that was never written.
+<br><strong>Step 4 (you):</strong> Name the class of bug this is (performance or correctness), explain which Bloom filter promise was misused, and give
+the one-line rule that would have prevented it.</div>
+
+<div class="exercise" id="ex55.9"><span class="ex-label">55.9</span> <span class="ex-tag mixed">mixed</span>
+For each, name the responsible concept — <em>false positive</em>, <em>false negative</em>, <em>optimal k</em>, <em>bits per element</em>, or
+<em>range scan</em> — and why: (a) the mistake a Bloom filter can never make; (b) the wasted run probe a filter occasionally allows; (c) the quantity fixed
+by the memory budget that minimizes the error; (d) the read a Bloom filter cannot accelerate; (e) the fixed per-key cost that sets the target error rate.</div>
+
+<div class="exercise" id="ex55.10"><span class="ex-label">55.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A Bloom filter can confirm that a key is present.&rdquo; (b)
+&ldquo;A Bloom filter never produces a false negative.&rdquo; (c) &ldquo;Doubling the bits per element roughly halves the false-positive rate.&rdquo;
+(d) &ldquo;You can delete a key from a standard Bloom filter by clearing its bits.&rdquo; (e) &ldquo;A Bloom filter lets an LSM range scan skip runs.&rdquo;</div>
+
+<div class="exercise" id="ex55.11"><span class="ex-label">55.11</span> <span class="ex-tag stretch">stretch</span>
+The whole read path. (a) Trace an LSM point miss on key <var>x</var> in a ten-run tree with 1% filters: what happens at each run, and how many device
+accesses in expectation? (b) Explain why, with filters, an LSM-tree's point-read amplification is near a B-tree's while its range-scan amplification is
+not. (c) Summarize the Monkey insight: why does spending the same total filter memory <em>unevenly</em> across levels beat spending it evenly, and what
+quantity does it minimize?</div>
+
+<div class="exercise" id="ex55.12"><span class="ex-label">55.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (any language): (a) Implement a Bloom filter (a bit array with <var>k</var> hash indices; double hashing is fine), insert
+<var>n</var> keys, probe <var>n</var> absent keys, and report the empirical false-positive rate at several bits-per-element budgets. (b) For each budget,
+compute the closed-form (1&nbsp;&minus;&nbsp;e^(&minus;kn/m))^k with the optimal <var>k</var> and lay it beside your measurement. (c) State your toolchain
+and explain why the false-positive rate is a hardware-independent property of <var>k</var>, <var>m</var>, and <var>n</var> — a structural rate, not a
+wall-clock timing — and why your empirical numbers differ from the formula only by sampling noise.</div>
+
+</section>
+</section>

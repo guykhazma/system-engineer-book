@@ -1,0 +1,108 @@
+<section class="solutions" id="sol44">
+<h1>Chapter 44 — Solutions</h1>
+
+<div class="solution" id="sol44.1"><span class="sol-label">44.1</span>
+Readiness asks &ldquo;which descriptors can I operate on without blocking?&rdquo; (and then you do the operation yourself); completion asks
+&ldquo;perform this operation and tell me when it is finished.&rdquo; <em>Tempting wrong answer:</em> &ldquo;they ask the same thing, one is
+just faster&rdquo; — they ask fundamentally different questions, which is why completion works for disk and readiness does not.
+<strong>Feed-forward:</strong> &sect;44.1.</div>
+
+<div class="solution" id="sol44.2"><span class="sol-label">44.2</span>
+The <strong>submission queue</strong> (SQEs) — the application writes it, the kernel reads it — and the <strong>completion queue</strong>
+(CQEs) — the kernel writes it, the application reads it. <em>Tempting wrong answer:</em> &ldquo;both are written by the kernel&rdquo; — the
+application fills submissions; that is the point of the shared submission ring. <strong>Feed-forward:</strong> &sect;44.2.</div>
+
+<div class="solution" id="sol44.3"><span class="sol-label">44.3</span>
+<strong>One</strong> <code>io_uring_enter</code> submits all 200 and waits for their completions, versus <strong>200</strong> separate
+<code>pread</code> system calls — a 200&times; reduction in kernel crossings. <em>Tempting wrong answer:</em> &ldquo;one
+<code>io_uring_enter</code> per operation&rdquo; — the whole design batches the boundary; one call handles the batch.
+<strong>Feed-forward:</strong> &sect;44.2&ndash;&sect;44.3.</div>
+
+<div class="solution" id="sol44.4"><span class="sol-label">44.4</span>
+(a) <code>epoll_wait</code> only tells you a descriptor is ready; you must still cross the boundary to do the <code>read</code>/<code>write</code>
+— so each handled operation is at least one more syscall. (b) A regular file is always &ldquo;ready&rdquo; (you can always attempt the read),
+but the attempt still blocks on the device on a cache miss, and there is no event meaning &ldquo;this read will not block,&rdquo; so
+<code>epoll</code> has nothing to watch for a file. (c) &ldquo;Tell me when it is done&rdquo; is meaningful for any operation — the kernel
+performs it and reports completion whether the wait was for socket data or a disk seek — whereas &ldquo;which are ready&rdquo; needs an
+observable ready state that disk files do not have. <em>Tempting wrong answer:</em> &ldquo;use non-blocking mode on the file&rdquo; —
+<code>O_NONBLOCK</code> does not make ordinary file reads non-blocking on a cache miss. <strong>Feed-forward:</strong> &sect;44.1.</div>
+
+<div class="solution" id="sol44.5"><span class="sol-label">44.5</span>
+(a) An SQE holds an opcode (e.g. <code>IORING_OP_READ</code>), a descriptor, a buffer address, a length, an offset, and a 64-bit
+<code>user_data</code>; a CQE holds the result <code>res</code> (byte count or negative error) and the echoed <code>user_data</code>.
+<code>user_data</code> lets you match a completion to the request that produced it. (b) Fill three SQEs, advance the submission ring tail, call
+<code>io_uring_enter</code> once to submit and wait; then read three CQEs from the completion ring, using each <code>user_data</code> to find
+its request, and advance the completion head. (c) <code>SQPOLL</code> has a kernel thread poll the submission ring, so the application submits
+by writing shared memory with <em>no</em> system call at all — removing even the per-batch <code>io_uring_enter</code>. <em>Tempting wrong
+answer:</em> &ldquo;<code>user_data</code> is required by the kernel to route the I/O&rdquo; — it is opaque to the kernel and purely for the
+application's own matching. <strong>Feed-forward:</strong> &sect;44.2.</div>
+
+<div class="solution" id="sol44.6"><span class="sol-label">44.6</span>
+(a) Because each <code>io_uring_enter</code> submitted and reaped a batch of 256 operations, so 65,536/256 = 256 calls covered all of them. (b)
+The reads hit the page cache, so each one is a 4&nbsp;KiB in-kernel copy; that copy done 65,536 times dominates the total and dwarfs the
+few-hundred-nanosecond boundary cost that batching removed — so cutting the crossings barely moved the clock. (c) Real wins: (i) huge numbers
+of tiny operations (high-IOPS storage, packet processing) where the syscall boundary <em>is</em> the dominant cost; (ii) genuine device I/O,
+where the dominant cost is milliseconds of device latency the kernel absorbs on its own threads while yours submits more work and never blocks.
+<em>Tempting wrong answer:</em> &ldquo;the measurement was flawed; io_uring must be faster&rdquo; — the measurement is correct and instructive:
+batching helps only in proportion to the boundary's share of the cost. <strong>Feed-forward:</strong> &sect;44.3.</div>
+
+<div class="solution" id="sol44.7"><span class="sol-label">44.7</span>
+(a) Ratio = <var>N</var>(<var>b</var>+<var>w</var>) / (<var>N</var><var>w</var> + (<var>N</var>/<var>k</var>)<var>b</var>) =
+(<var>b</var>+<var>w</var>) / (<var>w</var> + <var>b</var>/<var>k</var>). (b) Large when <var>b</var> is much greater than <var>w</var> (boundary dominates): the
+ratio approaches <var>b</var>/(<var>b</var>/<var>k</var>) = <var>k</var>; near 1 when <var>w</var> is much greater than <var>b</var> (work
+dominates), since both numerator and denominator are &asymp; <var>w</var>. (c) Cache-hot reads have <var>w</var> = a 4&nbsp;KiB copy (hundreds
+of ns to microseconds), well above <var>b</var> (a few hundred ns), so the ratio is near 1 — exactly the measured break-even; a real device makes <var>w</var> include
+milliseconds of latency, but that latency is absorbed by the kernel asynchronously rather than blocking your thread, so the relevant comparison
+becomes throughput/concurrency, not this per-op ratio, and completion wins decisively. <em>Tempting wrong answer:</em> &ldquo;bigger <var>k</var>
+always helps a lot&rdquo; — <var>k</var> only helps to the extent <var>b</var> matters; when <var>w</var> dominates, <var>k</var> is nearly
+irrelevant. <strong>Feed-forward:</strong> &sect;44.3.</div>
+
+<div class="solution" id="sol44.8"><span class="sol-label">44.8</span>
+<strong>Step 4:</strong> The SQE points at a stack buffer whose lifetime ends when the function returns, but the kernel writes the read data
+into that buffer only when the operation completes — after the function has returned and the stack frame (and its buffer) has been reused by
+other calls, so the read lands in memory now holding something else, corrupting it. It is intermittent and passes tests because under light
+load the completion comes back before the frame is reused (the data lands correctly by luck); only when load or a slow device delays the
+completion past the frame's reuse does it corrupt. Fix: give the buffer a lifetime tied to the completion, not the call — allocate it in
+per-request state kept alive until the CQE arrives (found via <code>user_data</code>), or use a registered buffer, and free/reuse it only after
+reaping the completion. <em>Tempting wrong answer:</em> &ldquo;add a small delay before returning&rdquo; — that masks the race under some
+timings and still corrupts under others; the buffer must genuinely outlive the operation. <strong>Feed-forward:</strong> &sect;44.4.</div>
+
+<div class="solution" id="sol44.9"><span class="sol-label">44.9</span>
+(a) <strong>Wrong</strong> — <code>io_uring_enter</code> returning means the batch was submitted (and possibly some completed if you waited), not
+that a given read is done; you know a read is done only when its CQE appears. (b) <strong>Wrong</strong> — completions arrive in finish order,
+not submission order; you must use <code>user_data</code> to match. (c) <strong>Correct</strong> — completion notification makes disk reads
+asynchronous, which readiness cannot. (d) <strong>Correct</strong> — one <code>io_uring_enter</code> can submit a whole batch. (e)
+<strong>Wrong</strong> — batching wins only when the boundary is a large share of the cost; on cache-hot data it was break-even. <em>Tempting
+wrong answer:</em> marking (e) correct from the &ldquo;fewer syscalls&rdquo; intuition — fewer syscalls is not fewer wall-clock ms unless the
+syscall was the bottleneck. <strong>Feed-forward:</strong> &sect;44.3&ndash;&sect;44.4.</div>
+
+<div class="solution" id="sol44.10"><span class="sol-label">44.10</span>
+(a) <strong>False</strong> — a regular file has no such readiness event; a cache-miss read blocks regardless. (b) <strong>True</strong> — the
+SQE's <code>user_data</code> is echoed in its CQE. (c) <strong>True</strong> — the buffer must stay valid until completion. (d)
+<strong>False</strong> — the rings are shared into the application's address space via <code>mmap</code>; both sides see them, which is what
+makes the boundary cheap. (e) <strong>True</strong> — batching 256 at a time turned 65,536 reads into 256 crossings. <em>Tempting wrong
+answer:</em> marking (d) true from &ldquo;the kernel owns I/O&rdquo; — the shared-memory rings are precisely how io_uring avoids per-op copying
+and syscalls. <strong>Feed-forward:</strong> &sect;44.2&ndash;&sect;44.4.</div>
+
+<div class="solution" id="sol44.11"><span class="sol-label">44.11</span>
+(a) Chapter 40's blocking <code>read</code> pays one boundary crossing and blocks the thread; Chapter 42's <code>epoll</code> removes the
+thread-per-wait but still pays a crossing per operation and cannot help disk; <code>io_uring</code> removes the per-operation crossing
+(batching) and makes disk truly asynchronous (completion), leaving the per-operation <em>work</em> (the copy, the device latency) as what
+remains — and the next chapter removes the copy. (b) The break-even result teaches the part's core discipline directly: a technique only helps
+in proportion to the cost it removes as a fraction of the total, so measuring reveals that batching the boundary is worthless when the copy
+dominates — a speed-up would have hidden that lesson behind a happy number. (c) Power-for-explicitness recurs throughout: manual memory
+management (Chapter 9) buys control at the cost of tracking lifetimes yourself; lock-free code (Chapter 23) buys scalability at the cost of
+reasoning about the memory model by hand; here completion buys async unification at the cost of managing buffer lifetime across the submit-complete
+gap. <em>Tempting wrong answer:</em> &ldquo;io_uring makes the earlier models obsolete&rdquo; — readiness is still right for sockets and
+simpler code; io_uring is the tool when the boundary or device concurrency is the bottleneck. <strong>Feed-forward:</strong> &sect;44.1&ndash;&sect;44.5.</div>
+
+<div class="solution" id="sol44.12"><span class="sol-label">44.12</span>
+Open-ended and platform-specific. A correct write-up: (a) submits an <code>IORING_OP_NOP</code> and reaps its CQE, confirming the ring setup
+and enter/reap loop work; (b) reports the synchronous loop crossing the kernel once per read and <code>io_uring</code> crossing once per batch
+(far fewer), with wall-clock times close on cache-hit data because the per-read copy dominates; (c) states kernel version, toolchain, and CPU,
+flags wall-clock timing without hardware counters, and notes that for uncached device reads the kernel absorbs the latency asynchronously so a
+single thread keeps many operations in flight — the regime where completion wins. <em>Tempting wrong answer:</em> &ldquo;conclude io_uring is
+slower because wall-clock was break-even&rdquo; — the measured win is in kernel crossings and in device-I/O concurrency, not in cache-hot
+throughput. <strong>Feed-forward:</strong> &sect;44.3&ndash;&sect;44.4.</div>
+
+</section>

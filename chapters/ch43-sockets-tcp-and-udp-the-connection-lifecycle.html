@@ -1,0 +1,384 @@
+<section class="chapter" id="ch43">
+<h1>Chapter 43 — Sockets, TCP, and UDP: The Connection Lifecycle</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch42">Chapter 42</a> (the event loop that watches many connections, and the
+blocking-versus-readiness choice), <a href="#ch40">Chapter 40</a> (the I/O syscalls and buffering), <a href="#ch13">Chapter 13</a> (the cost of
+a system call), <a href="#ch16">Chapter 16</a> (what a blocked thread does). &nbsp;·&nbsp; The last chapter watched thousands of descriptors
+without asking what they were. Here they get a name: a <strong>socket</strong> is the descriptor that connects a program to the network, and
+this chapter is how one is opened, connected, and fed bytes — and what the two transport protocols underneath, TCP and UDP, promise and refuse.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch40">Chapter 40</a> — a <code>read</code> returns however many bytes are available <em>now</em>, not a fixed
+record; what does that imply for data that arrives in pieces? (2) <a href="#ch13">Chapter 13</a> and <a href="#ch42">Chapter 42</a> — a system
+call that must enter the kernel costs a few hundred nanoseconds; keep that number in mind. (3) <em>Predict:</em> a client sends a 40-byte
+request as two small <code>write</code> calls and then waits for the reply; the server reads the whole request, then answers. On a plain TCP
+connection the round trip takes tens of milliseconds; flip one socket option and it drops to under a tenth of a millisecond. Two questions:
+what could make a localhost round trip take <em>40&nbsp;ms</em> when the network latency is microseconds? And what one option removes it? Write
+your guesses; &sect;43.4 answers them.</p>
+</aside>
+
+<p>Every network program is built from the same object: a <strong>socket</strong>, a file descriptor (Chapter 40) that instead of naming a
+file names an endpoint of a communication channel. Because it is a descriptor, everything the I/O chapters taught applies unchanged —
+<code>read</code>, <code>write</code>, <code>close</code>, <code>O_NONBLOCK</code>, and the <code>epoll</code> of Chapter 42 all work on
+sockets exactly as on files — which is the whole point of the design: the network is just another I/O device behind the descriptor
+abstraction. What is new is how a socket is <em>set up</em> (a file you just <code>open</code>; a connection must be negotiated between two
+machines), and what the transport protocol underneath guarantees about the bytes that flow through it. This chapter builds that in five steps:
+the socket API and the connection lifecycle, server and client (&sect;43.1); TCP as a reliable, ordered byte stream — and why it has no message
+boundaries (&sect;43.2); UDP as datagrams that keep boundaries but drop every other promise (&sect;43.3); the small-write stall where Nagle's
+algorithm and delayed acknowledgements collide, measured (&sect;43.4); and what to carry forward (&sect;43.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 20 hardware threads), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as the minimum of several trials
+(Chapter 33). Times are wall-clock; a hardware-counter profiler (<code>perf</code>) is <em>not</em> installed here. The client and server run
+as two threads in one process talking over the <strong>loopback</strong> interface (<code>127.0.0.1</code>), so there is no real network
+latency — which makes the &sect;43.4 result striking: the tens of milliseconds measured there are not the wire, they are a protocol timer
+firing, and they reproduce on localhost precisely because the wire is not the cause. Every socket call and flag below was checked against the
+Linux man pages (<code>socket(2)</code>, <code>bind(2)</code>, <code>listen(2)</code>, <code>accept(2)</code>, <code>connect(2)</code>,
+<code>send(2)</code>, <code>setsockopt(2)</code>, <code>tcp(7)</code>) on this machine.</p>
+
+<h2>43.1 The socket API and the connection lifecycle</h2>
+
+<p>A socket is created with <code>socket(domain, type, protocol)</code>, which returns a descriptor. The <em>domain</em> selects the address
+family (<code>AF_INET</code> for IPv4, <code>AF_INET6</code> for IPv6); the <em>type</em> selects the transport semantics —
+<code>SOCK_STREAM</code> for a TCP byte stream, <code>SOCK_DGRAM</code> for UDP datagrams. From there the server and client follow different
+sequences. A <strong>server</strong> runs four calls: <code>bind</code> attaches the socket to a local address and port so clients can find it;
+<code>listen</code> marks it passive and gives it a queue of pending connections (the <em>backlog</em>); and <code>accept</code> blocks until a
+client connects, then returns a <em>new</em> descriptor for that one connection — the listening socket stays open to accept the next, while the
+returned socket carries this client's bytes. A <strong>client</strong> runs one: <code>connect</code> to the server's address, which does not
+return until the connection is established (or fails). Establishing it is TCP's <strong>three-way handshake</strong> (RFC 793): the client
+sends a <code>SYN</code> (synchronise) segment, the server replies <code>SYN</code>+<code>ACK</code>, the client replies <code>ACK</code>, and
+now both sides agree on starting sequence numbers and the channel is open — one full round trip of latency spent before a single byte of data
+moves, which is why connection setup is a cost you pay per connection and why long-lived or pooled connections matter. Once open, both sides
+call <code>read</code>/<code>recv</code> and <code>write</code>/<code>send</code> on their connected socket exactly as on a pipe. Closing is
+also negotiated: <code>close</code> starts a <code>FIN</code>/<code>ACK</code> exchange, and the side that closes first (the <em>active</em>
+close) leaves its socket in the <strong>TIME_WAIT</strong> state for twice the maximum segment lifetime, holding the port so that stray delayed
+segments from the old connection cannot be mistaken for a new one — the reason a just-killed server sometimes cannot immediately rebind its
+port without <code>SO_REUSEADDR</code>. The lifecycle, then, is: create, (server) bind/listen/accept or (client) connect, exchange bytes,
+close — and every step but the byte exchange is machinery TCP runs to turn two unreliable hosts into one reliable pipe.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the four calls a TCP server makes before it can exchange bytes, and the one a client makes. What does <code>accept</code> return, and
+why is it a <em>different</em> descriptor from the listening socket? (Answer after the next section.)</p>
+</aside>
+
+<h2>43.2 TCP: a reliable, ordered byte stream — with no message boundaries</h2>
+
+<p>TCP (RFC 793) takes two hosts connected by a network that can lose, reorder, duplicate, and delay packets, and presents the application a
+channel that behaves as if none of that happened: a <strong>reliable, ordered stream of bytes</strong>. It achieves this with machinery the
+application never sees. Every byte is numbered by a <strong>sequence number</strong>; the receiver returns <strong>acknowledgements</strong>
+for bytes received, and the sender <strong>retransmits</strong> anything not acknowledged within a timeout — that is the reliability. The
+receiver uses the sequence numbers to deliver bytes in order even if packets arrive out of order — that is the ordering. A <strong>sliding
+window</strong> advertised by the receiver bounds how much unacknowledged data the sender may have outstanding, so a fast sender cannot
+overrun a slow receiver — that is <strong>flow control</strong> — and a separate <strong>congestion-control</strong> algorithm slows the
+sender when the network itself is loaded, the problem RFC 896 was written to solve. All of this is why TCP is the default: you get a pipe that
+just works. But the abstraction has one edge that trips nearly every beginner, and it follows directly from &ldquo;stream of bytes&rdquo;:
+<strong>TCP does not preserve message boundaries.</strong> If the sender makes three <code>write</code> calls of 100 bytes, the receiver may
+get all 300 in a single <code>read</code>, or 60 then 240, or one byte at a time — TCP guarantees the bytes arrive in order, not that they
+arrive grouped the way they were sent. The transport is free to coalesce small writes into one segment (indeed Nagle's algorithm, &sect;43.4,
+tries to) and to split large ones across segments, and a <code>read</code> returns whatever bytes have arrived at that instant (Chapter 40),
+which need not align with any <code>write</code>. The consequence is a rule: <strong>if your protocol has messages, you must frame them
+yourself</strong> — prefix each with a length, or use a delimiter, and loop <code>read</code> until a whole message is assembled. Assuming
+&ldquo;one <code>send</code>, one <code>recv</code>&rdquo; is the most common networking bug there is; it appears to work in testing (small
+messages on a fast link usually do arrive in one piece) and fails in production under load or across a real network, which is the same
+common-case-testing trap that runs through this whole part.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A sender issues three 100-byte <code>write</code> calls on a TCP socket. How many bytes might a single <code>read</code> on the other end
+return, and why does TCP not promise you get them in three pieces of 100? What must a protocol with real messages do about it? (Answer below
+the communicate box.)</p>
+</aside>
+
+<h2>43.3 UDP: datagrams without the promises</h2>
+
+<p>UDP (RFC 768) is the other transport, and it is almost the complement of TCP: it keeps the one guarantee TCP drops and drops every
+guarantee TCP keeps. UDP is <strong>connectionless</strong> — there is no handshake; you create a <code>SOCK_DGRAM</code> socket and
+<code>sendto</code> a datagram to an address, and it is sent — and it is <strong>message-oriented</strong>: each <code>sendto</code> is one
+datagram, and the receiver's <code>recvfrom</code> returns exactly one datagram per call, boundaries preserved. What you give up is everything
+TCP's machinery provided: UDP does <strong>not</strong> guarantee delivery (a lost datagram is simply gone — no retransmission), does
+<strong>not</strong> guarantee ordering (datagrams can arrive in any order), does <strong>not</strong> provide flow or congestion control
+(send too fast and you overrun the receiver or the network, and nothing slows you down), and offers only a weak optional checksum. Its header
+is a mere 8 bytes against TCP's 20-byte minimum, and it costs no setup round trip. So UDP is the right tool exactly when TCP's guarantees are
+either unneeded or actively in the way: DNS queries (one small request, one small reply — a whole TCP handshake would cost more than the
+query); real-time audio and video and games (a late packet is worse than a lost one, so TCP's retransmit-and-deliver-in-order would <em>add</em>
+harmful latency — you would rather skip the lost frame); and modern protocols such as QUIC that build their own reliability, ordering, and
+congestion control on top of UDP because they want control TCP's fixed implementation does not give. The trade is explicit and total: with UDP
+you get boundaries, low overhead, and no waiting, and in exchange you either do not need reliability and ordering, or you build exactly the
+version of them you want. Choosing between them is therefore not about speed in the abstract but about which guarantees your application needs
+and which it would rather implement or skip.</p>
+
+<aside class="threeways">
+<span class="box-title">The same choice three ways: TCP gives you the guarantees; UDP gives you the boundaries and the control</span>
+<p><strong>1. In words.</strong> TCP turns an unreliable network into a reliable, ordered byte stream — at the cost of a setup round trip,
+per-byte sequencing and acknowledgement, retransmission delay, and no message boundaries. UDP hands you the raw datagram: message boundaries
+preserved, no setup, minimal header — and no delivery, ordering, flow, or congestion guarantee at all. TCP when you want a pipe that just
+works; UDP when you need boundaries and low latency and will supply (or skip) reliability yourself.</p>
+<p><strong>2. As a picture.</strong> Figure 43.1: on the left, the TCP three-way handshake (SYN, SYN-ACK, ACK) then a numbered byte stream
+where three writes coalesce into whatever segments the transport chooses; on the right, UDP, where each <code>sendto</code> is one datagram
+delivered whole or not at all, in any order, with no handshake.</p>
+<p><strong>3. As numbers/contrast.</strong> TCP header minimum 20 bytes and one RTT of handshake before any data; UDP header 8 bytes and zero
+setup. And the guarantee has a price measured in &sect;43.4: a small-write request/response on default TCP can stall <strong>~40&nbsp;ms</strong>
+per round on the interaction of Nagle's algorithm with delayed acknowledgements — versus <strong>~0.09&nbsp;ms</strong> with
+<code>TCP_NODELAY</code> — an artifact of TCP's machinery that UDP, having no such machinery, cannot produce.</p>
+</aside>
+
+<p><em>(Answer to the &sect;43.1 quick check: a TCP server calls <code>socket</code>, <code>bind</code>, <code>listen</code>, and
+<code>accept</code>; a client calls <code>socket</code> then <code>connect</code>. <code>accept</code> returns a <strong>new</strong>
+descriptor dedicated to the one accepted connection, while the original listening socket stays open to accept further clients — so a server
+holds one listening socket plus one connected socket per client, which is exactly the set of descriptors the Chapter 42 event loop watches.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 320" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">TCP: negotiated connection, ordered byte stream (no message boundaries). UDP: fire-and-forget datagrams.</text>
+<text x="12" y="38" font-size="9" fill="#2f7d32">TCP three-way handshake, then a byte stream</text>
+<text x="40" y="56" font-size="8">client</text><text x="250" y="56" font-size="8">server</text>
+<line x1="60" y1="60" x2="60" y2="230" stroke="#333"/><line x1="270" y1="60" x2="270" y2="230" stroke="#333"/>
+<line x1="60" y1="70" x2="270" y2="86" stroke="#2f7d32"/><text x="90" y="72" font-size="7" fill="#2f7d32">SYN</text>
+<line x1="270" y1="96" x2="60" y2="112" stroke="#2f7d32"/><text x="150" y="112" font-size="7" fill="#2f7d32">SYN + ACK</text>
+<line x1="60" y1="122" x2="270" y2="138" stroke="#2f7d32"/><text x="90" y="124" font-size="7" fill="#2f7d32">ACK  (handshake: 1 RTT)</text>
+<line x1="60" y1="158" x2="270" y2="170" stroke="#14406b" stroke-width="1.5"/><text x="70" y="156" font-size="7" fill="#14406b">write 100 + write 100 + write 100</text>
+<text x="150" y="188" font-size="7" fill="#8c3a1d">one read() may return 300, or 60 then 240 &mdash; no boundaries</text>
+<line x1="60" y1="200" x2="270" y2="212" stroke="#333" stroke-dasharray="2,2"/><text x="80" y="200" font-size="7">FIN / ACK &rarr; TIME_WAIT</text>
+<line x1="330" y1="60" x2="330" y2="230" stroke="#b9c2cc"/>
+<text x="350" y="38" font-size="9" fill="#8c3a1d">UDP: no handshake, message boundaries kept</text>
+<text x="360" y="56" font-size="8">client</text><text x="560" y="56" font-size="8">server</text>
+<line x1="380" y1="60" x2="380" y2="230" stroke="#333"/><line x1="580" y1="60" x2="580" y2="230" stroke="#333"/>
+<line x1="380" y1="80" x2="580" y2="92" stroke="#8c3a1d"/><text x="400" y="80" font-size="7" fill="#8c3a1d">sendto(dgram A) &rarr; recvfrom = A</text>
+<line x1="380" y1="108" x2="580" y2="120" stroke="#8c3a1d"/><text x="400" y="108" font-size="7" fill="#8c3a1d">sendto(dgram B)</text>
+<line x1="380" y1="136" x2="520" y2="150" stroke="#c0392b" stroke-dasharray="3,2"/><text x="400" y="136" font-size="7" fill="#c0392b">sendto(dgram C) &mdash; lost, no retransmit</text>
+<text x="360" y="176" font-size="7" fill="#8c3a1d">each datagram whole or absent; order not guaranteed</text>
+<text x="12" y="252" font-size="8" fill="#14406b">TCP header min 20 bytes + 1 RTT setup; UDP header 8 bytes + 0 setup. TCP: reliable/ordered/flow-controlled. UDP: none of those.</text>
+<text x="12" y="272" font-size="8" fill="#8c3a1d">Framing rule: on TCP, prefix each message with a length and loop read() until a whole message is assembled &mdash; the stream has no seams.</text>
+<text x="12" y="298" font-size="8" fill="#2f7d32">Same descriptor abstraction as files (Ch 40): read/write/close/epoll all work unchanged once the socket is connected.</text>
+</svg>
+<figcaption>Figure 43.1: TCP (left) negotiates a connection with a three-way handshake, then delivers a reliable ordered byte stream in which
+message boundaries are <em>not</em> preserved — you must frame messages yourself. UDP (right) sends independent datagrams with boundaries
+intact but no delivery, ordering, or congestion guarantee. TCP costs a setup RTT and a 20-byte header; UDP costs nothing to set up and an
+8-byte header.</figcaption>
+</figure>
+
+<h2>43.4 Small writes, Nagle's algorithm, and the delayed-ACK stall</h2>
+
+<p>TCP's default configuration hides a latency trap that is invisible until it is catastrophic, and it is worth building precisely because it
+teaches how two independent optimisations can collide. <strong>Nagle's algorithm</strong> (RFC 896) reduces the number of tiny packets on the
+wire: when an application writes a small chunk, TCP will <em>hold</em> it rather than send a nearly-empty segment, waiting either until enough
+data accumulates to fill a segment or until all previously sent data has been acknowledged — the goal being to coalesce a flurry of small
+writes into fewer, fuller packets, which is good for the network. Independently, TCP's receiver uses <strong>delayed
+acknowledgements</strong> (RFC 1122): rather than send a bare ACK for every segment, it waits briefly (up to a fixed timer — about
+40&nbsp;ms on Linux) hoping to piggyback the ACK on a data segment it is about to send back, or to acknowledge two segments at once — which
+also reduces packet count. Each optimisation is sensible alone. Together, on a request/response pattern with small writes, they deadlock into a
+timer: the client writes a request in pieces; Nagle holds the second piece because the first is not yet acknowledged; the server cannot
+acknowledge yet because delayed-ACK is waiting to piggyback the ACK on the response — but the server has no response to send because it has not
+received the whole request, which is stuck in the client's Nagle buffer. Nothing moves until the delayed-ACK timer expires (~40&nbsp;ms),
+forcing the ACK, which releases Nagle, which sends the rest. Every round trip pays that timer. Measured here on loopback, with a client sending
+a 40-byte request as two small writes and waiting for a one-byte reply:</p>
+
+<pre><code>write-write-read round trip on loopback, mean per round (min of several trials):
+  Nagle ON  (TCP default)   :   ~43,800 us/round   (43.8 ms  &mdash; the delayed-ACK timer)
+  TCP_NODELAY (Nagle off)   :       ~90 us/round
+  ratio: ~488x
+</code></pre>
+
+<p>The number is unambiguous: the default connection spends about <strong>43.8&nbsp;ms</strong> per round trip, essentially all of it the
+~40&nbsp;ms delayed-ACK timer firing, while the same code with Nagle disabled runs in <strong>~90&nbsp;&micro;s</strong> — a ratio near
+<strong>500&times;</strong>, on a loopback link with no real latency at all. The fix is one socket option: <code>setsockopt(fd, IPPROTO_TCP,
+TCP_NODELAY, &amp;one, sizeof one)</code> disables Nagle's algorithm on that socket, so small writes are sent immediately. The lesson is not
+&ldquo;always set <code>TCP_NODELAY</code>&rdquo; as a superstition; it is to understand the interaction. For latency-sensitive
+request/response protocols (RPC, databases, interactive services) with small messages, <code>TCP_NODELAY</code> is almost always correct,
+because you care about round-trip latency far more than about saving a few packets. For bulk transfer where you write large buffers, Nagle
+never engages (your segments are already full) and disabling it changes nothing. The deeper fix, when you control the write pattern, is to
+avoid many small writes in the first place — assemble the whole request in one buffer and issue one <code>write</code> — which sidesteps the
+interaction regardless of the option. What you must never do is ship a request/response protocol without knowing which of these you did, and
+then wonder why every call takes 40&nbsp;ms.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the 40-millisecond RPC &mdash; Nagle's algorithm meets delayed ACK</span>
+<p>A request/response protocol that writes its request in more than one small <code>write</code> and then blocks for the reply can stall for
+the delayed-ACK timer (~40&nbsp;ms on Linux) on <em>every single call</em>, on the fastest possible link, because Nagle is holding the client's
+last small segment until the server acknowledges the first, and the server's delayed-ACK is holding that acknowledgement waiting for a response
+the server cannot produce until it has the whole request. The trap is that it is invisible in the obvious tests: a single small message often
+fits in one segment and never triggers the hold, and throughput benchmarks that stream large buffers never engage Nagle at all, so the bug
+surfaces only as a suspiciously round <strong>40&nbsp;ms</strong> (or a small multiple) added to interactive latency in production — a number so
+specific it is a fingerprint. The tell is exactly that: per-request latencies clustered near 40&nbsp;ms with the CPU idle and the network
+unloaded means a timer, not work, is the cost. Two fixes, in order of preference. First, do not split a logical message across several small
+writes — build it in one buffer and write once, which never triggers Nagle regardless of the option. Second, for small-message
+request/response protocols, set <code>TCP_NODELAY</code> to disable Nagle on the socket. Do <em>not</em> reach for <code>TCP_NODELAY</code>
+reflexively on bulk-transfer sockets, where Nagle does no harm and coalescing helps; and understand that the real defect is a chatty write
+pattern colliding with two reasonable protocol optimisations, not either optimisation being wrong. Diagnosing a fixed-latency stall as a timer
+rather than as slow code is the systems-level move here.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate reports: &ldquo;Our new internal RPC service is weirdly slow — every call takes about 40&nbsp;ms even
+though the servers are in the same rack and CPU is near zero. Under load throughput is fine, it is just that each individual call is slow.
+Maybe the network is bad?&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;43.2 and &sect;43.4.</p>
+<p><em>Model answer.</em> &ldquo;A flat ~40&nbsp;ms with idle CPU and an unloaded network is not a slow network — it is a timer, and the
+classic one is TCP's delayed-ACK interacting with Nagle's algorithm. If the client writes its request in more than one small <code>write</code>
+and then waits for the reply, Nagle holds the last piece until the first is acknowledged, and the server's delayed-ACK holds that
+acknowledgement for ~40&nbsp;ms because it has no reply to piggyback it on yet — so every call eats the delayed-ACK timer, which is exactly the
+40&nbsp;ms you are seeing. Throughput looks fine because under load the pipeline stays full and the timer overlaps other work; it is the
+isolated round-trip latency that shows it. The clean fix is to build each request in one buffer and issue a single <code>write</code> so Nagle
+never engages; if the write pattern is hard to change, set <code>TCP_NODELAY</code> on the socket to disable Nagle for this small-message
+protocol. Let me confirm with a capture that the request is going out in two segments — that will nail it in a minute.&rdquo; Naming the
+timer, explaining the Nagle/delayed-ACK collision, and reaching first for the one-write fix rather than a reflexive option flip is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;43.2 quick check: a single <code>read</code> after three 100-byte writes might return anywhere from 1 to 300
+bytes — all 300 at once, 60 then 240, one byte at a time, any split. TCP guarantees only that the bytes arrive <strong>in order and
+complete</strong>, not that they arrive grouped as they were written, because TCP is a byte stream and the transport freely coalesces and
+splits writes into whatever segments it chooses. A protocol with real messages must therefore <strong>frame</strong> them itself — length
+prefix or delimiter — and loop <code>read</code> until a whole message has been assembled.)</em></p>
+
+<h2>43.5 What to carry forward</h2>
+
+<p>A <strong>socket</strong> is a descriptor that names a network endpoint, so once connected it obeys every I/O lesson of this part —
+<code>read</code>, <code>write</code>, <code>close</code>, <code>O_NONBLOCK</code>, and <code>epoll</code> (Chapter 42) all apply unchanged;
+what is new is the setup. A <strong>server</strong> runs <code>socket</code>&rarr;<code>bind</code>&rarr;<code>listen</code>&rarr;<code>accept</code>,
+where <code>accept</code> returns a fresh per-connection descriptor and the listening socket stays open; a <strong>client</strong> runs
+<code>socket</code>&rarr;<code>connect</code>, whose three-way handshake spends one round trip before any data moves, and the active closer pays
+<strong>TIME_WAIT</strong> afterward (&sect;43.1). <strong>TCP</strong> (<code>SOCK_STREAM</code>, RFC 793) turns an unreliable network into a
+reliable, ordered byte stream via sequence numbers, acknowledgements, retransmission, and a sliding window for flow control — but it preserves
+<strong>no message boundaries</strong>, so a protocol with messages must frame them and loop <code>read</code> until each is complete
+(&sect;43.2). <strong>UDP</strong> (<code>SOCK_DGRAM</code>, RFC 768) keeps message boundaries and adds nothing else: no delivery, ordering,
+flow, or congestion guarantee, an 8-byte header, and no setup — the right choice when TCP's guarantees are unneeded (DNS) or harmful (real-time
+media) or when you will build your own (QUIC) (&sect;43.3). And TCP's default configuration hides the <strong>Nagle</strong>&ndash;<strong>delayed-ACK</strong>
+collision: a small-write request/response can stall on the ~40&nbsp;ms delayed-ACK timer every round — measured here at ~43.8&nbsp;ms versus
+~90&nbsp;&micro;s with <code>TCP_NODELAY</code>, a ~500&times; artifact of two reasonable optimisations meeting — fixed by writing each message
+once, or by disabling Nagle for small-message protocols (&sect;43.4).</p>
+
+<p>This is the endpoint the event loop of Chapter 42 has been watching, now built and understood: a socket you can create, connect, feed, and
+frame, over a transport whose guarantees you can name. Two threads of this part remain, and both are about spending the descriptor's bytes more
+cheaply. The next chapter returns to the <em>readiness</em>-versus-<em>completion</em> question Chapter 42 opened and follows it to its
+conclusion — <strong>io_uring</strong>, an interface where you submit a batch of operations and are told when each has <em>finished</em>,
+collapsing the per-operation system-call boundary this part has paid at every step and extending the asynchronous model from sockets to disk.
+The chapter after removes the last copy: the data path from a file to a socket still runs every byte through a user-space buffer, and
+<strong>zero-copy</strong> transfer (<code>sendfile</code>) eliminates it. The connection is open and its bytes are ordered; what remains is to
+move them with the fewest crossings and copies the machine allows.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>List the four calls a TCP server makes and the one a client makes, and say what <code>accept</code> returns.</li>
+<li>Describe the three-way handshake and why connection setup costs a round trip.</li>
+<li>Explain why TCP preserves no message boundaries, and what a protocol with messages must therefore do.</li>
+<li>State what UDP keeps and what it gives up, and name two workloads where UDP is the right choice.</li>
+<li>Explain how Nagle's algorithm and delayed ACK combine to add ~40&nbsp;ms per round trip, and two ways to fix it.</li>
+<li>Say why the Nagle stall reproduces on loopback with no real network latency.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are the server-side and client-side socket-call sequences, and what does <code>accept</code> return? (&sect;43.1)</li>
+<li><strong>R2.</strong> What does the three-way handshake accomplish, and what is TIME_WAIT for? (&sect;43.1)</li>
+<li><strong>R3.</strong> Why does TCP preserve no message boundaries, and what must a message protocol do about it? (&sect;43.2)</li>
+<li><strong>R4.</strong> What does UDP guarantee and not guarantee, and when is it the right transport? (&sect;43.3)</li>
+<li><strong>R5.</strong> How do Nagle and delayed ACK collide, and what are the two fixes? (&sect;43.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>W. Richard Stevens, Bill Fenner &amp; Andrew M. Rudoff, <em>UNIX Network Programming, Volume 1: The Sockets Networking API</em>,
+3rd ed. (Addison-Wesley, 2003), ISBN 978-0-13-141155-5.</strong> The definitive reference for this chapter: Chapters 4&ndash;5 (elementary
+TCP sockets and the connection lifecycle), Chapter 7 (socket options including <code>TCP_NODELAY</code>), and Chapter 8 (elementary UDP
+sockets). First author W. Richard Stevens; edition and ISBN verified via the publisher.</li>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapters
+56&ndash;61 cover sockets end to end — the API, TCP stream sockets, UDP datagram sockets, and socket options — as implemented on Linux, the
+system these programs run on. First author Michael Kerrisk; edition and ISBN verified via the publisher.</li>
+<li><strong>J. Postel, RFC 793, &ldquo;Transmission Control Protocol&rdquo; (September 1981), and RFC 768, &ldquo;User Datagram
+Protocol&rdquo; (August 1980).</strong> The original specifications of the two transports of &sect;43.2&ndash;&sect;43.3: the byte-stream
+service model and its handshake, and the datagram service. RFC 793 has since been consolidated and obsoleted by RFC 9293 (2022); both are
+worth reading. Cited by RFC number, author, and date via the RFC Editor.</li>
+<li><strong>J. Nagle, RFC 896, &ldquo;Congestion Control in IP/TCP Internetworks&rdquo; (January 1984), and R. Braden (ed.), RFC 1122,
+&ldquo;Requirements for Internet Hosts — Communication Layers&rdquo; (October 1989).</strong> RFC 896 defines the small-packet algorithm that
+bears Nagle's name; RFC 1122 specifies delayed acknowledgements — the two mechanisms whose collision &sect;43.4 measures. Cited by RFC number,
+author, and date via the RFC Editor.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex43.1"><span class="ex-label">43.1</span> <span class="ex-tag warm">warm-up</span>
+List, in order, the four system calls a TCP server makes before it can exchange bytes with a client, and the one call the client makes. In one
+sentence, say what <code>accept</code> returns.</div>
+
+<div class="exercise" id="ex43.2"><span class="ex-label">43.2</span> <span class="ex-tag warm">warm-up</span>
+What socket <em>type</em> selects TCP, and which selects UDP? Name one guarantee TCP provides that UDP does not, and one thing UDP preserves
+that TCP does not.</div>
+
+<div class="exercise" id="ex43.3"><span class="ex-label">43.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, state which socket option disables Nagle's algorithm, and on what kind of protocol you would set it.</div>
+
+<div class="exercise" id="ex43.4"><span class="ex-label">43.4</span> <span class="ex-tag core">core</span>
+The byte stream. (a) A sender makes three <code>write</code> calls of 100 bytes each on a TCP socket. Give three different ways the bytes
+might be split across <code>read</code> calls on the receiver, and say which of them TCP permits. (b) State precisely what TCP <em>does</em>
+guarantee about those 300 bytes. (c) Describe a concrete framing scheme that lets the receiver recover the three original messages, and the
+receive loop it implies.</div>
+
+<div class="exercise" id="ex43.5"><span class="ex-label">43.5</span> <span class="ex-tag core">core</span>
+The connection lifecycle. (a) Walk through the three-way handshake segment by segment and say what each side knows after it. (b) Why does
+connection setup cost a full round trip, and what does that imply for a client that opens a fresh connection per request? (c) What is
+TIME_WAIT, which side enters it, and why does it exist?</div>
+
+<div class="exercise" id="ex43.6"><span class="ex-label">43.6</span> <span class="ex-tag core">core</span>
+TCP versus UDP by workload. For each, say which transport you would choose and why: (a) a bulk file transfer; (b) a DNS query and reply; (c)
+live voice-over-IP; (d) a bank transaction; (e) a new protocol that wants its own congestion control and 0-RTT reconnection. For (c) and (e),
+explain what TCP would <em>add</em> that you do not want.</div>
+
+<div class="exercise" id="ex43.7"><span class="ex-label">43.7</span> <span class="ex-tag complexity">cost</span>
+The Nagle stall. (a) Explain step by step why a write-write-read pattern deadlocks Nagle against delayed ACK until the ~40&nbsp;ms timer fires.
+(b) Using the measured numbers (~43.8&nbsp;ms with Nagle, ~90&nbsp;&micro;s with <code>TCP_NODELAY</code>), a service does 25 sequential such
+round trips per user request; estimate the added latency per user request in each case. (c) Explain why a throughput benchmark that streams
+large buffers would completely miss this bug.</div>
+
+<div class="exercise" id="ex43.8"><span class="ex-label">43.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team's RPC library shows ~40&nbsp;ms per call in production between two hosts in the same rack,
+with CPU idle; a load test on the same code showed fine throughput.
+<br><strong>Step 1 (given):</strong> the client serialises each request by writing a 4-byte length prefix, then the body, as two separate
+<code>write</code> calls, then reads the reply.
+<br><strong>Step 2 (given):</strong> the socket uses TCP defaults, so Nagle is on.
+<br><strong>Step 3 (given):</strong> the server delays its acknowledgement of the length-prefix segment, waiting to piggyback it on the reply,
+which it cannot send until it has the whole request.
+<br><strong>Step 4 (you):</strong> Explain why every call stalls ~40&nbsp;ms, why the throughput load test missed it, and give the two fixes in
+order of preference.</div>
+
+<div class="exercise" id="ex43.9"><span class="ex-label">43.9</span> <span class="ex-tag mixed">mixed</span>
+For each statement, say safe/correct or buggy and why: (a) &ldquo;I called <code>send</code> once with my whole message, so the peer's
+<code>recv</code> will return it in one call.&rdquo; (b) &ldquo;I set <code>TCP_NODELAY</code> on my bulk-upload socket to make it faster.&rdquo;
+(c) &ldquo;I use UDP and rely on it to redeliver any datagram that gets lost.&rdquo; (d) &ldquo;I read into a buffer in a loop until I have a
+full length-prefixed message before parsing it.&rdquo; (e) &ldquo;My server accepts a connection and keeps using the listening socket to talk
+to that client.&rdquo;</div>
+
+<div class="exercise" id="ex43.10"><span class="ex-label">43.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A socket is a special object that does not support
+<code>read</code>/<code>write</code>.&rdquo; (b) &ldquo;UDP guarantees datagrams arrive in the order they were sent.&rdquo; (c) &ldquo;TCP's
+three-way handshake costs one round trip before any data is sent.&rdquo; (d) &ldquo;Disabling Nagle speeds up a socket that only ever sends
+large buffers.&rdquo; (e) &ldquo;On a TCP connection, one <code>write</code> always corresponds to exactly one <code>read</code> on the
+peer.&rdquo;</div>
+
+<div class="exercise" id="ex43.11"><span class="ex-label">43.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the chapter. (a) Explain why &ldquo;a socket is just a descriptor&rdquo; is both true (the I/O API applies unchanged) and
+incomplete (setup and transport semantics are new) — what does each half buy you? (b) TCP and UDP are often framed as &ldquo;reliable versus
+fast,&rdquo; which is misleading; give the accurate framing in terms of <em>which guarantees you get versus build</em>, and show how QUIC-on-UDP
+proves the point. (c) The Nagle stall comes from two individually correct optimisations. Argue why this is a recurring shape in systems (local
+optima composing into a global pathology) and what it implies about testing.</div>
+
+<div class="exercise" id="ex43.12"><span class="ex-label">43.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Write a TCP echo server and client over loopback; confirm that sending a message in two small
+<code>write</code> calls and reading the reply is subject to the Nagle stall, and measure the per-round latency with Nagle on and with
+<code>TCP_NODELAY</code> set. (b) Demonstrate the byte-stream property: have the client send three distinct small messages back-to-back and
+show that a single <code>read</code> on the server may return more than one of them; then add a length-prefix framing loop that recovers them
+correctly. (c) State your toolchain and CPU, note the times are wall-clock (no hardware counters), and explain why the ~40&nbsp;ms you measure
+is a protocol timer rather than network latency, given that loopback has essentially none.</div>
+
+</section>
+</section>

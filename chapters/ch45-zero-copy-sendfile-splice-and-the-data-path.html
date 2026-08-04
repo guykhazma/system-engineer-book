@@ -1,0 +1,374 @@
+<section class="chapter" id="ch45">
+<h1>Chapter 45 — Zero-Copy: sendfile, splice, and the Data Path</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch40">Chapter 40</a> (the page cache, and how <code>read</code> copies
+from it into a user buffer), <a href="#ch44">Chapter 44</a> (batching away the per-operation kernel boundary), <a href="#ch43">Chapter 43</a>
+(the socket the bytes go to), <a href="#ch13">Chapter 13</a> (the cost of a system call), <a href="#ch03">Chapter 3</a> (memory bandwidth — a
+copy is not free). &nbsp;·&nbsp; The part has solved the waiting and batched the boundary. One cost is left: every byte sent from a file to a
+socket is copied through a buffer in your process for no reason. This chapter removes it — the last copy between the file and the wire — and
+closes the part.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch40">Chapter 40</a> — when you <code>read</code> a file, where does the data physically move, and whose CPU makes
+that copy? (2) <a href="#ch03">Chapter 3</a> — copying a large buffer is bounded by memory bandwidth; is moving 512&nbsp;MiB through a user
+buffer free? (3) <em>Predict:</em> a program sends a 512&nbsp;MiB file (already warm in the page cache) over a socket two ways — a
+<code>read</code>-into-buffer-then-<code>write</code> loop, and a single <code>sendfile</code>. Two questions: how many times does the CPU copy
+each byte in the first version, and how many of those copies does the second remove? And what will happen to the number of system calls? Write
+your guesses; &sect;45.1&ndash;&sect;45.2 answer them.</p>
+</aside>
+
+<p>Consider the most ordinary server task there is: send the contents of a file over a network connection — a static web asset, a video chunk,
+a database page to a replica. The obvious code reads the file into a buffer and writes that buffer to the socket, in a loop. It works, and for
+most of this part it is exactly what we have done. But trace where the bytes actually go and you find the CPU copying every one of them twice,
+through a user-space buffer that exists only to be a middleman — the data is copied out of the kernel's page cache into your buffer, and then
+straight back into the kernel's socket buffer, unchanged. Those copies cost memory bandwidth (Chapter 3), and at scale they are the bottleneck:
+a file server bottlenecked on <code>memcpy</code> is spending its cycles shuffling bytes it never looks at. <strong>Zero-copy</strong> is the set
+of techniques that remove that pointless round trip through user space, letting the kernel move the data from the page cache to the socket
+directly. This final chapter of the part builds it in five steps: the copies in the normal file-to-socket path, counted (&sect;45.1);
+<code>sendfile</code>, which sends a file to a socket without ever touching user space, measured (&sect;45.2); <code>splice</code> and the
+pipe-as-conduit generalisation, and what &ldquo;zero&rdquo; really means once the hardware helps (&sect;45.3); the trap that zero-copy and
+touching-the-bytes are mutually exclusive — you cannot encrypt or transform what you never copy (&sect;45.4); and what to carry forward, out of
+this part and this volume (&sect;45.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 20 hardware threads), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as the best of several trials; times are
+wall-clock and a hardware-counter profiler (<code>perf</code>) is <em>not</em> installed. The file (512&nbsp;MiB) is sent over the
+<strong>loopback</strong> interface with its contents warm in the page cache, so the measurement isolates the <em>user-space copy</em> —
+loopback has no network card, so the saving here is the CPU copies and the system calls removed, not DMA to a NIC; the &ldquo;how far can
+zero-copy go&rdquo; discussion of &sect;45.3 names the hardware step loopback cannot show. Every call and flag below was checked against the
+Linux man pages (<code>sendfile(2)</code>, <code>splice(2)</code>, <code>tcp(7)</code>) on this machine.</p>
+
+<h2>45.1 The copies in the ordinary file-to-socket path</h2>
+
+<p>Follow one byte from a file on disk to a network connection under the ordinary <code>read</code>-then-<code>write</code> loop, and count the
+copies. When the file is served, the byte makes four moves. First, the disk controller copies it from the device into the kernel's page cache
+by <strong>DMA</strong> (direct memory access — the device's own engine moves it, not the CPU), which happens once and stays cached (Chapter 40).
+Then <code>read</code> copies it from the page cache into your user-space buffer — a <strong>CPU copy</strong>, your process's cycles spent on
+<code>memcpy</code>. Then <code>write</code> copies it from your user-space buffer into the kernel's socket send buffer — a second
+<strong>CPU copy</strong>, straight back into the kernel it just came from. Finally the network card copies it from the socket buffer onto the
+wire by DMA. Of those four, the two DMA copies are unavoidable and cheap (the hardware does them); the two <strong>CPU copies through user
+space are the waste</strong> — the byte went kernel &rarr; user &rarr; kernel without being changed at all, and your process paid memory
+bandwidth for the privilege of being a pass-through. On top of the copies, the loop crosses the system-call boundary twice per block (one
+<code>read</code>, one <code>write</code>), the per-syscall tax this part has tracked since Chapter 40. The realization that drives zero-copy
+is simple: if the user-space buffer is never read or modified — if it is purely a relay — then routing the data through it is pointless work,
+and the kernel, which has the data in the page cache and controls the socket buffer, could move it directly. Every zero-copy technique is a way
+to say to the kernel: take these bytes from that file and put them on that socket; do not bring them through my address space, because I am not
+going to touch them.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In the ordinary <code>read</code>-then-<code>write</code> loop that sends a file to a socket, how many times does the CPU copy each byte, and
+between which places? Which of the four total copies are done by DMA and are unavoidable, and which are the waste zero-copy removes? (Answer
+after the next section.)</p>
+</aside>
+
+<h2>45.2 sendfile: the file to the socket, without user space</h2>
+
+<p>The direct tool is <code>sendfile(out_fd, in_fd, offset, count)</code>: it copies up to <code>count</code> bytes from the file
+<code>in_fd</code> to the socket <code>out_fd</code> <em>inside the kernel</em>, so the data never enters your address space. As the
+<code>sendfile(2)</code> man page puts it, &ldquo;because this copying is done within the kernel, <code>sendfile()</code> is more efficient
+than the combination of <code>read(2)</code> and <code>write(2)</code>, which would require transferring data to and from user space.&rdquo;
+One call replaces the whole loop: no user buffer, no two CPU copies through it, and — because a single <code>sendfile</code> can move a large
+range — far fewer system calls. Measured here, sending a 512&nbsp;MiB cache-warm file over loopback:</p>
+
+<pre><code>send 512 MiB, file warm in page cache, over loopback TCP (best of several trials):
+  read()+write() loop (64 KiB buffer) :  ~1.73 GB/s    16,384 syscalls   (2 CPU copies/byte)
+  sendfile()                          :  ~4.04 GB/s          1 syscall    (no user-space copy)
+  sendfile: ~2.3x throughput, ~16,000x fewer syscalls
+</code></pre>
+
+<p>The <code>sendfile</code> version moved the same bytes at about <strong>2.3&times;</strong> the throughput — 4.04 against 1.73&nbsp;GB/s —
+and did it in <strong>one</strong> system call instead of 16,384, because it removed the two things the loop was spending on: the CPU copies
+into and out of the user buffer (the bandwidth), and the per-block <code>read</code>/<code>write</code> boundary crossings (the syscall tax).
+Note what the number is <em>not</em>: it is not infinite speed-up, because <code>sendfile</code> still does work — on ordinary hardware it still
+performs one in-kernel copy from the page cache into the socket buffer, and of course the DMA to move the data still happens; what it removed
+was specifically the user-space round trip. On this loopback test there is no network card, so the win you see is purely the eliminated
+user-space copies and syscalls; on a real server sending to a real NIC the win is larger, because the hardware can go further (&sect;45.3). The
+practical rule is clean: whenever you are relaying a file to a socket unchanged — static file serving, video streaming, proxying, replication —
+<code>sendfile</code> is the right call, and it is exactly why high-performance web and file servers (nginx, Kafka, and the like) are built on
+it. The user-space buffer in the ordinary loop was never doing anything but relaying; <code>sendfile</code> is the kernel doing the relay
+without you.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: don't relay bytes through user space you are not going to touch</span>
+<p><strong>1. In words.</strong> The ordinary loop copies each byte from the page cache into a user buffer and straight back into the socket
+buffer — two CPU copies through an address space that never reads or changes the data. <code>sendfile</code> tells the kernel to move the file's
+bytes to the socket directly, removing the user-space round trip and collapsing the per-block syscalls into one.</p>
+<p><strong>2. As a picture.</strong> Figure 45.1: on the left, the four-copy path — DMA disk&rarr;page cache, CPU page cache&rarr;user buffer,
+CPU user buffer&rarr;socket buffer, DMA socket buffer&rarr;NIC — with the two middle CPU copies highlighted as waste; on the right,
+<code>sendfile</code> going page cache&rarr;socket buffer inside the kernel, the user buffer gone entirely.</p>
+<p><strong>3. As numbers/contrast.</strong> 512&nbsp;MiB, cache-warm, loopback: the <code>read</code>+<code>write</code> loop at
+<strong>~1.73&nbsp;GB/s</strong> with 16,384 syscalls and two CPU copies per byte; <code>sendfile</code> at <strong>~4.04&nbsp;GB/s</strong> with
+one syscall and no user-space copy — ~2.3&times; the throughput and ~16,000&times; fewer boundary crossings (&sect;45.2), and more still once a
+scatter-gather NIC removes the last in-kernel copy (&sect;45.3).</p>
+</aside>
+
+<p><em>(Answer to the &sect;45.1 quick check: the CPU copies each byte <strong>twice</strong> — once from the page cache into the user-space
+buffer (by <code>read</code>) and once from that buffer into the socket send buffer (by <code>write</code>). Of the four total copies, the two
+<strong>DMA</strong> copies — disk into the page cache, and socket buffer out to the network card — are done by the hardware and are
+unavoidable; the two <strong>CPU</strong> copies through user space are the waste, because the buffer is a pure relay that never reads or
+changes the data, and that is exactly what <code>sendfile</code> removes.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">File to socket: four copies the ordinary way; sendfile removes the two CPU copies through user space.</text>
+<text x="12" y="38" font-size="9" fill="#8c3a1d">read() + write() loop &mdash; 2 CPU copies through a user buffer</text>
+<rect x="20" y="48" width="90" height="20" fill="#eef1f4" stroke="#333"/><text x="26" y="62" font-size="8">disk</text>
+<rect x="140" y="48" width="90" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="146" y="62" font-size="8">page cache</text>
+<rect x="260" y="48" width="90" height="20" fill="#f6dcd2" stroke="#8c3a1d"/><text x="266" y="62" font-size="8">user buffer</text>
+<rect x="380" y="48" width="90" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="386" y="62" font-size="8">socket buf</text>
+<rect x="500" y="48" width="90" height="20" fill="#eef1f4" stroke="#333"/><text x="506" y="62" font-size="8">NIC / wire</text>
+<path d="M110 58 L140 58" stroke="#2f7d32" stroke-width="1.5"/><text x="108" y="82" font-size="7" fill="#2f7d32">DMA</text>
+<path d="M230 58 L260 58" stroke="#8c3a1d" stroke-width="2"/><text x="224" y="82" font-size="7" fill="#8c3a1d">CPU copy (read)</text>
+<path d="M350 58 L380 58" stroke="#8c3a1d" stroke-width="2"/><text x="344" y="82" font-size="7" fill="#8c3a1d">CPU copy (write)</text>
+<path d="M470 58 L500 58" stroke="#2f7d32" stroke-width="1.5"/><text x="468" y="82" font-size="7" fill="#2f7d32">DMA</text>
+<text x="260" y="100" font-size="8" fill="#8c3a1d">the two CPU copies are pure waste: the buffer never reads or changes the bytes</text>
+<line x1="12" y1="118" x2="628" y2="118" stroke="#b9c2cc"/>
+<text x="12" y="138" font-size="9" fill="#2f7d32">sendfile() &mdash; page cache to socket buffer inside the kernel, no user space</text>
+<rect x="20" y="150" width="90" height="20" fill="#eef1f4" stroke="#333"/><text x="26" y="164" font-size="8">disk</text>
+<rect x="160" y="150" width="90" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="166" y="164" font-size="8">page cache</text>
+<rect x="360" y="150" width="90" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="366" y="164" font-size="8">socket buf</text>
+<rect x="500" y="150" width="90" height="20" fill="#eef1f4" stroke="#333"/><text x="506" y="164" font-size="8">NIC / wire</text>
+<path d="M110 160 L160 160" stroke="#2f7d32" stroke-width="1.5"/><text x="118" y="146" font-size="7" fill="#2f7d32">DMA</text>
+<path d="M250 160 L360 160" stroke="#14406b" stroke-width="2"/><text x="262" y="146" font-size="7" fill="#14406b">1 in-kernel copy (0 with scatter-gather DMA)</text>
+<path d="M450 160 L500 160" stroke="#2f7d32" stroke-width="1.5"/><text x="458" y="146" font-size="7" fill="#2f7d32">DMA</text>
+<text x="160" y="192" font-size="8" fill="#2f7d32">user buffer gone; no user-space copy, one syscall for a whole range</text>
+<line x1="12" y1="212" x2="628" y2="212" stroke="#b9c2cc"/>
+<text x="12" y="232" font-size="8" fill="#14406b">Measured (512 MiB, cache-warm, loopback): read+write ~1.73 GB/s, 16,384 syscalls; sendfile ~4.04 GB/s, 1 syscall.</text>
+<text x="12" y="252" font-size="8" fill="#8c3a1d">Trap: sendfile never brings the bytes to you &mdash; so you cannot encrypt, compress, or transform them in transit (&sect;45.4).</text>
+<text x="12" y="276" font-size="8" fill="#2f7d32">splice generalises this to any two descriptors via a pipe; kTLS restores encryption to the zero-copy path.</text>
+</svg>
+<figcaption>Figure 45.1: The ordinary loop (top) copies each byte through a user-space buffer twice (CPU copies) between two DMA transfers.
+<code>sendfile</code> (bottom) moves the data from the page cache to the socket buffer inside the kernel — no user-space copy, one system call
+for a whole range, and zero CPU copies at all when a scatter-gather NIC can send straight from the page cache.</figcaption>
+</figure>
+
+<h2>45.3 splice, the pipe conduit, and how far &ldquo;zero&rdquo; goes</h2>
+
+<p><code>sendfile</code> is specialised: a file in, a socket out. <code>splice(fd_in, off_in, fd_out, off_out, count, flags)</code> generalises
+the same idea — its man page describes it as moving data &ldquo;between two file descriptors without copying between kernel address space and
+user address space&rdquo; — with one constraint: one of the two descriptors must be a <strong>pipe</strong>. The pipe acts as a kernel-space
+conduit: rather than copy bytes, <code>splice</code> moves <em>references</em> to the kernel buffers (page-cache pages) through the pipe, so data
+can flow file&rarr;pipe&rarr;socket, or socket&rarr;pipe&rarr;file, or between two sockets, all without a user-space copy. That pipe requirement
+looks odd but it is the mechanism: the pipe is the kernel's internal handle for a queue of buffer references, and splicing is re-pointing them,
+not memcpy-ing them. This is the general zero-copy primitive; <code>sendfile</code> is essentially a convenient special case. It matters because
+the &ldquo;which two descriptors&rdquo; question is broader than file-to-socket: a proxy splicing one socket to another, a logger splicing a
+socket to a file, all get the same no-user-copy path. Now, how far does &ldquo;zero&rdquo; actually go? On ordinary hardware, even
+<code>sendfile</code> does <em>one</em> in-kernel copy, from the page cache into the socket buffer, because the network card needs the data laid
+out where it can DMA it. But modern NICs support <strong>scatter-gather DMA</strong> and checksum offload: given a list of page-cache pages, the
+card's DMA engine gathers them directly from the page cache onto the wire, computing the checksum in hardware — so that last in-kernel copy
+disappears too, and the byte goes disk &rarr; page cache (DMA) &rarr; wire (DMA) with the CPU never copying it at all. <em>That</em> is true
+zero-copy, and it is the endpoint the loopback measurement of &sect;45.2 cannot show (there is no card), but it is why the technique matters so
+much on real servers: the CPU is removed from the data path entirely, freeing it to do work that actually requires a CPU. The progression is
+the whole part's lesson in miniature — first stop blocking (Chapter 42), then stop crossing the boundary per operation (Chapter 44), then stop
+copying the bytes at all (here) — each step removing a cost the previous one left standing.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>splice</code> generalise about <code>sendfile</code>, and why does it require one of the two descriptors to be a pipe? On
+ordinary hardware <code>sendfile</code> still makes one in-kernel copy — what hardware feature removes even that, and what does the data path
+look like once it is gone? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>45.4 The trap: zero-copy means you never see the bytes</h2>
+
+<p>Zero-copy's power is exactly its limitation, and the two are the same fact stated twice: the data never enters your address space. If your
+process never touches the bytes, then your process <em>cannot</em> touch the bytes — you cannot inspect, modify, compress, or
+<strong>encrypt</strong> them on the way through, because there is no point in the path where they are in memory you can run code over. This is
+the trap that catches teams reaching for <code>sendfile</code> to speed up a server that also needs to do something to the data. The most
+common collision is TLS: a secure server must encrypt every byte before it goes on the wire, and encryption is a transformation of the bytes —
+which requires having them in a buffer to transform — so a naive &ldquo;<code>sendfile</code> for speed&rdquo; and &ldquo;TLS for security&rdquo;
+are directly incompatible, because the first says &ldquo;never bring the bytes to user space&rdquo; and the second says &ldquo;you must
+transform every byte.&rdquo; The same conflict appears with on-the-fly compression, watermarking, transcoding, content inspection, or any
+per-request modification: if you must change the bytes, zero-copy is off the table by definition, and the ordinary <code>read</code>/transform/<code>write</code>
+path is not a failure to optimise — it is the only path that can do the job. There are real answers when you need both, and they work by
+relocating the transformation, not by wishing the conflict away: <strong>kernel TLS</strong> (kTLS) moves the encryption <em>into</em> the
+kernel, so the kernel can encrypt page-cache data on its way to the socket and <code>sendfile</code> can once again feed a TLS connection
+without a user-space copy; hardware offload can push crypto or compression onto the NIC. But absent such a mechanism, the rule is firm and
+worth stating plainly: <strong>you can move bytes with zero copies, or you can transform them, but not both in the same step.</strong> Choosing
+<code>sendfile</code> for a path that must encrypt, without kTLS, does not make encryption fast — it makes it impossible, and the bug is
+discovering that your &ldquo;optimised&rdquo; path silently cannot meet a requirement the ordinary path met for free.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: reaching for sendfile on data you must transform &mdash; zero-copy and touching-the-bytes are exclusive</span>
+<p><code>sendfile</code> and <code>splice</code> are fast precisely because the data never enters your address space — which means any operation
+that must <em>read or change</em> the bytes (encryption for TLS, on-the-fly compression, transcoding, watermarking, content inspection) is
+fundamentally incompatible with them: there is no moment in the zero-copy path where the bytes are in memory your code can run over. The trap is
+to treat zero-copy as a free speed-up you can bolt onto any file-serving path, then discover it cannot coexist with a transformation the product
+requires — most often TLS, where &ldquo;encrypt every byte&rdquo; and &ldquo;never copy the bytes to user space&rdquo; are contradictory by
+construction. This surfaces late and badly: a static-file benchmark shows <code>sendfile</code>'s beautiful numbers, the path ships, and then
+the requirement to serve over HTTPS (or to compress, or to inspect) reveals that the fast path structurally cannot do it. The defenses are to
+decide up front whether the data must be transformed in transit: if it must and you have no in-kernel offload, use the ordinary
+<code>read</code>/transform/<code>write</code> path and do not pretend zero-copy is available; if you want both, use <strong>kernel TLS</strong>
+(kTLS) or NIC offload, which relocate the transformation into the kernel or hardware so the zero-copy path can carry it. What you must not do is
+choose <code>sendfile</code> for its throughput and assume the transformation can be added later — the whole point of the technique is that the
+bytes are never yours to transform. &ldquo;It is faster because we skip the copy&rdquo; and &ldquo;we encrypt every byte in the app&rdquo;
+cannot both be true of the same step.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our media server is CPU-bound just shoveling files to clients — let's switch the send path to
+<code>sendfile</code> and get the copies out of user space. Also, product wants everything served over HTTPS now.&rdquo; Cover the paragraph and
+respond in four or five sentences, drawing on &sect;45.2 and &sect;45.4.</p>
+<p><em>Model answer.</em> &ldquo;<code>sendfile</code> is exactly right for shoveling files unchanged — it removes the two user-space CPU copies
+and collapses the per-block syscalls, and I measured about 2&times; throughput on a plain relay, more on a real NIC that can DMA straight from
+the page cache. But there is a hard conflict with the HTTPS requirement: TLS means we must encrypt every byte before it hits the wire, and
+encryption is a transformation, so it needs the bytes in a buffer — which is exactly what <code>sendfile</code> refuses to give us. We cannot
+have both &lsquo;never copy to user space&rsquo; and &lsquo;encrypt every byte in the app&rsquo; in the same step. The clean answer is
+<strong>kernel TLS</strong> (kTLS): it moves the encryption into the kernel so the kernel encrypts page-cache data on the way to the socket and
+<code>sendfile</code> keeps working over TLS. So let's enable kTLS if the platform supports it; if it does not, the encrypted path has to go
+through user space and we optimise it differently — but we should not ship a <code>sendfile</code> fast path that structurally can't do HTTPS.&rdquo;
+Naming the throughput win, the encrypt-versus-copy contradiction, and kTLS as the specific reconciliation is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;45.3 quick check: <code>splice</code> generalises <code>sendfile</code> from &ldquo;file to socket&rdquo; to
+&ldquo;any two descriptors,&rdquo; still without a user-space copy; it requires one end to be a <strong>pipe</strong> because the pipe is the
+kernel's internal conduit — a queue of references to kernel buffers — and splicing moves those references rather than copying bytes. On ordinary
+hardware <code>sendfile</code> still does one in-kernel copy into the socket buffer; a NIC with <strong>scatter-gather DMA</strong> and checksum
+offload removes even that, gathering the page-cache pages straight onto the wire, so the byte travels disk &rarr; page cache &rarr; wire by DMA
+alone with the CPU never copying it.)</em></p>
+
+<h2>45.5 What to carry forward</h2>
+
+<p>Sending a file to a socket the ordinary way copies every byte through a user-space buffer twice — page cache &rarr; user buffer &rarr; socket
+buffer — two <strong>CPU copies</strong> that do nothing but relay, framed by two unavoidable DMA copies and paid for in memory bandwidth and
+per-block syscalls (&sect;45.1). <strong><code>sendfile</code></strong> moves the data file-to-socket inside the kernel, removing the user-space
+round trip: measured here at ~4.04&nbsp;GB/s against the loop's ~1.73&nbsp;GB/s (~2.3&times;) and one syscall against 16,384, and it is why
+nginx, Kafka, and every serious file server use it (&sect;45.2). <strong><code>splice</code></strong> generalises it to any two descriptors via a
+pipe conduit, and on a scatter-gather NIC even <code>sendfile</code>'s last in-kernel copy vanishes, giving <em>true</em> zero-copy where the CPU
+never touches the data — disk &rarr; page cache &rarr; wire by DMA alone (&sect;45.3). But zero-copy's power is its constraint: because the bytes
+never enter your address space, you <strong>cannot transform them in transit</strong> — no TLS encryption, compression, or modification — so
+reaching for <code>sendfile</code> on a path that must encrypt makes the transformation impossible, not fast, and the reconciliation when you
+need both is to relocate the transformation into the kernel (<strong>kTLS</strong>) or hardware (&sect;45.4).</p>
+
+<p>This closes the low-level I/O and networking part, and with it the first volume. The arc is one idea pursued to the bottom: a program does
+not run on an abstract machine, and neither does its I/O. We started with the syscall boundary and the page cache (Chapter 40), learned when
+bytes are durable and when the OS is lying about it (Chapter 41), stopped dedicating a thread to every wait and built the event loop (Chapter
+42), gave the connection a name and a transport whose guarantees we can state (Chapter 43), batched the kernel boundary away with completion-based
+submission (Chapter 44), and here removed the last needless copy between the file and the wire. The through-line was a single discipline, the
+same one that opened the volume: know where the bytes physically are, know who copies them and who waits, and measure the cost you claim to be
+removing rather than assume it — the honest break-even of Chapter 44 and the real 2.3&times; here are both results of that habit. This substrate
+— files, the page cache, durability, sockets, and the copies and crossings between them — is the ground the next volume builds a database on:
+the buffer pool that manages the page cache by hand, the write-ahead log that turns <code>fsync</code> into a durability guarantee, the storage
+engine that lays pages on disk. Everything a database does about storage is a specific, disciplined answer to the costs this part made concrete.
+The machine is real; now we build something serious on top of it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Count the copies in the ordinary file-to-socket path and say which are CPU copies and which are DMA.</li>
+<li>Explain what <code>sendfile</code> removes and why, and state its measured effect on throughput and syscall count.</li>
+<li>Say what <code>splice</code> generalises and why it needs a pipe.</li>
+<li>Explain what &ldquo;true&rdquo; zero-copy needs from the hardware, and what the data path looks like then.</li>
+<li>State why zero-copy and transforming the bytes (e.g. TLS) are mutually exclusive, and how kTLS reconciles them.</li>
+<li>Trace the part's arc: stop blocking, stop crossing per operation, stop copying — what each step removed.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> How many CPU copies does the ordinary file-to-socket loop make, between where and where, and which copies are DMA? (&sect;45.1)</li>
+<li><strong>R2.</strong> What does <code>sendfile</code> do, and what were its measured throughput and syscall effects? (&sect;45.2)</li>
+<li><strong>R3.</strong> What does <code>splice</code> generalise, and why the pipe? (&sect;45.3)</li>
+<li><strong>R4.</strong> What hardware feature yields true zero-copy, and what is the resulting data path? (&sect;45.3)</li>
+<li><strong>R5.</strong> Why can't you encrypt bytes you send with <code>sendfile</code>, and what reconciles zero-copy with TLS? (&sect;45.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Linux <code>sendfile(2)</code> man page (Linux man-pages project).</strong> The primary reference for &sect;45.2: the
+<code>sendfile(out_fd, in_fd, offset, count)</code> interface and its rationale — &ldquo;because this copying is done within the kernel,
+<code>sendfile()</code> is more efficient than the combination of <code>read(2)</code> and <code>write(2)</code>&rdquo; — verified against the
+page installed on this machine.</li>
+<li><strong>Linux <code>splice(2)</code> man page (Linux man-pages project).</strong> The reference for &sect;45.3: <code>splice</code> &ldquo;moves
+data between two file descriptors without copying between kernel address space and user address space,&rdquo; with one end a pipe — verified
+against the page installed on this machine.</li>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Section 61.4.4,
+&ldquo;Transferring a file to a socket: <code>sendfile()</code>,&rdquo; explains the copy the ordinary <code>read</code>/<code>write</code> loop
+wastes and how <code>sendfile</code> avoids it — the source for &sect;45.1&ndash;&sect;45.2's copy accounting. First author Michael Kerrisk;
+edition and ISBN verified via the publisher.</li>
+<li><strong>Vivek S. Pai, Peter Druschel &amp; Willy Zwaenepoel, &ldquo;IO-Lite: A Unified I/O Buffering and Caching System,&rdquo; in
+<em>Proc. 3rd USENIX OSDI</em> (1999); expanded in <em>ACM Transactions on Computer Systems</em> 18(1), 2000, DOI 10.1145/332799.332895.</strong>
+The research foundation of zero-copy I/O: a single physical copy of data shared safely across the file cache, IPC, and network subsystem — the
+idea &sect;45.3's page-reference splicing and scatter-gather sending descend from. First author Vivek S. Pai; venue, year, and DOI verified via
+the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex45.1"><span class="ex-label">45.1</span> <span class="ex-tag warm">warm-up</span>
+In the ordinary <code>read</code>-then-<code>write</code> loop that sends a file to a socket, how many times does the CPU copy each byte, and
+between which two pairs of places?</div>
+
+<div class="exercise" id="ex45.2"><span class="ex-label">45.2</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does <code>sendfile</code> remove from the ordinary loop, and roughly what was its measured effect on the number of
+system calls in this chapter?</div>
+
+<div class="exercise" id="ex45.3"><span class="ex-label">45.3</span> <span class="ex-tag warm">warm-up</span>
+Name one operation on the data that <code>sendfile</code> makes impossible, and say why.</div>
+
+<div class="exercise" id="ex45.4"><span class="ex-label">45.4</span> <span class="ex-tag core">core</span>
+Counting copies. (a) List all four copies a byte undergoes from disk to wire in the ordinary loop, labeling each as CPU or DMA. (b) Which two
+does <code>sendfile</code> remove, and why are they waste? (c) On ordinary hardware <code>sendfile</code> still does one in-kernel copy —
+between where and where, and what removes it?</div>
+
+<div class="exercise" id="ex45.5"><span class="ex-label">45.5</span> <span class="ex-tag core">core</span>
+The measurement. (a) The loop ran at ~1.73&nbsp;GB/s and <code>sendfile</code> at ~4.04&nbsp;GB/s for the same 512&nbsp;MiB; name the two
+distinct costs <code>sendfile</code> removed that account for the difference. (b) Why is the win only ~2.3&times; and not, say, 100&times;? (c)
+Why would the same comparison likely show a <em>larger</em> win on a real server with a network card than on this loopback test?</div>
+
+<div class="exercise" id="ex45.6"><span class="ex-label">45.6</span> <span class="ex-tag core">core</span>
+<code>splice</code> and the pipe. (a) How does <code>splice</code> generalise <code>sendfile</code>? (b) Why does it require one descriptor to
+be a pipe — what is the pipe actually doing? (c) Give two useful data paths <code>splice</code> enables that <code>sendfile</code> does not.</div>
+
+<div class="exercise" id="ex45.7"><span class="ex-label">45.7</span> <span class="ex-tag complexity">cost</span>
+A server sends files at rate <var>R</var> bytes/s. Model per-byte CPU-copy cost as 1/<var>B</var> seconds, where <var>B</var> is memory copy
+bandwidth. (a) The ordinary loop does two CPU copies per byte; write the CPU time per second it spends just copying at rate <var>R</var>. (b)
+<code>sendfile</code> on ordinary hardware does one in-kernel copy; write the same. (c) With a scatter-gather NIC (zero CPU copies), what is
+that CPU time, and what does the freed CPU now get to do? Comment on why a file server can become copy-bound.</div>
+
+<div class="exercise" id="ex45.8"><span class="ex-label">45.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team switched their static-asset server to <code>sendfile</code>, benchmarked a 3&times;
+throughput improvement, and shipped it. Two months later, product mandates HTTPS for all traffic.
+<br><strong>Step 1 (given):</strong> TLS requires encrypting every byte before it is sent on the socket.
+<br><strong>Step 2 (given):</strong> encryption is a transformation of the bytes and needs them in a buffer to transform.
+<br><strong>Step 3 (given):</strong> <code>sendfile</code> moves bytes from the page cache to the socket without ever bringing them to user
+space.
+<br><strong>Step 4 (you):</strong> Explain why the fast <code>sendfile</code> path structurally cannot serve TLS, why the benchmark did not
+reveal this, and the two ways forward (one that keeps zero-copy, one that does not).</div>
+
+<div class="exercise" id="ex45.9"><span class="ex-label">45.9</span> <span class="ex-tag mixed">mixed</span>
+For each task, say whether zero-copy (<code>sendfile</code>/<code>splice</code>) applies, and why: (a) serving a static image file over plain
+HTTP; (b) serving the same file over HTTPS with no kernel TLS; (c) proxying bytes from an upstream socket to a client socket unchanged; (d)
+gzip-compressing a log file as you stream it to a client; (e) serving a video file over HTTPS on a host with kTLS enabled.</div>
+
+<div class="exercise" id="ex45.10"><span class="ex-label">45.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;<code>sendfile</code> copies the file into a user buffer and
+then to the socket.&rdquo; (b) &ldquo;On a scatter-gather NIC, a sent byte need never be copied by the CPU.&rdquo; (c) &ldquo;You can encrypt
+data in your application and still send it with <code>sendfile</code> in the same step.&rdquo; (d) &ldquo;<code>splice</code> needs one end to
+be a pipe.&rdquo; (e) &ldquo;The two DMA copies in the ordinary path are the waste zero-copy removes.&rdquo;</div>
+
+<div class="exercise" id="ex45.11"><span class="ex-label">45.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the part. (a) The part removed three costs in sequence — blocking (Chapter 42), the per-operation kernel boundary (Chapter 44), and
+the user-space copy (this chapter). State what each step removed and what it left for the next. (b) Zero-copy's benefit and its limitation are
+the same fact; explain that identity and why it means the &ldquo;fastest&rdquo; path is not always the usable one. (c) Argue why &ldquo;know
+where the bytes physically are and who copies them&rdquo; is the single question that unifies this entire part, using the four-copy diagram to
+make the case.</div>
+
+<div class="exercise" id="ex45.12"><span class="ex-label">45.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Send a large cache-warm file over a loopback TCP connection two ways — a <code>read</code>/<code>write</code>
+loop with a fixed buffer, and a single <code>sendfile</code> — and report the throughput and the number of system calls for each. (b) Explain,
+from your syscall counts, how much of the difference is the removed copies versus the removed boundary crossings. (c) State your toolchain and
+CPU, note the times are wall-clock (no hardware counters), and explain why a loopback test understates the win a real network card would show,
+naming the hardware feature (scatter-gather DMA) that removes the last copy.</div>
+
+</section>
+</section>

@@ -1,0 +1,107 @@
+<section class="solutions" id="sol43">
+<h1>Chapter 43 — Solutions</h1>
+
+<div class="solution" id="sol43.1"><span class="sol-label">43.1</span>
+Server: <code>socket</code> &rarr; <code>bind</code> (attach to a local address/port) &rarr; <code>listen</code> (mark passive, set the
+backlog) &rarr; <code>accept</code> (block until a client connects). Client: <code>socket</code> &rarr; <code>connect</code>.
+<code>accept</code> returns a <strong>new descriptor</strong> for the one accepted connection, leaving the listening socket open for the next
+client. <em>Tempting wrong answer:</em> &ldquo;<code>accept</code> returns the listening socket&rdquo; — it returns a distinct per-connection
+socket; the listener keeps listening. <strong>Feed-forward:</strong> &sect;43.1.</div>
+
+<div class="solution" id="sol43.2"><span class="sol-label">43.2</span>
+<code>SOCK_STREAM</code> selects TCP; <code>SOCK_DGRAM</code> selects UDP. TCP guarantees reliable, ordered delivery (and flow control) that
+UDP does not; UDP preserves <strong>message boundaries</strong> (one <code>sendto</code> = one <code>recvfrom</code>) that TCP's byte stream
+does not. <em>Tempting wrong answer:</em> &ldquo;UDP is just TCP without the checksum&rdquo; — UDP drops delivery, ordering, flow, and
+congestion control, not merely error checking. <strong>Feed-forward:</strong> &sect;43.2&ndash;&sect;43.3.</div>
+
+<div class="solution" id="sol43.3"><span class="sol-label">43.3</span>
+<code>TCP_NODELAY</code> (via <code>setsockopt</code> at level <code>IPPROTO_TCP</code>) disables Nagle's algorithm; set it on
+latency-sensitive small-message request/response protocols (RPC, databases, interactive services). <em>Tempting wrong answer:</em>
+&ldquo;always set it, on every socket&rdquo; — on bulk-transfer sockets Nagle does no harm and coalescing helps, so it is not a universal win.
+<strong>Feed-forward:</strong> &sect;43.4.</div>
+
+<div class="solution" id="sol43.4"><span class="sol-label">43.4</span>
+(a) Any split is possible and TCP permits it: one <code>read</code> returning all 300; 60 then 240; one byte per <code>read</code>; etc. —
+because TCP is a byte stream and coalesces or splits writes into whatever segments it chooses. (b) TCP guarantees only that all 300 bytes
+arrive <strong>in order and without loss or duplication</strong> — nothing about grouping. (c) Length-prefix framing: prepend each message with
+its byte length; the receiver reads into a buffer in a loop, first reading the fixed-size length, then reading until that many body bytes have
+accumulated, then delivering one message and repeating. <em>Tempting wrong answer:</em> &ldquo;one <code>read</code> per message because I sent
+one <code>write</code> per message&rdquo; — writes and reads do not correspond on a stream. <strong>Feed-forward:</strong> &sect;43.2.</div>
+
+<div class="solution" id="sol43.5"><span class="sol-label">43.5</span>
+(a) Client &rarr; <code>SYN</code> (proposes its initial sequence number); server &rarr; <code>SYN</code>+<code>ACK</code> (acknowledges the
+client's and proposes its own); client &rarr; <code>ACK</code> (acknowledges the server's). After it, both sides know each other's starting
+sequence numbers and the channel is open. (b) Setup costs a round trip because the handshake requires a message from each side before data can
+flow; a client that opens a fresh connection per request therefore pays one RTT of pure setup latency (plus TIME_WAIT churn) on every request —
+the argument for connection pooling and keep-alive. (c) TIME_WAIT is entered by the side that closes <em>first</em> (the active closer), which
+holds the socket for twice the maximum segment lifetime so that stray delayed segments from the closed connection cannot be mistaken for data
+on a new connection reusing the same port. <em>Tempting wrong answer:</em> &ldquo;TIME_WAIT is a bug/leak to eliminate&rdquo; — it is a
+correctness mechanism; <code>SO_REUSEADDR</code> lets a server rebind despite it, but it is doing a job. <strong>Feed-forward:</strong> &sect;43.1.</div>
+
+<div class="solution" id="sol43.6"><span class="sol-label">43.6</span>
+(a) Bulk file transfer: <strong>TCP</strong> — you need every byte, in order, with flow/congestion control. (b) DNS query: <strong>UDP</strong>
+— one tiny request and reply; a TCP handshake would cost more than the query, and a lost query is cheaply retried. (c) Live VoIP:
+<strong>UDP</strong> — a late packet is useless, so TCP's retransmit-and-reorder would <em>add</em> latency and stall the stream; better to skip
+the lost audio. (d) Bank transaction: <strong>TCP</strong> — reliability and ordering are non-negotiable. (e) New protocol wanting its own
+congestion control and 0-RTT: <strong>UDP</strong> — TCP's fixed handshake and in-order delivery are exactly the machinery you want to replace
+(this is QUIC). <em>Tempting wrong answer:</em> &ldquo;UDP for (a) because it is faster&rdquo; — without reliability you would corrupt the file.
+<strong>Feed-forward:</strong> &sect;43.3.</div>
+
+<div class="solution" id="sol43.7"><span class="sol-label">43.7</span>
+(a) The client's second small write is held by Nagle until the first segment is acknowledged; the server's delayed-ACK holds that
+acknowledgement (up to ~40&nbsp;ms) hoping to piggyback it on a reply, but the server cannot reply until it has the whole request, whose tail
+is stuck in the client's Nagle buffer — so nothing moves until the delayed-ACK timer fires. (b) 25 round trips: with Nagle,
+25&times;43.8&nbsp;ms &asymp; <strong>1,095&nbsp;ms</strong> (over a second per user request); with <code>TCP_NODELAY</code>,
+25&times;90&nbsp;&micro;s &asymp; <strong>2.3&nbsp;ms</strong>. (c) A throughput benchmark streams large buffers that fill segments, so Nagle
+never holds anything and the timer never fires — the pathology needs the small-write request/response shape, which throughput tests do not
+have. <em>Tempting wrong answer:</em> &ldquo;the 40&nbsp;ms is network latency in the rack&rdquo; — intra-rack RTT is tens of microseconds; the
+40&nbsp;ms is a timer. <strong>Feed-forward:</strong> &sect;43.4.</div>
+
+<div class="solution" id="sol43.8"><span class="sol-label">43.8</span>
+<strong>Step 4:</strong> Writing the length prefix and the body as two separate <code>write</code> calls with Nagle on means the second write
+is held until the first is acknowledged; the server's delayed-ACK will not acknowledge the prefix on its own, waiting to piggyback on a reply
+it cannot send until it has the full request — so every call waits out the ~40&nbsp;ms delayed-ACK timer. The load test missed it because it
+measured aggregate throughput with the pipeline full, where the timer overlaps other in-flight work and never shows as per-call latency; only
+isolated sequential round trips expose it. Fixes, best first: (1) assemble the prefix and body into one buffer and issue a single
+<code>write</code>, so Nagle never engages; (2) set <code>TCP_NODELAY</code> on the socket. <em>Tempting wrong answer:</em> &ldquo;switch to
+UDP&rdquo; — that abandons reliability to dodge a one-line fix. <strong>Feed-forward:</strong> &sect;43.4.</div>
+
+<div class="solution" id="sol43.9"><span class="sol-label">43.9</span>
+(a) <strong>Buggy</strong> — one <code>send</code> does not imply one <code>recv</code>; the stream may deliver your message in pieces or joined
+to the next, so you must frame and loop. (b) <strong>No effect (harmless but pointless)</strong> — a bulk-upload socket sends full segments, so
+Nagle never holds anything; <code>TCP_NODELAY</code> changes nothing there. (c) <strong>Buggy</strong> — UDP does not redeliver lost datagrams;
+if you need reliability you must implement it. (d) <strong>Correct</strong> — reading in a loop until a full length-prefixed message is
+assembled is exactly the right way to consume a stream. (e) <strong>Buggy</strong> — you must talk to the client on the descriptor
+<code>accept</code> returned, not the listening socket. <em>Tempting wrong answer:</em> calling (b) a real speedup — it is a no-op on that
+traffic pattern. <strong>Feed-forward:</strong> &sect;43.2&ndash;&sect;43.4.</div>
+
+<div class="solution" id="sol43.10"><span class="sol-label">43.10</span>
+(a) <strong>False</strong> — a connected socket is a descriptor and supports <code>read</code>/<code>write</code> like any other. (b)
+<strong>False</strong> — UDP does not guarantee ordering; datagrams may arrive in any order. (c) <strong>True</strong> — the three-way
+handshake spends one RTT before data. (d) <strong>False</strong> — a socket that only sends large buffers already fills segments, so disabling
+Nagle changes nothing. (e) <strong>False</strong> — on a byte stream, writes and reads do not correspond one-to-one. <em>Tempting wrong
+answer:</em> marking (b) true by analogy to TCP — ordering is precisely one of the guarantees UDP drops. <strong>Feed-forward:</strong>
+&sect;43.1&ndash;&sect;43.4.</div>
+
+<div class="solution" id="sol43.11"><span class="sol-label">43.11</span>
+(a) &ldquo;Just a descriptor&rdquo; is true in that once connected, the entire I/O API (<code>read</code>/<code>write</code>/<code>close</code>/<code>epoll</code>/<code>O_NONBLOCK</code>)
+applies unchanged — that uniformity is what lets the event loop of Chapter 42 treat sockets and files alike; it is incomplete because setup
+(bind/listen/accept or connect, the handshake) and transport semantics (byte stream, framing, boundaries) have no file analogue. (b) The
+accurate framing is <em>which guarantees you get for free versus build yourself</em>: TCP gives reliability, ordering, flow, and congestion
+control as a fixed package; UDP gives boundaries and nothing else, so you supply exactly the guarantees you need — QUIC proves it by building
+reliability, ordering, and its own congestion control atop UDP precisely to escape TCP's fixed choices, which no &ldquo;reliable vs fast&rdquo;
+story explains. (c) Nagle and delayed-ACK are each a correct local optimisation (fewer small packets; fewer bare ACKs) that compose into a
+40&nbsp;ms global stall — a recurring systems shape where independently sensible policies interact pathologically, which is why integration and
+end-to-end latency testing (not just component or throughput tests) is essential. <em>Tempting wrong answer:</em> &ldquo;one of the two
+optimisations is simply wrong&rdquo; — each is reasonable alone; the defect is their interaction with a chatty write pattern.
+<strong>Feed-forward:</strong> &sect;43.2&ndash;&sect;43.5.</div>
+
+<div class="solution" id="sol43.12"><span class="sol-label">43.12</span>
+Open-ended and platform-specific. A correct write-up: (a) shows the write-write-read round trip stalling near the delayed-ACK timer (~40&nbsp;ms
+on Linux) with Nagle on and dropping to tens of microseconds with <code>TCP_NODELAY</code>; (b) demonstrates that a single <code>read</code>
+can return more than one back-to-back message, then shows a length-prefix loop recovering them; (c) states toolchain and CPU, flags wall-clock
+timing without hardware counters, and explains that the ~40&nbsp;ms is a protocol timer (Nagle waiting on a delayed ACK) rather than network
+latency, since loopback RTT is negligible. <em>Tempting wrong answer:</em> &ldquo;report the stall as the socket being slow&rdquo; — the
+stall is a specific timer, reproducible and removable, not a bandwidth or CPU limit. <strong>Feed-forward:</strong> &sect;43.2&ndash;&sect;43.4.</div>
+
+</section>

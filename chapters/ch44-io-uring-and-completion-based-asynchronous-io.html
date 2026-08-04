@@ -1,0 +1,382 @@
+<section class="chapter" id="ch44">
+<h1>Chapter 44 — io_uring and Completion-Based Asynchronous I/O</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch42">Chapter 42</a> (readiness notification — <code>epoll</code> tells you
+<em>which descriptors are ready</em>, then you do the operation), <a href="#ch41">Chapter 41</a> (a disk read that misses the page cache blocks
+on the device — and a regular file has no useful readiness signal), <a href="#ch40">Chapter 40</a> (the I/O syscalls), <a href="#ch13">Chapter 13</a>
+and <a href="#ch42">Chapter 42</a> (a system call costs a few hundred nanoseconds to enter the kernel). &nbsp;·&nbsp; Chapter 42 asked the kernel
+<em>which</em> descriptors are ready and then still made a syscall per operation. This chapter changes the question one more time: submit a batch
+of operations and be told when each has <em>finished</em> — the completion model, and its Linux realisation, <code>io_uring</code>.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch42">Chapter 42</a> — <code>epoll</code> reports a socket <em>ready</em>, after which you call <code>read</code>
+yourself; how many kernel crossings is one handled operation, and what does readiness tell you that a regular disk file cannot answer? (2)
+<a href="#ch41">Chapter 41</a> — when a <code>read</code> misses the page cache, what does the calling thread do, and why can't
+<code>epoll</code> help you avoid that wait on a file? (3) <em>Predict:</em> a program must issue 65,536 small reads. Version A calls
+<code>pread</code> 65,536 times. Version B submits them in batches of 256 through a shared ring and reaps completions. Two questions: how many
+kernel crossings does each pay? And on data already in the page cache, will version B's <em>wall-clock</em> time be dramatically lower,
+about the same, or is the syscall count the real story? Write your guesses; &sect;44.3 answers them.</p>
+</aside>
+
+<p>Chapter 42 solved <em>waiting</em>: instead of a thread per blocked call, one thread asks <code>epoll</code> which descriptors are ready and
+handles only those. But readiness has two limits this chapter removes. First, it is still one system call per operation: <code>epoll_wait</code>
+tells you a socket is readable, and then you cross the kernel boundary again to actually <code>read</code> it — so a busy server pays the
+few-hundred-nanosecond syscall tax (Chapter 42) on every single operation, and at millions of operations per second that boundary becomes the
+cost. Second, and deeper, readiness does not work for <strong>disk</strong>. A regular file is <em>always</em> reportable as ready — there is no
+&ldquo;the data has arrived&rdquo; event for a file the way there is for a socket — yet a <code>read</code> that misses the page cache still
+blocks the thread on the device for milliseconds (Chapter 41). <code>epoll</code> has nothing useful to say about a file; the whole readiness
+model assumes an operation that <em>would</em> block until a descriptor becomes ready, and disk I/O simply is not shaped that way. The answer to
+both is to stop notifying <em>readiness</em> and start notifying <em>completion</em>: you hand the kernel a description of the operation you
+want done, the kernel does it (blocking on the device on its own, not on your thread), and later tells you it is <em>finished</em>, with the
+result. This chapter builds that model in five steps: readiness versus completion and why disk forces the change (&sect;44.1); the
+<code>io_uring</code> interface — two shared ring buffers between application and kernel (&sect;44.2); why the boundary shrinks, with the
+syscall count measured (&sect;44.3); the hazard the completion model introduces — asynchronous buffer lifetime (&sect;44.4); and what to carry
+forward (&sect;44.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 20 hardware threads), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code>; times are wall-clock and a
+hardware-counter profiler (<code>perf</code>) is <em>not</em> installed. The kernel here is 6.x on WSL2, which supports <code>io_uring</code>; the
+helper library <code>liburing</code> is <em>not</em> installed, so the programs drive the interface through the raw system calls
+<code>io_uring_setup(2)</code> and <code>io_uring_enter(2)</code> directly — setting up the shared rings by hand with <code>mmap</code> — which
+is exactly what makes the mechanism visible. A minimal <code>IORING_OP_NOP</code> and batched <code>IORING_OP_READ</code> submissions were run
+here to confirm the interface works and to count kernel crossings; the honest wall-clock result of &sect;44.3 is reported as measured, including
+where it is <em>not</em> a speed-up.</p>
+
+<h2>44.1 Readiness versus completion, and why disk forces the change</h2>
+
+<p>There are two ways for the kernel to help a program do asynchronous I/O, and the difference is the whole chapter. The
+<strong>readiness</strong> model (Chapter 42: <code>select</code>, <code>poll</code>, <code>epoll</code>) answers the question &ldquo;which
+descriptors <em>can</em> I operate on without blocking?&rdquo; — the kernel watches, and when a socket has data or space you go and do the
+<code>read</code> or <code>write</code> yourself. The <strong>completion</strong> model answers a different question: &ldquo;here is the
+operation I want; tell me when it is <em>done</em>.&rdquo; You submit a read — descriptor, buffer, length, offset — and the kernel performs it,
+waiting on the device itself if it must, and later hands you a completion record saying how many bytes it read (or what error). The two are
+not just cosmetically different. Readiness fits sockets, where &ldquo;ready&rdquo; is a real, observable state and the operation, once ready,
+completes instantly from a buffer. It does <em>not</em> fit <strong>disk files</strong>, and this is the crucial point: a regular file is always
+&ldquo;ready&rdquo; in the readiness sense — you can always <em>attempt</em> the read — but the attempt can still block for milliseconds on a
+cache miss (Chapter 41), and there is no event to wait for that means &ldquo;now the read will not block.&rdquo; So <code>epoll</code> cannot
+make disk I/O asynchronous; historically Linux had a separate, awkward, partial mechanism (POSIX AIO) for that, and sockets and files needed
+different tools. The completion model unifies them, because &ldquo;tell me when it is done&rdquo; is meaningful for <em>any</em> operation —
+a socket read, a disk read, an <code>fsync</code>, an <code>accept</code>, a <code>send</code> — the kernel just does the work and reports
+completion. That generality is why the completion interface (<code>io_uring</code> on Linux; <code>IOCP</code> on Windows long before) is the
+model modern high-performance I/O converges on: one asynchronous interface for the whole descriptor world, sockets and disk alike.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In one sentence each: what does the readiness model ask the kernel, and what does the completion model ask instead? Why can
+<code>epoll</code>'s readiness model not make a disk-file <code>read</code> asynchronous? (Answer after the next section.)</p>
+</aside>
+
+<h2>44.2 The io_uring interface: two shared rings</h2>
+
+<p><code>io_uring</code> (merged into Linux 5.1 in 2019) implements the completion model with a design built to make the kernel boundary cheap:
+two ring buffers, shared directly between the application and the kernel in memory, so that submitting work and collecting results need not copy
+arguments across the boundary or, in the limit, make a system call at all. You create the instance with <code>io_uring_setup(entries,
+params)</code>, which returns a ring file descriptor and, through its <code>params</code>, the offsets of the shared structures; you then
+<code>mmap</code> them into your address space. There are two queues. The <strong>submission queue</strong> (SQ) is an array of
+<strong>submission queue entries</strong> (SQEs); each SQE describes one operation — an <code>opcode</code> (<code>IORING_OP_READ</code>,
+<code>IORING_OP_WRITE</code>, <code>IORING_OP_SEND</code>, <code>IORING_OP_ACCEPT</code>, <code>IORING_OP_FSYNC</code>, and dozens more), the
+descriptor, a buffer address, a length, an offset, and a 64-bit <code>user_data</code> field you choose and the kernel echoes back so you can
+tell which completion belongs to which request. The <strong>completion queue</strong> (CQ) is an array of <strong>completion queue
+entries</strong> (CQEs); each CQE carries the <code>user_data</code> you set and a <code>res</code> field holding the operation's result — the
+byte count on success, or a negative error code — exactly the value the synchronous call would have returned. The flow is: fill one or more
+SQEs, advance the submission ring's tail, and call <code>io_uring_enter(fd, to_submit, min_complete, flags)</code> <em>once</em> to submit that
+whole batch and optionally wait for completions; then walk the completion ring, reading a CQE per finished operation, and advance its head. The
+decisive property is that <em>one</em> <code>io_uring_enter</code> can submit many operations and reap many completions — the system-call
+boundary is crossed per <em>batch</em>, not per operation. And it can be pushed further: in <strong>polled submission</strong> mode
+(<code>SQPOLL</code>) a kernel thread watches the submission ring, so the application submits work by writing shared memory with <em>no system
+call at all</em>. The rings are the mechanism; batching across them is the payoff.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the two rings <code>io_uring</code> shares between application and kernel, and what one entry in each carries. What does the
+<code>user_data</code> field on a submission accomplish, and how many system calls does it take to submit a batch of 100 reads and collect
+their results? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>44.3 Why the boundary shrinks — the syscall count, measured</h2>
+
+<p>The point of the shared rings is to stop paying the kernel-entry tax per operation. To see it plainly, here is the same work done two ways on
+this machine: 65,536 reads of 4&nbsp;KiB each (256&nbsp;MiB total) from a file already warm in the page cache, issued once as 65,536
+synchronous <code>pread</code> calls, and once as <code>io_uring</code> submissions batched 256 at a time. The metric that matters first is
+<em>kernel crossings</em>:</p>
+
+<pre><code>65,536 random 4 KiB reads from the page cache (this machine):
+  synchronous pread loop      :  65,536 syscalls   ~87-94 ms
+  io_uring, batched QD=256    :     256 io_uring_enter calls   ~77-104 ms
+  kernel crossings: 256x fewer     wall-clock: roughly break-even (~0.8-1.2x, noisy)
+</code></pre>
+
+<p>Two things must be read honestly here. The first is a clean, large result: <code>io_uring</code> cut the number of system calls by
+<strong>256&times;</strong>, from 65,536 to 256, because each <code>io_uring_enter</code> submitted and reaped a whole batch. That is the
+architectural win, and at a few hundred nanoseconds per crossing (Chapter 42) it is real work removed. The second is a result the book will not
+inflate: on this workload the <strong>wall-clock time was roughly break-even</strong>, not a speed-up. The reason is exactly the cost model of
+this part. These reads <em>hit</em> the page cache, so each one is a 4&nbsp;KiB memory copy inside the kernel — and that copy, done 65,536
+times, dominates the total, dwarfing the syscall-entry cost that <code>io_uring</code> removed. When the thing you eliminated (the boundary
+crossing) is small next to the thing you did not (the per-read copy), collapsing the crossings barely moves the clock. This is the chapter's
+most important lesson and it is the part's recurring one: <strong>a technique's benefit is only as large as the cost it removes is of the
+total.</strong> <code>io_uring</code>'s boundary-batching is decisive precisely where the boundary <em>is</em> the cost — enormous numbers of
+tiny operations (high-IOPS storage, packet processing) where per-syscall overhead dominates, and, above all, cases the wall-clock here cannot
+show at all: genuine <em>device</em> I/O, where the kernel does the blocking on its own threads while yours submits the next batch and never
+sleeps — the completion model's real prize is that a single thread keeps thousands of disk and network operations in flight without a thread
+blocked on any of them, which readiness could never do for disk (&sect;44.1). The syscall count is the honest, measured headline; the
+throughput win is workload-dependent, and you must measure it, not assume it.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: don't cross the kernel boundary per operation — submit a batch, reap completions</span>
+<p><strong>1. In words.</strong> Readiness (Chapter 42) still costs one syscall per operation and cannot describe disk. The completion model
+lets you submit many operations at once and be told when each finishes; <code>io_uring</code> realises it with two shared rings so a single
+<code>io_uring_enter</code> submits and reaps a whole batch — and the kernel, not your thread, does any blocking on the device.</p>
+<p><strong>2. As a picture.</strong> Figure 44.1: on the left, the synchronous loop — one kernel crossing per read, thousands of them; on the
+right, the application filling many SQEs in the shared submission ring, one <code>io_uring_enter</code> for the batch, and completions
+appearing in the shared completion ring, each tagged with its <code>user_data</code>.</p>
+<p><strong>3. As numbers/contrast.</strong> 65,536 cache-hot 4&nbsp;KiB reads: 65,536 syscalls the synchronous way, <strong>256</strong> the
+<code>io_uring</code> way (256&times; fewer crossings) — but on cache-warm data the per-read copy dominates, so wall-clock is
+<strong>roughly break-even</strong> here (&sect;44.3). The win becomes a real speed-up when the boundary is the cost (huge counts of tiny ops)
+or when the operations touch a real device, where the kernel blocks and your thread does not.</p>
+</aside>
+
+<p><em>(Answer to the &sect;44.1 quick check: the readiness model asks the kernel &ldquo;which descriptors can I operate on without
+blocking?&rdquo; and then you do the operation yourself; the completion model asks &ldquo;do this operation and tell me when it is
+finished.&rdquo; <code>epoll</code> cannot make a disk-file <code>read</code> asynchronous because a regular file is always &ldquo;ready&rdquo;
+in the readiness sense — you can always attempt the read — yet the attempt still blocks on the device on a cache miss, and there is no readiness
+event that means &ldquo;this read will not block,&rdquo; so readiness has nothing to watch for a file.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Synchronous: one kernel crossing per operation. io_uring: one crossing per batch, over two shared rings.</text>
+<text x="12" y="38" font-size="9" fill="#8c3a1d">synchronous pread loop &mdash; N operations, N syscalls</text>
+<rect x="20" y="48" width="120" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="26" y="60" font-size="8">pread() &rarr; kernel &rarr; back</text>
+<rect x="20" y="68" width="120" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="26" y="80" font-size="8">pread() &rarr; kernel &rarr; back</text>
+<text x="26" y="100" font-size="8" fill="#8c3a1d">... 65,536 crossings</text>
+<line x1="300" y1="40" x2="300" y2="230" stroke="#b9c2cc"/>
+<text x="320" y="38" font-size="9" fill="#2f7d32">io_uring &mdash; shared rings, one crossing per batch</text>
+<text x="320" y="58" font-size="8" fill="#14406b">submission ring (SQEs): app writes, kernel reads</text>
+<rect x="320" y="64" width="40" height="16" fill="#dfeee0" stroke="#2f7d32"/><text x="325" y="76" font-size="7">SQE</text>
+<rect x="362" y="64" width="40" height="16" fill="#dfeee0" stroke="#2f7d32"/><text x="367" y="76" font-size="7">SQE</text>
+<rect x="404" y="64" width="40" height="16" fill="#dfeee0" stroke="#2f7d32"/><text x="409" y="76" font-size="7">SQE</text>
+<text x="450" y="76" font-size="7" fill="#2f7d32">... 256</text>
+<rect x="320" y="92" width="200" height="18" fill="#eef1f4" stroke="#14406b"/><text x="326" y="105" font-size="8">io_uring_enter(submit 256, wait) &mdash; one syscall</text>
+<text x="320" y="130" font-size="8" fill="#14406b">completion ring (CQEs): kernel writes, app reads</text>
+<rect x="320" y="136" width="56" height="16" fill="#dfe8f4" stroke="#14406b"/><text x="325" y="148" font-size="7">CQE res,ud</text>
+<rect x="378" y="136" width="56" height="16" fill="#dfe8f4" stroke="#14406b"/><text x="383" y="148" font-size="7">CQE res,ud</text>
+<text x="440" y="148" font-size="7" fill="#14406b">... 256</text>
+<text x="320" y="172" font-size="8" fill="#2f7d32">user_data on each SQE echoed in its CQE &rarr; match completion to request</text>
+<line x1="12" y1="200" x2="628" y2="200" stroke="#b9c2cc"/>
+<text x="12" y="220" font-size="8" fill="#14406b">Measured: 65,536 cache-hot 4 KiB reads &rarr; 65,536 syscalls vs 256 (256x fewer crossings).</text>
+<text x="12" y="238" font-size="8" fill="#8c3a1d">Wall-clock roughly break-even here: cache-hit copy dominates, so removing the boundary barely moves the clock.</text>
+<text x="12" y="262" font-size="8" fill="#2f7d32">The real win: on true device I/O the kernel blocks, not your thread &mdash; one thread keeps thousands of ops in flight.</text>
+</svg>
+<figcaption>Figure 44.1: The synchronous loop (left) crosses the kernel boundary once per operation. <code>io_uring</code> (right) shares a
+submission ring and a completion ring with the kernel, so one <code>io_uring_enter</code> submits and reaps a whole batch — 256&times; fewer
+crossings for 65,536 reads. On cache-warm data the per-read copy dominates and wall-clock is roughly break-even; the model's real payoff is on
+device I/O, where the kernel does the blocking and one thread keeps thousands of operations in flight.</figcaption>
+</figure>
+
+<h2>44.4 The completion model's hazard: asynchronous buffer lifetime</h2>
+
+<p>The completion model buys its power by decoupling the moment you <em>submit</em> an operation from the moment it <em>completes</em>, and that
+gap is where its characteristic bug lives. When you fill an SQE for a read, you give the kernel the address of a buffer to read into; when you
+fill one for a write or send, you give it the address of a buffer to read <em>from</em>. In the synchronous world those buffers are only in use
+for the duration of the call, which returns before your next line runs, so their lifetime is trivial. Under <code>io_uring</code> the kernel may
+touch that buffer at <em>any</em> time between your submission and the matching completion — which can be milliseconds later, while your thread
+has run on to submit more work or handle other completions. The rule this imposes is absolute and easy to violate: <strong>every buffer
+referenced by an in-flight SQE must remain valid and unchanged until its CQE arrives.</strong> Free it, let it go out of scope, reuse it for a
+different operation, or overwrite it with the next request, and you have handed the kernel a dangling or racing pointer — a read that lands in
+freed memory, a send that transmits half-overwritten garbage, an intermittent corruption that appears only under the timing that makes the
+completion late. It is the asynchronous version of a use-after-free, and it is invisible in exactly the tests where completions come back fast:
+a lightly loaded run completes each operation almost immediately, so the buffer is still alive by luck, and the bug hides until load or a slow
+device stretches the gap. The same decoupling creates a second discipline: completions arrive in <em>whatever order the kernel finishes</em>,
+not submission order, so you must use the <code>user_data</code> tag to match each completion to its request and its buffer — assuming
+completions come back in order is a sibling bug. Both hazards are the price of asynchrony made explicit: the interface that lets one thread keep
+thousands of operations in flight also makes you, not the call stack, responsible for keeping each operation's memory alive across the gap.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the buffer freed before its completion &mdash; asynchronous use-after-free</span>
+<p>Under a completion interface, submitting an operation does not finish it: the kernel may read from or write to the buffer you named at any
+point up to the completion event, potentially milliseconds later. The trap is to treat submission like a synchronous call and reuse, free, or
+let the buffer go out of scope as soon as <code>io_uring_enter</code> returns — which works perfectly whenever the completion happens to come
+back fast (light load, warm cache, fast device), and corrupts memory intermittently exactly when it does not (heavy load, cold cache, slow
+device stretch the submit-to-complete gap). Because the failure is timing-dependent it survives unit tests and casual load tests and surfaces
+as rare, unreproducible data corruption in production — the worst kind of bug. Two disciplines defend against it. First, tie each in-flight
+buffer's lifetime to its completion, not to the submitting call: keep it owned by the request state you look up via <code>user_data</code> when
+the CQE arrives, and only then free or reuse it (registered/fixed buffers make this ownership explicit). Second, never assume completion order —
+match every CQE to its SQE through <code>user_data</code>, because the kernel completes operations in whatever order they finish, not the order
+you submitted. The mental shift is the whole point of the chapter: a submitted operation is a promise outstanding, and everything it references
+must outlive the promise. Reasoning about a buffer's lifetime as if submission were completion is the completion-model version of a
+use-after-free, and it is the first bug every io_uring program must be designed against.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Let's rewrite our storage service's hot read path on <code>io_uring</code> — it's the
+fastest I/O interface Linux has, so we should get a big throughput win basically for free.&rdquo; Cover the paragraph and respond in four or
+five sentences, drawing on &sect;44.1, &sect;44.3, and &sect;44.4.</p>
+<p><em>Model answer.</em> &ldquo;<code>io_uring</code> is the right long-term direction, but let's be precise about <em>why</em> it wins, because
+&lsquo;fastest, for free&rsquo; will burn us. Its concrete gains are two: it batches the kernel boundary — many operations per
+<code>io_uring_enter</code> instead of one syscall each — and it makes <em>disk</em> I/O truly asynchronous, so one thread keeps thousands of
+device operations in flight without blocking, which <code>epoll</code> cannot do for files. But the throughput win is workload-dependent: for
+reads that hit the page cache, the per-read copy dominates and batching the syscall barely moves the wall clock — I measured that as roughly
+break-even — so the payoff is real only where the syscall boundary or actual device latency is the bottleneck. And it is not free to write: a
+completion interface means every buffer must stay alive until its completion, or we get an asynchronous use-after-free that only shows under
+load. So let's prototype it on the path that is actually device-bound, measure against the current code, and design the buffer ownership
+carefully — not rewrite the cache-hot path expecting magic.&rdquo; Naming the two real gains, refusing the free-lunch framing with a measured
+break-even, and flagging the buffer-lifetime hazard is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;44.2 quick check: the two rings are the <strong>submission queue</strong> (SQEs, which the application writes and
+the kernel reads) and the <strong>completion queue</strong> (CQEs, which the kernel writes and the application reads); an SQE describes one
+operation (opcode, descriptor, buffer, length, offset, <code>user_data</code>) and a CQE carries the result (<code>res</code>) and the echoed
+<code>user_data</code>. The <code>user_data</code> field lets you match each completion to the request that produced it, since completions can
+arrive out of order. Submitting 100 reads and collecting their results takes <strong>one</strong> <code>io_uring_enter</code> — the boundary is
+crossed per batch, not per operation.)</em></p>
+
+<h2>44.5 What to carry forward</h2>
+
+<p>There are two ways the kernel helps with asynchronous I/O, and the difference is the chapter. <strong>Readiness</strong> (Chapter 42:
+<code>epoll</code>) says which descriptors can be operated on without blocking, then you do the operation — one syscall per operation, and no
+help at all for disk, since a regular file is always &ldquo;ready&rdquo; yet a cache-miss <code>read</code> still blocks on the device
+(&sect;44.1). <strong>Completion</strong> says &ldquo;do this operation and tell me when it is done,&rdquo; which is meaningful for any operation
+— socket or disk — and so unifies the two worlds. <strong><code>io_uring</code></strong> (Linux 5.1, 2019) implements it with two memory-shared
+ring buffers: a submission queue of SQEs describing operations and a completion queue of CQEs carrying results, so one
+<code>io_uring_enter</code> submits and reaps a whole batch — and <code>SQPOLL</code> can remove even that (&sect;44.2). Measured here, 65,536
+cache-hot reads cost <strong>256&times; fewer kernel crossings</strong> through <code>io_uring</code> (256 syscalls versus 65,536) — but
+roughly <strong>break-even wall-clock</strong>, because on cache-warm data the per-read copy dominates the boundary cost that was removed; the
+throughput win is real where the boundary or the device is the bottleneck, and must be measured, not assumed (&sect;44.3). And the completion
+model's power — decoupling submit from complete — creates its signature hazard: <strong>every buffer must stay valid until its completion</strong>,
+or you get an asynchronous use-after-free that hides until load stretches the gap, and completions must be matched to requests by
+<code>user_data</code> because they arrive out of order (&sect;44.4).</p>
+
+<p>This is where the I/O part's central thread — the cost of the kernel boundary, traced from the first <code>read</code> syscall of Chapter 40
+through the readiness of Chapter 42 — reaches its conclusion: submit in batches, be told on completion, and let the kernel, not your thread, do
+the blocking. One cost remains, and it is the last one in the part. Even with the boundary batched away, every byte moved from a file to a
+socket still travels through a buffer in your process — read into user space, written back out — a copy the CPU makes that does no useful
+transformation. The final chapter removes it: <strong>zero-copy</strong> transfer with <code>sendfile</code> and <code>splice</code>, where the
+data goes from the page cache to the network card without ever entering your address space. The waiting is solved and the boundary is batched;
+the last thing to eliminate is the copy itself.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the question the readiness model asks the kernel and the different one the completion model asks.</li>
+<li>Explain why <code>epoll</code>'s readiness model cannot make disk-file I/O asynchronous.</li>
+<li>Describe the two <code>io_uring</code> rings and what one SQE and one CQE each carry.</li>
+<li>Say how many system calls it takes to submit and reap a batch of 100 operations, and why.</li>
+<li>Explain why 65,536 cache-hot reads were 256&times; fewer syscalls yet roughly break-even in wall-clock — and where io_uring does win.</li>
+<li>State the buffer-lifetime rule the completion model imposes and the bug that violating it causes.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does readiness ask versus completion, and why does disk force the change? (&sect;44.1)</li>
+<li><strong>R2.</strong> What are the two rings, and what do SQEs and CQEs carry? (&sect;44.2)</li>
+<li><strong>R3.</strong> How many syscalls submit a batch of N operations, and what did the measured 65,536-read comparison show — in syscalls and in wall-clock? (&sect;44.3)</li>
+<li><strong>R4.</strong> Why was the wall-clock roughly break-even on cache-hot data, and where does <code>io_uring</code> actually win? (&sect;44.3)</li>
+<li><strong>R5.</strong> What is the buffer-lifetime rule, why is the bug intermittent, and how do you match completions to requests? (&sect;44.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Jens Axboe, &ldquo;Efficient IO with io_uring&rdquo; (kernel.dk, 2019).</strong> The design document by <code>io_uring</code>'s
+author: the submission and completion rings, SQE and CQE layout, the <code>io_uring_setup</code>/<code>io_uring_enter</code> system calls, and
+the polled-submission mode — the primary reference for &sect;44.2. Author Jens Axboe (also the author of the kernel implementation); a
+freely-available technical document cited by author, title, and year.</li>
+<li><strong>&ldquo;Ringing in a new asynchronous I/O API,&rdquo; <em>LWN.net</em> (2019).</strong> LWN's walkthrough of <code>io_uring</code> as
+it was merged into Linux 5.1, motivating the completion model against the limits of readiness and POSIX AIO that &sect;44.1 draws on. Cited by
+title, venue, and year; LWN articles carry no DOI.</li>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapter 63
+(&ldquo;Alternative I/O Models&rdquo;) covers the readiness-based predecessors — <code>select</code>/<code>poll</code>/<code>epoll</code>,
+signal-driven I/O, and POSIX AIO — that motivate <code>io_uring</code>; note that <code>io_uring</code> postdates the book (2019 vs 2010), so it
+is context for &sect;44.1, not a reference for the interface itself. First author Michael Kerrisk; edition and ISBN verified via the
+publisher.</li>
+<li><strong>W. Richard Stevens, Bill Fenner &amp; Andrew M. Rudoff, <em>UNIX Network Programming, Volume 1: The Sockets Networking API</em>,
+3rd ed. (Addison-Wesley, 2003), ISBN 978-0-13-141155-5.</strong> Chapter 6's taxonomy of I/O models — blocking, non-blocking, multiplexing,
+signal-driven, and asynchronous (completion) — is the classic framing that &sect;44.1's readiness-versus-completion distinction extends. First
+author W. Richard Stevens; edition and ISBN verified via the publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex44.1"><span class="ex-label">44.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, state the question the readiness model asks the kernel and the question the completion model asks instead.</div>
+
+<div class="exercise" id="ex44.2"><span class="ex-label">44.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two ring buffers <code>io_uring</code> shares with the kernel, and say which side (application or kernel) writes each.</div>
+
+<div class="exercise" id="ex44.3"><span class="ex-label">44.3</span> <span class="ex-tag warm">warm-up</span>
+How many <code>io_uring_enter</code> calls does it take to submit a batch of 200 operations and wait for their completions, and how does that
+compare to doing 200 synchronous <code>pread</code> calls?</div>
+
+<div class="exercise" id="ex44.4"><span class="ex-label">44.4</span> <span class="ex-tag core">core</span>
+Readiness versus completion. (a) Explain why the readiness model needs one system call per operation even after <code>epoll_wait</code>
+returns. (b) A regular disk file is always reportable as &ldquo;ready&rdquo;; explain why that makes <code>epoll</code> useless for making a
+cache-missing <code>read</code> asynchronous. (c) Why is &ldquo;tell me when it is done&rdquo; a question that works for both sockets and disk,
+where &ldquo;which are ready&rdquo; does not?</div>
+
+<div class="exercise" id="ex44.5"><span class="ex-label">44.5</span> <span class="ex-tag core">core</span>
+The rings. (a) Describe the fields of a submission queue entry and of a completion queue entry, and what <code>user_data</code> is for. (b)
+Walk through the steps to submit three reads and collect their results. (c) What does <code>SQPOLL</code> (polled submission) change about the
+number of system calls, and how?</div>
+
+<div class="exercise" id="ex44.6"><span class="ex-label">44.6</span> <span class="ex-tag core">core</span>
+The measured result. (a) Why did 65,536 cache-hot reads cost 256 syscalls through <code>io_uring</code> instead of 65,536? (b) Given that
+result, why was the wall-clock time only roughly break-even rather than 256&times; faster? (c) Name two workloads where <code>io_uring</code>
+would show a real wall-clock win, and say what is the dominant cost in each that batching or async submission removes.</div>
+
+<div class="exercise" id="ex44.7"><span class="ex-label">44.7</span> <span class="ex-tag complexity">cost</span>
+Model the cost of N operations as <var>N</var>(<var>b</var> + <var>w</var>) for the synchronous loop, where <var>b</var> is the per-syscall
+boundary cost and <var>w</var> is the per-operation work (e.g. the copy), versus <var>N</var>&middot;<var>w</var> + (<var>N</var>/<var>k</var>)&middot;<var>b</var>
+for <code>io_uring</code> batching <var>k</var> at a time. (a) Write the ratio of the two and simplify. (b) For which relative sizes of
+<var>b</var> and <var>w</var> is the speed-up large, and for which is it near 1? (c) Explain how the &sect;44.3 measurement (cache-hot reads:
+<var>w</var> is a 4&nbsp;KiB copy, <var>b</var> a few hundred ns) lands in the &ldquo;near 1&rdquo; regime, and how a real device (<var>w</var>
+includes milliseconds of latency the kernel absorbs) changes the picture entirely.</div>
+
+<div class="exercise" id="ex44.8"><span class="ex-label">44.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A service ported its read path to <code>io_uring</code> and now returns corrupted data — but only
+occasionally, and never in the test suite.
+<br><strong>Step 1 (given):</strong> for each request it fills an SQE pointing at a stack buffer, calls <code>io_uring_enter</code> to submit,
+and returns from the function.
+<br><strong>Step 2 (given):</strong> the completion for that read arrives later, on a separate reaping loop.
+<br><strong>Step 3 (given):</strong> by the time the kernel writes the read data, the function has returned and its stack frame — including the
+buffer — has been reused.
+<br><strong>Step 4 (you):</strong> Explain the bug precisely, why it is intermittent and passes tests, and how to fix the buffer's lifetime.</div>
+
+<div class="exercise" id="ex44.9"><span class="ex-label">44.9</span> <span class="ex-tag mixed">mixed</span>
+For each claim, say correct or wrong and why: (a) &ldquo;After <code>io_uring_enter</code> returns, my read is done and the buffer holds the
+data.&rdquo; (b) &ldquo;Completions come back in the order I submitted, so I can ignore <code>user_data</code>.&rdquo; (c) &ldquo;<code>io_uring</code>
+can make disk reads asynchronous, unlike <code>epoll</code>.&rdquo; (d) &ldquo;One <code>io_uring_enter</code> can submit a hundred operations.&rdquo;
+(e) &ldquo;Because it batches syscalls, <code>io_uring</code> always beats synchronous I/O on wall-clock.&rdquo;</div>
+
+<div class="exercise" id="ex44.10"><span class="ex-label">44.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A regular file has a readiness event that tells you a
+<code>read</code> will not block.&rdquo; (b) &ldquo;An SQE's <code>user_data</code> is echoed back in the matching CQE.&rdquo; (c) &ldquo;The
+completion model requires the caller to keep each operation's buffer valid until its completion.&rdquo; (d) &ldquo;<code>io_uring</code>'s
+rings live only in kernel memory and the application cannot see them.&rdquo; (e) &ldquo;Batching cut the 65,536-read example to 256 kernel
+crossings.&rdquo;</div>
+
+<div class="exercise" id="ex44.11"><span class="ex-label">44.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the chapter with the part. (a) Trace the &ldquo;cost of the kernel boundary&rdquo; thread from the blocking <code>read</code> of
+Chapter 40, through <code>epoll</code> readiness in Chapter 42, to <code>io_uring</code> completion here — what does each stage remove and what
+remains? (b) Argue why the honest break-even result of &sect;44.3 is <em>more</em> instructive than a speed-up would have been, tying it to the
+part's cost-model discipline. (c) The completion model unifies sockets and disk under one interface but shifts buffer-lifetime responsibility
+to the programmer; discuss this as a general pattern — power purchased with explicitness — and one other place in this book where the same
+trade appears.</div>
+
+<div class="exercise" id="ex44.12"><span class="ex-label">44.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a recent Linux kernel with <code>io_uring</code>; <code>liburing</code> optional): (a) Submit a single
+<code>IORING_OP_NOP</code> through <code>io_uring_setup</code>/<code>io_uring_enter</code> and confirm you reap its completion, to verify the
+interface works. (b) Read a large cache-warm file two ways — a synchronous <code>pread</code> loop and <code>io_uring</code> batched at some
+queue depth — and report the <em>kernel-crossing count</em> for each and the wall-clock time; comment on why the wall-clock difference is small
+on cache-hit data. (c) State your kernel version, toolchain, and CPU; note the times are wall-clock (no hardware counters); and, if you can,
+sketch how the picture would change for uncached reads from a real disk, where the kernel absorbs the device latency and your thread stays
+free.</div>
+
+</section>
+</section>

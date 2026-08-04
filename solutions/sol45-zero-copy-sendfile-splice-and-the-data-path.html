@@ -1,0 +1,100 @@
+<section class="solutions" id="sol45">
+<h1>Chapter 45 — Solutions</h1>
+
+<div class="solution" id="sol45.1"><span class="sol-label">45.1</span>
+Twice: once from the page cache into the user-space buffer (by <code>read</code>), and once from that buffer into the socket send buffer (by
+<code>write</code>). <em>Tempting wrong answer:</em> &ldquo;once&rdquo; — people forget the buffer is copied <em>out</em> to the socket as well
+as <em>in</em> from the cache. <strong>Feed-forward:</strong> &sect;45.1.</div>
+
+<div class="solution" id="sol45.2"><span class="sol-label">45.2</span>
+It removes the two CPU copies through the user-space buffer (and the buffer itself), sending the file to the socket inside the kernel; measured
+here it cut the system calls from 16,384 to <strong>1</strong>. <em>Tempting wrong answer:</em> &ldquo;it makes the copy faster&rdquo; — it
+removes the user-space copies, it does not speed them up. <strong>Feed-forward:</strong> &sect;45.2.</div>
+
+<div class="solution" id="sol45.3"><span class="sol-label">45.3</span>
+Any transformation of the bytes — for example encrypting them for TLS (also compressing, transcoding, inspecting) — because the data never
+enters your address space, so there is no point at which your code can run over it. <em>Tempting wrong answer:</em> &ldquo;none — sendfile can
+do anything read/write can&rdquo; — it cannot touch the bytes, by design. <strong>Feed-forward:</strong> &sect;45.4.</div>
+
+<div class="solution" id="sol45.4"><span class="sol-label">45.4</span>
+(a) DMA disk &rarr; page cache; CPU page cache &rarr; user buffer (<code>read</code>); CPU user buffer &rarr; socket buffer (<code>write</code>);
+DMA socket buffer &rarr; NIC/wire. (b) <code>sendfile</code> removes the two CPU copies through the user buffer; they are waste because the
+buffer is a pure relay that never reads or changes the data. (c) On ordinary hardware <code>sendfile</code> still copies once inside the kernel,
+from the page cache into the socket buffer; a NIC with scatter-gather DMA and checksum offload removes even that by gathering the page-cache
+pages straight onto the wire. <em>Tempting wrong answer:</em> &ldquo;sendfile removes all copies on any hardware&rdquo; — the last in-kernel
+copy needs scatter-gather DMA to disappear. <strong>Feed-forward:</strong> &sect;45.1&ndash;&sect;45.3.</div>
+
+<div class="solution" id="sol45.5"><span class="sol-label">45.5</span>
+(a) It removed the two user-space CPU copies (memory bandwidth) and the per-block <code>read</code>/<code>write</code> boundary crossings (the
+syscall tax) — 16,384 syscalls down to 1. (b) Because <code>sendfile</code> still does real work: on this hardware one in-kernel copy from the
+page cache to the socket buffer plus the DMA, so it removed a portion of the cost, not all of it — a ~2.3&times; win, not an unbounded one. (c)
+A real network card can use scatter-gather DMA to send straight from the page cache, removing the last in-kernel copy that the loopback path
+still pays, so the CPU leaves the data path entirely — a larger relative win. <em>Tempting wrong answer:</em> &ldquo;the 2.3&times; is the
+theoretical max&rdquo; — with hardware offload the CPU copy count reaches zero, beyond what loopback shows. <strong>Feed-forward:</strong>
+&sect;45.2&ndash;&sect;45.3.</div>
+
+<div class="solution" id="sol45.6"><span class="sol-label">45.6</span>
+(a) <code>splice</code> moves data between <em>any</em> two descriptors without a user-space copy, where <code>sendfile</code> is fixed to
+file-in, socket-out. (b) One end must be a pipe because the pipe is the kernel's internal conduit — a queue of references to kernel buffers
+(page-cache pages) — and <code>splice</code> moves those references rather than copying bytes. (c) For example: proxying one socket to another
+(socket &rarr; pipe &rarr; socket), and logging a socket to a file (socket &rarr; pipe &rarr; file). <em>Tempting wrong answer:</em> &ldquo;the
+pipe is just a temporary buffer that holds a copy&rdquo; — it holds references, not a byte copy; that is the point. <strong>Feed-forward:</strong>
+&sect;45.3.</div>
+
+<div class="solution" id="sol45.7"><span class="sol-label">45.7</span>
+(a) Two CPU copies per byte at rate <var>R</var>: <strong>2<var>R</var>/<var>B</var></strong> CPU-seconds per second. (b) One in-kernel copy:
+<strong><var>R</var>/<var>B</var></strong>. (c) With scatter-gather DMA, <strong>0</strong> — the CPU makes no copy, so those cycles are freed
+for real work (request handling, TLS if offloaded, other connections). A file server becomes copy-bound because at high <var>R</var>,
+2<var>R</var>/<var>B</var> can approach or exceed one core's worth of time spent purely on <code>memcpy</code>, so the CPU saturates moving
+bytes it never inspects — exactly the waste zero-copy targets. <em>Tempting wrong answer:</em> &ldquo;copying is negligible, servers are
+network-bound&rdquo; — at multi-GB/s a memory-bandwidth-bound double copy is a real, often dominant, CPU cost. <strong>Feed-forward:</strong>
+&sect;45.1&ndash;&sect;45.3.</div>
+
+<div class="solution" id="sol45.8"><span class="sol-label">45.8</span>
+<strong>Step 4:</strong> TLS requires transforming (encrypting) every byte before it goes on the socket, which needs the bytes in a buffer the
+code can run over; <code>sendfile</code> deliberately never brings the bytes to user space, so there is no point in its path to encrypt them —
+the fast path structurally cannot serve TLS. The benchmark did not reveal it because it measured plaintext static serving, where no
+transformation is needed and <code>sendfile</code> shines; the requirement to transform was simply not exercised. Two ways forward: (1) keep
+zero-copy by enabling <strong>kernel TLS</strong> (kTLS), which moves encryption into the kernel so it encrypts page-cache data on the way to
+the socket and <code>sendfile</code> works over TLS; (2) give up zero-copy on the encrypted path and use the ordinary
+<code>read</code>/encrypt/<code>write</code> loop, optimising it differently. <em>Tempting wrong answer:</em> &ldquo;encrypt the file at rest
+once and sendfile the ciphertext&rdquo; — TLS session keys are per-connection, so you cannot pre-encrypt a shared file for all clients.
+<strong>Feed-forward:</strong> &sect;45.4.</div>
+
+<div class="solution" id="sol45.9"><span class="sol-label">45.9</span>
+(a) <strong>Applies</strong> — plain HTTP relays the file unchanged; <code>sendfile</code> is ideal. (b) <strong>Does not apply</strong> — TLS
+must encrypt every byte and there is no kTLS, so the bytes must go through user space. (c) <strong>Applies</strong> — unchanged
+socket-to-socket relay is exactly what <code>splice</code> does via a pipe. (d) <strong>Does not apply</strong> — gzip transforms the bytes, so
+they must be in a buffer. (e) <strong>Applies</strong> — with kTLS the kernel encrypts on the way out, so <code>sendfile</code> keeps the
+zero-copy path over TLS. <em>Tempting wrong answer:</em> calling (b) applicable &ldquo;because it is still just sending a file&rdquo; — the
+encryption requirement forbids zero-copy without kTLS. <strong>Feed-forward:</strong> &sect;45.2&ndash;&sect;45.4.</div>
+
+<div class="solution" id="sol45.10"><span class="sol-label">45.10</span>
+(a) <strong>False</strong> — <code>sendfile</code> copies inside the kernel and never uses a user buffer. (b) <strong>True</strong> — a
+scatter-gather NIC gathers page-cache pages straight to the wire, so no CPU copy is needed. (c) <strong>False</strong> — encrypting in the app
+needs the bytes in user space, which <code>sendfile</code> refuses; the two cannot coexist in one step without kTLS. (d) <strong>True</strong> —
+<code>splice</code> requires one descriptor to be a pipe. (e) <strong>False</strong> — the two <em>DMA</em> copies are unavoidable and cheap;
+the waste is the two <em>CPU</em> copies through user space. <em>Tempting wrong answer:</em> marking (e) true by miscounting which copies are
+the waste — DMA copies are hardware and necessary. <strong>Feed-forward:</strong> &sect;45.1&ndash;&sect;45.4.</div>
+
+<div class="solution" id="sol45.11"><span class="sol-label">45.11</span>
+(a) Chapter 42 removed <em>blocking</em> — one thread waits on many descriptors via readiness instead of a thread per wait — leaving one syscall
+per operation and no help for disk; Chapter 44 removed the <em>per-operation kernel boundary</em> via completion-based batching and made disk
+async, leaving the per-byte copy; this chapter removes the <em>user-space copy</em>, leaving only the unavoidable DMA. (b) Zero-copy is fast
+<em>because</em> the bytes never enter your address space, and it cannot transform them <em>because</em> the bytes never enter your address
+space — one fact — so the fastest path is unusable whenever the job requires touching the bytes (TLS, compression), and the correct choice
+depends on whether transformation is needed, not on raw speed. (c) The four-copy diagram makes every cost visible as a physical move: two DMA
+copies (necessary), two CPU copies (waste), two boundary crossings — so &ldquo;where are the bytes and who copies them&rdquo; directly names
+what each technique in the part removes, from the event loop's avoided waits to <code>sendfile</code>'s avoided copies. <em>Tempting wrong
+answer:</em> &ldquo;always pick the fastest primitive&rdquo; — the usable primitive depends on whether you must transform the data.
+<strong>Feed-forward:</strong> &sect;45.1&ndash;&sect;45.5.</div>
+
+<div class="solution" id="sol45.12"><span class="sol-label">45.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports the <code>read</code>/<code>write</code> loop's throughput and its two
+syscalls per block against <code>sendfile</code>'s higher throughput and one (or few) syscalls; (b) attributes the gain to both removed user-space
+copies and removed boundary crossings, using the syscall counts to separate them; (c) states toolchain and CPU, flags wall-clock timing without
+hardware counters, and explains that loopback understates the win because there is no NIC to use scatter-gather DMA — the feature that removes
+the final in-kernel copy on a real network path. <em>Tempting wrong answer:</em> &ldquo;conclude the loopback number is the real-world
+ceiling&rdquo; — a scatter-gather NIC removes a copy loopback still pays. <strong>Feed-forward:</strong> &sect;45.2&ndash;&sect;45.3.</div>
+
+</section>

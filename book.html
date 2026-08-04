@@ -286,6 +286,9 @@ aside.threeways { border-left: 4px solid #1a6d6d; background: #eef7f7; }
 <li class="toc-ch"><a href="#ch40">Chapter 40 — The I/O Stack: System Calls, Buffering, and the Page Cache</a></li>
 <li class="toc-ch"><a href="#ch41">Chapter 41 — Files and Durability: fsync, Direct I/O, and Memory Mapping</a></li>
 <li class="toc-ch"><a href="#ch42">Chapter 42 — Blocking, Non-Blocking, and Event-Driven I/O</a></li>
+<li class="toc-ch"><a href="#ch43">Chapter 43 — Sockets, TCP, and UDP: The Connection Lifecycle</a></li>
+<li class="toc-ch"><a href="#ch44">Chapter 44 — io_uring and Completion-Based Asynchronous I/O</a></li>
+<li class="toc-ch"><a href="#ch45">Chapter 45 — Zero-Copy: sendfile, splice, and the Data Path</a></li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part VIII &mdash; Storage & the Disk</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part IX &mdash; Storage Engines</li>
 <li class="toc-part">Vol 2 · Database Internals (Build a Database) · Part X &mdash; Durability & Recovery</li>
@@ -17139,6 +17142,1149 @@ descriptors, mark exactly one ready, and time a readiness scan with <code>select
 </section>
 </section>
 
+<section class="chapter" id="ch43">
+<h1>Chapter 43 — Sockets, TCP, and UDP: The Connection Lifecycle</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch42">Chapter 42</a> (the event loop that watches many connections, and the
+blocking-versus-readiness choice), <a href="#ch40">Chapter 40</a> (the I/O syscalls and buffering), <a href="#ch13">Chapter 13</a> (the cost of
+a system call), <a href="#ch16">Chapter 16</a> (what a blocked thread does). &nbsp;·&nbsp; The last chapter watched thousands of descriptors
+without asking what they were. Here they get a name: a <strong>socket</strong> is the descriptor that connects a program to the network, and
+this chapter is how one is opened, connected, and fed bytes — and what the two transport protocols underneath, TCP and UDP, promise and refuse.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch40">Chapter 40</a> — a <code>read</code> returns however many bytes are available <em>now</em>, not a fixed
+record; what does that imply for data that arrives in pieces? (2) <a href="#ch13">Chapter 13</a> and <a href="#ch42">Chapter 42</a> — a system
+call that must enter the kernel costs a few hundred nanoseconds; keep that number in mind. (3) <em>Predict:</em> a client sends a 40-byte
+request as two small <code>write</code> calls and then waits for the reply; the server reads the whole request, then answers. On a plain TCP
+connection the round trip takes tens of milliseconds; flip one socket option and it drops to under a tenth of a millisecond. Two questions:
+what could make a localhost round trip take <em>40&nbsp;ms</em> when the network latency is microseconds? And what one option removes it? Write
+your guesses; &sect;43.4 answers them.</p>
+</aside>
+
+<p>Every network program is built from the same object: a <strong>socket</strong>, a file descriptor (Chapter 40) that instead of naming a
+file names an endpoint of a communication channel. Because it is a descriptor, everything the I/O chapters taught applies unchanged —
+<code>read</code>, <code>write</code>, <code>close</code>, <code>O_NONBLOCK</code>, and the <code>epoll</code> of Chapter 42 all work on
+sockets exactly as on files — which is the whole point of the design: the network is just another I/O device behind the descriptor
+abstraction. What is new is how a socket is <em>set up</em> (a file you just <code>open</code>; a connection must be negotiated between two
+machines), and what the transport protocol underneath guarantees about the bytes that flow through it. This chapter builds that in five steps:
+the socket API and the connection lifecycle, server and client (&sect;43.1); TCP as a reliable, ordered byte stream — and why it has no message
+boundaries (&sect;43.2); UDP as datagrams that keep boundaries but drop every other promise (&sect;43.3); the small-write stall where Nagle's
+algorithm and delayed acknowledgements collide, measured (&sect;43.4); and what to carry forward (&sect;43.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 20 hardware threads), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as the minimum of several trials
+(Chapter 33). Times are wall-clock; a hardware-counter profiler (<code>perf</code>) is <em>not</em> installed here. The client and server run
+as two threads in one process talking over the <strong>loopback</strong> interface (<code>127.0.0.1</code>), so there is no real network
+latency — which makes the &sect;43.4 result striking: the tens of milliseconds measured there are not the wire, they are a protocol timer
+firing, and they reproduce on localhost precisely because the wire is not the cause. Every socket call and flag below was checked against the
+Linux man pages (<code>socket(2)</code>, <code>bind(2)</code>, <code>listen(2)</code>, <code>accept(2)</code>, <code>connect(2)</code>,
+<code>send(2)</code>, <code>setsockopt(2)</code>, <code>tcp(7)</code>) on this machine.</p>
+
+<h2>43.1 The socket API and the connection lifecycle</h2>
+
+<p>A socket is created with <code>socket(domain, type, protocol)</code>, which returns a descriptor. The <em>domain</em> selects the address
+family (<code>AF_INET</code> for IPv4, <code>AF_INET6</code> for IPv6); the <em>type</em> selects the transport semantics —
+<code>SOCK_STREAM</code> for a TCP byte stream, <code>SOCK_DGRAM</code> for UDP datagrams. From there the server and client follow different
+sequences. A <strong>server</strong> runs four calls: <code>bind</code> attaches the socket to a local address and port so clients can find it;
+<code>listen</code> marks it passive and gives it a queue of pending connections (the <em>backlog</em>); and <code>accept</code> blocks until a
+client connects, then returns a <em>new</em> descriptor for that one connection — the listening socket stays open to accept the next, while the
+returned socket carries this client's bytes. A <strong>client</strong> runs one: <code>connect</code> to the server's address, which does not
+return until the connection is established (or fails). Establishing it is TCP's <strong>three-way handshake</strong> (RFC 793): the client
+sends a <code>SYN</code> (synchronise) segment, the server replies <code>SYN</code>+<code>ACK</code>, the client replies <code>ACK</code>, and
+now both sides agree on starting sequence numbers and the channel is open — one full round trip of latency spent before a single byte of data
+moves, which is why connection setup is a cost you pay per connection and why long-lived or pooled connections matter. Once open, both sides
+call <code>read</code>/<code>recv</code> and <code>write</code>/<code>send</code> on their connected socket exactly as on a pipe. Closing is
+also negotiated: <code>close</code> starts a <code>FIN</code>/<code>ACK</code> exchange, and the side that closes first (the <em>active</em>
+close) leaves its socket in the <strong>TIME_WAIT</strong> state for twice the maximum segment lifetime, holding the port so that stray delayed
+segments from the old connection cannot be mistaken for a new one — the reason a just-killed server sometimes cannot immediately rebind its
+port without <code>SO_REUSEADDR</code>. The lifecycle, then, is: create, (server) bind/listen/accept or (client) connect, exchange bytes,
+close — and every step but the byte exchange is machinery TCP runs to turn two unreliable hosts into one reliable pipe.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the four calls a TCP server makes before it can exchange bytes, and the one a client makes. What does <code>accept</code> return, and
+why is it a <em>different</em> descriptor from the listening socket? (Answer after the next section.)</p>
+</aside>
+
+<h2>43.2 TCP: a reliable, ordered byte stream — with no message boundaries</h2>
+
+<p>TCP (RFC 793) takes two hosts connected by a network that can lose, reorder, duplicate, and delay packets, and presents the application a
+channel that behaves as if none of that happened: a <strong>reliable, ordered stream of bytes</strong>. It achieves this with machinery the
+application never sees. Every byte is numbered by a <strong>sequence number</strong>; the receiver returns <strong>acknowledgements</strong>
+for bytes received, and the sender <strong>retransmits</strong> anything not acknowledged within a timeout — that is the reliability. The
+receiver uses the sequence numbers to deliver bytes in order even if packets arrive out of order — that is the ordering. A <strong>sliding
+window</strong> advertised by the receiver bounds how much unacknowledged data the sender may have outstanding, so a fast sender cannot
+overrun a slow receiver — that is <strong>flow control</strong> — and a separate <strong>congestion-control</strong> algorithm slows the
+sender when the network itself is loaded, the problem RFC 896 was written to solve. All of this is why TCP is the default: you get a pipe that
+just works. But the abstraction has one edge that trips nearly every beginner, and it follows directly from &ldquo;stream of bytes&rdquo;:
+<strong>TCP does not preserve message boundaries.</strong> If the sender makes three <code>write</code> calls of 100 bytes, the receiver may
+get all 300 in a single <code>read</code>, or 60 then 240, or one byte at a time — TCP guarantees the bytes arrive in order, not that they
+arrive grouped the way they were sent. The transport is free to coalesce small writes into one segment (indeed Nagle's algorithm, &sect;43.4,
+tries to) and to split large ones across segments, and a <code>read</code> returns whatever bytes have arrived at that instant (Chapter 40),
+which need not align with any <code>write</code>. The consequence is a rule: <strong>if your protocol has messages, you must frame them
+yourself</strong> — prefix each with a length, or use a delimiter, and loop <code>read</code> until a whole message is assembled. Assuming
+&ldquo;one <code>send</code>, one <code>recv</code>&rdquo; is the most common networking bug there is; it appears to work in testing (small
+messages on a fast link usually do arrive in one piece) and fails in production under load or across a real network, which is the same
+common-case-testing trap that runs through this whole part.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>A sender issues three 100-byte <code>write</code> calls on a TCP socket. How many bytes might a single <code>read</code> on the other end
+return, and why does TCP not promise you get them in three pieces of 100? What must a protocol with real messages do about it? (Answer below
+the communicate box.)</p>
+</aside>
+
+<h2>43.3 UDP: datagrams without the promises</h2>
+
+<p>UDP (RFC 768) is the other transport, and it is almost the complement of TCP: it keeps the one guarantee TCP drops and drops every
+guarantee TCP keeps. UDP is <strong>connectionless</strong> — there is no handshake; you create a <code>SOCK_DGRAM</code> socket and
+<code>sendto</code> a datagram to an address, and it is sent — and it is <strong>message-oriented</strong>: each <code>sendto</code> is one
+datagram, and the receiver's <code>recvfrom</code> returns exactly one datagram per call, boundaries preserved. What you give up is everything
+TCP's machinery provided: UDP does <strong>not</strong> guarantee delivery (a lost datagram is simply gone — no retransmission), does
+<strong>not</strong> guarantee ordering (datagrams can arrive in any order), does <strong>not</strong> provide flow or congestion control
+(send too fast and you overrun the receiver or the network, and nothing slows you down), and offers only a weak optional checksum. Its header
+is a mere 8 bytes against TCP's 20-byte minimum, and it costs no setup round trip. So UDP is the right tool exactly when TCP's guarantees are
+either unneeded or actively in the way: DNS queries (one small request, one small reply — a whole TCP handshake would cost more than the
+query); real-time audio and video and games (a late packet is worse than a lost one, so TCP's retransmit-and-deliver-in-order would <em>add</em>
+harmful latency — you would rather skip the lost frame); and modern protocols such as QUIC that build their own reliability, ordering, and
+congestion control on top of UDP because they want control TCP's fixed implementation does not give. The trade is explicit and total: with UDP
+you get boundaries, low overhead, and no waiting, and in exchange you either do not need reliability and ordering, or you build exactly the
+version of them you want. Choosing between them is therefore not about speed in the abstract but about which guarantees your application needs
+and which it would rather implement or skip.</p>
+
+<aside class="threeways">
+<span class="box-title">The same choice three ways: TCP gives you the guarantees; UDP gives you the boundaries and the control</span>
+<p><strong>1. In words.</strong> TCP turns an unreliable network into a reliable, ordered byte stream — at the cost of a setup round trip,
+per-byte sequencing and acknowledgement, retransmission delay, and no message boundaries. UDP hands you the raw datagram: message boundaries
+preserved, no setup, minimal header — and no delivery, ordering, flow, or congestion guarantee at all. TCP when you want a pipe that just
+works; UDP when you need boundaries and low latency and will supply (or skip) reliability yourself.</p>
+<p><strong>2. As a picture.</strong> Figure 43.1: on the left, the TCP three-way handshake (SYN, SYN-ACK, ACK) then a numbered byte stream
+where three writes coalesce into whatever segments the transport chooses; on the right, UDP, where each <code>sendto</code> is one datagram
+delivered whole or not at all, in any order, with no handshake.</p>
+<p><strong>3. As numbers/contrast.</strong> TCP header minimum 20 bytes and one RTT of handshake before any data; UDP header 8 bytes and zero
+setup. And the guarantee has a price measured in &sect;43.4: a small-write request/response on default TCP can stall <strong>~40&nbsp;ms</strong>
+per round on the interaction of Nagle's algorithm with delayed acknowledgements — versus <strong>~0.09&nbsp;ms</strong> with
+<code>TCP_NODELAY</code> — an artifact of TCP's machinery that UDP, having no such machinery, cannot produce.</p>
+</aside>
+
+<p><em>(Answer to the &sect;43.1 quick check: a TCP server calls <code>socket</code>, <code>bind</code>, <code>listen</code>, and
+<code>accept</code>; a client calls <code>socket</code> then <code>connect</code>. <code>accept</code> returns a <strong>new</strong>
+descriptor dedicated to the one accepted connection, while the original listening socket stays open to accept further clients — so a server
+holds one listening socket plus one connected socket per client, which is exactly the set of descriptors the Chapter 42 event loop watches.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 320" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">TCP: negotiated connection, ordered byte stream (no message boundaries). UDP: fire-and-forget datagrams.</text>
+<text x="12" y="38" font-size="9" fill="#2f7d32">TCP three-way handshake, then a byte stream</text>
+<text x="40" y="56" font-size="8">client</text><text x="250" y="56" font-size="8">server</text>
+<line x1="60" y1="60" x2="60" y2="230" stroke="#333"/><line x1="270" y1="60" x2="270" y2="230" stroke="#333"/>
+<line x1="60" y1="70" x2="270" y2="86" stroke="#2f7d32"/><text x="90" y="72" font-size="7" fill="#2f7d32">SYN</text>
+<line x1="270" y1="96" x2="60" y2="112" stroke="#2f7d32"/><text x="150" y="112" font-size="7" fill="#2f7d32">SYN + ACK</text>
+<line x1="60" y1="122" x2="270" y2="138" stroke="#2f7d32"/><text x="90" y="124" font-size="7" fill="#2f7d32">ACK  (handshake: 1 RTT)</text>
+<line x1="60" y1="158" x2="270" y2="170" stroke="#14406b" stroke-width="1.5"/><text x="70" y="156" font-size="7" fill="#14406b">write 100 + write 100 + write 100</text>
+<text x="150" y="188" font-size="7" fill="#8c3a1d">one read() may return 300, or 60 then 240 &mdash; no boundaries</text>
+<line x1="60" y1="200" x2="270" y2="212" stroke="#333" stroke-dasharray="2,2"/><text x="80" y="200" font-size="7">FIN / ACK &rarr; TIME_WAIT</text>
+<line x1="330" y1="60" x2="330" y2="230" stroke="#b9c2cc"/>
+<text x="350" y="38" font-size="9" fill="#8c3a1d">UDP: no handshake, message boundaries kept</text>
+<text x="360" y="56" font-size="8">client</text><text x="560" y="56" font-size="8">server</text>
+<line x1="380" y1="60" x2="380" y2="230" stroke="#333"/><line x1="580" y1="60" x2="580" y2="230" stroke="#333"/>
+<line x1="380" y1="80" x2="580" y2="92" stroke="#8c3a1d"/><text x="400" y="80" font-size="7" fill="#8c3a1d">sendto(dgram A) &rarr; recvfrom = A</text>
+<line x1="380" y1="108" x2="580" y2="120" stroke="#8c3a1d"/><text x="400" y="108" font-size="7" fill="#8c3a1d">sendto(dgram B)</text>
+<line x1="380" y1="136" x2="520" y2="150" stroke="#c0392b" stroke-dasharray="3,2"/><text x="400" y="136" font-size="7" fill="#c0392b">sendto(dgram C) &mdash; lost, no retransmit</text>
+<text x="360" y="176" font-size="7" fill="#8c3a1d">each datagram whole or absent; order not guaranteed</text>
+<text x="12" y="252" font-size="8" fill="#14406b">TCP header min 20 bytes + 1 RTT setup; UDP header 8 bytes + 0 setup. TCP: reliable/ordered/flow-controlled. UDP: none of those.</text>
+<text x="12" y="272" font-size="8" fill="#8c3a1d">Framing rule: on TCP, prefix each message with a length and loop read() until a whole message is assembled &mdash; the stream has no seams.</text>
+<text x="12" y="298" font-size="8" fill="#2f7d32">Same descriptor abstraction as files (Ch 40): read/write/close/epoll all work unchanged once the socket is connected.</text>
+</svg>
+<figcaption>Figure 43.1: TCP (left) negotiates a connection with a three-way handshake, then delivers a reliable ordered byte stream in which
+message boundaries are <em>not</em> preserved — you must frame messages yourself. UDP (right) sends independent datagrams with boundaries
+intact but no delivery, ordering, or congestion guarantee. TCP costs a setup RTT and a 20-byte header; UDP costs nothing to set up and an
+8-byte header.</figcaption>
+</figure>
+
+<h2>43.4 Small writes, Nagle's algorithm, and the delayed-ACK stall</h2>
+
+<p>TCP's default configuration hides a latency trap that is invisible until it is catastrophic, and it is worth building precisely because it
+teaches how two independent optimisations can collide. <strong>Nagle's algorithm</strong> (RFC 896) reduces the number of tiny packets on the
+wire: when an application writes a small chunk, TCP will <em>hold</em> it rather than send a nearly-empty segment, waiting either until enough
+data accumulates to fill a segment or until all previously sent data has been acknowledged — the goal being to coalesce a flurry of small
+writes into fewer, fuller packets, which is good for the network. Independently, TCP's receiver uses <strong>delayed
+acknowledgements</strong> (RFC 1122): rather than send a bare ACK for every segment, it waits briefly (up to a fixed timer — about
+40&nbsp;ms on Linux) hoping to piggyback the ACK on a data segment it is about to send back, or to acknowledge two segments at once — which
+also reduces packet count. Each optimisation is sensible alone. Together, on a request/response pattern with small writes, they deadlock into a
+timer: the client writes a request in pieces; Nagle holds the second piece because the first is not yet acknowledged; the server cannot
+acknowledge yet because delayed-ACK is waiting to piggyback the ACK on the response — but the server has no response to send because it has not
+received the whole request, which is stuck in the client's Nagle buffer. Nothing moves until the delayed-ACK timer expires (~40&nbsp;ms),
+forcing the ACK, which releases Nagle, which sends the rest. Every round trip pays that timer. Measured here on loopback, with a client sending
+a 40-byte request as two small writes and waiting for a one-byte reply:</p>
+
+<pre><code>write-write-read round trip on loopback, mean per round (min of several trials):
+  Nagle ON  (TCP default)   :   ~43,800 us/round   (43.8 ms  &mdash; the delayed-ACK timer)
+  TCP_NODELAY (Nagle off)   :       ~90 us/round
+  ratio: ~488x
+</code></pre>
+
+<p>The number is unambiguous: the default connection spends about <strong>43.8&nbsp;ms</strong> per round trip, essentially all of it the
+~40&nbsp;ms delayed-ACK timer firing, while the same code with Nagle disabled runs in <strong>~90&nbsp;&micro;s</strong> — a ratio near
+<strong>500&times;</strong>, on a loopback link with no real latency at all. The fix is one socket option: <code>setsockopt(fd, IPPROTO_TCP,
+TCP_NODELAY, &amp;one, sizeof one)</code> disables Nagle's algorithm on that socket, so small writes are sent immediately. The lesson is not
+&ldquo;always set <code>TCP_NODELAY</code>&rdquo; as a superstition; it is to understand the interaction. For latency-sensitive
+request/response protocols (RPC, databases, interactive services) with small messages, <code>TCP_NODELAY</code> is almost always correct,
+because you care about round-trip latency far more than about saving a few packets. For bulk transfer where you write large buffers, Nagle
+never engages (your segments are already full) and disabling it changes nothing. The deeper fix, when you control the write pattern, is to
+avoid many small writes in the first place — assemble the whole request in one buffer and issue one <code>write</code> — which sidesteps the
+interaction regardless of the option. What you must never do is ship a request/response protocol without knowing which of these you did, and
+then wonder why every call takes 40&nbsp;ms.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the 40-millisecond RPC &mdash; Nagle's algorithm meets delayed ACK</span>
+<p>A request/response protocol that writes its request in more than one small <code>write</code> and then blocks for the reply can stall for
+the delayed-ACK timer (~40&nbsp;ms on Linux) on <em>every single call</em>, on the fastest possible link, because Nagle is holding the client's
+last small segment until the server acknowledges the first, and the server's delayed-ACK is holding that acknowledgement waiting for a response
+the server cannot produce until it has the whole request. The trap is that it is invisible in the obvious tests: a single small message often
+fits in one segment and never triggers the hold, and throughput benchmarks that stream large buffers never engage Nagle at all, so the bug
+surfaces only as a suspiciously round <strong>40&nbsp;ms</strong> (or a small multiple) added to interactive latency in production — a number so
+specific it is a fingerprint. The tell is exactly that: per-request latencies clustered near 40&nbsp;ms with the CPU idle and the network
+unloaded means a timer, not work, is the cost. Two fixes, in order of preference. First, do not split a logical message across several small
+writes — build it in one buffer and write once, which never triggers Nagle regardless of the option. Second, for small-message
+request/response protocols, set <code>TCP_NODELAY</code> to disable Nagle on the socket. Do <em>not</em> reach for <code>TCP_NODELAY</code>
+reflexively on bulk-transfer sockets, where Nagle does no harm and coalescing helps; and understand that the real defect is a chatty write
+pattern colliding with two reasonable protocol optimisations, not either optimisation being wrong. Diagnosing a fixed-latency stall as a timer
+rather than as slow code is the systems-level move here.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate reports: &ldquo;Our new internal RPC service is weirdly slow — every call takes about 40&nbsp;ms even
+though the servers are in the same rack and CPU is near zero. Under load throughput is fine, it is just that each individual call is slow.
+Maybe the network is bad?&rdquo; Cover the paragraph and respond in four or five sentences, drawing on &sect;43.2 and &sect;43.4.</p>
+<p><em>Model answer.</em> &ldquo;A flat ~40&nbsp;ms with idle CPU and an unloaded network is not a slow network — it is a timer, and the
+classic one is TCP's delayed-ACK interacting with Nagle's algorithm. If the client writes its request in more than one small <code>write</code>
+and then waits for the reply, Nagle holds the last piece until the first is acknowledged, and the server's delayed-ACK holds that
+acknowledgement for ~40&nbsp;ms because it has no reply to piggyback it on yet — so every call eats the delayed-ACK timer, which is exactly the
+40&nbsp;ms you are seeing. Throughput looks fine because under load the pipeline stays full and the timer overlaps other work; it is the
+isolated round-trip latency that shows it. The clean fix is to build each request in one buffer and issue a single <code>write</code> so Nagle
+never engages; if the write pattern is hard to change, set <code>TCP_NODELAY</code> on the socket to disable Nagle for this small-message
+protocol. Let me confirm with a capture that the request is going out in two segments — that will nail it in a minute.&rdquo; Naming the
+timer, explaining the Nagle/delayed-ACK collision, and reaching first for the one-write fix rather than a reflexive option flip is the senior
+register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;43.2 quick check: a single <code>read</code> after three 100-byte writes might return anywhere from 1 to 300
+bytes — all 300 at once, 60 then 240, one byte at a time, any split. TCP guarantees only that the bytes arrive <strong>in order and
+complete</strong>, not that they arrive grouped as they were written, because TCP is a byte stream and the transport freely coalesces and
+splits writes into whatever segments it chooses. A protocol with real messages must therefore <strong>frame</strong> them itself — length
+prefix or delimiter — and loop <code>read</code> until a whole message has been assembled.)</em></p>
+
+<h2>43.5 What to carry forward</h2>
+
+<p>A <strong>socket</strong> is a descriptor that names a network endpoint, so once connected it obeys every I/O lesson of this part —
+<code>read</code>, <code>write</code>, <code>close</code>, <code>O_NONBLOCK</code>, and <code>epoll</code> (Chapter 42) all apply unchanged;
+what is new is the setup. A <strong>server</strong> runs <code>socket</code>&rarr;<code>bind</code>&rarr;<code>listen</code>&rarr;<code>accept</code>,
+where <code>accept</code> returns a fresh per-connection descriptor and the listening socket stays open; a <strong>client</strong> runs
+<code>socket</code>&rarr;<code>connect</code>, whose three-way handshake spends one round trip before any data moves, and the active closer pays
+<strong>TIME_WAIT</strong> afterward (&sect;43.1). <strong>TCP</strong> (<code>SOCK_STREAM</code>, RFC 793) turns an unreliable network into a
+reliable, ordered byte stream via sequence numbers, acknowledgements, retransmission, and a sliding window for flow control — but it preserves
+<strong>no message boundaries</strong>, so a protocol with messages must frame them and loop <code>read</code> until each is complete
+(&sect;43.2). <strong>UDP</strong> (<code>SOCK_DGRAM</code>, RFC 768) keeps message boundaries and adds nothing else: no delivery, ordering,
+flow, or congestion guarantee, an 8-byte header, and no setup — the right choice when TCP's guarantees are unneeded (DNS) or harmful (real-time
+media) or when you will build your own (QUIC) (&sect;43.3). And TCP's default configuration hides the <strong>Nagle</strong>&ndash;<strong>delayed-ACK</strong>
+collision: a small-write request/response can stall on the ~40&nbsp;ms delayed-ACK timer every round — measured here at ~43.8&nbsp;ms versus
+~90&nbsp;&micro;s with <code>TCP_NODELAY</code>, a ~500&times; artifact of two reasonable optimisations meeting — fixed by writing each message
+once, or by disabling Nagle for small-message protocols (&sect;43.4).</p>
+
+<p>This is the endpoint the event loop of Chapter 42 has been watching, now built and understood: a socket you can create, connect, feed, and
+frame, over a transport whose guarantees you can name. Two threads of this part remain, and both are about spending the descriptor's bytes more
+cheaply. The next chapter returns to the <em>readiness</em>-versus-<em>completion</em> question Chapter 42 opened and follows it to its
+conclusion — <strong>io_uring</strong>, an interface where you submit a batch of operations and are told when each has <em>finished</em>,
+collapsing the per-operation system-call boundary this part has paid at every step and extending the asynchronous model from sockets to disk.
+The chapter after removes the last copy: the data path from a file to a socket still runs every byte through a user-space buffer, and
+<strong>zero-copy</strong> transfer (<code>sendfile</code>) eliminates it. The connection is open and its bytes are ordered; what remains is to
+move them with the fewest crossings and copies the machine allows.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>List the four calls a TCP server makes and the one a client makes, and say what <code>accept</code> returns.</li>
+<li>Describe the three-way handshake and why connection setup costs a round trip.</li>
+<li>Explain why TCP preserves no message boundaries, and what a protocol with messages must therefore do.</li>
+<li>State what UDP keeps and what it gives up, and name two workloads where UDP is the right choice.</li>
+<li>Explain how Nagle's algorithm and delayed ACK combine to add ~40&nbsp;ms per round trip, and two ways to fix it.</li>
+<li>Say why the Nagle stall reproduces on loopback with no real network latency.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What are the server-side and client-side socket-call sequences, and what does <code>accept</code> return? (&sect;43.1)</li>
+<li><strong>R2.</strong> What does the three-way handshake accomplish, and what is TIME_WAIT for? (&sect;43.1)</li>
+<li><strong>R3.</strong> Why does TCP preserve no message boundaries, and what must a message protocol do about it? (&sect;43.2)</li>
+<li><strong>R4.</strong> What does UDP guarantee and not guarantee, and when is it the right transport? (&sect;43.3)</li>
+<li><strong>R5.</strong> How do Nagle and delayed ACK collide, and what are the two fixes? (&sect;43.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>W. Richard Stevens, Bill Fenner &amp; Andrew M. Rudoff, <em>UNIX Network Programming, Volume 1: The Sockets Networking API</em>,
+3rd ed. (Addison-Wesley, 2003), ISBN 978-0-13-141155-5.</strong> The definitive reference for this chapter: Chapters 4&ndash;5 (elementary
+TCP sockets and the connection lifecycle), Chapter 7 (socket options including <code>TCP_NODELAY</code>), and Chapter 8 (elementary UDP
+sockets). First author W. Richard Stevens; edition and ISBN verified via the publisher.</li>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapters
+56&ndash;61 cover sockets end to end — the API, TCP stream sockets, UDP datagram sockets, and socket options — as implemented on Linux, the
+system these programs run on. First author Michael Kerrisk; edition and ISBN verified via the publisher.</li>
+<li><strong>J. Postel, RFC 793, &ldquo;Transmission Control Protocol&rdquo; (September 1981), and RFC 768, &ldquo;User Datagram
+Protocol&rdquo; (August 1980).</strong> The original specifications of the two transports of &sect;43.2&ndash;&sect;43.3: the byte-stream
+service model and its handshake, and the datagram service. RFC 793 has since been consolidated and obsoleted by RFC 9293 (2022); both are
+worth reading. Cited by RFC number, author, and date via the RFC Editor.</li>
+<li><strong>J. Nagle, RFC 896, &ldquo;Congestion Control in IP/TCP Internetworks&rdquo; (January 1984), and R. Braden (ed.), RFC 1122,
+&ldquo;Requirements for Internet Hosts — Communication Layers&rdquo; (October 1989).</strong> RFC 896 defines the small-packet algorithm that
+bears Nagle's name; RFC 1122 specifies delayed acknowledgements — the two mechanisms whose collision &sect;43.4 measures. Cited by RFC number,
+author, and date via the RFC Editor.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex43.1"><span class="ex-label">43.1</span> <span class="ex-tag warm">warm-up</span>
+List, in order, the four system calls a TCP server makes before it can exchange bytes with a client, and the one call the client makes. In one
+sentence, say what <code>accept</code> returns.</div>
+
+<div class="exercise" id="ex43.2"><span class="ex-label">43.2</span> <span class="ex-tag warm">warm-up</span>
+What socket <em>type</em> selects TCP, and which selects UDP? Name one guarantee TCP provides that UDP does not, and one thing UDP preserves
+that TCP does not.</div>
+
+<div class="exercise" id="ex43.3"><span class="ex-label">43.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, state which socket option disables Nagle's algorithm, and on what kind of protocol you would set it.</div>
+
+<div class="exercise" id="ex43.4"><span class="ex-label">43.4</span> <span class="ex-tag core">core</span>
+The byte stream. (a) A sender makes three <code>write</code> calls of 100 bytes each on a TCP socket. Give three different ways the bytes
+might be split across <code>read</code> calls on the receiver, and say which of them TCP permits. (b) State precisely what TCP <em>does</em>
+guarantee about those 300 bytes. (c) Describe a concrete framing scheme that lets the receiver recover the three original messages, and the
+receive loop it implies.</div>
+
+<div class="exercise" id="ex43.5"><span class="ex-label">43.5</span> <span class="ex-tag core">core</span>
+The connection lifecycle. (a) Walk through the three-way handshake segment by segment and say what each side knows after it. (b) Why does
+connection setup cost a full round trip, and what does that imply for a client that opens a fresh connection per request? (c) What is
+TIME_WAIT, which side enters it, and why does it exist?</div>
+
+<div class="exercise" id="ex43.6"><span class="ex-label">43.6</span> <span class="ex-tag core">core</span>
+TCP versus UDP by workload. For each, say which transport you would choose and why: (a) a bulk file transfer; (b) a DNS query and reply; (c)
+live voice-over-IP; (d) a bank transaction; (e) a new protocol that wants its own congestion control and 0-RTT reconnection. For (c) and (e),
+explain what TCP would <em>add</em> that you do not want.</div>
+
+<div class="exercise" id="ex43.7"><span class="ex-label">43.7</span> <span class="ex-tag complexity">cost</span>
+The Nagle stall. (a) Explain step by step why a write-write-read pattern deadlocks Nagle against delayed ACK until the ~40&nbsp;ms timer fires.
+(b) Using the measured numbers (~43.8&nbsp;ms with Nagle, ~90&nbsp;&micro;s with <code>TCP_NODELAY</code>), a service does 25 sequential such
+round trips per user request; estimate the added latency per user request in each case. (c) Explain why a throughput benchmark that streams
+large buffers would completely miss this bug.</div>
+
+<div class="exercise" id="ex43.8"><span class="ex-label">43.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team's RPC library shows ~40&nbsp;ms per call in production between two hosts in the same rack,
+with CPU idle; a load test on the same code showed fine throughput.
+<br><strong>Step 1 (given):</strong> the client serialises each request by writing a 4-byte length prefix, then the body, as two separate
+<code>write</code> calls, then reads the reply.
+<br><strong>Step 2 (given):</strong> the socket uses TCP defaults, so Nagle is on.
+<br><strong>Step 3 (given):</strong> the server delays its acknowledgement of the length-prefix segment, waiting to piggyback it on the reply,
+which it cannot send until it has the whole request.
+<br><strong>Step 4 (you):</strong> Explain why every call stalls ~40&nbsp;ms, why the throughput load test missed it, and give the two fixes in
+order of preference.</div>
+
+<div class="exercise" id="ex43.9"><span class="ex-label">43.9</span> <span class="ex-tag mixed">mixed</span>
+For each statement, say safe/correct or buggy and why: (a) &ldquo;I called <code>send</code> once with my whole message, so the peer's
+<code>recv</code> will return it in one call.&rdquo; (b) &ldquo;I set <code>TCP_NODELAY</code> on my bulk-upload socket to make it faster.&rdquo;
+(c) &ldquo;I use UDP and rely on it to redeliver any datagram that gets lost.&rdquo; (d) &ldquo;I read into a buffer in a loop until I have a
+full length-prefixed message before parsing it.&rdquo; (e) &ldquo;My server accepts a connection and keeps using the listening socket to talk
+to that client.&rdquo;</div>
+
+<div class="exercise" id="ex43.10"><span class="ex-label">43.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A socket is a special object that does not support
+<code>read</code>/<code>write</code>.&rdquo; (b) &ldquo;UDP guarantees datagrams arrive in the order they were sent.&rdquo; (c) &ldquo;TCP's
+three-way handshake costs one round trip before any data is sent.&rdquo; (d) &ldquo;Disabling Nagle speeds up a socket that only ever sends
+large buffers.&rdquo; (e) &ldquo;On a TCP connection, one <code>write</code> always corresponds to exactly one <code>read</code> on the
+peer.&rdquo;</div>
+
+<div class="exercise" id="ex43.11"><span class="ex-label">43.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the chapter. (a) Explain why &ldquo;a socket is just a descriptor&rdquo; is both true (the I/O API applies unchanged) and
+incomplete (setup and transport semantics are new) — what does each half buy you? (b) TCP and UDP are often framed as &ldquo;reliable versus
+fast,&rdquo; which is misleading; give the accurate framing in terms of <em>which guarantees you get versus build</em>, and show how QUIC-on-UDP
+proves the point. (c) The Nagle stall comes from two individually correct optimisations. Argue why this is a recurring shape in systems (local
+optima composing into a global pathology) and what it implies about testing.</div>
+
+<div class="exercise" id="ex43.12"><span class="ex-label">43.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Write a TCP echo server and client over loopback; confirm that sending a message in two small
+<code>write</code> calls and reading the reply is subject to the Nagle stall, and measure the per-round latency with Nagle on and with
+<code>TCP_NODELAY</code> set. (b) Demonstrate the byte-stream property: have the client send three distinct small messages back-to-back and
+show that a single <code>read</code> on the server may return more than one of them; then add a length-prefix framing loop that recovers them
+correctly. (c) State your toolchain and CPU, note the times are wall-clock (no hardware counters), and explain why the ~40&nbsp;ms you measure
+is a protocol timer rather than network latency, given that loopback has essentially none.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch44">
+<h1>Chapter 44 — io_uring and Completion-Based Asynchronous I/O</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch42">Chapter 42</a> (readiness notification — <code>epoll</code> tells you
+<em>which descriptors are ready</em>, then you do the operation), <a href="#ch41">Chapter 41</a> (a disk read that misses the page cache blocks
+on the device — and a regular file has no useful readiness signal), <a href="#ch40">Chapter 40</a> (the I/O syscalls), <a href="#ch13">Chapter 13</a>
+and <a href="#ch42">Chapter 42</a> (a system call costs a few hundred nanoseconds to enter the kernel). &nbsp;·&nbsp; Chapter 42 asked the kernel
+<em>which</em> descriptors are ready and then still made a syscall per operation. This chapter changes the question one more time: submit a batch
+of operations and be told when each has <em>finished</em> — the completion model, and its Linux realisation, <code>io_uring</code>.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch42">Chapter 42</a> — <code>epoll</code> reports a socket <em>ready</em>, after which you call <code>read</code>
+yourself; how many kernel crossings is one handled operation, and what does readiness tell you that a regular disk file cannot answer? (2)
+<a href="#ch41">Chapter 41</a> — when a <code>read</code> misses the page cache, what does the calling thread do, and why can't
+<code>epoll</code> help you avoid that wait on a file? (3) <em>Predict:</em> a program must issue 65,536 small reads. Version A calls
+<code>pread</code> 65,536 times. Version B submits them in batches of 256 through a shared ring and reaps completions. Two questions: how many
+kernel crossings does each pay? And on data already in the page cache, will version B's <em>wall-clock</em> time be dramatically lower,
+about the same, or is the syscall count the real story? Write your guesses; &sect;44.3 answers them.</p>
+</aside>
+
+<p>Chapter 42 solved <em>waiting</em>: instead of a thread per blocked call, one thread asks <code>epoll</code> which descriptors are ready and
+handles only those. But readiness has two limits this chapter removes. First, it is still one system call per operation: <code>epoll_wait</code>
+tells you a socket is readable, and then you cross the kernel boundary again to actually <code>read</code> it — so a busy server pays the
+few-hundred-nanosecond syscall tax (Chapter 42) on every single operation, and at millions of operations per second that boundary becomes the
+cost. Second, and deeper, readiness does not work for <strong>disk</strong>. A regular file is <em>always</em> reportable as ready — there is no
+&ldquo;the data has arrived&rdquo; event for a file the way there is for a socket — yet a <code>read</code> that misses the page cache still
+blocks the thread on the device for milliseconds (Chapter 41). <code>epoll</code> has nothing useful to say about a file; the whole readiness
+model assumes an operation that <em>would</em> block until a descriptor becomes ready, and disk I/O simply is not shaped that way. The answer to
+both is to stop notifying <em>readiness</em> and start notifying <em>completion</em>: you hand the kernel a description of the operation you
+want done, the kernel does it (blocking on the device on its own, not on your thread), and later tells you it is <em>finished</em>, with the
+result. This chapter builds that model in five steps: readiness versus completion and why disk forces the change (&sect;44.1); the
+<code>io_uring</code> interface — two shared ring buffers between application and kernel (&sect;44.2); why the boundary shrinks, with the
+syscall count measured (&sect;44.3); the hazard the completion model introduces — asynchronous buffer lifetime (&sect;44.4); and what to carry
+forward (&sect;44.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 20 hardware threads), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code>; times are wall-clock and a
+hardware-counter profiler (<code>perf</code>) is <em>not</em> installed. The kernel here is 6.x on WSL2, which supports <code>io_uring</code>; the
+helper library <code>liburing</code> is <em>not</em> installed, so the programs drive the interface through the raw system calls
+<code>io_uring_setup(2)</code> and <code>io_uring_enter(2)</code> directly — setting up the shared rings by hand with <code>mmap</code> — which
+is exactly what makes the mechanism visible. A minimal <code>IORING_OP_NOP</code> and batched <code>IORING_OP_READ</code> submissions were run
+here to confirm the interface works and to count kernel crossings; the honest wall-clock result of &sect;44.3 is reported as measured, including
+where it is <em>not</em> a speed-up.</p>
+
+<h2>44.1 Readiness versus completion, and why disk forces the change</h2>
+
+<p>There are two ways for the kernel to help a program do asynchronous I/O, and the difference is the whole chapter. The
+<strong>readiness</strong> model (Chapter 42: <code>select</code>, <code>poll</code>, <code>epoll</code>) answers the question &ldquo;which
+descriptors <em>can</em> I operate on without blocking?&rdquo; — the kernel watches, and when a socket has data or space you go and do the
+<code>read</code> or <code>write</code> yourself. The <strong>completion</strong> model answers a different question: &ldquo;here is the
+operation I want; tell me when it is <em>done</em>.&rdquo; You submit a read — descriptor, buffer, length, offset — and the kernel performs it,
+waiting on the device itself if it must, and later hands you a completion record saying how many bytes it read (or what error). The two are
+not just cosmetically different. Readiness fits sockets, where &ldquo;ready&rdquo; is a real, observable state and the operation, once ready,
+completes instantly from a buffer. It does <em>not</em> fit <strong>disk files</strong>, and this is the crucial point: a regular file is always
+&ldquo;ready&rdquo; in the readiness sense — you can always <em>attempt</em> the read — but the attempt can still block for milliseconds on a
+cache miss (Chapter 41), and there is no event to wait for that means &ldquo;now the read will not block.&rdquo; So <code>epoll</code> cannot
+make disk I/O asynchronous; historically Linux had a separate, awkward, partial mechanism (POSIX AIO) for that, and sockets and files needed
+different tools. The completion model unifies them, because &ldquo;tell me when it is done&rdquo; is meaningful for <em>any</em> operation —
+a socket read, a disk read, an <code>fsync</code>, an <code>accept</code>, a <code>send</code> — the kernel just does the work and reports
+completion. That generality is why the completion interface (<code>io_uring</code> on Linux; <code>IOCP</code> on Windows long before) is the
+model modern high-performance I/O converges on: one asynchronous interface for the whole descriptor world, sockets and disk alike.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In one sentence each: what does the readiness model ask the kernel, and what does the completion model ask instead? Why can
+<code>epoll</code>'s readiness model not make a disk-file <code>read</code> asynchronous? (Answer after the next section.)</p>
+</aside>
+
+<h2>44.2 The io_uring interface: two shared rings</h2>
+
+<p><code>io_uring</code> (merged into Linux 5.1 in 2019) implements the completion model with a design built to make the kernel boundary cheap:
+two ring buffers, shared directly between the application and the kernel in memory, so that submitting work and collecting results need not copy
+arguments across the boundary or, in the limit, make a system call at all. You create the instance with <code>io_uring_setup(entries,
+params)</code>, which returns a ring file descriptor and, through its <code>params</code>, the offsets of the shared structures; you then
+<code>mmap</code> them into your address space. There are two queues. The <strong>submission queue</strong> (SQ) is an array of
+<strong>submission queue entries</strong> (SQEs); each SQE describes one operation — an <code>opcode</code> (<code>IORING_OP_READ</code>,
+<code>IORING_OP_WRITE</code>, <code>IORING_OP_SEND</code>, <code>IORING_OP_ACCEPT</code>, <code>IORING_OP_FSYNC</code>, and dozens more), the
+descriptor, a buffer address, a length, an offset, and a 64-bit <code>user_data</code> field you choose and the kernel echoes back so you can
+tell which completion belongs to which request. The <strong>completion queue</strong> (CQ) is an array of <strong>completion queue
+entries</strong> (CQEs); each CQE carries the <code>user_data</code> you set and a <code>res</code> field holding the operation's result — the
+byte count on success, or a negative error code — exactly the value the synchronous call would have returned. The flow is: fill one or more
+SQEs, advance the submission ring's tail, and call <code>io_uring_enter(fd, to_submit, min_complete, flags)</code> <em>once</em> to submit that
+whole batch and optionally wait for completions; then walk the completion ring, reading a CQE per finished operation, and advance its head. The
+decisive property is that <em>one</em> <code>io_uring_enter</code> can submit many operations and reap many completions — the system-call
+boundary is crossed per <em>batch</em>, not per operation. And it can be pushed further: in <strong>polled submission</strong> mode
+(<code>SQPOLL</code>) a kernel thread watches the submission ring, so the application submits work by writing shared memory with <em>no system
+call at all</em>. The rings are the mechanism; batching across them is the payoff.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the two rings <code>io_uring</code> shares between application and kernel, and what one entry in each carries. What does the
+<code>user_data</code> field on a submission accomplish, and how many system calls does it take to submit a batch of 100 reads and collect
+their results? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>44.3 Why the boundary shrinks — the syscall count, measured</h2>
+
+<p>The point of the shared rings is to stop paying the kernel-entry tax per operation. To see it plainly, here is the same work done two ways on
+this machine: 65,536 reads of 4&nbsp;KiB each (256&nbsp;MiB total) from a file already warm in the page cache, issued once as 65,536
+synchronous <code>pread</code> calls, and once as <code>io_uring</code> submissions batched 256 at a time. The metric that matters first is
+<em>kernel crossings</em>:</p>
+
+<pre><code>65,536 random 4 KiB reads from the page cache (this machine):
+  synchronous pread loop      :  65,536 syscalls   ~87-94 ms
+  io_uring, batched QD=256    :     256 io_uring_enter calls   ~77-104 ms
+  kernel crossings: 256x fewer     wall-clock: roughly break-even (~0.8-1.2x, noisy)
+</code></pre>
+
+<p>Two things must be read honestly here. The first is a clean, large result: <code>io_uring</code> cut the number of system calls by
+<strong>256&times;</strong>, from 65,536 to 256, because each <code>io_uring_enter</code> submitted and reaped a whole batch. That is the
+architectural win, and at a few hundred nanoseconds per crossing (Chapter 42) it is real work removed. The second is a result the book will not
+inflate: on this workload the <strong>wall-clock time was roughly break-even</strong>, not a speed-up. The reason is exactly the cost model of
+this part. These reads <em>hit</em> the page cache, so each one is a 4&nbsp;KiB memory copy inside the kernel — and that copy, done 65,536
+times, dominates the total, dwarfing the syscall-entry cost that <code>io_uring</code> removed. When the thing you eliminated (the boundary
+crossing) is small next to the thing you did not (the per-read copy), collapsing the crossings barely moves the clock. This is the chapter's
+most important lesson and it is the part's recurring one: <strong>a technique's benefit is only as large as the cost it removes is of the
+total.</strong> <code>io_uring</code>'s boundary-batching is decisive precisely where the boundary <em>is</em> the cost — enormous numbers of
+tiny operations (high-IOPS storage, packet processing) where per-syscall overhead dominates, and, above all, cases the wall-clock here cannot
+show at all: genuine <em>device</em> I/O, where the kernel does the blocking on its own threads while yours submits the next batch and never
+sleeps — the completion model's real prize is that a single thread keeps thousands of disk and network operations in flight without a thread
+blocked on any of them, which readiness could never do for disk (&sect;44.1). The syscall count is the honest, measured headline; the
+throughput win is workload-dependent, and you must measure it, not assume it.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: don't cross the kernel boundary per operation — submit a batch, reap completions</span>
+<p><strong>1. In words.</strong> Readiness (Chapter 42) still costs one syscall per operation and cannot describe disk. The completion model
+lets you submit many operations at once and be told when each finishes; <code>io_uring</code> realises it with two shared rings so a single
+<code>io_uring_enter</code> submits and reaps a whole batch — and the kernel, not your thread, does any blocking on the device.</p>
+<p><strong>2. As a picture.</strong> Figure 44.1: on the left, the synchronous loop — one kernel crossing per read, thousands of them; on the
+right, the application filling many SQEs in the shared submission ring, one <code>io_uring_enter</code> for the batch, and completions
+appearing in the shared completion ring, each tagged with its <code>user_data</code>.</p>
+<p><strong>3. As numbers/contrast.</strong> 65,536 cache-hot 4&nbsp;KiB reads: 65,536 syscalls the synchronous way, <strong>256</strong> the
+<code>io_uring</code> way (256&times; fewer crossings) — but on cache-warm data the per-read copy dominates, so wall-clock is
+<strong>roughly break-even</strong> here (&sect;44.3). The win becomes a real speed-up when the boundary is the cost (huge counts of tiny ops)
+or when the operations touch a real device, where the kernel blocks and your thread does not.</p>
+</aside>
+
+<p><em>(Answer to the &sect;44.1 quick check: the readiness model asks the kernel &ldquo;which descriptors can I operate on without
+blocking?&rdquo; and then you do the operation yourself; the completion model asks &ldquo;do this operation and tell me when it is
+finished.&rdquo; <code>epoll</code> cannot make a disk-file <code>read</code> asynchronous because a regular file is always &ldquo;ready&rdquo;
+in the readiness sense — you can always attempt the read — yet the attempt still blocks on the device on a cache miss, and there is no readiness
+event that means &ldquo;this read will not block,&rdquo; so readiness has nothing to watch for a file.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">Synchronous: one kernel crossing per operation. io_uring: one crossing per batch, over two shared rings.</text>
+<text x="12" y="38" font-size="9" fill="#8c3a1d">synchronous pread loop &mdash; N operations, N syscalls</text>
+<rect x="20" y="48" width="120" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="26" y="60" font-size="8">pread() &rarr; kernel &rarr; back</text>
+<rect x="20" y="68" width="120" height="16" fill="#f6dcd2" stroke="#8c3a1d"/><text x="26" y="80" font-size="8">pread() &rarr; kernel &rarr; back</text>
+<text x="26" y="100" font-size="8" fill="#8c3a1d">... 65,536 crossings</text>
+<line x1="300" y1="40" x2="300" y2="230" stroke="#b9c2cc"/>
+<text x="320" y="38" font-size="9" fill="#2f7d32">io_uring &mdash; shared rings, one crossing per batch</text>
+<text x="320" y="58" font-size="8" fill="#14406b">submission ring (SQEs): app writes, kernel reads</text>
+<rect x="320" y="64" width="40" height="16" fill="#dfeee0" stroke="#2f7d32"/><text x="325" y="76" font-size="7">SQE</text>
+<rect x="362" y="64" width="40" height="16" fill="#dfeee0" stroke="#2f7d32"/><text x="367" y="76" font-size="7">SQE</text>
+<rect x="404" y="64" width="40" height="16" fill="#dfeee0" stroke="#2f7d32"/><text x="409" y="76" font-size="7">SQE</text>
+<text x="450" y="76" font-size="7" fill="#2f7d32">... 256</text>
+<rect x="320" y="92" width="200" height="18" fill="#eef1f4" stroke="#14406b"/><text x="326" y="105" font-size="8">io_uring_enter(submit 256, wait) &mdash; one syscall</text>
+<text x="320" y="130" font-size="8" fill="#14406b">completion ring (CQEs): kernel writes, app reads</text>
+<rect x="320" y="136" width="56" height="16" fill="#dfe8f4" stroke="#14406b"/><text x="325" y="148" font-size="7">CQE res,ud</text>
+<rect x="378" y="136" width="56" height="16" fill="#dfe8f4" stroke="#14406b"/><text x="383" y="148" font-size="7">CQE res,ud</text>
+<text x="440" y="148" font-size="7" fill="#14406b">... 256</text>
+<text x="320" y="172" font-size="8" fill="#2f7d32">user_data on each SQE echoed in its CQE &rarr; match completion to request</text>
+<line x1="12" y1="200" x2="628" y2="200" stroke="#b9c2cc"/>
+<text x="12" y="220" font-size="8" fill="#14406b">Measured: 65,536 cache-hot 4 KiB reads &rarr; 65,536 syscalls vs 256 (256x fewer crossings).</text>
+<text x="12" y="238" font-size="8" fill="#8c3a1d">Wall-clock roughly break-even here: cache-hit copy dominates, so removing the boundary barely moves the clock.</text>
+<text x="12" y="262" font-size="8" fill="#2f7d32">The real win: on true device I/O the kernel blocks, not your thread &mdash; one thread keeps thousands of ops in flight.</text>
+</svg>
+<figcaption>Figure 44.1: The synchronous loop (left) crosses the kernel boundary once per operation. <code>io_uring</code> (right) shares a
+submission ring and a completion ring with the kernel, so one <code>io_uring_enter</code> submits and reaps a whole batch — 256&times; fewer
+crossings for 65,536 reads. On cache-warm data the per-read copy dominates and wall-clock is roughly break-even; the model's real payoff is on
+device I/O, where the kernel does the blocking and one thread keeps thousands of operations in flight.</figcaption>
+</figure>
+
+<h2>44.4 The completion model's hazard: asynchronous buffer lifetime</h2>
+
+<p>The completion model buys its power by decoupling the moment you <em>submit</em> an operation from the moment it <em>completes</em>, and that
+gap is where its characteristic bug lives. When you fill an SQE for a read, you give the kernel the address of a buffer to read into; when you
+fill one for a write or send, you give it the address of a buffer to read <em>from</em>. In the synchronous world those buffers are only in use
+for the duration of the call, which returns before your next line runs, so their lifetime is trivial. Under <code>io_uring</code> the kernel may
+touch that buffer at <em>any</em> time between your submission and the matching completion — which can be milliseconds later, while your thread
+has run on to submit more work or handle other completions. The rule this imposes is absolute and easy to violate: <strong>every buffer
+referenced by an in-flight SQE must remain valid and unchanged until its CQE arrives.</strong> Free it, let it go out of scope, reuse it for a
+different operation, or overwrite it with the next request, and you have handed the kernel a dangling or racing pointer — a read that lands in
+freed memory, a send that transmits half-overwritten garbage, an intermittent corruption that appears only under the timing that makes the
+completion late. It is the asynchronous version of a use-after-free, and it is invisible in exactly the tests where completions come back fast:
+a lightly loaded run completes each operation almost immediately, so the buffer is still alive by luck, and the bug hides until load or a slow
+device stretches the gap. The same decoupling creates a second discipline: completions arrive in <em>whatever order the kernel finishes</em>,
+not submission order, so you must use the <code>user_data</code> tag to match each completion to its request and its buffer — assuming
+completions come back in order is a sibling bug. Both hazards are the price of asynchrony made explicit: the interface that lets one thread keep
+thousands of operations in flight also makes you, not the call stack, responsible for keeping each operation's memory alive across the gap.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: the buffer freed before its completion &mdash; asynchronous use-after-free</span>
+<p>Under a completion interface, submitting an operation does not finish it: the kernel may read from or write to the buffer you named at any
+point up to the completion event, potentially milliseconds later. The trap is to treat submission like a synchronous call and reuse, free, or
+let the buffer go out of scope as soon as <code>io_uring_enter</code> returns — which works perfectly whenever the completion happens to come
+back fast (light load, warm cache, fast device), and corrupts memory intermittently exactly when it does not (heavy load, cold cache, slow
+device stretch the submit-to-complete gap). Because the failure is timing-dependent it survives unit tests and casual load tests and surfaces
+as rare, unreproducible data corruption in production — the worst kind of bug. Two disciplines defend against it. First, tie each in-flight
+buffer's lifetime to its completion, not to the submitting call: keep it owned by the request state you look up via <code>user_data</code> when
+the CQE arrives, and only then free or reuse it (registered/fixed buffers make this ownership explicit). Second, never assume completion order —
+match every CQE to its SQE through <code>user_data</code>, because the kernel completes operations in whatever order they finish, not the order
+you submitted. The mental shift is the whole point of the chapter: a submitted operation is a promise outstanding, and everything it references
+must outlive the promise. Reasoning about a buffer's lifetime as if submission were completion is the completion-model version of a
+use-after-free, and it is the first bug every io_uring program must be designed against.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate proposes: &ldquo;Let's rewrite our storage service's hot read path on <code>io_uring</code> — it's the
+fastest I/O interface Linux has, so we should get a big throughput win basically for free.&rdquo; Cover the paragraph and respond in four or
+five sentences, drawing on &sect;44.1, &sect;44.3, and &sect;44.4.</p>
+<p><em>Model answer.</em> &ldquo;<code>io_uring</code> is the right long-term direction, but let's be precise about <em>why</em> it wins, because
+&lsquo;fastest, for free&rsquo; will burn us. Its concrete gains are two: it batches the kernel boundary — many operations per
+<code>io_uring_enter</code> instead of one syscall each — and it makes <em>disk</em> I/O truly asynchronous, so one thread keeps thousands of
+device operations in flight without blocking, which <code>epoll</code> cannot do for files. But the throughput win is workload-dependent: for
+reads that hit the page cache, the per-read copy dominates and batching the syscall barely moves the wall clock — I measured that as roughly
+break-even — so the payoff is real only where the syscall boundary or actual device latency is the bottleneck. And it is not free to write: a
+completion interface means every buffer must stay alive until its completion, or we get an asynchronous use-after-free that only shows under
+load. So let's prototype it on the path that is actually device-bound, measure against the current code, and design the buffer ownership
+carefully — not rewrite the cache-hot path expecting magic.&rdquo; Naming the two real gains, refusing the free-lunch framing with a measured
+break-even, and flagging the buffer-lifetime hazard is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;44.2 quick check: the two rings are the <strong>submission queue</strong> (SQEs, which the application writes and
+the kernel reads) and the <strong>completion queue</strong> (CQEs, which the kernel writes and the application reads); an SQE describes one
+operation (opcode, descriptor, buffer, length, offset, <code>user_data</code>) and a CQE carries the result (<code>res</code>) and the echoed
+<code>user_data</code>. The <code>user_data</code> field lets you match each completion to the request that produced it, since completions can
+arrive out of order. Submitting 100 reads and collecting their results takes <strong>one</strong> <code>io_uring_enter</code> — the boundary is
+crossed per batch, not per operation.)</em></p>
+
+<h2>44.5 What to carry forward</h2>
+
+<p>There are two ways the kernel helps with asynchronous I/O, and the difference is the chapter. <strong>Readiness</strong> (Chapter 42:
+<code>epoll</code>) says which descriptors can be operated on without blocking, then you do the operation — one syscall per operation, and no
+help at all for disk, since a regular file is always &ldquo;ready&rdquo; yet a cache-miss <code>read</code> still blocks on the device
+(&sect;44.1). <strong>Completion</strong> says &ldquo;do this operation and tell me when it is done,&rdquo; which is meaningful for any operation
+— socket or disk — and so unifies the two worlds. <strong><code>io_uring</code></strong> (Linux 5.1, 2019) implements it with two memory-shared
+ring buffers: a submission queue of SQEs describing operations and a completion queue of CQEs carrying results, so one
+<code>io_uring_enter</code> submits and reaps a whole batch — and <code>SQPOLL</code> can remove even that (&sect;44.2). Measured here, 65,536
+cache-hot reads cost <strong>256&times; fewer kernel crossings</strong> through <code>io_uring</code> (256 syscalls versus 65,536) — but
+roughly <strong>break-even wall-clock</strong>, because on cache-warm data the per-read copy dominates the boundary cost that was removed; the
+throughput win is real where the boundary or the device is the bottleneck, and must be measured, not assumed (&sect;44.3). And the completion
+model's power — decoupling submit from complete — creates its signature hazard: <strong>every buffer must stay valid until its completion</strong>,
+or you get an asynchronous use-after-free that hides until load stretches the gap, and completions must be matched to requests by
+<code>user_data</code> because they arrive out of order (&sect;44.4).</p>
+
+<p>This is where the I/O part's central thread — the cost of the kernel boundary, traced from the first <code>read</code> syscall of Chapter 40
+through the readiness of Chapter 42 — reaches its conclusion: submit in batches, be told on completion, and let the kernel, not your thread, do
+the blocking. One cost remains, and it is the last one in the part. Even with the boundary batched away, every byte moved from a file to a
+socket still travels through a buffer in your process — read into user space, written back out — a copy the CPU makes that does no useful
+transformation. The final chapter removes it: <strong>zero-copy</strong> transfer with <code>sendfile</code> and <code>splice</code>, where the
+data goes from the page cache to the network card without ever entering your address space. The waiting is solved and the boundary is batched;
+the last thing to eliminate is the copy itself.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the question the readiness model asks the kernel and the different one the completion model asks.</li>
+<li>Explain why <code>epoll</code>'s readiness model cannot make disk-file I/O asynchronous.</li>
+<li>Describe the two <code>io_uring</code> rings and what one SQE and one CQE each carry.</li>
+<li>Say how many system calls it takes to submit and reap a batch of 100 operations, and why.</li>
+<li>Explain why 65,536 cache-hot reads were 256&times; fewer syscalls yet roughly break-even in wall-clock — and where io_uring does win.</li>
+<li>State the buffer-lifetime rule the completion model imposes and the bug that violating it causes.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What does readiness ask versus completion, and why does disk force the change? (&sect;44.1)</li>
+<li><strong>R2.</strong> What are the two rings, and what do SQEs and CQEs carry? (&sect;44.2)</li>
+<li><strong>R3.</strong> How many syscalls submit a batch of N operations, and what did the measured 65,536-read comparison show — in syscalls and in wall-clock? (&sect;44.3)</li>
+<li><strong>R4.</strong> Why was the wall-clock roughly break-even on cache-hot data, and where does <code>io_uring</code> actually win? (&sect;44.3)</li>
+<li><strong>R5.</strong> What is the buffer-lifetime rule, why is the bug intermittent, and how do you match completions to requests? (&sect;44.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Jens Axboe, &ldquo;Efficient IO with io_uring&rdquo; (kernel.dk, 2019).</strong> The design document by <code>io_uring</code>'s
+author: the submission and completion rings, SQE and CQE layout, the <code>io_uring_setup</code>/<code>io_uring_enter</code> system calls, and
+the polled-submission mode — the primary reference for &sect;44.2. Author Jens Axboe (also the author of the kernel implementation); a
+freely-available technical document cited by author, title, and year.</li>
+<li><strong>&ldquo;Ringing in a new asynchronous I/O API,&rdquo; <em>LWN.net</em> (2019).</strong> LWN's walkthrough of <code>io_uring</code> as
+it was merged into Linux 5.1, motivating the completion model against the limits of readiness and POSIX AIO that &sect;44.1 draws on. Cited by
+title, venue, and year; LWN articles carry no DOI.</li>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Chapter 63
+(&ldquo;Alternative I/O Models&rdquo;) covers the readiness-based predecessors — <code>select</code>/<code>poll</code>/<code>epoll</code>,
+signal-driven I/O, and POSIX AIO — that motivate <code>io_uring</code>; note that <code>io_uring</code> postdates the book (2019 vs 2010), so it
+is context for &sect;44.1, not a reference for the interface itself. First author Michael Kerrisk; edition and ISBN verified via the
+publisher.</li>
+<li><strong>W. Richard Stevens, Bill Fenner &amp; Andrew M. Rudoff, <em>UNIX Network Programming, Volume 1: The Sockets Networking API</em>,
+3rd ed. (Addison-Wesley, 2003), ISBN 978-0-13-141155-5.</strong> Chapter 6's taxonomy of I/O models — blocking, non-blocking, multiplexing,
+signal-driven, and asynchronous (completion) — is the classic framing that &sect;44.1's readiness-versus-completion distinction extends. First
+author W. Richard Stevens; edition and ISBN verified via the publisher.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex44.1"><span class="ex-label">44.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, state the question the readiness model asks the kernel and the question the completion model asks instead.</div>
+
+<div class="exercise" id="ex44.2"><span class="ex-label">44.2</span> <span class="ex-tag warm">warm-up</span>
+Name the two ring buffers <code>io_uring</code> shares with the kernel, and say which side (application or kernel) writes each.</div>
+
+<div class="exercise" id="ex44.3"><span class="ex-label">44.3</span> <span class="ex-tag warm">warm-up</span>
+How many <code>io_uring_enter</code> calls does it take to submit a batch of 200 operations and wait for their completions, and how does that
+compare to doing 200 synchronous <code>pread</code> calls?</div>
+
+<div class="exercise" id="ex44.4"><span class="ex-label">44.4</span> <span class="ex-tag core">core</span>
+Readiness versus completion. (a) Explain why the readiness model needs one system call per operation even after <code>epoll_wait</code>
+returns. (b) A regular disk file is always reportable as &ldquo;ready&rdquo;; explain why that makes <code>epoll</code> useless for making a
+cache-missing <code>read</code> asynchronous. (c) Why is &ldquo;tell me when it is done&rdquo; a question that works for both sockets and disk,
+where &ldquo;which are ready&rdquo; does not?</div>
+
+<div class="exercise" id="ex44.5"><span class="ex-label">44.5</span> <span class="ex-tag core">core</span>
+The rings. (a) Describe the fields of a submission queue entry and of a completion queue entry, and what <code>user_data</code> is for. (b)
+Walk through the steps to submit three reads and collect their results. (c) What does <code>SQPOLL</code> (polled submission) change about the
+number of system calls, and how?</div>
+
+<div class="exercise" id="ex44.6"><span class="ex-label">44.6</span> <span class="ex-tag core">core</span>
+The measured result. (a) Why did 65,536 cache-hot reads cost 256 syscalls through <code>io_uring</code> instead of 65,536? (b) Given that
+result, why was the wall-clock time only roughly break-even rather than 256&times; faster? (c) Name two workloads where <code>io_uring</code>
+would show a real wall-clock win, and say what is the dominant cost in each that batching or async submission removes.</div>
+
+<div class="exercise" id="ex44.7"><span class="ex-label">44.7</span> <span class="ex-tag complexity">cost</span>
+Model the cost of N operations as <var>N</var>(<var>b</var> + <var>w</var>) for the synchronous loop, where <var>b</var> is the per-syscall
+boundary cost and <var>w</var> is the per-operation work (e.g. the copy), versus <var>N</var>&middot;<var>w</var> + (<var>N</var>/<var>k</var>)&middot;<var>b</var>
+for <code>io_uring</code> batching <var>k</var> at a time. (a) Write the ratio of the two and simplify. (b) For which relative sizes of
+<var>b</var> and <var>w</var> is the speed-up large, and for which is it near 1? (c) Explain how the &sect;44.3 measurement (cache-hot reads:
+<var>w</var> is a 4&nbsp;KiB copy, <var>b</var> a few hundred ns) lands in the &ldquo;near 1&rdquo; regime, and how a real device (<var>w</var>
+includes milliseconds of latency the kernel absorbs) changes the picture entirely.</div>
+
+<div class="exercise" id="ex44.8"><span class="ex-label">44.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A service ported its read path to <code>io_uring</code> and now returns corrupted data — but only
+occasionally, and never in the test suite.
+<br><strong>Step 1 (given):</strong> for each request it fills an SQE pointing at a stack buffer, calls <code>io_uring_enter</code> to submit,
+and returns from the function.
+<br><strong>Step 2 (given):</strong> the completion for that read arrives later, on a separate reaping loop.
+<br><strong>Step 3 (given):</strong> by the time the kernel writes the read data, the function has returned and its stack frame — including the
+buffer — has been reused.
+<br><strong>Step 4 (you):</strong> Explain the bug precisely, why it is intermittent and passes tests, and how to fix the buffer's lifetime.</div>
+
+<div class="exercise" id="ex44.9"><span class="ex-label">44.9</span> <span class="ex-tag mixed">mixed</span>
+For each claim, say correct or wrong and why: (a) &ldquo;After <code>io_uring_enter</code> returns, my read is done and the buffer holds the
+data.&rdquo; (b) &ldquo;Completions come back in the order I submitted, so I can ignore <code>user_data</code>.&rdquo; (c) &ldquo;<code>io_uring</code>
+can make disk reads asynchronous, unlike <code>epoll</code>.&rdquo; (d) &ldquo;One <code>io_uring_enter</code> can submit a hundred operations.&rdquo;
+(e) &ldquo;Because it batches syscalls, <code>io_uring</code> always beats synchronous I/O on wall-clock.&rdquo;</div>
+
+<div class="exercise" id="ex44.10"><span class="ex-label">44.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;A regular file has a readiness event that tells you a
+<code>read</code> will not block.&rdquo; (b) &ldquo;An SQE's <code>user_data</code> is echoed back in the matching CQE.&rdquo; (c) &ldquo;The
+completion model requires the caller to keep each operation's buffer valid until its completion.&rdquo; (d) &ldquo;<code>io_uring</code>'s
+rings live only in kernel memory and the application cannot see them.&rdquo; (e) &ldquo;Batching cut the 65,536-read example to 256 kernel
+crossings.&rdquo;</div>
+
+<div class="exercise" id="ex44.11"><span class="ex-label">44.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the chapter with the part. (a) Trace the &ldquo;cost of the kernel boundary&rdquo; thread from the blocking <code>read</code> of
+Chapter 40, through <code>epoll</code> readiness in Chapter 42, to <code>io_uring</code> completion here — what does each stage remove and what
+remains? (b) Argue why the honest break-even result of &sect;44.3 is <em>more</em> instructive than a speed-up would have been, tying it to the
+part's cost-model discipline. (c) The completion model unifies sockets and disk under one interface but shifts buffer-lifetime responsibility
+to the programmer; discuss this as a general pattern — power purchased with explicitness — and one other place in this book where the same
+trade appears.</div>
+
+<div class="exercise" id="ex44.12"><span class="ex-label">44.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a recent Linux kernel with <code>io_uring</code>; <code>liburing</code> optional): (a) Submit a single
+<code>IORING_OP_NOP</code> through <code>io_uring_setup</code>/<code>io_uring_enter</code> and confirm you reap its completion, to verify the
+interface works. (b) Read a large cache-warm file two ways — a synchronous <code>pread</code> loop and <code>io_uring</code> batched at some
+queue depth — and report the <em>kernel-crossing count</em> for each and the wall-clock time; comment on why the wall-clock difference is small
+on cache-hit data. (c) State your kernel version, toolchain, and CPU; note the times are wall-clock (no hardware counters); and, if you can,
+sketch how the picture would change for uncached reads from a real disk, where the kernel absorbs the device latency and your thread stays
+free.</div>
+
+</section>
+</section>
+
+<section class="chapter" id="ch45">
+<h1>Chapter 45 — Zero-Copy: sendfile, splice, and the Data Path</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch40">Chapter 40</a> (the page cache, and how <code>read</code> copies
+from it into a user buffer), <a href="#ch44">Chapter 44</a> (batching away the per-operation kernel boundary), <a href="#ch43">Chapter 43</a>
+(the socket the bytes go to), <a href="#ch13">Chapter 13</a> (the cost of a system call), <a href="#ch03">Chapter 3</a> (memory bandwidth — a
+copy is not free). &nbsp;·&nbsp; The part has solved the waiting and batched the boundary. One cost is left: every byte sent from a file to a
+socket is copied through a buffer in your process for no reason. This chapter removes it — the last copy between the file and the wire — and
+closes the part.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory: (1) <a href="#ch40">Chapter 40</a> — when you <code>read</code> a file, where does the data physically move, and whose CPU makes
+that copy? (2) <a href="#ch03">Chapter 3</a> — copying a large buffer is bounded by memory bandwidth; is moving 512&nbsp;MiB through a user
+buffer free? (3) <em>Predict:</em> a program sends a 512&nbsp;MiB file (already warm in the page cache) over a socket two ways — a
+<code>read</code>-into-buffer-then-<code>write</code> loop, and a single <code>sendfile</code>. Two questions: how many times does the CPU copy
+each byte in the first version, and how many of those copies does the second remove? And what will happen to the number of system calls? Write
+your guesses; &sect;45.1&ndash;&sect;45.2 answer them.</p>
+</aside>
+
+<p>Consider the most ordinary server task there is: send the contents of a file over a network connection — a static web asset, a video chunk,
+a database page to a replica. The obvious code reads the file into a buffer and writes that buffer to the socket, in a loop. It works, and for
+most of this part it is exactly what we have done. But trace where the bytes actually go and you find the CPU copying every one of them twice,
+through a user-space buffer that exists only to be a middleman — the data is copied out of the kernel's page cache into your buffer, and then
+straight back into the kernel's socket buffer, unchanged. Those copies cost memory bandwidth (Chapter 3), and at scale they are the bottleneck:
+a file server bottlenecked on <code>memcpy</code> is spending its cycles shuffling bytes it never looks at. <strong>Zero-copy</strong> is the set
+of techniques that remove that pointless round trip through user space, letting the kernel move the data from the page cache to the socket
+directly. This final chapter of the part builds it in five steps: the copies in the normal file-to-socket path, counted (&sect;45.1);
+<code>sendfile</code>, which sends a file to a socket without ever touching user space, measured (&sect;45.2); <code>splice</code> and the
+pipe-as-conduit generalisation, and what &ldquo;zero&rdquo; really means once the hardware helps (&sect;45.3); the trap that zero-copy and
+touching-the-bytes are mutually exclusive — you cannot encrypt or transform what you never copy (&sect;45.4); and what to carry forward, out of
+this part and this volume (&sect;45.5).</p>
+
+<p><strong>On the code in this chapter.</strong> The programs are C, compiled with gcc 11.4.0 and run in this environment on an Intel Core
+i7-12700H (glibc 2.35, 20 hardware threads), timed with <code>clock_gettime(CLOCK_MONOTONIC)</code> as the best of several trials; times are
+wall-clock and a hardware-counter profiler (<code>perf</code>) is <em>not</em> installed. The file (512&nbsp;MiB) is sent over the
+<strong>loopback</strong> interface with its contents warm in the page cache, so the measurement isolates the <em>user-space copy</em> —
+loopback has no network card, so the saving here is the CPU copies and the system calls removed, not DMA to a NIC; the &ldquo;how far can
+zero-copy go&rdquo; discussion of &sect;45.3 names the hardware step loopback cannot show. Every call and flag below was checked against the
+Linux man pages (<code>sendfile(2)</code>, <code>splice(2)</code>, <code>tcp(7)</code>) on this machine.</p>
+
+<h2>45.1 The copies in the ordinary file-to-socket path</h2>
+
+<p>Follow one byte from a file on disk to a network connection under the ordinary <code>read</code>-then-<code>write</code> loop, and count the
+copies. When the file is served, the byte makes four moves. First, the disk controller copies it from the device into the kernel's page cache
+by <strong>DMA</strong> (direct memory access — the device's own engine moves it, not the CPU), which happens once and stays cached (Chapter 40).
+Then <code>read</code> copies it from the page cache into your user-space buffer — a <strong>CPU copy</strong>, your process's cycles spent on
+<code>memcpy</code>. Then <code>write</code> copies it from your user-space buffer into the kernel's socket send buffer — a second
+<strong>CPU copy</strong>, straight back into the kernel it just came from. Finally the network card copies it from the socket buffer onto the
+wire by DMA. Of those four, the two DMA copies are unavoidable and cheap (the hardware does them); the two <strong>CPU copies through user
+space are the waste</strong> — the byte went kernel &rarr; user &rarr; kernel without being changed at all, and your process paid memory
+bandwidth for the privilege of being a pass-through. On top of the copies, the loop crosses the system-call boundary twice per block (one
+<code>read</code>, one <code>write</code>), the per-syscall tax this part has tracked since Chapter 40. The realization that drives zero-copy
+is simple: if the user-space buffer is never read or modified — if it is purely a relay — then routing the data through it is pointless work,
+and the kernel, which has the data in the page cache and controls the socket buffer, could move it directly. Every zero-copy technique is a way
+to say to the kernel: take these bytes from that file and put them on that socket; do not bring them through my address space, because I am not
+going to touch them.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In the ordinary <code>read</code>-then-<code>write</code> loop that sends a file to a socket, how many times does the CPU copy each byte, and
+between which places? Which of the four total copies are done by DMA and are unavoidable, and which are the waste zero-copy removes? (Answer
+after the next section.)</p>
+</aside>
+
+<h2>45.2 sendfile: the file to the socket, without user space</h2>
+
+<p>The direct tool is <code>sendfile(out_fd, in_fd, offset, count)</code>: it copies up to <code>count</code> bytes from the file
+<code>in_fd</code> to the socket <code>out_fd</code> <em>inside the kernel</em>, so the data never enters your address space. As the
+<code>sendfile(2)</code> man page puts it, &ldquo;because this copying is done within the kernel, <code>sendfile()</code> is more efficient
+than the combination of <code>read(2)</code> and <code>write(2)</code>, which would require transferring data to and from user space.&rdquo;
+One call replaces the whole loop: no user buffer, no two CPU copies through it, and — because a single <code>sendfile</code> can move a large
+range — far fewer system calls. Measured here, sending a 512&nbsp;MiB cache-warm file over loopback:</p>
+
+<pre><code>send 512 MiB, file warm in page cache, over loopback TCP (best of several trials):
+  read()+write() loop (64 KiB buffer) :  ~1.73 GB/s    16,384 syscalls   (2 CPU copies/byte)
+  sendfile()                          :  ~4.04 GB/s          1 syscall    (no user-space copy)
+  sendfile: ~2.3x throughput, ~16,000x fewer syscalls
+</code></pre>
+
+<p>The <code>sendfile</code> version moved the same bytes at about <strong>2.3&times;</strong> the throughput — 4.04 against 1.73&nbsp;GB/s —
+and did it in <strong>one</strong> system call instead of 16,384, because it removed the two things the loop was spending on: the CPU copies
+into and out of the user buffer (the bandwidth), and the per-block <code>read</code>/<code>write</code> boundary crossings (the syscall tax).
+Note what the number is <em>not</em>: it is not infinite speed-up, because <code>sendfile</code> still does work — on ordinary hardware it still
+performs one in-kernel copy from the page cache into the socket buffer, and of course the DMA to move the data still happens; what it removed
+was specifically the user-space round trip. On this loopback test there is no network card, so the win you see is purely the eliminated
+user-space copies and syscalls; on a real server sending to a real NIC the win is larger, because the hardware can go further (&sect;45.3). The
+practical rule is clean: whenever you are relaying a file to a socket unchanged — static file serving, video streaming, proxying, replication —
+<code>sendfile</code> is the right call, and it is exactly why high-performance web and file servers (nginx, Kafka, and the like) are built on
+it. The user-space buffer in the ordinary loop was never doing anything but relaying; <code>sendfile</code> is the kernel doing the relay
+without you.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: don't relay bytes through user space you are not going to touch</span>
+<p><strong>1. In words.</strong> The ordinary loop copies each byte from the page cache into a user buffer and straight back into the socket
+buffer — two CPU copies through an address space that never reads or changes the data. <code>sendfile</code> tells the kernel to move the file's
+bytes to the socket directly, removing the user-space round trip and collapsing the per-block syscalls into one.</p>
+<p><strong>2. As a picture.</strong> Figure 45.1: on the left, the four-copy path — DMA disk&rarr;page cache, CPU page cache&rarr;user buffer,
+CPU user buffer&rarr;socket buffer, DMA socket buffer&rarr;NIC — with the two middle CPU copies highlighted as waste; on the right,
+<code>sendfile</code> going page cache&rarr;socket buffer inside the kernel, the user buffer gone entirely.</p>
+<p><strong>3. As numbers/contrast.</strong> 512&nbsp;MiB, cache-warm, loopback: the <code>read</code>+<code>write</code> loop at
+<strong>~1.73&nbsp;GB/s</strong> with 16,384 syscalls and two CPU copies per byte; <code>sendfile</code> at <strong>~4.04&nbsp;GB/s</strong> with
+one syscall and no user-space copy — ~2.3&times; the throughput and ~16,000&times; fewer boundary crossings (&sect;45.2), and more still once a
+scatter-gather NIC removes the last in-kernel copy (&sect;45.3).</p>
+</aside>
+
+<p><em>(Answer to the &sect;45.1 quick check: the CPU copies each byte <strong>twice</strong> — once from the page cache into the user-space
+buffer (by <code>read</code>) and once from that buffer into the socket send buffer (by <code>write</code>). Of the four total copies, the two
+<strong>DMA</strong> copies — disk into the page cache, and socket buffer out to the network card — are done by the hardware and are
+unavoidable; the two <strong>CPU</strong> copies through user space are the waste, because the buffer is a pure relay that never reads or
+changes the data, and that is exactly what <code>sendfile</code> removes.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 300" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="12" y="16" fill="#14406b">File to socket: four copies the ordinary way; sendfile removes the two CPU copies through user space.</text>
+<text x="12" y="38" font-size="9" fill="#8c3a1d">read() + write() loop &mdash; 2 CPU copies through a user buffer</text>
+<rect x="20" y="48" width="90" height="20" fill="#eef1f4" stroke="#333"/><text x="26" y="62" font-size="8">disk</text>
+<rect x="140" y="48" width="90" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="146" y="62" font-size="8">page cache</text>
+<rect x="260" y="48" width="90" height="20" fill="#f6dcd2" stroke="#8c3a1d"/><text x="266" y="62" font-size="8">user buffer</text>
+<rect x="380" y="48" width="90" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="386" y="62" font-size="8">socket buf</text>
+<rect x="500" y="48" width="90" height="20" fill="#eef1f4" stroke="#333"/><text x="506" y="62" font-size="8">NIC / wire</text>
+<path d="M110 58 L140 58" stroke="#2f7d32" stroke-width="1.5"/><text x="108" y="82" font-size="7" fill="#2f7d32">DMA</text>
+<path d="M230 58 L260 58" stroke="#8c3a1d" stroke-width="2"/><text x="224" y="82" font-size="7" fill="#8c3a1d">CPU copy (read)</text>
+<path d="M350 58 L380 58" stroke="#8c3a1d" stroke-width="2"/><text x="344" y="82" font-size="7" fill="#8c3a1d">CPU copy (write)</text>
+<path d="M470 58 L500 58" stroke="#2f7d32" stroke-width="1.5"/><text x="468" y="82" font-size="7" fill="#2f7d32">DMA</text>
+<text x="260" y="100" font-size="8" fill="#8c3a1d">the two CPU copies are pure waste: the buffer never reads or changes the bytes</text>
+<line x1="12" y1="118" x2="628" y2="118" stroke="#b9c2cc"/>
+<text x="12" y="138" font-size="9" fill="#2f7d32">sendfile() &mdash; page cache to socket buffer inside the kernel, no user space</text>
+<rect x="20" y="150" width="90" height="20" fill="#eef1f4" stroke="#333"/><text x="26" y="164" font-size="8">disk</text>
+<rect x="160" y="150" width="90" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="166" y="164" font-size="8">page cache</text>
+<rect x="360" y="150" width="90" height="20" fill="#dfe8f4" stroke="#14406b"/><text x="366" y="164" font-size="8">socket buf</text>
+<rect x="500" y="150" width="90" height="20" fill="#eef1f4" stroke="#333"/><text x="506" y="164" font-size="8">NIC / wire</text>
+<path d="M110 160 L160 160" stroke="#2f7d32" stroke-width="1.5"/><text x="118" y="146" font-size="7" fill="#2f7d32">DMA</text>
+<path d="M250 160 L360 160" stroke="#14406b" stroke-width="2"/><text x="262" y="146" font-size="7" fill="#14406b">1 in-kernel copy (0 with scatter-gather DMA)</text>
+<path d="M450 160 L500 160" stroke="#2f7d32" stroke-width="1.5"/><text x="458" y="146" font-size="7" fill="#2f7d32">DMA</text>
+<text x="160" y="192" font-size="8" fill="#2f7d32">user buffer gone; no user-space copy, one syscall for a whole range</text>
+<line x1="12" y1="212" x2="628" y2="212" stroke="#b9c2cc"/>
+<text x="12" y="232" font-size="8" fill="#14406b">Measured (512 MiB, cache-warm, loopback): read+write ~1.73 GB/s, 16,384 syscalls; sendfile ~4.04 GB/s, 1 syscall.</text>
+<text x="12" y="252" font-size="8" fill="#8c3a1d">Trap: sendfile never brings the bytes to you &mdash; so you cannot encrypt, compress, or transform them in transit (&sect;45.4).</text>
+<text x="12" y="276" font-size="8" fill="#2f7d32">splice generalises this to any two descriptors via a pipe; kTLS restores encryption to the zero-copy path.</text>
+</svg>
+<figcaption>Figure 45.1: The ordinary loop (top) copies each byte through a user-space buffer twice (CPU copies) between two DMA transfers.
+<code>sendfile</code> (bottom) moves the data from the page cache to the socket buffer inside the kernel — no user-space copy, one system call
+for a whole range, and zero CPU copies at all when a scatter-gather NIC can send straight from the page cache.</figcaption>
+</figure>
+
+<h2>45.3 splice, the pipe conduit, and how far &ldquo;zero&rdquo; goes</h2>
+
+<p><code>sendfile</code> is specialised: a file in, a socket out. <code>splice(fd_in, off_in, fd_out, off_out, count, flags)</code> generalises
+the same idea — its man page describes it as moving data &ldquo;between two file descriptors without copying between kernel address space and
+user address space&rdquo; — with one constraint: one of the two descriptors must be a <strong>pipe</strong>. The pipe acts as a kernel-space
+conduit: rather than copy bytes, <code>splice</code> moves <em>references</em> to the kernel buffers (page-cache pages) through the pipe, so data
+can flow file&rarr;pipe&rarr;socket, or socket&rarr;pipe&rarr;file, or between two sockets, all without a user-space copy. That pipe requirement
+looks odd but it is the mechanism: the pipe is the kernel's internal handle for a queue of buffer references, and splicing is re-pointing them,
+not memcpy-ing them. This is the general zero-copy primitive; <code>sendfile</code> is essentially a convenient special case. It matters because
+the &ldquo;which two descriptors&rdquo; question is broader than file-to-socket: a proxy splicing one socket to another, a logger splicing a
+socket to a file, all get the same no-user-copy path. Now, how far does &ldquo;zero&rdquo; actually go? On ordinary hardware, even
+<code>sendfile</code> does <em>one</em> in-kernel copy, from the page cache into the socket buffer, because the network card needs the data laid
+out where it can DMA it. But modern NICs support <strong>scatter-gather DMA</strong> and checksum offload: given a list of page-cache pages, the
+card's DMA engine gathers them directly from the page cache onto the wire, computing the checksum in hardware — so that last in-kernel copy
+disappears too, and the byte goes disk &rarr; page cache (DMA) &rarr; wire (DMA) with the CPU never copying it at all. <em>That</em> is true
+zero-copy, and it is the endpoint the loopback measurement of &sect;45.2 cannot show (there is no card), but it is why the technique matters so
+much on real servers: the CPU is removed from the data path entirely, freeing it to do work that actually requires a CPU. The progression is
+the whole part's lesson in miniature — first stop blocking (Chapter 42), then stop crossing the boundary per operation (Chapter 44), then stop
+copying the bytes at all (here) — each step removing a cost the previous one left standing.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>What does <code>splice</code> generalise about <code>sendfile</code>, and why does it require one of the two descriptors to be a pipe? On
+ordinary hardware <code>sendfile</code> still makes one in-kernel copy — what hardware feature removes even that, and what does the data path
+look like once it is gone? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>45.4 The trap: zero-copy means you never see the bytes</h2>
+
+<p>Zero-copy's power is exactly its limitation, and the two are the same fact stated twice: the data never enters your address space. If your
+process never touches the bytes, then your process <em>cannot</em> touch the bytes — you cannot inspect, modify, compress, or
+<strong>encrypt</strong> them on the way through, because there is no point in the path where they are in memory you can run code over. This is
+the trap that catches teams reaching for <code>sendfile</code> to speed up a server that also needs to do something to the data. The most
+common collision is TLS: a secure server must encrypt every byte before it goes on the wire, and encryption is a transformation of the bytes —
+which requires having them in a buffer to transform — so a naive &ldquo;<code>sendfile</code> for speed&rdquo; and &ldquo;TLS for security&rdquo;
+are directly incompatible, because the first says &ldquo;never bring the bytes to user space&rdquo; and the second says &ldquo;you must
+transform every byte.&rdquo; The same conflict appears with on-the-fly compression, watermarking, transcoding, content inspection, or any
+per-request modification: if you must change the bytes, zero-copy is off the table by definition, and the ordinary <code>read</code>/transform/<code>write</code>
+path is not a failure to optimise — it is the only path that can do the job. There are real answers when you need both, and they work by
+relocating the transformation, not by wishing the conflict away: <strong>kernel TLS</strong> (kTLS) moves the encryption <em>into</em> the
+kernel, so the kernel can encrypt page-cache data on its way to the socket and <code>sendfile</code> can once again feed a TLS connection
+without a user-space copy; hardware offload can push crypto or compression onto the NIC. But absent such a mechanism, the rule is firm and
+worth stating plainly: <strong>you can move bytes with zero copies, or you can transform them, but not both in the same step.</strong> Choosing
+<code>sendfile</code> for a path that must encrypt, without kTLS, does not make encryption fast — it makes it impossible, and the bug is
+discovering that your &ldquo;optimised&rdquo; path silently cannot meet a requirement the ordinary path met for free.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: reaching for sendfile on data you must transform &mdash; zero-copy and touching-the-bytes are exclusive</span>
+<p><code>sendfile</code> and <code>splice</code> are fast precisely because the data never enters your address space — which means any operation
+that must <em>read or change</em> the bytes (encryption for TLS, on-the-fly compression, transcoding, watermarking, content inspection) is
+fundamentally incompatible with them: there is no moment in the zero-copy path where the bytes are in memory your code can run over. The trap is
+to treat zero-copy as a free speed-up you can bolt onto any file-serving path, then discover it cannot coexist with a transformation the product
+requires — most often TLS, where &ldquo;encrypt every byte&rdquo; and &ldquo;never copy the bytes to user space&rdquo; are contradictory by
+construction. This surfaces late and badly: a static-file benchmark shows <code>sendfile</code>'s beautiful numbers, the path ships, and then
+the requirement to serve over HTTPS (or to compress, or to inspect) reveals that the fast path structurally cannot do it. The defenses are to
+decide up front whether the data must be transformed in transit: if it must and you have no in-kernel offload, use the ordinary
+<code>read</code>/transform/<code>write</code> path and do not pretend zero-copy is available; if you want both, use <strong>kernel TLS</strong>
+(kTLS) or NIC offload, which relocate the transformation into the kernel or hardware so the zero-copy path can carry it. What you must not do is
+choose <code>sendfile</code> for its throughput and assume the transformation can be added later — the whole point of the technique is that the
+bytes are never yours to transform. &ldquo;It is faster because we skip the copy&rdquo; and &ldquo;we encrypt every byte in the app&rdquo;
+cannot both be true of the same step.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our media server is CPU-bound just shoveling files to clients — let's switch the send path to
+<code>sendfile</code> and get the copies out of user space. Also, product wants everything served over HTTPS now.&rdquo; Cover the paragraph and
+respond in four or five sentences, drawing on &sect;45.2 and &sect;45.4.</p>
+<p><em>Model answer.</em> &ldquo;<code>sendfile</code> is exactly right for shoveling files unchanged — it removes the two user-space CPU copies
+and collapses the per-block syscalls, and I measured about 2&times; throughput on a plain relay, more on a real NIC that can DMA straight from
+the page cache. But there is a hard conflict with the HTTPS requirement: TLS means we must encrypt every byte before it hits the wire, and
+encryption is a transformation, so it needs the bytes in a buffer — which is exactly what <code>sendfile</code> refuses to give us. We cannot
+have both &lsquo;never copy to user space&rsquo; and &lsquo;encrypt every byte in the app&rsquo; in the same step. The clean answer is
+<strong>kernel TLS</strong> (kTLS): it moves the encryption into the kernel so the kernel encrypts page-cache data on the way to the socket and
+<code>sendfile</code> keeps working over TLS. So let's enable kTLS if the platform supports it; if it does not, the encrypted path has to go
+through user space and we optimise it differently — but we should not ship a <code>sendfile</code> fast path that structurally can't do HTTPS.&rdquo;
+Naming the throughput win, the encrypt-versus-copy contradiction, and kTLS as the specific reconciliation is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;45.3 quick check: <code>splice</code> generalises <code>sendfile</code> from &ldquo;file to socket&rdquo; to
+&ldquo;any two descriptors,&rdquo; still without a user-space copy; it requires one end to be a <strong>pipe</strong> because the pipe is the
+kernel's internal conduit — a queue of references to kernel buffers — and splicing moves those references rather than copying bytes. On ordinary
+hardware <code>sendfile</code> still does one in-kernel copy into the socket buffer; a NIC with <strong>scatter-gather DMA</strong> and checksum
+offload removes even that, gathering the page-cache pages straight onto the wire, so the byte travels disk &rarr; page cache &rarr; wire by DMA
+alone with the CPU never copying it.)</em></p>
+
+<h2>45.5 What to carry forward</h2>
+
+<p>Sending a file to a socket the ordinary way copies every byte through a user-space buffer twice — page cache &rarr; user buffer &rarr; socket
+buffer — two <strong>CPU copies</strong> that do nothing but relay, framed by two unavoidable DMA copies and paid for in memory bandwidth and
+per-block syscalls (&sect;45.1). <strong><code>sendfile</code></strong> moves the data file-to-socket inside the kernel, removing the user-space
+round trip: measured here at ~4.04&nbsp;GB/s against the loop's ~1.73&nbsp;GB/s (~2.3&times;) and one syscall against 16,384, and it is why
+nginx, Kafka, and every serious file server use it (&sect;45.2). <strong><code>splice</code></strong> generalises it to any two descriptors via a
+pipe conduit, and on a scatter-gather NIC even <code>sendfile</code>'s last in-kernel copy vanishes, giving <em>true</em> zero-copy where the CPU
+never touches the data — disk &rarr; page cache &rarr; wire by DMA alone (&sect;45.3). But zero-copy's power is its constraint: because the bytes
+never enter your address space, you <strong>cannot transform them in transit</strong> — no TLS encryption, compression, or modification — so
+reaching for <code>sendfile</code> on a path that must encrypt makes the transformation impossible, not fast, and the reconciliation when you
+need both is to relocate the transformation into the kernel (<strong>kTLS</strong>) or hardware (&sect;45.4).</p>
+
+<p>This closes the low-level I/O and networking part, and with it the first volume. The arc is one idea pursued to the bottom: a program does
+not run on an abstract machine, and neither does its I/O. We started with the syscall boundary and the page cache (Chapter 40), learned when
+bytes are durable and when the OS is lying about it (Chapter 41), stopped dedicating a thread to every wait and built the event loop (Chapter
+42), gave the connection a name and a transport whose guarantees we can state (Chapter 43), batched the kernel boundary away with completion-based
+submission (Chapter 44), and here removed the last needless copy between the file and the wire. The through-line was a single discipline, the
+same one that opened the volume: know where the bytes physically are, know who copies them and who waits, and measure the cost you claim to be
+removing rather than assume it — the honest break-even of Chapter 44 and the real 2.3&times; here are both results of that habit. This substrate
+— files, the page cache, durability, sockets, and the copies and crossings between them — is the ground the next volume builds a database on:
+the buffer pool that manages the page cache by hand, the write-ahead log that turns <code>fsync</code> into a durability guarantee, the storage
+engine that lays pages on disk. Everything a database does about storage is a specific, disciplined answer to the costs this part made concrete.
+The machine is real; now we build something serious on top of it.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Count the copies in the ordinary file-to-socket path and say which are CPU copies and which are DMA.</li>
+<li>Explain what <code>sendfile</code> removes and why, and state its measured effect on throughput and syscall count.</li>
+<li>Say what <code>splice</code> generalises and why it needs a pipe.</li>
+<li>Explain what &ldquo;true&rdquo; zero-copy needs from the hardware, and what the data path looks like then.</li>
+<li>State why zero-copy and transforming the bytes (e.g. TLS) are mutually exclusive, and how kTLS reconciles them.</li>
+<li>Trace the part's arc: stop blocking, stop crossing per operation, stop copying — what each step removed.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> How many CPU copies does the ordinary file-to-socket loop make, between where and where, and which copies are DMA? (&sect;45.1)</li>
+<li><strong>R2.</strong> What does <code>sendfile</code> do, and what were its measured throughput and syscall effects? (&sect;45.2)</li>
+<li><strong>R3.</strong> What does <code>splice</code> generalise, and why the pipe? (&sect;45.3)</li>
+<li><strong>R4.</strong> What hardware feature yields true zero-copy, and what is the resulting data path? (&sect;45.3)</li>
+<li><strong>R5.</strong> Why can't you encrypt bytes you send with <code>sendfile</code>, and what reconciles zero-copy with TLS? (&sect;45.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Linux <code>sendfile(2)</code> man page (Linux man-pages project).</strong> The primary reference for &sect;45.2: the
+<code>sendfile(out_fd, in_fd, offset, count)</code> interface and its rationale — &ldquo;because this copying is done within the kernel,
+<code>sendfile()</code> is more efficient than the combination of <code>read(2)</code> and <code>write(2)</code>&rdquo; — verified against the
+page installed on this machine.</li>
+<li><strong>Linux <code>splice(2)</code> man page (Linux man-pages project).</strong> The reference for &sect;45.3: <code>splice</code> &ldquo;moves
+data between two file descriptors without copying between kernel address space and user address space,&rdquo; with one end a pipe — verified
+against the page installed on this machine.</li>
+<li><strong>Michael Kerrisk, <em>The Linux Programming Interface</em> (No Starch Press, 2010), ISBN 978-1-59327-220-3.</strong> Section 61.4.4,
+&ldquo;Transferring a file to a socket: <code>sendfile()</code>,&rdquo; explains the copy the ordinary <code>read</code>/<code>write</code> loop
+wastes and how <code>sendfile</code> avoids it — the source for &sect;45.1&ndash;&sect;45.2's copy accounting. First author Michael Kerrisk;
+edition and ISBN verified via the publisher.</li>
+<li><strong>Vivek S. Pai, Peter Druschel &amp; Willy Zwaenepoel, &ldquo;IO-Lite: A Unified I/O Buffering and Caching System,&rdquo; in
+<em>Proc. 3rd USENIX OSDI</em> (1999); expanded in <em>ACM Transactions on Computer Systems</em> 18(1), 2000, DOI 10.1145/332799.332895.</strong>
+The research foundation of zero-copy I/O: a single physical copy of data shared safely across the file cache, IPC, and network subsystem — the
+idea &sect;45.3's page-reference splicing and scatter-gather sending descend from. First author Vivek S. Pai; venue, year, and DOI verified via
+the ACM Digital Library.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex45.1"><span class="ex-label">45.1</span> <span class="ex-tag warm">warm-up</span>
+In the ordinary <code>read</code>-then-<code>write</code> loop that sends a file to a socket, how many times does the CPU copy each byte, and
+between which two pairs of places?</div>
+
+<div class="exercise" id="ex45.2"><span class="ex-label">45.2</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does <code>sendfile</code> remove from the ordinary loop, and roughly what was its measured effect on the number of
+system calls in this chapter?</div>
+
+<div class="exercise" id="ex45.3"><span class="ex-label">45.3</span> <span class="ex-tag warm">warm-up</span>
+Name one operation on the data that <code>sendfile</code> makes impossible, and say why.</div>
+
+<div class="exercise" id="ex45.4"><span class="ex-label">45.4</span> <span class="ex-tag core">core</span>
+Counting copies. (a) List all four copies a byte undergoes from disk to wire in the ordinary loop, labeling each as CPU or DMA. (b) Which two
+does <code>sendfile</code> remove, and why are they waste? (c) On ordinary hardware <code>sendfile</code> still does one in-kernel copy —
+between where and where, and what removes it?</div>
+
+<div class="exercise" id="ex45.5"><span class="ex-label">45.5</span> <span class="ex-tag core">core</span>
+The measurement. (a) The loop ran at ~1.73&nbsp;GB/s and <code>sendfile</code> at ~4.04&nbsp;GB/s for the same 512&nbsp;MiB; name the two
+distinct costs <code>sendfile</code> removed that account for the difference. (b) Why is the win only ~2.3&times; and not, say, 100&times;? (c)
+Why would the same comparison likely show a <em>larger</em> win on a real server with a network card than on this loopback test?</div>
+
+<div class="exercise" id="ex45.6"><span class="ex-label">45.6</span> <span class="ex-tag core">core</span>
+<code>splice</code> and the pipe. (a) How does <code>splice</code> generalise <code>sendfile</code>? (b) Why does it require one descriptor to
+be a pipe — what is the pipe actually doing? (c) Give two useful data paths <code>splice</code> enables that <code>sendfile</code> does not.</div>
+
+<div class="exercise" id="ex45.7"><span class="ex-label">45.7</span> <span class="ex-tag complexity">cost</span>
+A server sends files at rate <var>R</var> bytes/s. Model per-byte CPU-copy cost as 1/<var>B</var> seconds, where <var>B</var> is memory copy
+bandwidth. (a) The ordinary loop does two CPU copies per byte; write the CPU time per second it spends just copying at rate <var>R</var>. (b)
+<code>sendfile</code> on ordinary hardware does one in-kernel copy; write the same. (c) With a scatter-gather NIC (zero CPU copies), what is
+that CPU time, and what does the freed CPU now get to do? Comment on why a file server can become copy-bound.</div>
+
+<div class="exercise" id="ex45.8"><span class="ex-label">45.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A team switched their static-asset server to <code>sendfile</code>, benchmarked a 3&times;
+throughput improvement, and shipped it. Two months later, product mandates HTTPS for all traffic.
+<br><strong>Step 1 (given):</strong> TLS requires encrypting every byte before it is sent on the socket.
+<br><strong>Step 2 (given):</strong> encryption is a transformation of the bytes and needs them in a buffer to transform.
+<br><strong>Step 3 (given):</strong> <code>sendfile</code> moves bytes from the page cache to the socket without ever bringing them to user
+space.
+<br><strong>Step 4 (you):</strong> Explain why the fast <code>sendfile</code> path structurally cannot serve TLS, why the benchmark did not
+reveal this, and the two ways forward (one that keeps zero-copy, one that does not).</div>
+
+<div class="exercise" id="ex45.9"><span class="ex-label">45.9</span> <span class="ex-tag mixed">mixed</span>
+For each task, say whether zero-copy (<code>sendfile</code>/<code>splice</code>) applies, and why: (a) serving a static image file over plain
+HTTP; (b) serving the same file over HTTPS with no kernel TLS; (c) proxying bytes from an upstream socket to a client socket unchanged; (d)
+gzip-compressing a log file as you stream it to a client; (e) serving a video file over HTTPS on a host with kTLS enabled.</div>
+
+<div class="exercise" id="ex45.10"><span class="ex-label">45.10</span> <span class="ex-tag mixed">mixed</span>
+Classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;<code>sendfile</code> copies the file into a user buffer and
+then to the socket.&rdquo; (b) &ldquo;On a scatter-gather NIC, a sent byte need never be copied by the CPU.&rdquo; (c) &ldquo;You can encrypt
+data in your application and still send it with <code>sendfile</code> in the same step.&rdquo; (d) &ldquo;<code>splice</code> needs one end to
+be a pipe.&rdquo; (e) &ldquo;The two DMA copies in the ordinary path are the waste zero-copy removes.&rdquo;</div>
+
+<div class="exercise" id="ex45.11"><span class="ex-label">45.11</span> <span class="ex-tag stretch">stretch</span>
+Synthesize the part. (a) The part removed three costs in sequence — blocking (Chapter 42), the per-operation kernel boundary (Chapter 44), and
+the user-space copy (this chapter). State what each step removed and what it left for the next. (b) Zero-copy's benefit and its limitation are
+the same fact; explain that identity and why it means the &ldquo;fastest&rdquo; path is not always the usable one. (c) Argue why &ldquo;know
+where the bytes physically are and who copies them&rdquo; is the single question that unifies this entire part, using the four-copy diagram to
+make the case.</div>
+
+<div class="exercise" id="ex45.12"><span class="ex-label">45.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain): (a) Send a large cache-warm file over a loopback TCP connection two ways — a <code>read</code>/<code>write</code>
+loop with a fixed buffer, and a single <code>sendfile</code> — and report the throughput and the number of system calls for each. (b) Explain,
+from your syscall counts, how much of the difference is the removed copies versus the removed boundary crossings. (c) State your toolchain and
+CPU, note the times are wall-clock (no hardware counters), and explain why a loopback test understates the win a real network card would show,
+naming the hardware feature (scatter-gather DMA) that removes the last copy.</div>
+
+</section>
+</section>
+
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part VIII</div><h1>Storage & the Disk</h1><p class='part-blurb'>Pages, files, the buffer pool, and the storage manager — the foundation you build a database on.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part IX</div><h1>Storage Engines</h1><p class='part-blurb'>B-trees and LSM-trees implemented and analyzed — the two families and when each wins.</p></div>
 <div class="part-page"><div class="part-num">Vol 2 · Database Internals (Build a Database) · Part X</div><h1>Durability & Recovery</h1><p class='part-blurb'>Write-ahead logging, ARIES, checkpoints, and crash recovery — how a database keeps its promises across failures.</p></div>
@@ -22056,6 +23202,324 @@ typical, higher under virtualization) and contrasts it with a vDSO call that is 
 hardware counters, and notes that absolute syscall cost varies with the environment while the scaling shape is portable. <em>Tempting wrong
 answer:</em> &ldquo;report <code>epoll</code> is faster by a fixed factor&rdquo; — the factor grows with the descriptor count; the
 scaling, not a single ratio, is the result. <strong>Feed-forward:</strong> &sect;42.1&ndash;&sect;42.3.</div>
+
+</section>
+
+<section class="solutions" id="sol43">
+<h1>Chapter 43 — Solutions</h1>
+
+<div class="solution" id="sol43.1"><span class="sol-label">43.1</span>
+Server: <code>socket</code> &rarr; <code>bind</code> (attach to a local address/port) &rarr; <code>listen</code> (mark passive, set the
+backlog) &rarr; <code>accept</code> (block until a client connects). Client: <code>socket</code> &rarr; <code>connect</code>.
+<code>accept</code> returns a <strong>new descriptor</strong> for the one accepted connection, leaving the listening socket open for the next
+client. <em>Tempting wrong answer:</em> &ldquo;<code>accept</code> returns the listening socket&rdquo; — it returns a distinct per-connection
+socket; the listener keeps listening. <strong>Feed-forward:</strong> &sect;43.1.</div>
+
+<div class="solution" id="sol43.2"><span class="sol-label">43.2</span>
+<code>SOCK_STREAM</code> selects TCP; <code>SOCK_DGRAM</code> selects UDP. TCP guarantees reliable, ordered delivery (and flow control) that
+UDP does not; UDP preserves <strong>message boundaries</strong> (one <code>sendto</code> = one <code>recvfrom</code>) that TCP's byte stream
+does not. <em>Tempting wrong answer:</em> &ldquo;UDP is just TCP without the checksum&rdquo; — UDP drops delivery, ordering, flow, and
+congestion control, not merely error checking. <strong>Feed-forward:</strong> &sect;43.2&ndash;&sect;43.3.</div>
+
+<div class="solution" id="sol43.3"><span class="sol-label">43.3</span>
+<code>TCP_NODELAY</code> (via <code>setsockopt</code> at level <code>IPPROTO_TCP</code>) disables Nagle's algorithm; set it on
+latency-sensitive small-message request/response protocols (RPC, databases, interactive services). <em>Tempting wrong answer:</em>
+&ldquo;always set it, on every socket&rdquo; — on bulk-transfer sockets Nagle does no harm and coalescing helps, so it is not a universal win.
+<strong>Feed-forward:</strong> &sect;43.4.</div>
+
+<div class="solution" id="sol43.4"><span class="sol-label">43.4</span>
+(a) Any split is possible and TCP permits it: one <code>read</code> returning all 300; 60 then 240; one byte per <code>read</code>; etc. —
+because TCP is a byte stream and coalesces or splits writes into whatever segments it chooses. (b) TCP guarantees only that all 300 bytes
+arrive <strong>in order and without loss or duplication</strong> — nothing about grouping. (c) Length-prefix framing: prepend each message with
+its byte length; the receiver reads into a buffer in a loop, first reading the fixed-size length, then reading until that many body bytes have
+accumulated, then delivering one message and repeating. <em>Tempting wrong answer:</em> &ldquo;one <code>read</code> per message because I sent
+one <code>write</code> per message&rdquo; — writes and reads do not correspond on a stream. <strong>Feed-forward:</strong> &sect;43.2.</div>
+
+<div class="solution" id="sol43.5"><span class="sol-label">43.5</span>
+(a) Client &rarr; <code>SYN</code> (proposes its initial sequence number); server &rarr; <code>SYN</code>+<code>ACK</code> (acknowledges the
+client's and proposes its own); client &rarr; <code>ACK</code> (acknowledges the server's). After it, both sides know each other's starting
+sequence numbers and the channel is open. (b) Setup costs a round trip because the handshake requires a message from each side before data can
+flow; a client that opens a fresh connection per request therefore pays one RTT of pure setup latency (plus TIME_WAIT churn) on every request —
+the argument for connection pooling and keep-alive. (c) TIME_WAIT is entered by the side that closes <em>first</em> (the active closer), which
+holds the socket for twice the maximum segment lifetime so that stray delayed segments from the closed connection cannot be mistaken for data
+on a new connection reusing the same port. <em>Tempting wrong answer:</em> &ldquo;TIME_WAIT is a bug/leak to eliminate&rdquo; — it is a
+correctness mechanism; <code>SO_REUSEADDR</code> lets a server rebind despite it, but it is doing a job. <strong>Feed-forward:</strong> &sect;43.1.</div>
+
+<div class="solution" id="sol43.6"><span class="sol-label">43.6</span>
+(a) Bulk file transfer: <strong>TCP</strong> — you need every byte, in order, with flow/congestion control. (b) DNS query: <strong>UDP</strong>
+— one tiny request and reply; a TCP handshake would cost more than the query, and a lost query is cheaply retried. (c) Live VoIP:
+<strong>UDP</strong> — a late packet is useless, so TCP's retransmit-and-reorder would <em>add</em> latency and stall the stream; better to skip
+the lost audio. (d) Bank transaction: <strong>TCP</strong> — reliability and ordering are non-negotiable. (e) New protocol wanting its own
+congestion control and 0-RTT: <strong>UDP</strong> — TCP's fixed handshake and in-order delivery are exactly the machinery you want to replace
+(this is QUIC). <em>Tempting wrong answer:</em> &ldquo;UDP for (a) because it is faster&rdquo; — without reliability you would corrupt the file.
+<strong>Feed-forward:</strong> &sect;43.3.</div>
+
+<div class="solution" id="sol43.7"><span class="sol-label">43.7</span>
+(a) The client's second small write is held by Nagle until the first segment is acknowledged; the server's delayed-ACK holds that
+acknowledgement (up to ~40&nbsp;ms) hoping to piggyback it on a reply, but the server cannot reply until it has the whole request, whose tail
+is stuck in the client's Nagle buffer — so nothing moves until the delayed-ACK timer fires. (b) 25 round trips: with Nagle,
+25&times;43.8&nbsp;ms &asymp; <strong>1,095&nbsp;ms</strong> (over a second per user request); with <code>TCP_NODELAY</code>,
+25&times;90&nbsp;&micro;s &asymp; <strong>2.3&nbsp;ms</strong>. (c) A throughput benchmark streams large buffers that fill segments, so Nagle
+never holds anything and the timer never fires — the pathology needs the small-write request/response shape, which throughput tests do not
+have. <em>Tempting wrong answer:</em> &ldquo;the 40&nbsp;ms is network latency in the rack&rdquo; — intra-rack RTT is tens of microseconds; the
+40&nbsp;ms is a timer. <strong>Feed-forward:</strong> &sect;43.4.</div>
+
+<div class="solution" id="sol43.8"><span class="sol-label">43.8</span>
+<strong>Step 4:</strong> Writing the length prefix and the body as two separate <code>write</code> calls with Nagle on means the second write
+is held until the first is acknowledged; the server's delayed-ACK will not acknowledge the prefix on its own, waiting to piggyback on a reply
+it cannot send until it has the full request — so every call waits out the ~40&nbsp;ms delayed-ACK timer. The load test missed it because it
+measured aggregate throughput with the pipeline full, where the timer overlaps other in-flight work and never shows as per-call latency; only
+isolated sequential round trips expose it. Fixes, best first: (1) assemble the prefix and body into one buffer and issue a single
+<code>write</code>, so Nagle never engages; (2) set <code>TCP_NODELAY</code> on the socket. <em>Tempting wrong answer:</em> &ldquo;switch to
+UDP&rdquo; — that abandons reliability to dodge a one-line fix. <strong>Feed-forward:</strong> &sect;43.4.</div>
+
+<div class="solution" id="sol43.9"><span class="sol-label">43.9</span>
+(a) <strong>Buggy</strong> — one <code>send</code> does not imply one <code>recv</code>; the stream may deliver your message in pieces or joined
+to the next, so you must frame and loop. (b) <strong>No effect (harmless but pointless)</strong> — a bulk-upload socket sends full segments, so
+Nagle never holds anything; <code>TCP_NODELAY</code> changes nothing there. (c) <strong>Buggy</strong> — UDP does not redeliver lost datagrams;
+if you need reliability you must implement it. (d) <strong>Correct</strong> — reading in a loop until a full length-prefixed message is
+assembled is exactly the right way to consume a stream. (e) <strong>Buggy</strong> — you must talk to the client on the descriptor
+<code>accept</code> returned, not the listening socket. <em>Tempting wrong answer:</em> calling (b) a real speedup — it is a no-op on that
+traffic pattern. <strong>Feed-forward:</strong> &sect;43.2&ndash;&sect;43.4.</div>
+
+<div class="solution" id="sol43.10"><span class="sol-label">43.10</span>
+(a) <strong>False</strong> — a connected socket is a descriptor and supports <code>read</code>/<code>write</code> like any other. (b)
+<strong>False</strong> — UDP does not guarantee ordering; datagrams may arrive in any order. (c) <strong>True</strong> — the three-way
+handshake spends one RTT before data. (d) <strong>False</strong> — a socket that only sends large buffers already fills segments, so disabling
+Nagle changes nothing. (e) <strong>False</strong> — on a byte stream, writes and reads do not correspond one-to-one. <em>Tempting wrong
+answer:</em> marking (b) true by analogy to TCP — ordering is precisely one of the guarantees UDP drops. <strong>Feed-forward:</strong>
+&sect;43.1&ndash;&sect;43.4.</div>
+
+<div class="solution" id="sol43.11"><span class="sol-label">43.11</span>
+(a) &ldquo;Just a descriptor&rdquo; is true in that once connected, the entire I/O API (<code>read</code>/<code>write</code>/<code>close</code>/<code>epoll</code>/<code>O_NONBLOCK</code>)
+applies unchanged — that uniformity is what lets the event loop of Chapter 42 treat sockets and files alike; it is incomplete because setup
+(bind/listen/accept or connect, the handshake) and transport semantics (byte stream, framing, boundaries) have no file analogue. (b) The
+accurate framing is <em>which guarantees you get for free versus build yourself</em>: TCP gives reliability, ordering, flow, and congestion
+control as a fixed package; UDP gives boundaries and nothing else, so you supply exactly the guarantees you need — QUIC proves it by building
+reliability, ordering, and its own congestion control atop UDP precisely to escape TCP's fixed choices, which no &ldquo;reliable vs fast&rdquo;
+story explains. (c) Nagle and delayed-ACK are each a correct local optimisation (fewer small packets; fewer bare ACKs) that compose into a
+40&nbsp;ms global stall — a recurring systems shape where independently sensible policies interact pathologically, which is why integration and
+end-to-end latency testing (not just component or throughput tests) is essential. <em>Tempting wrong answer:</em> &ldquo;one of the two
+optimisations is simply wrong&rdquo; — each is reasonable alone; the defect is their interaction with a chatty write pattern.
+<strong>Feed-forward:</strong> &sect;43.2&ndash;&sect;43.5.</div>
+
+<div class="solution" id="sol43.12"><span class="sol-label">43.12</span>
+Open-ended and platform-specific. A correct write-up: (a) shows the write-write-read round trip stalling near the delayed-ACK timer (~40&nbsp;ms
+on Linux) with Nagle on and dropping to tens of microseconds with <code>TCP_NODELAY</code>; (b) demonstrates that a single <code>read</code>
+can return more than one back-to-back message, then shows a length-prefix loop recovering them; (c) states toolchain and CPU, flags wall-clock
+timing without hardware counters, and explains that the ~40&nbsp;ms is a protocol timer (Nagle waiting on a delayed ACK) rather than network
+latency, since loopback RTT is negligible. <em>Tempting wrong answer:</em> &ldquo;report the stall as the socket being slow&rdquo; — the
+stall is a specific timer, reproducible and removable, not a bandwidth or CPU limit. <strong>Feed-forward:</strong> &sect;43.2&ndash;&sect;43.4.</div>
+
+</section>
+
+<section class="solutions" id="sol44">
+<h1>Chapter 44 — Solutions</h1>
+
+<div class="solution" id="sol44.1"><span class="sol-label">44.1</span>
+Readiness asks &ldquo;which descriptors can I operate on without blocking?&rdquo; (and then you do the operation yourself); completion asks
+&ldquo;perform this operation and tell me when it is finished.&rdquo; <em>Tempting wrong answer:</em> &ldquo;they ask the same thing, one is
+just faster&rdquo; — they ask fundamentally different questions, which is why completion works for disk and readiness does not.
+<strong>Feed-forward:</strong> &sect;44.1.</div>
+
+<div class="solution" id="sol44.2"><span class="sol-label">44.2</span>
+The <strong>submission queue</strong> (SQEs) — the application writes it, the kernel reads it — and the <strong>completion queue</strong>
+(CQEs) — the kernel writes it, the application reads it. <em>Tempting wrong answer:</em> &ldquo;both are written by the kernel&rdquo; — the
+application fills submissions; that is the point of the shared submission ring. <strong>Feed-forward:</strong> &sect;44.2.</div>
+
+<div class="solution" id="sol44.3"><span class="sol-label">44.3</span>
+<strong>One</strong> <code>io_uring_enter</code> submits all 200 and waits for their completions, versus <strong>200</strong> separate
+<code>pread</code> system calls — a 200&times; reduction in kernel crossings. <em>Tempting wrong answer:</em> &ldquo;one
+<code>io_uring_enter</code> per operation&rdquo; — the whole design batches the boundary; one call handles the batch.
+<strong>Feed-forward:</strong> &sect;44.2&ndash;&sect;44.3.</div>
+
+<div class="solution" id="sol44.4"><span class="sol-label">44.4</span>
+(a) <code>epoll_wait</code> only tells you a descriptor is ready; you must still cross the boundary to do the <code>read</code>/<code>write</code>
+— so each handled operation is at least one more syscall. (b) A regular file is always &ldquo;ready&rdquo; (you can always attempt the read),
+but the attempt still blocks on the device on a cache miss, and there is no event meaning &ldquo;this read will not block,&rdquo; so
+<code>epoll</code> has nothing to watch for a file. (c) &ldquo;Tell me when it is done&rdquo; is meaningful for any operation — the kernel
+performs it and reports completion whether the wait was for socket data or a disk seek — whereas &ldquo;which are ready&rdquo; needs an
+observable ready state that disk files do not have. <em>Tempting wrong answer:</em> &ldquo;use non-blocking mode on the file&rdquo; —
+<code>O_NONBLOCK</code> does not make ordinary file reads non-blocking on a cache miss. <strong>Feed-forward:</strong> &sect;44.1.</div>
+
+<div class="solution" id="sol44.5"><span class="sol-label">44.5</span>
+(a) An SQE holds an opcode (e.g. <code>IORING_OP_READ</code>), a descriptor, a buffer address, a length, an offset, and a 64-bit
+<code>user_data</code>; a CQE holds the result <code>res</code> (byte count or negative error) and the echoed <code>user_data</code>.
+<code>user_data</code> lets you match a completion to the request that produced it. (b) Fill three SQEs, advance the submission ring tail, call
+<code>io_uring_enter</code> once to submit and wait; then read three CQEs from the completion ring, using each <code>user_data</code> to find
+its request, and advance the completion head. (c) <code>SQPOLL</code> has a kernel thread poll the submission ring, so the application submits
+by writing shared memory with <em>no</em> system call at all — removing even the per-batch <code>io_uring_enter</code>. <em>Tempting wrong
+answer:</em> &ldquo;<code>user_data</code> is required by the kernel to route the I/O&rdquo; — it is opaque to the kernel and purely for the
+application's own matching. <strong>Feed-forward:</strong> &sect;44.2.</div>
+
+<div class="solution" id="sol44.6"><span class="sol-label">44.6</span>
+(a) Because each <code>io_uring_enter</code> submitted and reaped a batch of 256 operations, so 65,536/256 = 256 calls covered all of them. (b)
+The reads hit the page cache, so each one is a 4&nbsp;KiB in-kernel copy; that copy done 65,536 times dominates the total and dwarfs the
+few-hundred-nanosecond boundary cost that batching removed — so cutting the crossings barely moved the clock. (c) Real wins: (i) huge numbers
+of tiny operations (high-IOPS storage, packet processing) where the syscall boundary <em>is</em> the dominant cost; (ii) genuine device I/O,
+where the dominant cost is milliseconds of device latency the kernel absorbs on its own threads while yours submits more work and never blocks.
+<em>Tempting wrong answer:</em> &ldquo;the measurement was flawed; io_uring must be faster&rdquo; — the measurement is correct and instructive:
+batching helps only in proportion to the boundary's share of the cost. <strong>Feed-forward:</strong> &sect;44.3.</div>
+
+<div class="solution" id="sol44.7"><span class="sol-label">44.7</span>
+(a) Ratio = <var>N</var>(<var>b</var>+<var>w</var>) / (<var>N</var><var>w</var> + (<var>N</var>/<var>k</var>)<var>b</var>) =
+(<var>b</var>+<var>w</var>) / (<var>w</var> + <var>b</var>/<var>k</var>). (b) Large when <var>b</var> is much greater than <var>w</var> (boundary dominates): the
+ratio approaches <var>b</var>/(<var>b</var>/<var>k</var>) = <var>k</var>; near 1 when <var>w</var> is much greater than <var>b</var> (work
+dominates), since both numerator and denominator are &asymp; <var>w</var>. (c) Cache-hot reads have <var>w</var> = a 4&nbsp;KiB copy (hundreds
+of ns to microseconds), well above <var>b</var> (a few hundred ns), so the ratio is near 1 — exactly the measured break-even; a real device makes <var>w</var> include
+milliseconds of latency, but that latency is absorbed by the kernel asynchronously rather than blocking your thread, so the relevant comparison
+becomes throughput/concurrency, not this per-op ratio, and completion wins decisively. <em>Tempting wrong answer:</em> &ldquo;bigger <var>k</var>
+always helps a lot&rdquo; — <var>k</var> only helps to the extent <var>b</var> matters; when <var>w</var> dominates, <var>k</var> is nearly
+irrelevant. <strong>Feed-forward:</strong> &sect;44.3.</div>
+
+<div class="solution" id="sol44.8"><span class="sol-label">44.8</span>
+<strong>Step 4:</strong> The SQE points at a stack buffer whose lifetime ends when the function returns, but the kernel writes the read data
+into that buffer only when the operation completes — after the function has returned and the stack frame (and its buffer) has been reused by
+other calls, so the read lands in memory now holding something else, corrupting it. It is intermittent and passes tests because under light
+load the completion comes back before the frame is reused (the data lands correctly by luck); only when load or a slow device delays the
+completion past the frame's reuse does it corrupt. Fix: give the buffer a lifetime tied to the completion, not the call — allocate it in
+per-request state kept alive until the CQE arrives (found via <code>user_data</code>), or use a registered buffer, and free/reuse it only after
+reaping the completion. <em>Tempting wrong answer:</em> &ldquo;add a small delay before returning&rdquo; — that masks the race under some
+timings and still corrupts under others; the buffer must genuinely outlive the operation. <strong>Feed-forward:</strong> &sect;44.4.</div>
+
+<div class="solution" id="sol44.9"><span class="sol-label">44.9</span>
+(a) <strong>Wrong</strong> — <code>io_uring_enter</code> returning means the batch was submitted (and possibly some completed if you waited), not
+that a given read is done; you know a read is done only when its CQE appears. (b) <strong>Wrong</strong> — completions arrive in finish order,
+not submission order; you must use <code>user_data</code> to match. (c) <strong>Correct</strong> — completion notification makes disk reads
+asynchronous, which readiness cannot. (d) <strong>Correct</strong> — one <code>io_uring_enter</code> can submit a whole batch. (e)
+<strong>Wrong</strong> — batching wins only when the boundary is a large share of the cost; on cache-hot data it was break-even. <em>Tempting
+wrong answer:</em> marking (e) correct from the &ldquo;fewer syscalls&rdquo; intuition — fewer syscalls is not fewer wall-clock ms unless the
+syscall was the bottleneck. <strong>Feed-forward:</strong> &sect;44.3&ndash;&sect;44.4.</div>
+
+<div class="solution" id="sol44.10"><span class="sol-label">44.10</span>
+(a) <strong>False</strong> — a regular file has no such readiness event; a cache-miss read blocks regardless. (b) <strong>True</strong> — the
+SQE's <code>user_data</code> is echoed in its CQE. (c) <strong>True</strong> — the buffer must stay valid until completion. (d)
+<strong>False</strong> — the rings are shared into the application's address space via <code>mmap</code>; both sides see them, which is what
+makes the boundary cheap. (e) <strong>True</strong> — batching 256 at a time turned 65,536 reads into 256 crossings. <em>Tempting wrong
+answer:</em> marking (d) true from &ldquo;the kernel owns I/O&rdquo; — the shared-memory rings are precisely how io_uring avoids per-op copying
+and syscalls. <strong>Feed-forward:</strong> &sect;44.2&ndash;&sect;44.4.</div>
+
+<div class="solution" id="sol44.11"><span class="sol-label">44.11</span>
+(a) Chapter 40's blocking <code>read</code> pays one boundary crossing and blocks the thread; Chapter 42's <code>epoll</code> removes the
+thread-per-wait but still pays a crossing per operation and cannot help disk; <code>io_uring</code> removes the per-operation crossing
+(batching) and makes disk truly asynchronous (completion), leaving the per-operation <em>work</em> (the copy, the device latency) as what
+remains — and the next chapter removes the copy. (b) The break-even result teaches the part's core discipline directly: a technique only helps
+in proportion to the cost it removes as a fraction of the total, so measuring reveals that batching the boundary is worthless when the copy
+dominates — a speed-up would have hidden that lesson behind a happy number. (c) Power-for-explicitness recurs throughout: manual memory
+management (Chapter 9) buys control at the cost of tracking lifetimes yourself; lock-free code (Chapter 23) buys scalability at the cost of
+reasoning about the memory model by hand; here completion buys async unification at the cost of managing buffer lifetime across the submit-complete
+gap. <em>Tempting wrong answer:</em> &ldquo;io_uring makes the earlier models obsolete&rdquo; — readiness is still right for sockets and
+simpler code; io_uring is the tool when the boundary or device concurrency is the bottleneck. <strong>Feed-forward:</strong> &sect;44.1&ndash;&sect;44.5.</div>
+
+<div class="solution" id="sol44.12"><span class="sol-label">44.12</span>
+Open-ended and platform-specific. A correct write-up: (a) submits an <code>IORING_OP_NOP</code> and reaps its CQE, confirming the ring setup
+and enter/reap loop work; (b) reports the synchronous loop crossing the kernel once per read and <code>io_uring</code> crossing once per batch
+(far fewer), with wall-clock times close on cache-hit data because the per-read copy dominates; (c) states kernel version, toolchain, and CPU,
+flags wall-clock timing without hardware counters, and notes that for uncached device reads the kernel absorbs the latency asynchronously so a
+single thread keeps many operations in flight — the regime where completion wins. <em>Tempting wrong answer:</em> &ldquo;conclude io_uring is
+slower because wall-clock was break-even&rdquo; — the measured win is in kernel crossings and in device-I/O concurrency, not in cache-hot
+throughput. <strong>Feed-forward:</strong> &sect;44.3&ndash;&sect;44.4.</div>
+
+</section>
+
+<section class="solutions" id="sol45">
+<h1>Chapter 45 — Solutions</h1>
+
+<div class="solution" id="sol45.1"><span class="sol-label">45.1</span>
+Twice: once from the page cache into the user-space buffer (by <code>read</code>), and once from that buffer into the socket send buffer (by
+<code>write</code>). <em>Tempting wrong answer:</em> &ldquo;once&rdquo; — people forget the buffer is copied <em>out</em> to the socket as well
+as <em>in</em> from the cache. <strong>Feed-forward:</strong> &sect;45.1.</div>
+
+<div class="solution" id="sol45.2"><span class="sol-label">45.2</span>
+It removes the two CPU copies through the user-space buffer (and the buffer itself), sending the file to the socket inside the kernel; measured
+here it cut the system calls from 16,384 to <strong>1</strong>. <em>Tempting wrong answer:</em> &ldquo;it makes the copy faster&rdquo; — it
+removes the user-space copies, it does not speed them up. <strong>Feed-forward:</strong> &sect;45.2.</div>
+
+<div class="solution" id="sol45.3"><span class="sol-label">45.3</span>
+Any transformation of the bytes — for example encrypting them for TLS (also compressing, transcoding, inspecting) — because the data never
+enters your address space, so there is no point at which your code can run over it. <em>Tempting wrong answer:</em> &ldquo;none — sendfile can
+do anything read/write can&rdquo; — it cannot touch the bytes, by design. <strong>Feed-forward:</strong> &sect;45.4.</div>
+
+<div class="solution" id="sol45.4"><span class="sol-label">45.4</span>
+(a) DMA disk &rarr; page cache; CPU page cache &rarr; user buffer (<code>read</code>); CPU user buffer &rarr; socket buffer (<code>write</code>);
+DMA socket buffer &rarr; NIC/wire. (b) <code>sendfile</code> removes the two CPU copies through the user buffer; they are waste because the
+buffer is a pure relay that never reads or changes the data. (c) On ordinary hardware <code>sendfile</code> still copies once inside the kernel,
+from the page cache into the socket buffer; a NIC with scatter-gather DMA and checksum offload removes even that by gathering the page-cache
+pages straight onto the wire. <em>Tempting wrong answer:</em> &ldquo;sendfile removes all copies on any hardware&rdquo; — the last in-kernel
+copy needs scatter-gather DMA to disappear. <strong>Feed-forward:</strong> &sect;45.1&ndash;&sect;45.3.</div>
+
+<div class="solution" id="sol45.5"><span class="sol-label">45.5</span>
+(a) It removed the two user-space CPU copies (memory bandwidth) and the per-block <code>read</code>/<code>write</code> boundary crossings (the
+syscall tax) — 16,384 syscalls down to 1. (b) Because <code>sendfile</code> still does real work: on this hardware one in-kernel copy from the
+page cache to the socket buffer plus the DMA, so it removed a portion of the cost, not all of it — a ~2.3&times; win, not an unbounded one. (c)
+A real network card can use scatter-gather DMA to send straight from the page cache, removing the last in-kernel copy that the loopback path
+still pays, so the CPU leaves the data path entirely — a larger relative win. <em>Tempting wrong answer:</em> &ldquo;the 2.3&times; is the
+theoretical max&rdquo; — with hardware offload the CPU copy count reaches zero, beyond what loopback shows. <strong>Feed-forward:</strong>
+&sect;45.2&ndash;&sect;45.3.</div>
+
+<div class="solution" id="sol45.6"><span class="sol-label">45.6</span>
+(a) <code>splice</code> moves data between <em>any</em> two descriptors without a user-space copy, where <code>sendfile</code> is fixed to
+file-in, socket-out. (b) One end must be a pipe because the pipe is the kernel's internal conduit — a queue of references to kernel buffers
+(page-cache pages) — and <code>splice</code> moves those references rather than copying bytes. (c) For example: proxying one socket to another
+(socket &rarr; pipe &rarr; socket), and logging a socket to a file (socket &rarr; pipe &rarr; file). <em>Tempting wrong answer:</em> &ldquo;the
+pipe is just a temporary buffer that holds a copy&rdquo; — it holds references, not a byte copy; that is the point. <strong>Feed-forward:</strong>
+&sect;45.3.</div>
+
+<div class="solution" id="sol45.7"><span class="sol-label">45.7</span>
+(a) Two CPU copies per byte at rate <var>R</var>: <strong>2<var>R</var>/<var>B</var></strong> CPU-seconds per second. (b) One in-kernel copy:
+<strong><var>R</var>/<var>B</var></strong>. (c) With scatter-gather DMA, <strong>0</strong> — the CPU makes no copy, so those cycles are freed
+for real work (request handling, TLS if offloaded, other connections). A file server becomes copy-bound because at high <var>R</var>,
+2<var>R</var>/<var>B</var> can approach or exceed one core's worth of time spent purely on <code>memcpy</code>, so the CPU saturates moving
+bytes it never inspects — exactly the waste zero-copy targets. <em>Tempting wrong answer:</em> &ldquo;copying is negligible, servers are
+network-bound&rdquo; — at multi-GB/s a memory-bandwidth-bound double copy is a real, often dominant, CPU cost. <strong>Feed-forward:</strong>
+&sect;45.1&ndash;&sect;45.3.</div>
+
+<div class="solution" id="sol45.8"><span class="sol-label">45.8</span>
+<strong>Step 4:</strong> TLS requires transforming (encrypting) every byte before it goes on the socket, which needs the bytes in a buffer the
+code can run over; <code>sendfile</code> deliberately never brings the bytes to user space, so there is no point in its path to encrypt them —
+the fast path structurally cannot serve TLS. The benchmark did not reveal it because it measured plaintext static serving, where no
+transformation is needed and <code>sendfile</code> shines; the requirement to transform was simply not exercised. Two ways forward: (1) keep
+zero-copy by enabling <strong>kernel TLS</strong> (kTLS), which moves encryption into the kernel so it encrypts page-cache data on the way to
+the socket and <code>sendfile</code> works over TLS; (2) give up zero-copy on the encrypted path and use the ordinary
+<code>read</code>/encrypt/<code>write</code> loop, optimising it differently. <em>Tempting wrong answer:</em> &ldquo;encrypt the file at rest
+once and sendfile the ciphertext&rdquo; — TLS session keys are per-connection, so you cannot pre-encrypt a shared file for all clients.
+<strong>Feed-forward:</strong> &sect;45.4.</div>
+
+<div class="solution" id="sol45.9"><span class="sol-label">45.9</span>
+(a) <strong>Applies</strong> — plain HTTP relays the file unchanged; <code>sendfile</code> is ideal. (b) <strong>Does not apply</strong> — TLS
+must encrypt every byte and there is no kTLS, so the bytes must go through user space. (c) <strong>Applies</strong> — unchanged
+socket-to-socket relay is exactly what <code>splice</code> does via a pipe. (d) <strong>Does not apply</strong> — gzip transforms the bytes, so
+they must be in a buffer. (e) <strong>Applies</strong> — with kTLS the kernel encrypts on the way out, so <code>sendfile</code> keeps the
+zero-copy path over TLS. <em>Tempting wrong answer:</em> calling (b) applicable &ldquo;because it is still just sending a file&rdquo; — the
+encryption requirement forbids zero-copy without kTLS. <strong>Feed-forward:</strong> &sect;45.2&ndash;&sect;45.4.</div>
+
+<div class="solution" id="sol45.10"><span class="sol-label">45.10</span>
+(a) <strong>False</strong> — <code>sendfile</code> copies inside the kernel and never uses a user buffer. (b) <strong>True</strong> — a
+scatter-gather NIC gathers page-cache pages straight to the wire, so no CPU copy is needed. (c) <strong>False</strong> — encrypting in the app
+needs the bytes in user space, which <code>sendfile</code> refuses; the two cannot coexist in one step without kTLS. (d) <strong>True</strong> —
+<code>splice</code> requires one descriptor to be a pipe. (e) <strong>False</strong> — the two <em>DMA</em> copies are unavoidable and cheap;
+the waste is the two <em>CPU</em> copies through user space. <em>Tempting wrong answer:</em> marking (e) true by miscounting which copies are
+the waste — DMA copies are hardware and necessary. <strong>Feed-forward:</strong> &sect;45.1&ndash;&sect;45.4.</div>
+
+<div class="solution" id="sol45.11"><span class="sol-label">45.11</span>
+(a) Chapter 42 removed <em>blocking</em> — one thread waits on many descriptors via readiness instead of a thread per wait — leaving one syscall
+per operation and no help for disk; Chapter 44 removed the <em>per-operation kernel boundary</em> via completion-based batching and made disk
+async, leaving the per-byte copy; this chapter removes the <em>user-space copy</em>, leaving only the unavoidable DMA. (b) Zero-copy is fast
+<em>because</em> the bytes never enter your address space, and it cannot transform them <em>because</em> the bytes never enter your address
+space — one fact — so the fastest path is unusable whenever the job requires touching the bytes (TLS, compression), and the correct choice
+depends on whether transformation is needed, not on raw speed. (c) The four-copy diagram makes every cost visible as a physical move: two DMA
+copies (necessary), two CPU copies (waste), two boundary crossings — so &ldquo;where are the bytes and who copies them&rdquo; directly names
+what each technique in the part removes, from the event loop's avoided waits to <code>sendfile</code>'s avoided copies. <em>Tempting wrong
+answer:</em> &ldquo;always pick the fastest primitive&rdquo; — the usable primitive depends on whether you must transform the data.
+<strong>Feed-forward:</strong> &sect;45.1&ndash;&sect;45.5.</div>
+
+<div class="solution" id="sol45.12"><span class="sol-label">45.12</span>
+Open-ended and platform-specific. A correct write-up: (a) reports the <code>read</code>/<code>write</code> loop's throughput and its two
+syscalls per block against <code>sendfile</code>'s higher throughput and one (or few) syscalls; (b) attributes the gain to both removed user-space
+copies and removed boundary crossings, using the syscall counts to separate them; (c) states toolchain and CPU, flags wall-clock timing without
+hardware counters, and explains that loopback understates the win because there is no NIC to use scatter-gather DMA — the feature that removes
+the final in-kernel copy on a real network path. <em>Tempting wrong answer:</em> &ldquo;conclude the loopback number is the real-world
+ceiling&rdquo; — a scatter-gather NIC removes a copy loopback still pays. <strong>Feed-forward:</strong> &sect;45.2&ndash;&sect;45.3.</div>
 
 </section>
 </body></html>

@@ -1,0 +1,110 @@
+<section class="solutions" id="sol27">
+<h1>Chapter 27 — Solutions</h1>
+
+<div class="solution" id="sol27.1"><span class="sol-label">27.1</span>
+(1) Every value has an owner. (2) There is exactly one owner at a time. (3) When the owner goes out of scope, the value is
+dropped (its resources freed). <em>Tempting wrong answer:</em> &ldquo;a value can have several owners as long as they cooperate&rdquo;
+— rule 2 forbids it; shared access comes later via borrowing, not multiple ownership. <strong>Feed-forward:</strong> &sect;27.2.</div>
+
+<div class="solution" id="sol27.2"><span class="sol-label">27.2</span>
+&ldquo;Dropped&rdquo; means Rust automatically runs the value's cleanup at the point its owner's scope ends; for a heap-owning
+value it corresponds to calling <code>free</code> on the buffer in C — but inserted by the compiler, deterministically, not by
+hand. <em>Tempting wrong answer:</em> &ldquo;drop is like a garbage collector reclaiming it later&rdquo; — drop happens at a
+fixed, known point (end of scope), not whenever a collector runs. <strong>Feed-forward:</strong> &sect;27.2.</div>
+
+<div class="solution" id="sol27.3"><span class="sol-label">27.3</span>
+No — <code>s1</code> has been <strong>moved from</strong> and is invalid; the compiler rejects any use of it with a compile error
+(<code>error[E0382]</code>, borrow/use of moved value). <em>Tempting wrong answer:</em> &ldquo;<code>s1</code> is still usable
+because assignment copies&rdquo; — for an owning type assignment moves, not copies. <strong>Feed-forward:</strong> &sect;27.3.</div>
+
+<div class="solution" id="sol27.4"><span class="sol-label">27.4</span>
+(a) After <code>char *t = s;</code> and <code>free(s);</code>: the <code>printf("%s", t)</code> is a <strong>use-after-free</strong>
+(reading a freed buffer through the alias), and <code>free(t)</code> is a <strong>double-free</strong> (the same block returned
+twice). (b) It compiles because C's type system does not track ownership or validity — a <code>char*</code> carries no
+information about whether its target is still allocated or who may free it. (c) In Rust the analogous <code>let t = s;</code>
+<em>moves</em> ownership from <code>s</code> to <code>t</code>, so <code>s</code> immediately becomes invalid; there is never a
+state with two live owners, so no second owner exists to free the buffer again — the double-free is unrepresentable.
+<em>Tempting wrong answer:</em> &ldquo;Rust catches it by inserting a runtime check before the second free&rdquo; — it is a
+compile-time rejection; there is no second free to check. <strong>Feed-forward:</strong> &sect;27.1, &sect;27.3.</div>
+
+<div class="solution" id="sol27.5"><span class="sol-label">27.5</span>
+Rule 2 (one owner) means only one binding is ever responsible for the buffer, so it is freed exactly once — preventing the
+double-free. Rule 3 (drop at end of scope) means that single owner's cleanup runs automatically when its scope ends, so the free
+is never forgotten — preventing the leak. Rule 1 ties every value to an owner so rules 2 and 3 always apply. No GC is needed
+because the drop point is known at compile time and inserted there. <em>Tempting wrong answer:</em> &ldquo;you still need to
+remember to drop it&rdquo; — drop is automatic at scope exit; forgetting is not possible for an owned value.
+<strong>Feed-forward:</strong> &sect;27.2.</div>
+
+<div class="solution" id="sol27.6"><span class="sol-label">27.6</span>
+(a) <strong>Move</strong>: ownership transfers, source becomes invalid, no heap buffer duplicated (just the small stack record is
+bit-copied and the source invalidated). <strong><code>clone</code></strong>: allocates and deep-copies the heap buffer, source
+stays valid, two independent owners of two buffers. <strong><code>Copy</code></strong>: bit-copy of a stack-only value, source
+stays valid, no heap involved. (b) <code>String</code> owns a heap buffer, so a copy would create two owners of one buffer
+(unsafe) — hence it moves; <code>i32</code> is entirely on the stack with no resource to double-free, so it implements
+<code>Copy</code> and is duplicated harmlessly. (c) Reaching for <code>.clone()</code> to silence a move error is wrong when you
+only need to <em>read</em> the value — you should borrow a reference instead of paying for a deep copy. <em>Method-selection
+cue:</em> owns a resource &rarr; moves; plain stack data &rarr; <code>Copy</code>; need a real second copy &rarr;
+<code>clone</code>; only need to look &rarr; borrow. <strong>Feed-forward:</strong> &sect;27.3.</div>
+
+<div class="solution" id="sol27.7"><span class="sol-label">27.7</span>
+(a) The move/drop machinery is resolved at <strong>compile time</strong> — the compiler decides where drops go and rejects
+use-after-move statically; the ownership <em>checking</em> adds no run-time cost. (b) <code>drop</code>-at-end-of-scope is
+<strong>deterministic</strong> — memory is freed at a known program point — whereas a tracing GC reclaims at unpredictable times;
+determinism means no GC pauses and tighter, more predictable peak memory. (c) A move only bit-copies a small stack record and
+invalidates the source (essentially free); <code>.clone()</code> allocates a new buffer and copies the contents (real time and
+memory proportional to the data). <em>Tempting wrong answer:</em> &ldquo;ownership adds runtime overhead like reference
+counting&rdquo; — plain ownership is entirely compile-time; ref-counting (<code>Rc</code>/<code>Arc</code>) is a separate,
+opt-in mechanism. <strong>Feed-forward:</strong> &sect;27.2, &sect;27.3.</div>
+
+<div class="solution" id="sol27.8"><span class="sol-label">27.8</span>
+<strong>Step 4:</strong> Fix A (no clone): have <code>process</code> take a <em>reference</em> — <code>process(&amp;cfg)</code>
+— so it borrows rather than moves; <code>cfg</code> stays owned by the caller and <code>log(&amp;cfg)</code> (or
+<code>log(cfg)</code> last) works. This is right whenever the functions only need to read/inspect the value. Fix B (clone):
+if <code>process</code> genuinely needs to <em>take ownership</em> (e.g. to store or consume <code>cfg</code>) and you still
+need it afterward, pass <code>process(cfg.clone())</code> and keep the original for <code>log</code>. Decide by asking whether
+<code>process</code> must own the value: if not, borrow (Fix A); if it must and you also need the original, clone (Fix B).
+Blindly cloning is the wrong default because it silently deep-copies data you may only be reading, discarding performance for no
+reason. <em>Tempting wrong answer:</em> &ldquo;always clone — it's simplest&rdquo; — it builds needless copies into hot paths;
+borrowing is the usual right answer. <strong>Feed-forward:</strong> &sect;27.3, and Ch 28 (borrowing).</div>
+
+<div class="solution" id="sol27.9"><span class="sol-label">27.9</span>
+(a) <strong>Move</strong> — <code>String</code> owns a heap buffer and is not <code>Copy</code>; <code>a</code> becomes invalid.
+(b) <strong>Copy</strong> — <code>i32</code> implements <code>Copy</code>; <code>a</code> stays usable. (c) <strong>Move</strong> —
+<code>Vec&lt;u8&gt;</code> owns a heap buffer; passing by value moves it and the caller can no longer use it. (d)
+<strong>Copy</strong> — a tuple of <code>Copy</code> types (<code>i32</code>, <code>bool</code>) is itself <code>Copy</code>, so
+it copies and <code>a</code> stays usable. <em>Method-selection cue:</em> owns heap &rarr; move; all-stack <code>Copy</code>
+types &rarr; copy. <strong>Feed-forward:</strong> &sect;27.3.</div>
+
+<div class="solution" id="sol27.10"><span class="sol-label">27.10</span>
+(a) <strong>False</strong> — Rust has no garbage collector; safety comes from compile-time ownership. (b) <strong>False</strong>
+— <code>s1</code> is moved from and invalid; only <code>s2</code> is valid. (c) <strong>True</strong> — move errors are
+compile-time and add no runtime cost. (d) <strong>False</strong> — <code>clone</code> deep-copies into a new buffer (both valid);
+a move transfers ownership and invalidates the source (no buffer copied). (e) <strong>False</strong> — ownership controls
+aliasing, which is also the basis for preventing data races. <em>Tempting wrong answer:</em> marking (a) true because &ldquo;safe
+languages use GC&rdquo; — Rust is the counterexample; it is safe without one. <strong>Feed-forward:</strong> &sect;27.1&ndash;&sect;27.4.</div>
+
+<div class="solution" id="sol27.11"><span class="sol-label">27.11</span>
+(a) Moving a value into a thread transfers ownership to that thread; by rule 2 the original thread is no longer an owner and
+cannot touch the value, so two threads cannot both own-and-mutate it — the accidental sharing that causes races is structurally
+excluded. (b) A use-after-free is one alias freeing/mutating memory another alias still uses; a data race is two threads
+accessing the same location with at least one write, unsynchronized — both are &ldquo;two paths to the same data, at least one
+mutating.&rdquo; Ownership attacks that shared root by ensuring a single responsible owner, rather than patching use-after-free
+and races as separate problems. (c) Ownership-by-move alone won't let you <em>use</em> a value without giving it away, so you
+can't, e.g., let two functions read the same buffer without moving/cloning; you need <strong>borrowing</strong> (references),
+which must guarantee that references never outlive their value and that you never have a mutable reference aliased with any other
+reference — keeping aliasing safe without transferring ownership. <em>Tempting wrong answer:</em> &ldquo;ownership by itself is
+enough to write real programs&rdquo; — without borrowing you'd move or clone constantly; borrowing is what makes it practical.
+<strong>Feed-forward:</strong> &sect;27.4, and Ch 24, Ch 28.</div>
+
+<div class="solution" id="sol27.12"><span class="sol-label">27.12</span>
+Toolchain-specific. A correct write-up reports: (a) the C snippet compiles with no warning and, at run time, aborts on the
+double-free (glibc &ldquo;double free detected&rdquo;, SIGABRT) or, under <code>-fsanitize=address</code>, is flagged as a
+heap-use-after-free — demonstrating the C type system misses it. (b) With <code>rustc</code>, the
+<code>let s2 = s1; println!("{s1}")</code> program fails to compile with <code>error[E0382]</code> on the <code>println!</code>
+line (use of moved value); without <code>rustc</code>, name that exact line and explain the move at <code>let s2 = s1;</code>
+invalidated <code>s1</code>. (c) For three variables, correctly label each assignment move or copy from its type (owning type
+&rarr; move; <code>Copy</code> stack type &rarr; copy). <em>Tempting wrong answer:</em> &ldquo;the C program is fine because it
+compiled&rdquo; — compiling proves nothing about UB; it aborts (or corrupts) at run time. <strong>Feed-forward:</strong>
+&sect;27.1, &sect;27.3.</div>
+
+</section>

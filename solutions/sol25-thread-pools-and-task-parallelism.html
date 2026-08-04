@@ -1,0 +1,113 @@
+<section class="solutions" id="sol25">
+<h1>Chapter 25 — Solutions</h1>
+
+<div class="solution" id="sol25.1"><span class="sol-label">25.1</span>
+(1) <strong>Creation/teardown cost</strong>: creating a thread makes the kernel allocate a stack and task structure and schedule
+it, and joining tears that down — hundreds of microseconds, dwarfing a small task. (2) <strong>Oversubscription</strong>: more
+runnable threads than cores forces the scheduler to time-slice them, paying context switches and cache disruption without adding
+parallelism. <em>Tempting wrong answer:</em> &ldquo;threads are bad because of locks&rdquo; — the cost here is creation and
+oversubscription, independent of any locking. <strong>Feed-forward:</strong> &sect;25.1.</div>
+
+<div class="solution" id="sol25.2"><span class="sol-label">25.2</span>
+It is the <strong>producer&ndash;consumer</strong> pattern (Chapter 21): producers enqueue tasks, worker-consumers dequeue and
+run them. The work queue uses a <strong>mutex</strong> (mutual exclusion over the shared queue's state) and a <strong>condition
+variable</strong> (workers block on it when the queue is empty and are signalled when a task is enqueued, so they wait without
+spinning). <em>Tempting wrong answer:</em> &ldquo;it just needs a mutex&rdquo; — without a condition variable an empty-queue
+worker either busy-waits or has no way to be woken. <strong>Feed-forward:</strong> &sect;25.2.</div>
+
+<div class="solution" id="sol25.3"><span class="sol-label">25.3</span>
+A <strong>future</strong> is a handle to a value that may not be computed yet (returned immediately when a task is submitted).
+<code>.get()</code> on an unfinished task <em>blocks</em> until it completes and then returns the result; on an already-finished
+task it returns the result immediately. <em>Tempting wrong answer:</em> &ldquo;a future is the result value&rdquo; — it is a
+handle/placeholder for a result that may still be pending, not the value itself. <strong>Feed-forward:</strong> &sect;25.3.</div>
+
+<div class="solution" id="sol25.4"><span class="sol-label">25.4</span>
+A pool creates its <code>W</code> workers once at startup and keeps them alive, so the ~220&nbsp;us creation cost is paid
+<code>W</code> times total, not per task; every one of the <code>N</code> tasks reuses an already-running worker, so its cost is
+just enqueue + dequeue + run. In the measurement, thread-per-task cost 217&nbsp;us/task while the pool cost 1.04&nbsp;us/task —
+so on the order of 216 of the 217&nbsp;us per task (well over 99%) was thread creation/teardown overhead, not useful work; the
+pool eliminates it by never creating a thread per task. <em>Tempting wrong answer:</em> &ldquo;the pool is faster because it
+uses more threads&rdquo; — it uses <em>fewer</em> (a fixed <code>W</code>); the win is amortized creation, not more threads.
+<strong>Feed-forward:</strong> &sect;25.1, &sect;25.2.</div>
+
+<div class="solution" id="sol25.5"><span class="sol-label">25.5</span>
+(a) The mutex protects only the queue; holding it while running <code>t.fn()</code> would let just one worker be inside the pool
+at a time, serializing all the work and destroying parallelism. (b) A <code>while</code> loop re-checks the predicate after
+waking because condition-variable waits can wake spuriously and because another worker may have taken the item first; an
+<code>if</code> would proceed on an empty queue (Chapter 21). (c) The worker <em>blocks</em> in <code>cond_wait</code> when the
+queue is empty, releasing the CPU until a signal arrives, so an idle pool consumes no CPU. <em>Tempting wrong answer:</em>
+&ldquo;run under the lock so the task is safe&rdquo; — the task's own data safety is its concern; the lock guards the queue, and
+holding it over the task serializes the pool. <strong>Feed-forward:</strong> &sect;25.2.</div>
+
+<div class="solution" id="sol25.6"><span class="sol-label">25.6</span>
+Each worker owns a double-ended queue (<strong>deque</strong>). The owner pushes and pops from one end (the bottom) as a local,
+uncontended operation; a <strong>thief</strong>, when its own deque is empty, steals from the <em>other</em> end (the top) of a
+randomly chosen victim. Because owner and thieves touch opposite ends, the common local path needs no contention with thieves.
+Blumofe&ndash;Leiserson: a well-structured (fully-strict) computation with work <code>T1</code> and span <code>T&infin;</code>
+runs in expected <em>O</em>(<code>T1</code>/<code>P</code> + <code>T&infin;</code>) time on <code>P</code> processors; near-linear
+speedup needs enough parallelism, <code>T1</code>/<code>T&infin;</code> &gt; <code>P</code>. <em>Tempting wrong answer:</em>
+&ldquo;a thief steals from the same end the owner uses&rdquo; — that would contend on every local push/pop; thieves take the
+opposite (top) end. <strong>Feed-forward:</strong> &sect;25.4.</div>
+
+<div class="solution" id="sol25.7"><span class="sol-label">25.7</span>
+(a) Every worker must hold the one global lock for time <code>c</code> to dequeue; the lock is a serial resource, so the pool
+cannot dequeue faster than one task per <code>c</code>. Once <code>P</code> is large enough that <code>P&middot;t</code> of work
+demands dequeues faster than the lock can grant them, throughput saturates at roughly 1/<code>c</code> tasks per unit time — the
+shared queue is the bottleneck (an Amdahl serial fraction, next chapter). (b) Per-worker deques let each worker enqueue/dequeue
+locally with no shared lock; stealing is rare, so the serial bottleneck largely disappears. (c) Coarser tasks mean more useful
+work <code>t</code> per dequeue <code>c</code>, so the lock is taken less often relative to work done, improving scaling; too
+coarse and you have too few tasks to balance load and fill all workers (poor parallelism, idle cores). <em>Tempting wrong
+answer:</em> &ldquo;just add more workers&rdquo; — past saturation, more workers only add lock contention.
+<strong>Feed-forward:</strong> &sect;25.2, &sect;25.4.</div>
+
+<div class="solution" id="sol25.8"><span class="sol-label">25.8</span>
+<strong>Step 4:</strong> This is <strong>pool deadlock</strong> (thread-pool starvation). It is a genuine deadlock: the 4 worker
+threads are the only resource that can run tasks, and all 4 are <em>held</em> by request tasks that are <em>waiting</em> on
+futures for subtasks; those subtasks need a free worker to run, but none exists — a circular wait between &ldquo;workers held by
+waiters&rdquo; and &ldquo;subtasks needing a worker.&rdquo; Fix 1 (structure): run blocking/dependent work in a
+<em>separate</em> pool from the CPU work, or use a work-stealing fork&ndash;join runtime whose join executes the pending subtask
+on the current thread instead of blocking. Fix 2 (expression): don't have a worker block on a future for same-pool work — compose
+dependencies with continuations/callbacks the runtime can schedule, so no worker sits idle holding a thread. <em>Tempting wrong
+answer:</em> &ldquo;just make the pool a bit bigger&rdquo; — any fixed size <code>W</code> deadlocks once <code>W</code> tasks
+block on un-started subtasks; size only shifts the load at which it hangs. <strong>Feed-forward:</strong> &sect;25.4.</div>
+
+<div class="solution" id="sol25.9"><span class="sol-label">25.9</span>
+(a) <strong>Right</strong> — CPU-bound non-blocking tasks want about one worker per hardware thread; more just oversubscribes. (b)
+<strong>Change it</strong> — I/O-bound tasks spend most time blocked, so a larger pool (or async I/O) keeps cores busy while
+threads wait. (c) <strong>Change it</strong> — millions of tiny recursive subtasks want a work-stealing fork&ndash;join pool
+whose join doesn't block a worker, not a plain shared-queue pool. (d) <strong>Change it</strong> — separate the pools: a
+hardware-sized pool for the short CPU tasks and a distinct pool (or async) for the long blocking DB calls, so blocking work can't
+starve CPU work. <em>Method-selection cue:</em> CPU-bound &rarr; ~hardware-thread count; blocking &rarr; larger/separate pool or
+async; recursive fork&ndash;join &rarr; work-stealing runtime. <strong>Feed-forward:</strong> &sect;25.2, &sect;25.4.</div>
+
+<div class="solution" id="sol25.10"><span class="sol-label">25.10</span>
+(a) <strong>False</strong> — parallelism is capped at the number of cores; extra threads oversubscribe. (b) <strong>True</strong>
+— the work queue is a producer&ndash;consumer buffer under a mutex + condition variable. (c) <strong>False</strong> — an idle
+pool blocks in <code>cond_wait</code> and uses no CPU. (d) <strong>True</strong> — work-stealing replaces the one shared queue
+with per-worker deques (plus occasional stealing). (e) <strong>False</strong> — <code>get()</code> blocks only until <em>that
+task</em> finishes (or returns immediately if it already has), not until the whole pool is idle. <em>Tempting wrong answer:</em>
+marking (a) true because &ldquo;each task has its own thread&rdquo; — having a thread is not having a core to run it on.
+<strong>Feed-forward:</strong> &sect;25.1&ndash;&sect;25.4.</div>
+
+<div class="solution" id="sol25.11"><span class="sol-label">25.11</span>
+(a) The owner pushes/pops the bottom, so a thief taking from the top rarely touches the same slot — low contention — and the top
+holds the <em>oldest</em> task, which in a fork&ndash;join tree is the highest, coarsest-grained subtree; stealing a large task
+means one steal hands the thief a lot of independent work, so steals are infrequent and load balances well. (b) In
+<em>O</em>(<code>T1</code>/<code>P</code> + <code>T&infin;</code>), <code>T1</code>/<code>P</code> is the total work spread
+perfectly over <code>P</code> processors, and <code>T&infin;</code> is the span — the critical path that must run sequentially no
+matter how many processors you have. If <code>T&infin;</code> is close to <code>T1</code> (little parallelism), the
+<code>T&infin;</code> term dominates and adding processors barely helps — the same wall Amdahl's law describes with a serial
+fraction. <em>Tempting wrong answer:</em> &ldquo;more processors always cuts the time by that factor&rdquo; — only the
+<code>T1</code>/<code>P</code> term shrinks; the span <code>T&infin;</code> is a floor. <strong>Feed-forward:</strong>
+&sect;25.4, and Ch 26.</div>
+
+<div class="solution" id="sol25.12"><span class="sol-label">25.12</span>
+Machine-specific by design. A correct write-up reports: (a) a per-thread <code>create</code>+<code>join</code> cost (on the
+book's WSL2 machine ~220&nbsp;us; bare-metal Linux is typically far lower — label your environment). (b) The pool runs the same
+tiny tasks at a small fraction of the thread-per-task time (here 1.04&nbsp;us/task vs 217&nbsp;us/task, ~200&times;), because
+creation is amortized. (c) A fork&ndash;join sum showing near-linear speedup at small <code>P</code> (here ~1.98&times; at 2) that
+bends below linear as <code>P</code> grows (here ~4.38&times; at 8). Warm up and average; absolute numbers are hardware/OS
+dependent. <em>Tempting wrong answer:</em> &ldquo;my pool is broken because 8 threads didn't give 8&times;&rdquo; — sub-linear
+scaling is expected and is exactly Chapter 26's subject, not a bug. <strong>Feed-forward:</strong> &sect;25.1&ndash;&sect;25.4.</div>
+
+</section>

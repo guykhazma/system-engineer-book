@@ -1,0 +1,376 @@
+<section class="chapter" id="ch25">
+<h1>Chapter 25 — Thread Pools and Task Parallelism</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch15">Chapter 15</a> (threads share an address space — the
+substrate every worker here runs on), <a href="#ch21">Chapter 21</a> (condition variables and the producer&ndash;consumer
+pattern — a work queue <em>is</em> a producer&ndash;consumer), <a href="#ch16">Chapter 16</a> (the scheduler multiplexes
+runnable threads onto cores — more threads is not more parallelism), <a href="#ch06">Chapter 6</a> (the cost model — a thread
+is not free). &nbsp;·&nbsp; The last five chapters were about making concurrent code <em>correct</em>; this one is about making
+parallel code <em>fast to structure</em> — decoupling the work you have from the threads that run it.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch21">Chapter 21</a> — sketch the producer&ndash;consumer pattern: how does a
+consumer wait for an item without busy-spinning, and what wakes it? (2) <a href="#ch06">Chapter 6</a> — a thread has a stack
+(often ~8&nbsp;MiB of address space) and must be set up and torn down by the kernel; is creating one closer to a function call
+or to a system call in cost? (3) <em>Predict:</em> on a laptop, roughly how many microseconds does it take to
+<code>pthread_create</code> a thread and <code>pthread_join</code> it? If you have 100,000 tiny tasks, how much faster might a
+pool of 8 reused workers be than spawning one thread per task? Write your guesses; §25.1 and §25.2 measure both.</p>
+</aside>
+
+<p>You have a machine with many cores and a pile of work. The naive move is to spawn a thread for each unit of work and let the
+scheduler sort it out. It is a trap on both ends: a thread is expensive to create and destroy, and thousands of runnable
+threads oversubscribe the cores and drown the scheduler in context switches. The discipline that fixes both is to <em>separate
+the work from the workers</em>. A fixed pool of long-lived threads pulls units of work — <strong>tasks</strong> — off a shared
+queue; you submit tasks, the pool runs them. This chapter builds that idea up from the cost of a bare thread. First, why a
+thread-per-task does not scale — the measured cost of creation and the problem of oversubscription (&sect;25.1). Then the
+<strong>thread pool</strong>: workers draining a queue, built from the very condition-variable machinery of Chapter 21
+(&sect;25.2). Then <strong>task parallelism</strong> and the <strong>fork&ndash;join</strong> model — decomposing a
+computation into tasks whose results you wait on, with <strong>futures</strong> as handles to not-yet-computed values
+(&sect;25.3). Then the scalability problem a single shared queue creates, and its classic answer, <strong>work-stealing</strong>
+(&sect;25.4). We close by carrying the task abstraction forward as the unit in which parallel work is expressed (&sect;25.5).</p>
+
+<h2>25.1 The cost of a thread: why not one per task</h2>
+
+<p>A thread is not a function call. Creating one asks the kernel to allocate a stack, set up a task structure, and make the
+thread schedulable; joining it tears all that down. That is real work on the system-call boundary of Chapter 13, not the handful
+of cycles a call costs. Measure it directly — create and immediately join an empty thread, 200,000 times (gcc 11.4.0,
+<code>-O2 -pthread</code>, Linux 6.18 under WSL2; this environment has higher thread-setup overhead than bare metal, so treat
+the absolute number as illustrative):</p>
+
+<pre><code>pthread_create + pthread_join, 200000 iters: 44.07 s  (220.4 us each)</code></pre>
+
+<p>Roughly <em>220 microseconds</em> per thread on this machine. In that time a modern core executes on the order of a million
+instructions — so if your task is smaller than that, you spend more time managing the thread than doing the work. And there is a
+second, subtler cost: <strong>oversubscription</strong>. Spawning 100,000 threads for 100,000 tasks does not give you 100,000-way
+parallelism; you have a fixed number of cores (Chapter 16), so the scheduler must time-slice all those threads onto them,
+paying a context switch and cache disruption at every slice, plus the memory for every thread's stack. More runnable threads
+than cores is not more parallelism — it is more overhead. The fix follows from stating the problem precisely: you want as much
+<em>parallelism</em> as you have cores, and as many <em>tasks</em> as the problem naturally has, and those two numbers should be
+decoupled. That decoupling is exactly what a thread pool provides.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Name the two distinct costs that make thread-per-task a bad structure for many small tasks — one paid at creation/teardown,
+one paid while they run. Why does spawning 100,000 threads on an 8-core machine not give 100,000-way parallelism? (Answer after
+the next section.)</p>
+</aside>
+
+<h2>25.2 The thread pool: workers draining a work queue</h2>
+
+<p>A <strong>thread pool</strong> creates a fixed set of worker threads once, up front, and keeps them alive. Work is submitted
+as <strong>tasks</strong> onto a shared queue; each idle worker loops: take a task, run it, repeat. This is the
+producer&ndash;consumer pattern of Chapter 21 wearing a new name — the queue is guarded by a mutex, and workers block on a
+condition variable when it is empty rather than busy-waiting, so an idle pool costs no CPU. The core of a worker is exactly the
+Chapter 21 consumer:</p>
+
+<pre><code>void *worker(void *_) {
+    for (;;) {
+        pthread_mutex_lock(&amp;mtx);
+        while (queue_empty() &amp;&amp; !shutdown)   /* predicate loop, never an if */
+            pthread_cond_wait(&amp;not_empty, &amp;mtx);
+        if (queue_empty() &amp;&amp; shutdown) { pthread_mutex_unlock(&amp;mtx); return NULL; }
+        task_t t = dequeue();
+        pthread_mutex_unlock(&amp;mtx);         /* run the task OUTSIDE the lock */
+        t.fn(t.arg);                        /* do the work */
+    }
+}</code></pre>
+
+<p>The pool pays the ~220&nbsp;us thread-creation cost exactly <code>W</code> times — once per worker at startup — and then
+<em>amortizes</em> it across every task ever submitted. Run 100,000 tiny tasks (each a ~200-iteration arithmetic loop) two ways
+on this machine: one thread per task versus a pool of 8 workers (gcc 11.4.0, <code>-O2 -pthread</code>):</p>
+
+<pre><code>thread-per-task : 100000 tasks, 21.73 s   (217.2 us/task)
+thread pool (8) : 100000 tasks,  0.10 s   (  1.04 us/task)</code></pre>
+
+<p>The pool ran the same work about <strong>200&times; faster</strong> per task, because it stopped paying the thread tax on
+every task and paid it only eight times. Two design points matter. First, run the task <em>outside</em> the lock — the mutex
+guards the queue, not the work, so holding it during <code>t.fn()</code> would serialize the whole pool back down to one worker
+(that is the contention lesson of the next chapter, previewed). Second, the pool size is a knob: too few workers and cores sit
+idle; too many and you are back to oversubscription. A common default is one worker per hardware thread for CPU-bound work, more
+if tasks block on I/O. The pool has bought us the decoupling we wanted: submit as many tasks as the problem has, run them on as
+many workers as the machine has.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: a pool amortizes thread cost across many tasks</span>
+<p><strong>1. In words.</strong> Creating a thread is expensive and having more runnable threads than cores just adds overhead.
+A thread pool creates a fixed set of workers once and feeds them tasks from a shared queue, so the creation cost is paid a
+handful of times and reused for every task, and parallelism is capped at the number of workers rather than the number of tasks.</p>
+<p><strong>2. As a picture.</strong> Figure 25.1: producers enqueue tasks; a fixed row of workers each loop
+&ldquo;lock &rarr; wait if empty &rarr; dequeue &rarr; unlock &rarr; run&rdquo;, blocking on a condition variable when the queue
+drains.</p>
+<p><strong>3. As numbers.</strong> 100,000 tiny tasks: thread-per-task took 21.73&nbsp;s (217&nbsp;us/task, paying ~220&nbsp;us
+creation every time); a pool of 8 took 0.10&nbsp;s (1.04&nbsp;us/task) — about 200&times; faster.</p>
+</aside>
+
+<p><em>(Answer to the &sect;25.1 quick check: the two costs are (1) <strong>creation/teardown</strong> — the kernel allocates a
+stack and task structure and makes the thread schedulable, ~220&nbsp;us measured here, and (2) <strong>oversubscription</strong>
+— once runnable threads exceed cores, the scheduler time-slices them, paying context switches and cache disruption. 100,000
+threads on 8 cores gives at most 8-way parallelism because only 8 threads run at once; the other ~99,992 just wait, so you get
+the overhead of many threads with the parallelism of eight.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Thread pool: producers enqueue tasks; a fixed set of workers drain the queue.</text>
+<rect x="20" y="34" width="90" height="26" fill="#eef" stroke="#14406b"/><text x="30" y="51" font-size="9">producer A</text>
+<rect x="20" y="66" width="90" height="26" fill="#eef" stroke="#14406b"/><text x="30" y="83" font-size="9">producer B</text>
+<rect x="160" y="40" width="180" height="48" fill="#f5f8fb" stroke="#14406b"/>
+<text x="168" y="34" font-size="9" fill="#14406b">work queue (mutex + cond var)</text>
+<rect x="170" y="52" width="26" height="24" fill="#fff" stroke="#14406b"/><rect x="200" y="52" width="26" height="24" fill="#fff" stroke="#14406b"/><rect x="230" y="52" width="26" height="24" fill="#fff" stroke="#14406b"/><rect x="260" y="52" width="26" height="24" fill="#fff" stroke="#14406b"/><text x="300" y="68" font-size="9">tasks…</text>
+<line x1="110" y1="47" x2="160" y2="60" stroke="#14406b" marker-end="url(#a)"/>
+<line x1="110" y1="79" x2="160" y2="70" stroke="#14406b" marker-end="url(#a)"/>
+<rect x="420" y="20" width="150" height="22" fill="#fdeee6" stroke="#8c3a1d"/><text x="428" y="35" font-size="9">worker 1: dequeue &rarr; run</text>
+<rect x="420" y="48" width="150" height="22" fill="#fdeee6" stroke="#8c3a1d"/><text x="428" y="63" font-size="9">worker 2: dequeue &rarr; run</text>
+<rect x="420" y="76" width="150" height="22" fill="#fdeee6" stroke="#8c3a1d"/><text x="428" y="91" font-size="9">worker 3: dequeue &rarr; run</text>
+<rect x="420" y="104" width="150" height="22" fill="#f5f8fb" stroke="#14406b"/><text x="428" y="119" font-size="9">worker 4: blocked (queue empty)</text>
+<line x1="340" y1="64" x2="420" y2="59" stroke="#8c3a1d" marker-end="url(#a)"/>
+<text x="16" y="150" font-size="9" fill="#8c3a1d">Creation cost is paid once per worker at startup, then reused for every task.</text>
+<text x="16" y="168" font-size="9" fill="#14406b">Parallelism is capped at the number of workers; task count is whatever the problem needs.</text>
+<defs><marker id="a" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#14406b"/></marker></defs>
+</svg>
+<figcaption>Figure 25.1: A thread pool. A fixed set of workers repeatedly lock the queue, wait on a condition variable while it is
+empty, dequeue a task, unlock, and run the task outside the lock. Thread-creation cost is paid once per worker; every submitted
+task reuses those workers.</figcaption>
+</figure>
+
+<h2>25.3 Task parallelism and fork&ndash;join</h2>
+
+<p>A pool runs whatever tasks you give it; <strong>task parallelism</strong> is the discipline of <em>decomposing a
+computation</em> into independent tasks that can run concurrently, as opposed to <strong>data parallelism</strong>, which applies
+the same operation across many data elements. The canonical structure is <strong>fork&ndash;join</strong>: split the work into
+parts (<em>fork</em> subtasks), run them in parallel, then <em>join</em> — wait for all of them and combine results. Summing a
+large array is the textbook case: partition it into <code>P</code> ranges, hand each to a thread, and add the partial sums.
+Measured on this machine (64M doubles, each element passed through <code>sqrt</code>; gcc 11.4.0 <code>-O2 -pthread -lm</code>;
+warmed, averaged over 3 runs):</p>
+
+<pre><code>P= 1 : 0.369 s  (baseline)
+P= 2 : 0.186 s   speedup 1.98x
+P= 4 : 0.134 s   speedup 2.75x
+P= 8 : 0.084 s   speedup 4.38x
+P=16 : 0.076 s   speedup 4.86x</code></pre>
+
+<p>Two threads nearly halve the time (1.98&times;) — near-perfect for a problem that splits cleanly — but the speedup curve bends
+below linear as <code>P</code> grows: 4.38&times; at eight threads, not 8&times;. Why it bends (memory bandwidth, a serial
+remainder, this CPU's mix of performance and efficiency cores) is the whole subject of the next chapter; here the point is the
+<em>structure</em>. Fork&ndash;join needs a way to hand back a subtask's result, and the abstraction for that is a
+<strong>future</strong> (sometimes a <em>promise</em> on the producing side): a handle to a value that is not computed yet.
+Submitting a task returns a future immediately; calling <code>.get()</code> on it blocks until the task completes and yields the
+result — the join. Futures let you express a dependency graph directly: fork several tasks, get their futures, and a task that
+needs their outputs simply gets them, blocking only if they are not ready. The pool of &sect;25.2 plus futures is enough to
+express most fork&ndash;join parallelism: decompose, submit, collect.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Distinguish <em>task</em> parallelism from <em>data</em> parallelism in one line each. In a fork&ndash;join computation, what
+does &ldquo;join&rdquo; do, and what does a <em>future</em> represent? Why does calling <code>future.get()</code> sometimes block
+and sometimes return immediately? (Answer below the communicate box.)</p>
+</aside>
+
+<h2>25.4 Load balancing and work-stealing</h2>
+
+<p>The single shared queue of &sect;25.2 has a scaling flaw: every worker locks the <em>same</em> mutex to get its next task, so
+as you add workers they contend on that one lock, and the queue itself becomes a serial bottleneck — precisely the contention the
+next chapter measures. It also balances load only coarsely. The standard answer, introduced by the Cilk system (Frigo, Leiserson
+&amp; Randall, 1998) and analyzed by Blumofe and Leiserson, is <strong>work-stealing</strong>. Give <em>each</em> worker its own
+double-ended queue (a <em>deque</em>) of tasks. A worker pushes newly forked subtasks onto, and pops them from, the
+<em>bottom</em> of its own deque — a purely local, uncontended operation in the common case. When a worker's own deque runs
+empty, it becomes a <strong>thief</strong>: it picks another worker at random and steals a task from the <em>top</em> of that
+victim's deque. Pushing/popping one end locally while thieves take from the other end keeps the fast path contention-free and
+distributes load automatically — idle workers go find work rather than waiting to be fed.</p>
+
+<p>This is not just an engineering nicety; it comes with a proof. Blumofe and Leiserson (&ldquo;Scheduling Multithreaded
+Computations by Work Stealing,&rdquo; 1999) showed that for a fully-strict (well-structured fork&ndash;join) computation with
+work <em>T</em><sub>1</sub> (total operations) and span <em>T</em><sub>&infin;</sub> (the critical-path length, the time on
+infinitely many processors), a randomized work-stealing scheduler runs in expected time <em>O</em>(<em>T</em><sub>1</sub>/<em>P</em>
++ <em>T</em><sub>&infin;</sub>) on <em>P</em> processors — asymptotically optimal, with provably bounded space and communication.
+In words: you get near-linear speedup as long as there is enough parallelism (<em>T</em><sub>1</sub>/<em>T</em><sub>&infin;</sub>
+&gt; <em>P</em>) to keep the processors fed. Work-stealing is why fork&ndash;join frameworks scale: Cilk, Intel's TBB, and Doug
+Lea's Java Fork/Join framework (2000, the engine under Java's parallel streams) are all work-stealing pools. When you write
+&ldquo;fork these subtasks and join,&rdquo; a work-stealing runtime is what turns that into balanced parallelism without your
+managing which core does what.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: submitting tasks that block on other tasks in the same bounded pool (pool deadlock)</span>
+<p>A thread pool has a fixed number of workers, and that number is a resource that can be exhausted. The classic deadlock: a task
+running on the pool submits a <em>subtask</em> to the same pool and then <em>blocks waiting for that subtask's result</em>. If
+every worker is simultaneously blocked waiting on a subtask that is still sitting in the queue — because there is no free worker
+to run it — the pool is wedged forever: the waiters hold the only threads that could make progress. With a pool of <code>W</code>
+workers, <code>W</code> tasks that each block on an un-started subtask is all it takes. This bites people who treat a pool as
+infinitely deep, and it is especially nasty because it depends on timing and pool size, so it passes tests and hangs in
+production under load. The disciplines that avoid it: never block a pool worker waiting on work queued to the <em>same</em> pool;
+use a work-stealing runtime whose join can execute the pending subtask on the current thread instead of blocking (this is exactly
+what fork&ndash;join frameworks do); or separate blocking and CPU-bound work into different pools. If your tasks have
+dependencies, express them as futures the runtime understands — do not have a worker sit on a lock waiting for a task that has
+nowhere to run.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;Our request handler spawns a fresh thread for every incoming job so they run
+in parallel. Under load the box is at 100% CPU but throughput actually <em>drops</em>, and latency is all over the place. Should
+we just spawn the threads at higher priority?&rdquo; Cover the paragraph and respond in four or five sentences, drawing on
+&sect;25.1&ndash;&sect;25.2.</p>
+<p><em>Model answer.</em> &ldquo;Higher priority won't help — the problem is that you have far more runnable threads than cores,
+so the CPU is busy context-switching and thrashing caches instead of doing work, and you're also paying ~hundreds of microseconds
+to create and destroy a thread per job. Bound the concurrency: use a fixed thread pool sized to about the number of hardware
+threads for CPU-bound jobs, and submit jobs as tasks onto its queue. Now creation cost is paid once per worker and amortized over
+every job, and you never oversubscribe the cores, so throughput goes up and latency stabilizes. If jobs block on I/O rather than
+CPU, size that pool larger or give I/O its own pool — but the fix is bounding and reusing threads, not spawning more of them
+faster.&rdquo; Naming oversubscription and creation cost, and prescribing a bounded reused pool, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;25.3 quick check: <strong>task</strong> parallelism decomposes a computation into different tasks
+that run concurrently; <strong>data</strong> parallelism applies the same operation across many data elements. &ldquo;Join&rdquo;
+waits for all forked subtasks to finish and combines their results. A <strong>future</strong> is a handle to a value that may not
+be computed yet; <code>future.get()</code> blocks if the task is still running and returns immediately if it has already
+completed — it is how a dependent task waits exactly as long as necessary and no longer.)</em></p>
+
+<h2>25.5 What to carry forward</h2>
+
+<p>The organizing idea of this chapter is to <strong>separate the work from the workers</strong>. A thread is expensive — about
+220&nbsp;microseconds to create and join on the machine here — and more runnable threads than cores is not more parallelism, just
+more context-switching overhead, so spawning a thread per task fails on both cost and oversubscription. A <strong>thread
+pool</strong> fixes both: a fixed set of long-lived workers drains a shared work queue (the producer&ndash;consumer pattern of
+Chapter 21, built from a mutex and a condition variable so an idle pool burns no CPU), paying the creation cost a handful of
+times and amortizing it across every task — 100,000 tiny tasks ran ~200&times; faster on a pool of 8 than one-thread-per-task.
+<strong>Task parallelism</strong> decomposes a computation into tasks; the <strong>fork&ndash;join</strong> model forks subtasks,
+runs them in parallel, and joins their results, with <strong>futures</strong> as handles to not-yet-computed values (our parallel
+sum hit 1.98&times; on two threads, then bent below linear). A single shared queue contends, so real fork&ndash;join runtimes use
+<strong>work-stealing</strong> — per-worker deques with idle workers stealing from busy ones — which Blumofe and Leiserson proved
+runs a well-structured computation in near-optimal <em>O</em>(<em>T</em><sub>1</sub>/<em>P</em> + <em>T</em><sub>&infin;</sub>)
+time. The trap: a bounded pool is a finite resource, so a worker that blocks waiting on a subtask queued to the same pool can
+deadlock it.</p>
+
+<p>You now have the vocabulary for the rest of the part and much of the book: <em>task</em> as the unit of work, <em>pool</em> as
+the bounded set of workers, <em>fork/join</em> and <em>future</em> as the way to express and collect parallel work, and
+<em>work-stealing</em> as the runtime that balances it. But every speedup number in this chapter came with a caveat — two threads
+gave 1.98&times;, eight gave only 4.38&times;. That gap between the parallelism you asked for and the speedup you got is not
+sloppiness; it is fundamental, and it has names. The next chapter makes it precise: <strong>Amdahl's law</strong> and its serial
+fraction, <strong>Gustafson's</strong> rejoinder about growing the problem, and the two silent killers of scalability —
+<strong>lock contention</strong> and <strong>false sharing</strong> — that turn adding cores into a slowdown. Having learned to
+express parallel work, we turn to the question of how much of it actually pays off.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State the two costs (creation/teardown and oversubscription) that make thread-per-task a poor structure.</li>
+<li>Describe a thread pool and how it is the Chapter 21 producer&ndash;consumer pattern, and why the task runs outside the
+lock.</li>
+<li>Explain why a pool amortizes thread-creation cost, and roughly what that bought in the 100,000-task measurement.</li>
+<li>Define task vs data parallelism, the fork&ndash;join model, and what a future represents.</li>
+<li>Explain work-stealing: per-worker deques, local push/pop vs stealing, and what it buys over one shared queue.</li>
+<li>Explain how submitting a blocking, dependent task to a bounded pool can deadlock it, and how to avoid that.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> Why is thread-per-task a bad structure for many small tasks — name both costs. (&sect;25.1)</li>
+<li><strong>R2.</strong> What is a thread pool, which Chapter 21 pattern is it, and why is the creation cost amortized? (&sect;25.2)</li>
+<li><strong>R3.</strong> Define task parallelism, the fork&ndash;join model, and a future. (&sect;25.3)</li>
+<li><strong>R4.</strong> What is work-stealing, and what did Blumofe &amp; Leiserson prove about its running time? (&sect;25.4)</li>
+<li><strong>R5.</strong> How can a bounded pool deadlock, and how do you prevent it? (&sect;25.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Blumofe &amp; Leiserson, &ldquo;Scheduling Multithreaded Computations by Work Stealing,&rdquo; <em>Journal of the
+ACM</em> 46(5):720&ndash;748 (1999), DOI 10.1145/324133.324234.</strong> The provably-good work-stealing scheduler of
+&sect;25.4, with the <em>O</em>(<em>T</em><sub>1</sub>/<em>P</em> + <em>T</em><sub>&infin;</sub>) time and space bounds. First
+author Robert D. Blumofe; verified via dblp and the ACM Digital Library.</li>
+<li><strong>Frigo, Leiserson &amp; Randall, &ldquo;The Implementation of the Cilk-5 Multithreaded Language,&rdquo; <em>Proc. ACM
+PLDI</em> (1998), pp. 212&ndash;223, DOI 10.1145/277650.277725.</strong> The work-first principle and the runtime that
+popularized work-stealing fork&ndash;join. First author Matteo Frigo; verified via dblp and the ACM Digital Library.</li>
+<li><strong>Lea, &ldquo;A Java Fork/Join Framework,&rdquo; <em>Proc. ACM 2000 Java Grande Conference</em>, pp. 36&ndash;43, DOI
+10.1145/337449.337465.</strong> A practical work-stealing pool — the design under Java's parallel streams. First author Doug
+Lea; verified via dblp and the ACM Digital Library.</li>
+<li><strong>Arpaci-Dusseau &amp; Arpaci-Dusseau, <em>Operating Systems: Three Easy Pieces</em>, &ldquo;Concurrency&rdquo;
+chapters (free online, <code>ostep.org</code>).</strong> Threads, locks, and the producer&ndash;consumer / condition-variable
+foundation the pool of &sect;25.2 is built on. Accessible background; verify chapter numbers per edition.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex25.1"><span class="ex-label">25.1</span> <span class="ex-tag warm">warm-up</span>
+In one sentence each, name the two costs that make spawning one thread per task a poor structure for many small tasks.</div>
+
+<div class="exercise" id="ex25.2"><span class="ex-label">25.2</span> <span class="ex-tag warm">warm-up</span>
+A thread pool is an instance of which pattern from Chapter 21? Name the two synchronization primitives its work queue uses and
+what each is for.</div>
+
+<div class="exercise" id="ex25.3"><span class="ex-label">25.3</span> <span class="ex-tag warm">warm-up</span>
+What is a <em>future</em>, and what happens when you call <code>.get()</code> on one whose task has not finished versus one whose
+task has?</div>
+
+<div class="exercise" id="ex25.4"><span class="ex-label">25.4</span> <span class="ex-tag core">core</span>
+Explain why a pool of <code>W</code> workers running <code>N</code> tasks pays the thread-creation cost only about <code>W</code>
+times, not <code>N</code> times. Using the measured ~220&nbsp;us creation cost and the 1.04&nbsp;us/task pool result, estimate
+what fraction of the thread-per-task time (217&nbsp;us/task) was creation overhead rather than useful work, and why the pool
+avoids it.</div>
+
+<div class="exercise" id="ex25.5"><span class="ex-label">25.5</span> <span class="ex-tag core">core</span>
+In the worker loop of &sect;25.2, the task is run <em>after</em> unlocking the queue mutex. (a) What would go wrong for
+throughput if you held the lock while running <code>t.fn()</code>? (b) Why must the empty-queue wait be a <code>while</code>
+loop around <code>cond_wait</code>, not an <code>if</code> (recall Chapter 21)? (c) How does the pool ensure an idle worker uses
+no CPU?</div>
+
+<div class="exercise" id="ex25.6"><span class="ex-label">25.6</span> <span class="ex-tag core">core</span>
+Describe work-stealing precisely: what data structure does each worker own, which end does the owner use versus a thief, and why
+does that split keep the common case contention-free? Then state, in words, the Blumofe&ndash;Leiserson running-time bound and
+what condition on the computation is needed for near-linear speedup.</div>
+
+<div class="exercise" id="ex25.7"><span class="ex-label">25.7</span> <span class="ex-tag complexity">cost</span>
+Consider a single-shared-queue pool with <code>P</code> workers, each task taking time <code>t</code>, where dequeuing requires
+the one global lock held for time <code>c</code>. (a) Argue that when <code>c</code> is not negligible relative to <code>t</code>,
+throughput stops improving past some number of workers, and identify what caps it. (b) Explain qualitatively how per-worker
+deques with work-stealing change this. (c) Why does making tasks <em>coarser</em> (more work per task) improve a shared-queue
+pool's scaling, and what is the downside of tasks that are too coarse?</div>
+
+<div class="exercise" id="ex25.8"><span class="ex-label">25.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A service uses a pool of 4 workers. Each request task, midway through, submits a
+second task to the <em>same</em> pool and blocks on its future before finishing. Under light load it is fine; under load it hangs.
+<br><strong>Step 1 (given):</strong> The pool has exactly 4 worker threads; parallelism is capped at 4 running tasks.
+<br><strong>Step 2 (given):</strong> Under load, 4 request tasks each reach the point of submitting a subtask and blocking on
+its future — all 4 workers are now blocked.
+<br><strong>Step 3 (given):</strong> The 4 subtasks sit in the queue with no free worker to run them, so none of the futures will
+ever complete.
+<br><strong>Step 4 (you):</strong> Name this failure, explain precisely why it is a deadlock (what holds what, what waits on
+what), and give two concrete fixes — one about pool structure and one about how dependent work should be expressed.</div>
+
+<div class="exercise" id="ex25.9"><span class="ex-label">25.9</span> <span class="ex-tag mixed">mixed</span>
+For each workload, say whether a fixed pool sized to the hardware-thread count is right, and if not what to change: (a) CPU-bound
+numeric tasks that never block; (b) tasks that spend most of their time blocked on network I/O; (c) a recursive
+divide-and-conquer computation with millions of tiny subtasks and deep nesting; (d) a mix of short CPU tasks and occasional
+long-blocking database calls. Justify each in a line.</div>
+
+<div class="exercise" id="ex25.10"><span class="ex-label">25.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 21 and 25, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Spawning
+one thread per task gives you as much parallelism as you have tasks.&rdquo; (b) &ldquo;A thread pool's work queue is a
+producer&ndash;consumer buffer guarded by a mutex and a condition variable.&rdquo; (c) &ldquo;An idle thread pool spins, burning
+CPU while it waits for work.&rdquo; (d) &ldquo;Work-stealing eliminates the single shared queue by giving each worker its own
+deque.&rdquo; (e) &ldquo;Calling <code>future.get()</code> always blocks until the whole pool is idle.&rdquo;</div>
+
+<div class="exercise" id="ex25.11"><span class="ex-label">25.11</span> <span class="ex-tag stretch">stretch</span>
+Work-stealing is described as &ldquo;idle workers steal from busy ones.&rdquo; (a) Explain why stealing from the <em>top</em>
+(opposite end from the owner's push/pop) both reduces contention with the owner and tends to steal the <em>oldest</em>,
+largest-grained task — and why stealing a large task is good for load balance. (b) The Blumofe&ndash;Leiserson bound is
+<em>O</em>(<em>T</em><sub>1</sub>/<em>P</em> + <em>T</em><sub>&infin;</sub>). Interpret each term, and explain why a computation
+with too little parallelism (span <em>T</em><sub>&infin;</sub> close to work <em>T</em><sub>1</sub>) cannot be sped up much no
+matter how many workers you add — and connect this to the next chapter's Amdahl's law.</div>
+
+<div class="exercise" id="ex25.12"><span class="ex-label">25.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) measure the cost of <code>pthread_create</code> + <code>pthread_join</code> by creating and joining an
+empty thread in a loop; report microseconds per thread and your CPU/OS. (b) Build a small thread pool (fixed workers, a
+mutex+condvar work queue) and run a large number of tiny tasks through it, then run the same tasks one-thread-per-task; report
+the per-task times and the speedup. (c) Implement a fork&ndash;join parallel sum of a large array for
+<code>P&nbsp;=&nbsp;1,&nbsp;2,&nbsp;4,&nbsp;8</code> threads and plot speedup; note where it bends below linear. Warm up and
+average your runs, and state that absolute numbers are hardware- and OS-dependent.</div>
+
+</section>
+</section>

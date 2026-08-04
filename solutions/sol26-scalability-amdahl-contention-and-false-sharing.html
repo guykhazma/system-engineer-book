@@ -1,0 +1,121 @@
+<section class="solutions" id="sol26">
+<h1>Chapter 26 — Solutions</h1>
+
+<div class="solution" id="sol26.1"><span class="sol-label">26.1</span>
+speedup(<strong>P</strong>)&nbsp;=&nbsp;1/(<strong>s</strong>&nbsp;+&nbsp;(1&minus;<strong>s</strong>)/<strong>P</strong>). As
+<strong>P&nbsp;&rarr;&nbsp;&infin;</strong> the (1&minus;<strong>s</strong>)/<strong>P</strong> term vanishes and speedup
+approaches 1/<strong>s</strong> — the ceiling set by the serial fraction. <em>Tempting wrong answer:</em> &ldquo;speedup grows
+linearly with P&rdquo; — only the parallel part divides by P; the serial part is a floor. <strong>Feed-forward:</strong>
+&sect;26.1.</div>
+
+<div class="solution" id="sol26.2"><span class="sol-label">26.2</span>
+False sharing is when two threads write independent variables that happen to occupy the same cache line, so each write
+invalidates the other's cached copy and the line ping-pongs between cores — paying the cost of sharing while sharing no data. The
+granularity is the <strong>cache line</strong>, 64 bytes on a typical x86 machine. <em>Tempting wrong answer:</em> &ldquo;it's
+caused by sharing a variable&rdquo; — no variable is shared; the collision is at cache-line granularity, not variable
+granularity. <strong>Feed-forward:</strong> &sect;26.4.</div>
+
+<div class="solution" id="sol26.3"><span class="sol-label">26.3</span>
+A lock's critical section runs one thread at a time, so if every thread must pass through the same lock on the hot path, that
+section executes serially — it is a serial fraction, and Amdahl caps speedup at one over it. <em>Tempting wrong answer:</em>
+&ldquo;the lock only adds a small constant overhead&rdquo; — it serializes an entire fraction of the work, and Amdahl's ceiling
+applies to that fraction. <strong>Feed-forward:</strong> &sect;26.3.</div>
+
+<div class="solution" id="sol26.4"><span class="sol-label">26.4</span>
+<strong>s</strong>&nbsp;=&nbsp;0.20. (a) Limit&nbsp;=&nbsp;1/0.20&nbsp;=&nbsp;<strong>5&times;</strong> with infinite cores. (b) At
+<strong>P</strong>&nbsp;=&nbsp;4: 1/(0.2&nbsp;+&nbsp;0.8/4)&nbsp;=&nbsp;1/0.4&nbsp;=&nbsp;<strong>2.5&times;</strong>; at
+<strong>P</strong>&nbsp;=&nbsp;16: 1/(0.2&nbsp;+&nbsp;0.8/16)&nbsp;=&nbsp;1/0.25&nbsp;=&nbsp;<strong>4.0&times;</strong>. (c)
+Quadrupling cores (4&rarr;16) improved speedup only from 2.5&times; to 4.0&times; — a factor of 1.6, not 4 — so &ldquo;just add
+cores&rdquo; gives sharply diminishing returns once the serial fraction dominates. <em>Tempting wrong answer:</em> &ldquo;16
+cores gives 4&times; the speedup of 4 cores&rdquo; — it gives 1.6&times;; the serial 20% throttles it. <strong>Feed-forward:</strong>
+&sect;26.1.</div>
+
+<div class="solution" id="sol26.5"><span class="sol-label">26.5</span>
+(a) The entire work is inside the one critical section, so it is effectively 100% serial — Amdahl ceiling 1&times;, meaning even
+in the best case adding threads cannot speed it up. (b) On top of that, the lock's own <strong>cache line</strong> (and the
+contended counter's line) must be transferred to whichever core acquires it next, so it bounces between cores; that coherence
+traffic and the wait/hand-off overhead grow with the number of threads, pushing the time <em>above</em> the single-thread time —
+negative scaling. (c) Fix 1: shard into per-thread counters combined once at the end — serial fraction drops toward 0. Fix 2:
+a lock-free atomic or shrinking the critical section — reduces the serialized portion and the contended line. <em>Tempting wrong
+answer:</em> &ldquo;it's slow because the mutex syscall is expensive&rdquo; — uncontended mutexes are cheap userspace
+operations; the cost here is serialization plus cache-line bouncing under contention. <strong>Feed-forward:</strong> &sect;26.3.</div>
+
+<div class="solution" id="sol26.6"><span class="sol-label">26.6</span>
+(a) Version B (padded) is faster — about <strong>10&times;</strong> in the &sect;26.4 measurement (2.56&nbsp;s packed vs
+0.25&nbsp;s padded). In version A both counters share a cache line, so each thread's write invalidates the line in the other
+core, forcing a re-fetch every increment (the line ping-pongs); in B each counter owns its line, so writes stay core-local. (b)
+Neither has a data race: each thread writes only its own counter, and no location is accessed by two threads — the collision is
+at the cache-line level, not the variable level, so there is no shared variable at all. (c) Fix:
+<pre><code>struct { long v; char pad[64 - sizeof(long)]; } c[2];   /* one counter per line */
+/* or */  _Alignas(64) long c0;  _Alignas(64) long c1;   /* C11 */
+/* or GCC: */  long c[2] __attribute__((aligned(64)));   /* + stride to a line each */</code></pre>
+<em>Method-selection cue:</em> hot per-thread data written in a tight loop &rarr; give each thread's datum its own cache line.
+<strong>Feed-forward:</strong> &sect;26.4.</div>
+
+<div class="solution" id="sol26.7"><span class="sol-label">26.7</span>
+(a) Efficiency&nbsp;=&nbsp;speedup/<strong>P</strong>&nbsp;=&nbsp;1/(<strong>P</strong>&middot;<strong>s</strong>&nbsp;+&nbsp;(1&minus;<strong>s</strong>)).
+As <strong>P</strong> grows the <strong>P</strong>&middot;<strong>s</strong> term grows, so efficiency falls monotonically toward 0
+for any <strong>s</strong>&nbsp;&gt;&nbsp;0 — you keep more cores idle relative to the serial floor. (b) When efficiency has
+dropped so far that the marginal core does less useful work than it costs (money, power, coordination), more cores stop being
+cost-effective — well before the 1/<strong>s</strong> ceiling. (c) Under Gustafson the problem grows with <strong>P</strong>, so
+the parallel work per core stays roughly constant and the serial fraction of the <em>larger</em> job shrinks; efficiency can stay
+high because you are not dividing a fixed parallel part into ever-thinner slices. <em>Tempting wrong answer:</em> &ldquo;efficiency
+is constant if the program is well written&rdquo; — for a fixed problem with any serial part, efficiency always falls with P; only
+weak scaling avoids it. <strong>Feed-forward:</strong> &sect;26.1, &sect;26.2.</div>
+
+<div class="solution" id="sol26.8"><span class="sol-label">26.8</span>
+<strong>Step 4:</strong> This is <strong>false sharing</strong>. It gets worse with more threads because each additional core
+writing its slot adds another participant fighting over the same 64-byte line — more invalidations and cross-core transfers per
+unit time, so coherence traffic (not useful work) grows with the thread count. The fix is to give each thread's counter its own
+cache line: pad the element to 64 bytes (<code>struct { long v; char pad[56]; } counts[N];</code>) or align each counter with
+<code>_Alignas(64)</code> / <code>__attribute__((aligned(64)))</code> so no two threads' hot counters share a line. The &sect;26.4
+measurement showed this is worth roughly a <strong>10&times;</strong> speedup (2.56&nbsp;s &rarr; 0.25&nbsp;s) for the same
+arithmetic. <em>Tempting wrong answer:</em> &ldquo;add a lock around each slot to make it thread-safe&rdquo; — it is already
+correct; a lock would add real contention on top of the false sharing and make it worse. <strong>Feed-forward:</strong>
+&sect;26.4.</div>
+
+<div class="solution" id="sol26.9"><span class="sol-label">26.9</span>
+(a) <strong>Serial fraction (Amdahl)</strong> — a plateau at ~10&times; with no lock implies ~10% inherently serial work;
+confirm by measuring the sequential portion's share of runtime (~1/10). (b) <strong>Lock contention</strong> — throughput
+dropping with a profiler pointing at <code>pthread_mutex_lock</code> is the signature; confirm with the lock's contention/wait
+counters. (c) <strong>False sharing</strong> — per-thread array, no locks, poor scaling; confirm by padding each element to its
+own cache line and seeing the slowdown vanish (or via a perf counter for cache-coherence/HITM events). (d) <strong>Serial
+fraction (Amdahl)</strong> — a fixed 2&nbsp;s single-threaded merge is a literal serial section; confirm it stays constant as the
+parallel phase's core count changes. <em>Method-selection cue:</em> plateau &amp; no lock &rarr; Amdahl; time in lock &rarr;
+contention; per-thread array &amp; no lock &rarr; false sharing. <strong>Feed-forward:</strong> &sect;26.1, &sect;26.3, &sect;26.4.</div>
+
+<div class="solution" id="sol26.10"><span class="sol-label">26.10</span>
+(a) <strong>False</strong> — a fixed problem is capped at 1/<strong>s</strong> by its serial fraction, no matter the core count.
+(b) <strong>False</strong> — the laws answer different questions (fixed problem vs problem grown with the machine); they are
+consistent. (c) <strong>False</strong> — false sharing is a performance bug, not a data race; each thread writes only its own
+variable, so behavior is well-defined. (d) <strong>True</strong> — a contended hot lock serializes work and bounces a cache
+line, so adding threads can slow the program (negative scaling). (e) <strong>False</strong> — padding changes only memory layout
+and timing, never the computed results. <em>Tempting wrong answer:</em> calling (c) true because &ldquo;threads touch nearby
+memory&rdquo; — touching nearby memory is not a race; a race needs conflicting access to the <em>same</em> location.
+<strong>Feed-forward:</strong> &sect;26.1&ndash;&sect;26.4.</div>
+
+<div class="solution" id="sol26.11"><span class="sol-label">26.11</span>
+(a) Fix the total work <strong>W</strong>&nbsp;=&nbsp;serial&nbsp;+&nbsp;parallel with serial share <strong>s</strong>; time on
+<strong>P</strong> is <strong>s</strong>&middot;<strong>W</strong>&nbsp;+&nbsp;(1&minus;<strong>s</strong>)<strong>W</strong>/<strong>P</strong>,
+so speedup&nbsp;=&nbsp;1/(<strong>s</strong>&nbsp;+&nbsp;(1&minus;<strong>s</strong>)/<strong>P</strong>)&nbsp;&rarr;&nbsp;1/<strong>s</strong>
+— Amdahl. If instead the parallel work grows with <strong>P</strong> (fixed wall-clock), the work done is
+<strong>s</strong>&nbsp;+&nbsp;(1&minus;<strong>s</strong>)<strong>P</strong> relative to one processor's serial-plus-one-share, giving
+scaled speedup <strong>P</strong>&nbsp;&minus;&nbsp;<strong>s</strong>(<strong>P</strong>&minus;1) — Gustafson, near-linear. (b)
+&ldquo;Linear to 1000 cores&rdquo; is plausible under Gustafson if they grew the simulation with the machine (weak scaling); it
+does not contradict Amdahl, which governs a <em>fixed</em>-size run. Ask: &ldquo;Did the problem size stay fixed as you added
+cores, or grow with them?&rdquo; (c) The span <strong>T&infin;</strong> is the critical path that must run sequentially no matter
+how many processors you have — exactly the role of Amdahl's serial fraction; in
+<em>O</em>(<em>T</em><sub>1</sub>/<em>P</em>&nbsp;+&nbsp;<em>T</em><sub>&infin;</sub>) the span is the irreducible floor.
+<em>Tempting wrong answer:</em> &ldquo;the 1000&times; claim disproves Amdahl&rdquo; — it measures weak scaling, a different
+regime, not a violation. <strong>Feed-forward:</strong> &sect;26.1, &sect;26.2, and Ch 25.</div>
+
+<div class="solution" id="sol26.12"><span class="sol-label">26.12</span>
+Machine-specific by design. A correct write-up reports: (a) measured speedups that track Amdahl's 1/(<strong>s</strong>&nbsp;+&nbsp;(1&minus;<strong>s</strong>)/<strong>P</strong>)
+for the measured <strong>s</strong> and bend toward the 1/<strong>s</strong> ceiling (on the book's machine
+<strong>s</strong>&nbsp;&asymp;&nbsp;0.089, ceiling ~11&times;, 16 threads &asymp;&nbsp;6.4&times;). (b) The single-mutex counter
+showing flat or negative scaling (here 1.80&nbsp;s at 1 thread rising to 7.06&nbsp;s at 8). (c) A packed-vs-padded false-sharing
+slowdown of several times (here ~10&times;). Label CPU and cache-line size; numbers are hardware-dependent. <em>Tempting wrong
+answer:</em> &ldquo;my parallel loop is buggy because 8 threads gave 4&times;&rdquo; — sub-linear scaling is expected from the
+serial fraction and memory effects, not necessarily a bug. <strong>Feed-forward:</strong> &sect;26.1, &sect;26.3, &sect;26.4.</div>
+
+</section>

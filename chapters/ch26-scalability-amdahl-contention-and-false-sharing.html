@@ -1,0 +1,369 @@
+<section class="chapter" id="ch26">
+<h1>Chapter 26 — Scalability: Amdahl's Law, Contention, and False Sharing</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch25">Chapter 25</a> (fork&ndash;join gave 1.98&times; on two
+threads but only 4.38&times; on eight — this chapter explains the gap), <a href="#ch06">Chapter 6</a> (the cost model — speedup
+is a ratio you measure, not assume), <a href="#ch03">Chapter 3</a> (caches and the 64-byte line — false sharing lives here),
+<a href="#ch20">Chapter 20</a> (a critical section is serialized — that is a serial fraction). &nbsp;·&nbsp; The last chapter
+taught you to <em>express</em> parallel work; this one asks the harder question — how much of it actually pays off, and what
+silently steals the rest.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch20">Chapter 20</a> — a critical section runs one thread at a time; if every thread
+must pass through the same lock, what happens to parallel speedup? (2) <a href="#ch03">Chapter 3</a> — a cache coherence protocol
+keeps one value per line consistent across cores; what must happen when one core writes a line another core holds? (3)
+<em>Predict:</em> eight threads each increment their <em>own</em> separate counter, a billion times. If the eight counters sit
+in one array (adjacent in memory) versus each padded onto its own 64-byte cache line, how much slower do you think the adjacent
+version runs — 1.1&times;, 2&times;, or 10&times;? Write your guess; &sect;26.4 measures it.</p>
+</aside>
+
+<p>Adding cores is supposed to make a program faster. Chapter 25 showed it does — up to a point, and then the curve bends. This
+chapter is about that ceiling and the two forces that push you well below it. The first ceiling is arithmetic and unavoidable:
+any part of the program that must run serially caps the whole thing, no matter how many cores you throw at it — that is
+<strong>Amdahl's law</strong> (&sect;26.1). Its optimistic counterpart, <strong>Gustafson's law</strong>, observes that in
+practice we grow the problem to fit the machine, which changes the accounting (&sect;26.2). Then the two silent killers, both of
+which turn &ldquo;add a core&rdquo; into &ldquo;go slower.&rdquo; <strong>Lock contention</strong>: when threads pile up on the
+same lock, the critical section becomes a serial bottleneck and scaling goes <em>negative</em> (&sect;26.3). And <strong>false
+sharing</strong>: two threads touching <em>different</em> variables that happen to share a cache line ping-pong that line between
+cores, paying coherence traffic for data they never actually share (&sect;26.4). We close the concurrency part by carrying
+forward a discipline: measure speedup honestly, and hunt the serial fraction (&sect;26.5).</p>
+
+<h2>26.1 Amdahl's law: the serial fraction is the ceiling</h2>
+
+<p>Suppose a fraction <em>s</em> of a program's runtime is inherently serial — it cannot be parallelized — and the remaining
+<em>1&nbsp;&minus;&nbsp;s</em> parallelizes perfectly across <em>P</em> processors. The parallel part shrinks to
+<em>(1&nbsp;&minus;&nbsp;s)/P</em>, but the serial part <em>s</em> does not move. So the speedup is</p>
+
+<pre><code>speedup(P) = 1 / ( s + (1 - s)/P )</code></pre>
+
+<p>This is <strong>Amdahl's law</strong> (Gene Amdahl, 1967). Its brutal consequence is the limit as <em>P&nbsp;&rarr;&nbsp;&infin;</em>:
+the <em>(1&nbsp;&minus;&nbsp;s)/P</em> term vanishes, and speedup tops out at <strong>1/<em>s</em></strong>. If 10% of your program
+is serial, the most you can ever get — with infinite cores — is 10&times;. Not 100&times;, not 1000&times;: ten. The serial
+fraction, not the core count, is the ceiling. Measure it: a compute-bound workload (no shared memory, so we isolate the serial
+fraction from the contention effects below) with a serial section of about 9% and the rest split across <em>P</em> threads (gcc
+11.4.0, <code>-O2 -pthread -lm</code>, this machine; illustrative):</p>
+
+<pre><code>measured serial fraction s = 0.089   (ceiling 1/s = 11.2x)
+P= 2 : speedup 2.01x   Amdahl predicts 1.84x
+P= 4 : speedup 3.20x   Amdahl predicts 3.16x
+P= 8 : speedup 4.58x   Amdahl predicts 4.93x
+P=16 : speedup 6.37x   Amdahl predicts 6.85x</code></pre>
+
+<p>The measured speedups track Amdahl's prediction closely and are visibly bending toward the 11.2&times; ceiling set by the
+9% serial part — sixteen threads bought only 6.4&times;, and no number of threads would break 11.2&times;. This reframes
+optimization: to make a parallel program scale, attack the <em>serial fraction</em> — the sequential setup, the single lock every
+thread passes through, the one-threaded merge at the end. Doubling cores helps less and less; shrinking <em>s</em> raises the
+ceiling for everyone. Amdahl's law is why &ldquo;we'll just add more cores&rdquo; is rarely the answer, and why profiling to find
+what is <em>not</em> parallel is the highest-leverage move.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Write Amdahl's law for speedup on <em>P</em> processors with serial fraction <em>s</em>. What is the limit as
+<em>P&nbsp;&rarr;&nbsp;&infin;</em>? If a program is 5% serial, what is the best possible speedup, and does buying a 128-core
+machine change that ceiling? (Answer after the next section.)</p>
+</aside>
+
+<h2>26.2 Gustafson's law: grow the problem with the machine</h2>
+
+<p>Amdahl's law fixes the <em>problem size</em> and asks how much faster a bigger machine runs it — a pessimistic framing, and for
+a fixed problem, an honest one. But John Gustafson (1988), working on a 1024-processor machine at Sandia, observed that people do
+not buy bigger machines to run the <em>same</em> problem faster; they buy them to run <em>bigger</em> problems in the same time.
+When you scale the problem up with the processor count, the serial part (setup, I/O) tends to stay roughly constant while the
+parallel part grows with the data. Under that assumption, <strong>Gustafson's law</strong> gives the <em>scaled</em> speedup:</p>
+
+<pre><code>scaled_speedup(P) = P - s*(P - 1)     (s = serial fraction of the scaled work)</code></pre>
+
+<p>This grows nearly linearly with <em>P</em> — no fixed ceiling — because as the problem grows, the parallel fraction grows too,
+and the constant serial part becomes a smaller share of a larger job. Gustafson reported over 1000-fold speedups on 1024
+processors precisely this way. The two laws are not contradictory; they answer different questions. <strong>Amdahl</strong> is
+<em>strong scaling</em>: fixed problem, more cores — the serial fraction caps you at 1/<em>s</em>. <strong>Gustafson</strong> is
+<em>weak scaling</em>: problem grows with cores — scaling stays near-linear. Which one governs depends on what you actually do
+when you get a bigger machine. If your problem size is fixed (render <em>this</em> frame, sort <em>this</em> file), Amdahl rules
+and you must attack the serial fraction. If it grows (train on more data, simulate a finer grid), Gustafson says throwing cores at
+a proportionally bigger problem keeps paying off. The practical lesson is to know which regime you are in before you reason about
+whether more cores will help.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: the serial fraction governs scaling</span>
+<p><strong>1. In words.</strong> For a fixed problem, speedup is capped by the serial fraction at 1/<em>s</em> (Amdahl) — the part
+that can't parallelize dominates as cores grow. If instead you grow the problem with the machine, the parallel part grows too and
+the constant serial part shrinks in relative terms, so speedup stays near-linear (Gustafson).</p>
+<p><strong>2. As a picture.</strong> Figure 26.1: the serial slice (dark) stays fixed while the parallel slice (light) shrinks as
+you add cores — Amdahl; or the parallel slice grows with the problem while the serial slice stays put — Gustafson.</p>
+<p><strong>3. As numbers.</strong> With <em>s</em>&nbsp;=&nbsp;0.089, Amdahl caps speedup at 11.2&times; (16 threads got 6.4&times;,
+tracking the prediction). Gustafson: <em>P</em>&nbsp;&minus;&nbsp;<em>s</em>(<em>P</em>&minus;1) at <em>P</em>&nbsp;=&nbsp;16 with
+the same <em>s</em> is 14.7&times; — near-linear, because the work grew with the cores.</p>
+</aside>
+
+<p><em>(Answer to the &sect;26.1 quick check: speedup(<strong>P</strong>)&nbsp;=&nbsp;1/(<strong>s</strong>&nbsp;+&nbsp;(1&minus;<strong>s</strong>)/<strong>P</strong>);
+as <strong>P&nbsp;&rarr;&nbsp;&infin;</strong> it approaches 1/<strong>s</strong>. At 5% serial the ceiling is 1/0.05&nbsp;=&nbsp;20&times;, and a
+128-core machine cannot beat it — the serial fraction, not the core count, sets the limit.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 210" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">Amdahl (fixed problem): the serial slice stays fixed; only the parallel slice shrinks with more cores.</text>
+<text x="20" y="44" font-size="9" fill="#14406b">P = 1</text>
+<rect x="70" y="34" width="60" height="20" fill="#14406b"/><rect x="130" y="34" width="360" height="20" fill="#cfe0ef" stroke="#14406b"/>
+<text x="500" y="49" font-size="9">serial + parallel</text>
+<text x="20" y="74" font-size="9" fill="#14406b">P = 4</text>
+<rect x="70" y="64" width="60" height="20" fill="#14406b"/><rect x="130" y="64" width="90" height="20" fill="#cfe0ef" stroke="#14406b"/>
+<text x="230" y="79" font-size="9">parallel/4 — serial unchanged</text>
+<text x="20" y="104" font-size="9" fill="#14406b">P = &#8734;</text>
+<rect x="70" y="94" width="60" height="20" fill="#14406b"/><rect x="130" y="94" width="6" height="20" fill="#cfe0ef" stroke="#14406b"/>
+<text x="150" y="109" font-size="9">parallel &#8594; 0, but serial floor remains: speedup &#8594; 1/s</text>
+<line x1="70" y1="122" x2="130" y2="122" stroke="#8c3a1d"/><text x="72" y="134" font-size="8" fill="#8c3a1d">this width never shrinks</text>
+<text x="16" y="164" font-size="9" fill="#8c3a1d">Gustafson (grow the problem): the parallel slice grows with P while the serial slice stays put — near-linear scaling.</text>
+<rect x="70" y="176" width="60" height="16" fill="#14406b"/><rect x="130" y="176" width="120" height="16" fill="#cfe0ef" stroke="#14406b"/>
+<rect x="70" y="176" width="0" height="0"/><text x="260" y="188" font-size="9" fill="#14406b">bigger P &#8594; wider parallel slice, same serial slice</text>
+</svg>
+<figcaption>Figure 26.1: Amdahl vs Gustafson. Under Amdahl (fixed problem) the serial slice is a fixed floor, so speedup approaches
+1/<em>s</em> no matter how many cores divide the parallel slice. Under Gustafson (problem grows with the machine) the parallel
+slice grows while the serial slice stays constant, so scaled speedup stays near-linear.</figcaption>
+</figure>
+
+<h2>26.3 Contention: the critical section is a serial fraction</h2>
+
+<p>Amdahl's serial fraction is often not an explicit sequential block — it is <em>hidden inside a lock</em>. A critical section
+runs one thread at a time (Chapter 20), so if every thread must pass through the same lock on every operation, that lock <em>is</em>
+the serial fraction, and Amdahl's ceiling applies to it. Worse, contention does not merely fail to speed up — it can make the
+program <em>slower</em> as you add threads, because the lock itself becomes a contended cache line that bounces between cores, and
+threads spend their time waiting and handing off rather than working. Measure the extreme case: many threads incrementing one
+shared counter, each increment under one global mutex (gcc 11.4.0, <code>-O2 -pthread</code>, this machine):</p>
+
+<pre><code>one global mutex, 40M increments total:
+P= 1 : 1.80 s   speedup 1.00x
+P= 2 : 5.42 s   speedup 0.33x
+P= 4 : 5.52 s   speedup 0.33x
+P= 8 : 7.06 s   speedup 0.26x</code></pre>
+
+<p>Adding threads made it <em>nearly three times slower</em>, not faster. This is <strong>negative scaling</strong>: the entire
+work is inside the critical section, so it is 100% serial (Amdahl ceiling 1&times;), and on top of that the lock's cache line
+ping-pongs among the contending cores, adding coherence overhead that grows with <em>P</em>. The lesson is that a lock on a hot
+path is a scalability tax, and the fixes are all about <em>shrinking or removing the serial fraction</em>: make the critical
+section smaller (hold the lock for less), shard the state so threads touch different locks (per-thread or per-bucket counters
+combined at the end), or use a lock-free structure (Chapter 23) or per-thread accumulation to remove the shared write entirely.
+&ldquo;Just add threads&rdquo; applied to a contended lock is how you make a program slower and call it optimization.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>Why is a lock on a hot path a &ldquo;serial fraction&rdquo; in Amdahl's sense? Explain how adding threads to a single-mutex
+counter can make it <em>slower</em>, not just fail to speed up — name what physically bounces between cores. Give one fix that
+shrinks the serial fraction. (Answer below the communicate box.)</p>
+</aside>
+
+<h2>26.4 False sharing: contention you did not write</h2>
+
+<p>The most insidious scalability bug involves no shared variable at all. Recall from Chapter 3 that cache coherence operates at
+the granularity of a <strong>cache line</strong> — 64 bytes on this machine, not one variable. When one core writes any byte of a
+line, the coherence protocol invalidates that line in every other core's cache; a core that then reads or writes its own,
+<em>different</em> variable in the same line must re-fetch the whole line. So if two threads update two <em>independent</em>
+variables that happen to land in the same 64-byte line, every update by one invalidates the other's cache, and the line
+ping-pongs between cores on every write — the threads pay the full cost of sharing a variable while sharing nothing. This is
+<strong>false sharing</strong>. Measure it: eight threads, each incrementing its own counter 200 million times, with the eight
+counters packed adjacently in an array (they fall in the same one or two lines) versus each padded to its own 64-byte line (gcc
+11.4.0, <code>-O2 -pthread</code>, this machine, 64-byte lines):</p>
+
+<pre><code>packed (false sharing) : 2.56 s
+padded (own cache line): 0.25 s
+false sharing slowdown : ~10x</code></pre>
+
+<p>The <em>same</em> arithmetic ran about <strong>ten times slower</strong> purely because the counters shared cache lines. No
+variable is shared between threads; the bug is entirely in the memory layout. The fix is to <strong>pad and align</strong> hot
+per-thread data so each thread's data owns its own cache line — the padded version's per-counter struct is exactly 64 bytes. This
+is the same mechanical-sympathy discipline as Chapter 3 and 5: layout is performance. False sharing is especially dangerous
+because it is invisible in the source — the code looks embarrassingly parallel and correct, and it <em>is</em> correct; it is just
+slow, and profilers that don't attribute cache-coherence stalls can hide it. Whenever independent threads write to nearby memory —
+adjacent array slots, fields of a shared struct, a counters table — suspect false sharing and check the line layout.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: false sharing — independent data colliding on one cache line (correct but 10&times; slow)</span>
+<p>You split a counter into one slot per thread precisely to avoid contention: <code>long counts[NUM_THREADS];</code>, each
+thread touches only <code>counts[my_id]</code>. There is no shared variable, no data race, the code is correct — and it is
+several times slower than you expect and gets <em>worse</em> as you add threads. The reason is that <code>counts</code> is a
+dense array, so eight <code>long</code>s fit in one or two 64-byte cache lines, and every thread's write to its own slot
+invalidates the whole line in every other thread's cache — the line ping-pongs between cores on every increment. The threads
+share a cache line even though they share no data, so they pay the full coherence cost of true sharing. The tell is that padding
+each slot to its own line — <code>struct { long v; char pad[56]; } counts[NUM_THREADS];</code>, or C11
+<code>alignas(64)</code> / <code>__attribute__((aligned(64)))</code> — makes the slowdown vanish (the &sect;26.4 measurement
+went from 2.56&nbsp;s to 0.25&nbsp;s). The discipline: hot, frequently-written per-thread data must not share a cache line with
+another thread's hot data; align it to the line size, and be suspicious of any &ldquo;per-thread&rdquo; array of small elements.
+It is a correctness-preserving performance bug, which is why it survives testing and hides in production.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate says: &ldquo;I parallelized the histogram: each of the 8 threads owns one entry of a
+<code>long hist[8]</code> array, so there's no lock and no shared variable — but with 8 threads it's barely faster than 1, and
+with 16 it's actually slower. The threads are totally independent, so I don't get it.&rdquo; Cover the paragraph and respond in
+four or five sentences, drawing on &sect;26.3&ndash;&sect;26.4.</p>
+<p><em>Model answer.</em> &ldquo;The threads are independent in the source but not in the cache: those eight
+<code>long</code>s sit in one 64-byte cache line, so every increment by any thread invalidates that line in every other core, and
+the line ping-pongs between cores on every write — that's false sharing, and it costs as much as truly sharing the variable.
+Nothing is wrong with correctness; the bug is the memory layout. Pad each counter onto its own cache line — an
+<code>alignas(64)</code> struct per thread, or 64 bytes of stride — and the slowdown disappears; in a similar test that took a
+per-counter workload from ~2.5&nbsp;s to ~0.25&nbsp;s. Adding a sixteenth thread made it worse because you added another core
+fighting over the same line, more coherence traffic, not more work done. The rule is that hot per-thread data must own its cache
+line.&rdquo; Naming false sharing, the 64-byte line, and the padding fix — and distinguishing it from a correctness bug — is the
+senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;26.3 quick check: a lock serializes its critical section — one thread at a time — so a lock every
+thread passes through on the hot path is a serial fraction, and Amdahl caps speedup at 1 over that fraction. Adding threads makes
+it slower because the lock's own <strong>cache line</strong> bounces between the contending cores (coherence traffic) and threads
+spend time waiting and handing off rather than working, so overhead grows with <strong>P</strong>. A fix that shrinks the serial fraction:
+shard the state into per-thread or per-bucket counters combined at the end, or shrink/remove the critical section with a lock-free
+or per-thread approach.)</em></p>
+
+<h2>26.5 What to carry forward</h2>
+
+<p>Parallel speedup has a ceiling, and it is set by the part that does <em>not</em> parallelize. <strong>Amdahl's law</strong>
+— speedup(<em>P</em>)&nbsp;=&nbsp;1/(<em>s</em>&nbsp;+&nbsp;(1&minus;<em>s</em>)/<em>P</em>) — says a fixed problem with serial
+fraction <em>s</em> tops out at 1/<em>s</em> no matter how many cores you add (our 9%-serial workload bent toward 11.2&times; and
+16 threads got only 6.4&times;). <strong>Gustafson's law</strong> — <em>P</em>&nbsp;&minus;&nbsp;<em>s</em>(<em>P</em>&minus;1) —
+answers the other question: grow the problem with the machine and scaling stays near-linear, because the parallel work grows while
+the serial part stays constant. Strong scaling (fixed problem) is Amdahl; weak scaling (growing problem) is Gustafson; know which
+you are in. Two forces push you below even Amdahl's ceiling. <strong>Lock contention</strong> turns a hot lock into a serial
+fraction <em>and</em> a bouncing cache line, so adding threads can go <em>negative</em> — our single-mutex counter went from
+1.8&nbsp;s at one thread to 7.1&nbsp;s at eight. <strong>False sharing</strong> makes independent threads collide on a shared
+64-byte cache line, paying the full cost of sharing while sharing nothing — our packed counters ran ~10&times; slower than the
+padded ones, fixed by aligning hot per-thread data to its own line.</p>
+
+<p>This closes the concurrency and parallelism part, and with it Volume 1's tour of how the machine really behaves. The through-line
+of the whole part has been a single, unforgiving fact: the abstract machine's simple, sequential, single-memory model is not what
+runs, and every gap between the model and the metal — reordering, the store buffer, the coherence protocol, the cost of a thread,
+the serial fraction hiding in a lock — is where concurrency's bugs and slowdowns live. You now hold the full shared-memory
+toolkit: threads and their hazards (Chapter 15), locks and condition variables (Chapters 20&ndash;21), atomics and lock-free
+structures (Chapters 22&ndash;23), the memory model that says when a write is visible (Chapter 24), the pool-and-task machinery
+that structures parallel work (Chapter 25), and now the scalability laws that tell you how much of it pays off. Every one of these
+correctness properties you have had to prove by hand and hold in your head — which data is shared, which access needs a lock,
+which ordering an atomic requires, whether padding avoids false sharing. The next part turns to a language built to encode those
+very invariants in its type system, so that data-race freedom and memory safety become properties the compiler checks rather than
+disciplines you maintain: Rust, and it begins with the idea beneath all of it — ownership.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>State Amdahl's law and its 1/<em>s</em> limit, and explain why the serial fraction — not the core count — is the ceiling.</li>
+<li>State Gustafson's law and explain how it answers a different question (weak vs strong scaling).</li>
+<li>Explain why a hot lock is a serial fraction and how contention can make a program slower as threads are added.</li>
+<li>Define false sharing, name the granularity (the 64-byte cache line) that causes it, and give the padding/alignment fix.</li>
+<li>Given a scaling problem, say whether to suspect the serial fraction, lock contention, or false sharing, and why.</li>
+<li>Explain why false sharing is a correctness-preserving performance bug that hides in testing.</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> State Amdahl's law and its limit as <em>P&nbsp;&rarr;&nbsp;&infin;</em>; what does it imply about a
+5%-serial program? (&sect;26.1)</li>
+<li><strong>R2.</strong> State Gustafson's law and explain how it differs from Amdahl (weak vs strong scaling). (&sect;26.2)</li>
+<li><strong>R3.</strong> Why is a hot lock a serial fraction, and how can contention cause negative scaling? (&sect;26.3)</li>
+<li><strong>R4.</strong> What is false sharing, what granularity causes it, and what is the fix? (&sect;26.4)</li>
+<li><strong>R5.</strong> Contrast lock contention and false sharing — what is actually shared in each? (&sect;26.3&ndash;&sect;26.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Amdahl, &ldquo;Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities,&rdquo;
+<em>AFIPS Conference Proceedings</em>, vol. 30 (1967), pp. 483&ndash;485, DOI 10.1145/1465482.1465560.</strong> The original
+statement of the serial-fraction ceiling of &sect;26.1. First author Gene M. Amdahl; verified via dblp and the ACM Digital
+Library.</li>
+<li><strong>Gustafson, &ldquo;Reevaluating Amdahl's Law,&rdquo; <em>Communications of the ACM</em> 31(5):532&ndash;533 (1988),
+DOI 10.1145/42411.42415.</strong> The scaled-speedup (weak-scaling) rejoinder of &sect;26.2, from the 1024-processor experiments
+at Sandia. First author John L. Gustafson; verified via the ACM Digital Library.</li>
+<li><strong>Hill &amp; Marty, &ldquo;Amdahl's Law in the Multicore Era,&rdquo; <em>IEEE Computer</em> 41(7):33&ndash;38 (2008),
+DOI 10.1109/MC.2008.209.</strong> Amdahl's law applied to multicore chip design — how the serial fraction shapes core-count
+trade-offs. First author Mark D. Hill; verified via IEEE Xplore.</li>
+<li><strong>Drepper, &ldquo;What Every Programmer Should Know About Memory&rdquo; (2007, Red Hat; freely available online).</strong>
+Section 6 covers false sharing and cache-line effects behind &sect;26.4 in depth. A technical whitepaper (no DOI); widely cited
+reference, verify the current PDF.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex26.1"><span class="ex-label">26.1</span> <span class="ex-tag warm">warm-up</span>
+Write Amdahl's law for speedup on <em>P</em> processors with serial fraction <em>s</em>, and state its limit as
+<em>P&nbsp;&rarr;&nbsp;&infin;</em>.</div>
+
+<div class="exercise" id="ex26.2"><span class="ex-label">26.2</span> <span class="ex-tag warm">warm-up</span>
+Define <em>false sharing</em> in one sentence, and name the memory granularity (and its size on a typical x86 machine) that causes
+it.</div>
+
+<div class="exercise" id="ex26.3"><span class="ex-label">26.3</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, why is a lock that every thread passes through on the hot path a &ldquo;serial fraction&rdquo; in Amdahl's
+sense?</div>
+
+<div class="exercise" id="ex26.4"><span class="ex-label">26.4</span> <span class="ex-tag core">core</span>
+A program is 20% serial. (a) Compute the best possible speedup with infinite cores. (b) Compute the actual speedup with
+<em>P</em>&nbsp;=&nbsp;4 and <em>P</em>&nbsp;=&nbsp;16 from Amdahl's law. (c) Going from 4 to 16 cores quadruples the hardware —
+by what factor does the speedup actually improve, and what does that say about &ldquo;just add cores&rdquo;?</div>
+
+<div class="exercise" id="ex26.5"><span class="ex-label">26.5</span> <span class="ex-tag core">core</span>
+Explain, in Amdahl's terms, why the single-mutex counter of &sect;26.3 exhibited <em>negative</em> scaling (1.80&nbsp;s at one
+thread, 7.06&nbsp;s at eight). (a) What is the serial fraction of that workload? (b) Beyond the serial fraction, what extra cost
+grows with the number of threads, and what physically causes it? (c) Give two distinct fixes and say what each does to the serial
+fraction.</div>
+
+<div class="exercise" id="ex26.6"><span class="ex-label">26.6</span> <span class="ex-tag core">core</span>
+Two threads each increment their own <code>long</code> counter a billion times. Version A stores them as <code>long c[2];</code>;
+version B pads each onto its own 64-byte cache line. (a) Which is faster and by roughly how much (cite the &sect;26.4 result), and
+why — what happens to the cache line on each write? (b) Confirm there is no data race or shared variable in either version. (c)
+Show the padding fix in code (a struct with padding, or an alignment attribute).</div>
+
+<div class="exercise" id="ex26.7"><span class="ex-label">26.7</span> <span class="ex-tag complexity">cost</span>
+For a workload with serial fraction <em>s</em> and perfectly parallel remainder: (a) Derive the efficiency
+<em>speedup(P)/P</em> as a function of <em>s</em> and <em>P</em>, and explain why efficiency falls as <em>P</em> grows for any
+<em>s</em>&nbsp;&gt;&nbsp;0. (b) At what point does buying more cores stop being cost-effective, in terms of efficiency? (c)
+Contrast this with Gustafson's regime: why can efficiency stay high under weak scaling even though Amdahl's efficiency falls?</div>
+
+<div class="exercise" id="ex26.8"><span class="ex-label">26.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A parallel word-count gives each of 8 threads a slot in <code>long counts[8]</code>
+to tally its chunk. It is correct but barely faster than single-threaded, and adding threads makes it worse.
+<br><strong>Step 1 (given):</strong> There is no lock and no shared variable — each thread writes only <code>counts[my_id]</code>,
+so it is not lock contention.
+<br><strong>Step 2 (given):</strong> The eight <code>long</code>s occupy 64 bytes — one cache line — so all eight slots live on
+the same line.
+<br><strong>Step 3 (given):</strong> Each thread's write invalidates that line in every other core's cache, so the line
+ping-pongs between cores on every increment.
+<br><strong>Step 4 (you):</strong> Name the phenomenon, explain why more threads make it worse, and give the precise fix
+(including how you would lay out or align the counters), citing what the &sect;26.4 measurement showed the fix is worth.</div>
+
+<div class="exercise" id="ex26.9"><span class="ex-label">26.9</span> <span class="ex-tag mixed">mixed</span>
+For each scaling problem, name the most likely cause — <em>serial fraction (Amdahl)</em>, <em>lock contention</em>, or <em>false
+sharing</em> — and one diagnostic that would confirm it: (a) speedup plateaus at ~10&times; regardless of cores, with no lock on
+the hot path; (b) throughput <em>drops</em> as threads are added, and a profiler shows most time in <code>pthread_mutex_lock</code>;
+(c) an embarrassingly parallel loop over a per-thread results array barely scales, with no locks anywhere; (d) a single-threaded
+merge at the end takes a fixed 2 seconds no matter how fast the parallel phase runs.</div>
+
+<div class="exercise" id="ex26.10"><span class="ex-label">26.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 20, 23, and 26, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;With
+enough cores, any parallel program can reach arbitrarily high speedup.&rdquo; (b) &ldquo;Gustafson's law contradicts Amdahl's
+law.&rdquo; (c) &ldquo;False sharing is a data race.&rdquo; (d) &ldquo;A lock on the hot path can make a program slower as you add
+threads.&rdquo; (e) &ldquo;Padding per-thread counters to separate cache lines changes the program's results.&rdquo;</div>
+
+<div class="exercise" id="ex26.11"><span class="ex-label">26.11</span> <span class="ex-tag stretch">stretch</span>
+Amdahl and Gustafson give different answers because they hold different things fixed. (a) Show algebraically that if you fix the
+problem size and let <em>P</em> grow, Amdahl's 1/<em>s</em> ceiling follows; if instead you fix the <em>time</em> and grow the
+problem with <em>P</em>, Gustafson's near-linear scaled speedup follows. (b) A team reports &ldquo;linear speedup to 1000
+cores&rdquo; on their simulation. Explain how that can be true under Gustafson yet not contradict Amdahl, and what question you
+would ask to tell which regime they measured. (c) Connect this to Chapter 25's span bound
+<em>O</em>(<em>T</em><sub>1</sub>/<em>P</em>&nbsp;+&nbsp;<em>T</em><sub>&infin;</sub>): how is the span like Amdahl's serial
+fraction?</div>
+
+<div class="exercise" id="ex26.12"><span class="ex-label">26.12</span> <span class="ex-tag lab">lab</span>
+On your own machine: (a) build a workload with a tunable serial fraction (a fixed serial section plus a parallel section split
+across <em>P</em> threads), measure speedup for <em>P</em>&nbsp;=&nbsp;1,&nbsp;2,&nbsp;4,&nbsp;8,&nbsp;16, and compare to Amdahl's
+prediction for your measured <em>s</em>. (b) Increment one shared counter under a single mutex with 1,&nbsp;2,&nbsp;4,&nbsp;8
+threads and observe whether scaling goes negative. (c) Have <em>N</em> threads each increment their own counter a billion times,
+packed in an array versus padded to 64-byte lines, and report the false-sharing slowdown. Label your CPU (and its cache-line
+size) and note that the numbers are hardware-dependent.</div>
+
+</section>
+</section>

@@ -1,0 +1,394 @@
+<section class="chapter" id="ch27">
+<h1>Chapter 27 — Ownership and Moves</h1>
+
+<p class="chapter-nav"><strong>Before you start:</strong> <a href="#ch08">Chapter 8</a> (the stack and the heap — ownership is
+about who is responsible for heap memory), <a href="#ch09">Chapter 9</a> (<code>malloc</code>/<code>free</code> and what goes
+wrong — use-after-free, double-free, leaks are exactly what ownership prevents), <a href="#ch24">Chapter 24</a> (a data race is
+undefined behavior — the memory model you had to obey by hand, a type system can enforce), <a href="#ch10">Chapter 10</a>
+(undefined behavior and the optimizing compiler — the failure mode ownership rules out). &nbsp;·&nbsp; This chapter opens the
+Rust part; every hazard the C parts made you track by hand, Rust encodes as a rule the compiler checks — and it all rests on
+one idea: ownership.</p>
+
+<aside class="recall">
+<span class="box-title">Before you read on</span>
+<p>From memory, reaching back: (1) <a href="#ch09">Chapter 9</a> — what are the three classic bugs of manual
+<code>malloc</code>/<code>free</code> memory management, and which one does calling <code>free</code> twice on the same pointer
+cause? (2) <a href="#ch08">Chapter 8</a> — when does a stack variable's storage get reclaimed, and does the compiler need you to
+say so? (3) <em>Predict:</em> in C, you write <code>char *t = s;</code> then <code>free(s)</code> then use <code>t</code> and
+<code>free(t)</code>. Does that <em>compile</em>? Does it <em>run</em> correctly? In Rust, the closest equivalent —
+<code>let t = s;</code> then using <code>s</code> — will the compiler accept it? Write your guesses; &sect;27.1 and &sect;27.3
+answer all three.</p>
+</aside>
+
+<p>A note on this part before we begin. The C parts of this book gave you no safety net on purpose: you allocated and freed by
+hand, reasoned about lifetimes yourself, and proved data-race freedom by careful thought (Chapter 24). Rust keeps the same
+low-level control — no garbage collector, the same machine model, predictable performance — but moves those proofs into the type
+system, so the compiler rejects the programs you would otherwise have to keep correct by discipline. The engine of that is
+<strong>ownership</strong>, and this chapter is only about ownership and its most surprising consequence, <strong>moves</strong>.
+First, the problem ownership solves — the manual-memory bugs of Chapter 9, shown in real C that compiles and then crashes
+(&sect;27.1). Then the three <strong>ownership rules</strong> and how &ldquo;dropped when the owner goes out of scope&rdquo; gives
+automatic, deterministic cleanup with no GC (&sect;27.2). Then <strong>move semantics</strong>: assigning or passing a value
+transfers ownership and <em>invalidates the source</em>, so use-after-move is a compile error, not a runtime crash (&sect;27.3).
+Then ownership across function boundaries, and a first glimpse of why this same rule makes data races impossible (&sect;27.4). We
+close by carrying ownership forward toward borrowing — the way to use a value without taking ownership (&sect;27.5).</p>
+
+<p><strong>On the code in this part.</strong> The book's environment has a C toolchain (gcc 11.4.0) but <em>no Rust compiler
+installed</em>, so the C programs below were compiled and run and their output is real, whereas the Rust snippets were
+<em>not</em> compiled here; their behavior and the quoted compiler diagnostics are drawn from <em>The Rust Programming
+Language</em> (Klabnik &amp; Nichols, 2nd ed., 2023) and the official Rust documentation, and are labeled as such. Nothing about
+Rust's behavior below is invented — it is cited.</p>
+
+<h2>27.1 The problem ownership solves</h2>
+
+<p>Recall the three failure modes of manual memory management from Chapter 9: <strong>use-after-free</strong> (touching memory
+you already returned), <strong>double-free</strong> (returning the same block twice), and <strong>leaks</strong> (never returning
+it). All three come from the same root: in C, freeing memory is decoupled from any notion of <em>who owns it</em>, so nothing
+stops two pointers from aliasing one block and both trying to manage it. Here is the bug in real C — it compiles cleanly with no
+warning, and then aborts at run time (gcc 11.4.0, <code>-O2</code>, Linux 6.18):</p>
+
+<pre><code>char *s = malloc(16);
+strcpy(s, "hello");
+char *t = s;          /* alias: t and s point at the SAME buffer */
+free(s);              /* one "owner" frees it */
+printf("%s\n", t);    /* use-after-free through t  — undefined behavior */
+free(t);              /* double free */
+
+$ gcc -O2 usefree.c -o usefree      # compiles, exit 0, no warning
+$ ./usefree
+free(): double free detected in tcache 2
+Aborted (core dumped)               # exit 134 (SIGABRT)</code></pre>
+
+<p>The compiler accepted it — the aliasing and the second <code>free</code> are invisible to the C type system — and the program
+died at run time (a lucky outcome; use-after-free often <em>silently</em> corrupts instead). The root cause is that
+<code>s</code> and <code>t</code> both claim the right to free the same buffer, and C has no way to express that only one of them
+should. Rust's answer is to make <em>ownership</em> a first-class, compiler-enforced concept: every value has exactly one owner,
+responsibility for freeing follows the owner, and the type system tracks it. The promise is <strong>memory safety without a
+garbage collector</strong> — the same manual, predictable, no-runtime layout as C, but with use-after-free, double-free, and
+leaks of owned memory ruled out at compile time. That the guarantee is real, not just a convention, was established formally by
+the RustBelt project (Jung et al., 2018), which gave a machine-checked safety proof for a realistic subset of the language. The
+rest of this chapter is how the rule works.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In the C snippet, name the two distinct bugs that occur once <code>t</code> aliases <code>s</code> and <code>s</code> is
+freed. Why can the C compiler not catch either? State Rust's one-sentence promise about memory safety and the garbage collector.
+(Answer after the next section.)</p>
+</aside>
+
+<h2>27.2 The ownership rules and drop</h2>
+
+<p>Rust's model is three rules, stated in <em>The Rust Programming Language</em> (Klabnik &amp; Nichols, 2023, ch. 4):</p>
+
+<pre><code>1. Each value in Rust has an owner.
+2. There can only be one owner at a time.
+3. When the owner goes out of scope, the value is dropped.</code></pre>
+
+<p>&ldquo;Dropped&rdquo; means Rust automatically runs cleanup — for a heap-owning type like <code>String</code>, its
+<code>drop</code> frees the heap buffer — at the exact point the owning variable's scope ends. This is <strong>RAII</strong>
+(resource acquisition is initialization, the C++ idea from Chapter 12's arena discussion): cleanup is tied to scope, not to a
+manual call. Because there is exactly <em>one</em> owner (rule 2), the buffer is freed exactly <em>once</em> (rule 3) — no
+double-free — and because drop is automatic at end of scope, it is never forgotten — no leak of owned memory. Consider (Rust;
+not compiled here — behavior per the cited book):</p>
+
+<pre><code>{
+    let s = String::from("hello");   // s owns a heap buffer
+    // ... use s ...
+}                                    // s goes out of scope here: Rust calls drop(s),
+                                     // which frees the buffer — automatically, exactly once</code></pre>
+
+<p>No <code>free</code> call appears, yet the memory is released deterministically at the closing brace — not by a garbage
+collector scanning the heap later, but by a <code>drop</code> the compiler inserts at compile time, at a place you can point to
+in the source. This is the crucial difference from a GC language: the cleanup is <em>deterministic</em> and has the same
+performance characteristics as the manual <code>free</code> you would have written in C, without your having to write it or risk
+forgetting it. Ownership turns &ldquo;remember to free exactly once, at the right time&rdquo; — a discipline you maintained by
+hand and sometimes got wrong — into a property of the program's structure that the compiler guarantees. The single-owner rule is
+what makes it sound; the next section shows the price it extracts, which is that ordinary assignment does not mean what it means
+in C.</p>
+
+<aside class="threeways">
+<span class="box-title">The same idea three ways: one owner frees exactly once, automatically</span>
+<p><strong>1. In words.</strong> Every value has exactly one owner; when the owner's scope ends, the value is dropped (its
+resources freed). One owner means one free — no double-free — and automatic drop means no forgotten free — no leak — all decided
+at compile time, with no garbage collector.</p>
+<p><strong>2. As a picture.</strong> Figure 27.1: a <code>String</code> value is a small stack record (pointer, length,
+capacity) owning a heap buffer; when the owning variable leaves scope, <code>drop</code> frees the buffer — one arrow, one
+free.</p>
+<p><strong>3. As numbers/contrast.</strong> The C snippet of &sect;27.1 has two pointers to one buffer and calls
+<code>free</code> twice &rarr; abort. The Rust equivalent has one owner and one automatic drop &rarr; freed once; the aliasing
+that caused the double-free cannot even be written (see &sect;27.3).</p>
+</aside>
+
+<p><em>(Answer to the &sect;27.1 quick check: once <code>t</code> aliases <code>s</code> and <code>s</code> is freed, using
+<code>t</code> is a <strong>use-after-free</strong> and the second <code>free(t)</code> is a <strong>double-free</strong>. The C
+compiler cannot catch either because its type system does not track ownership or lifetimes — a pointer carries no information
+about whether the memory it points to is still valid or who is responsible for freeing it. Rust's promise: memory safety —
+no use-after-free, double-free, or leak of owned memory — with no garbage collector, enforced at compile time.)</em></p>
+
+<figure>
+<svg viewBox="0 0 640 190" font-family="DejaVu Sans, sans-serif" font-size="11">
+<text x="16" y="16" fill="#14406b">A String owner: a small stack record owning one heap buffer; drop frees it once at end of scope.</text>
+<rect x="40" y="40" width="170" height="86" fill="#f5f8fb" stroke="#14406b"/><text x="50" y="34" font-size="9" fill="#14406b">stack: variable s (the owner)</text>
+<rect x="55" y="52" width="140" height="18" fill="#eef" stroke="#14406b"/><text x="62" y="65" font-size="9">ptr &#8594;</text>
+<rect x="55" y="74" width="140" height="18" fill="#eef" stroke="#14406b"/><text x="62" y="87" font-size="9">len = 5</text>
+<rect x="55" y="96" width="140" height="18" fill="#eef" stroke="#14406b"/><text x="62" y="109" font-size="9">capacity = 5</text>
+<rect x="360" y="52" width="230" height="40" fill="#fdeee6" stroke="#8c3a1d"/><text x="368" y="46" font-size="9" fill="#8c3a1d">heap buffer (owned)</text>
+<text x="372" y="76" font-size="10">'h' 'e' 'l' 'l' 'o'</text>
+<line x1="195" y1="61" x2="360" y2="70" stroke="#14406b" marker-end="url(#a)"/>
+<text x="230" y="56" font-size="8" fill="#14406b">owns</text>
+<text x="40" y="150" font-size="9" fill="#8c3a1d">End of s's scope &#8594; Rust inserts drop(s) &#8594; heap buffer freed exactly once (no GC, deterministic).</text>
+<text x="40" y="168" font-size="9" fill="#14406b">One owner (rule 2) &#8594; one free (rule 3). A second owner would mean a second free — which moves forbid.</text>
+<defs><marker id="a" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#14406b"/></marker></defs>
+</svg>
+<figcaption>Figure 27.1: A <code>String</code> owner. The stack record (pointer, length, capacity) owns a heap buffer; when the
+owning variable leaves scope, the compiler-inserted <code>drop</code> frees the buffer exactly once. One owner means one free —
+the structural reason double-frees and leaks of owned memory cannot occur.</figcaption>
+</figure>
+
+<h2>27.3 Moves: assignment transfers ownership</h2>
+
+<p>Here is where Rust departs sharply from C and even C++. In C, <code>char *t = s;</code> copies the pointer, giving two
+pointers to one buffer — the aliasing that caused &sect;27.1's double-free. Rust cannot allow that, because two owners would mean
+two drops. So for a heap-owning type, assignment is a <strong>move</strong>: it transfers ownership to the destination and
+<em>invalidates the source</em>. After the move the source is no longer a valid owner, and any use of it is a compile error.
+Consider (Rust; not compiled here — diagnostic quoted from the cited documentation):</p>
+
+<pre><code>let s1 = String::from("hello");
+let s2 = s1;            // MOVE: ownership transfers from s1 to s2; s1 is now invalid
+println!("{s1}");       // error: use of moved value
+
+error[E0382]: borrow of moved value: `s1`
+  = note: move occurs because `s1` has type `String`, which does not implement the `Copy` trait</code></pre>
+
+<p>The program does not compile: after <code>let s2 = s1;</code>, the value has moved, so <code>s1</code> is dead and touching it
+is rejected at compile time with error <code>E0382</code>. This is the whole game. The C double-free of &sect;27.1 is
+<em>unwriteable</em> in Rust: the moment you make a second binding, the first stops being an owner, so there is never a moment
+when two owners could both free. The bug that compiled-and-crashed in C is caught before the program ever runs — and note that
+this is a <em>compile-time</em> rejection, costing nothing at run time. Two refinements complete the picture. If you genuinely
+want two independent copies, you ask for one explicitly with <code>.clone()</code>, which allocates a new buffer and deep-copies
+— now there are two owners of two <em>separate</em> buffers, each dropped once. And small values that live entirely on the stack
+— integers, <code>bool</code>, <code>char</code>, and tuples of them — implement the <code>Copy</code> trait, so
+<code>let y = x;</code> <em>copies</em> them instead of moving (there is no heap buffer to double-free, so copying is safe and
+cheap); <code>x</code> stays usable. The rule of thumb: values that own a resource move; plain stack data copies.</p>
+
+<aside class="recall">
+<span class="box-title">Quick check</span>
+<p>In Rust, after <code>let s2 = s1;</code> where <code>s1</code> is a <code>String</code>, what is the status of
+<code>s1</code>, and what happens if you use it? Why does the same pattern work fine for <code>let y = x;</code> when
+<code>x</code> is an <code>i32</code>? How do you get two independent <code>String</code>s from one? (Answer below the communicate
+box.)</p>
+</aside>
+
+<h2>27.4 Ownership across functions, and a first look at safety</h2>
+
+<p>Ownership follows the same move rule across function boundaries: passing a value to a function <em>moves</em> it into the
+function (unless the type is <code>Copy</code>), so the caller can no longer use it; returning a value moves ownership back out.
+This makes the flow of responsibility explicit in the signatures (Rust; not compiled here — behavior per the cited book):</p>
+
+<pre><code>fn consume(s: String) {           // s is moved IN; consume now owns it
+    println!("{s}");
+}                                 // s dropped here — buffer freed
+
+let a = String::from("hi");
+consume(a);                       // a is MOVED into consume
+// println!("{a}");               // error[E0382]: a was moved, no longer valid</code></pre>
+
+<p>If a function needs a value but should not take ownership, moving it in and out by value is clumsy — which is exactly the
+motivation for <em>borrowing</em>, the subject of the next chapters: a way to lend access without transferring ownership. But
+ownership already buys something profound beyond memory safety. Because a moved-from value is dead, and because there is only ever
+one owner, ownership controls <em>aliasing</em> — and aliasing plus mutation is the root of both memory-corruption bugs and data
+races (Chapter 24). A taste: when you hand a value to another thread, Rust <em>moves</em> it there, so the original thread can no
+longer touch it — two threads cannot both own and mutate the same value by accident, which is the beginning of how Rust makes
+data races a compile error rather than the undefined behavior you had to prevent by hand in Chapter 24. The full story needs
+borrowing and the <code>Send</code>/<code>Sync</code> traits, developed in the chapters ahead. The point to hold now is that
+ownership is not merely a memory-management scheme; it is a discipline on aliasing, and aliasing is where the hazards of the
+whole first volume lived.</p>
+
+<aside class="warning">
+<span class="box-title">Trap: expecting assignment or a function call to copy (it moves, and the source goes dead)</span>
+<p>Coming from C or a garbage-collected language, the deepest habit to unlearn is that <code>let b = a;</code> or
+<code>f(a)</code> leaves <code>a</code> usable. For an owning type in Rust it does not: the value <em>moves</em>, and
+<code>a</code> is invalidated — using it afterward is a compile error (<code>E0382</code>, &ldquo;borrow of moved value&rdquo;).
+Beginners read this as the compiler being obstinate and reach for the wrong fixes: sprinkling <code>.clone()</code> everywhere to
+silence it (correct but often needlessly copies heap data, throwing away the performance you came to Rust for), or fighting the
+borrow checker without understanding that the error is <em>telling them something true</em> — that they tried to use a value
+whose ownership they gave away. The right response is to decide, at each move, what you actually mean: if the callee should take
+over the value, move is correct and you simply must not use the source again; if the caller still needs it, you want to
+<em>borrow</em> it (lend a reference — the next chapters) rather than move it; and only if you truly need a second independent
+value should you <code>clone</code>. The move error is not noise; it is the ownership rule catching an aliasing decision you have
+to make consciously. Reaching for <code>clone</code> to make the compiler quiet is the analog of casting away a warning in C —
+it works and hides the point.</p>
+</aside>
+
+<aside class="communicate">
+<span class="box-title">Say it like a systems engineer</span>
+<p><em>Try it first.</em> A teammate porting C to Rust says: &ldquo;This is ridiculous — I wrote <code>let b = a; use(a);</code>
+and it won't compile, saying <code>a</code> was moved. In C this just copies the pointer and works. I've been adding
+<code>.clone()</code> everywhere to get it to build. Isn't the borrow checker just getting in the way?&rdquo; Cover the paragraph
+and respond in four or five sentences, drawing on &sect;27.1&ndash;&sect;27.3.</p>
+<p><em>Model answer.</em> &ldquo;In C, <code>let b = a;</code> copying the pointer is exactly the bug that bites you later —
+now two pointers own one buffer, and whoever frees second gets a double-free or use-after-free, which is what that C program did
+at run time. Rust makes assignment of an owning type a <em>move</em>: ownership transfers to <code>b</code> and <code>a</code>
+goes dead, so there is never a moment when two owners could both free — the crash is turned into a compile error. So the checker
+isn't in the way; it's reporting that you used a value after giving its ownership away. <code>clone</code> silences it by making
+a real second buffer, which is sometimes right but often wasteful — if you only need to <em>look at</em> the value in
+<code>use()</code>, you want to borrow a reference, not clone. Decide per case: move if you're handing it off, borrow if the
+caller still needs it, clone only if you truly need two independent values.&rdquo; Framing the move as preventing the C
+double-free, and clone-vs-borrow as a real decision, is the senior register.</p>
+</aside>
+
+<p><em>(Answer to the &sect;27.3 quick check: after <code>let s2 = s1;</code> with a <code>String</code>, <code>s1</code> has
+been <strong>moved from</strong> and is invalid; using it is a compile error (<code>E0382</code>). It works for
+<code>let y = x;</code> with an <code>i32</code> because integers implement the <code>Copy</code> trait — they live entirely on
+the stack with no heap resource to double-free, so assignment copies the bits and leaves <code>x</code> valid. To get two
+independent <code>String</code>s, call <code>s1.clone()</code>, which allocates and deep-copies a separate buffer.)</em></p>
+
+<h2>27.5 What to carry forward</h2>
+
+<p>Ownership is the idea beneath everything in this part. The manual-memory bugs of Chapter 9 — use-after-free, double-free,
+leaks — all stem from C's having no notion of who is responsible for a piece of memory: our C snippet aliased one buffer with two
+pointers, compiled without a warning, and aborted at run time on the double-free. Rust replaces the discipline with three
+compiler-enforced rules: every value has exactly <strong>one owner</strong>, and when the owner goes out of scope the value is
+<strong>dropped</strong> — cleanup tied to scope (RAII), deterministic, with no garbage collector, so owned memory is freed
+exactly once and never forgotten. The consequence is <strong>move semantics</strong>: assigning or passing an owning value
+<em>transfers</em> ownership and <em>invalidates the source</em>, so the two-owners situation that caused the C double-free
+literally cannot be written — using a moved-from value is a compile error (<code>E0382</code>), caught before the program runs
+and at zero runtime cost. Explicit <code>.clone()</code> makes a genuine second copy when you want one; small stack types
+(<code>Copy</code>) copy instead of move. And ownership is more than memory management: because a moved-from value is dead and
+there is only ever one owner, ownership is a discipline on <em>aliasing</em> — the root of both corruption and the data races of
+Chapter 24.</p>
+
+<p>You have now seen the core move, but two things are still missing, and they are what the rest of the part builds. First,
+constantly moving values in and out of functions just to read them is untenable — you need a way to <em>use</em> a value without
+<em>owning</em> it. That is <strong>borrowing</strong>: taking a reference, shared or exclusive, under rules that keep aliasing
+safe — the next chapter. Second, borrowing raises the question of <em>how long</em> a reference may live relative to the value it
+points at, which is what <strong>lifetimes</strong> make precise — and together, ownership, borrowing, and lifetimes are how
+Rust's type system encodes, and checks at compile time, the very invariants you spent the C parts proving by hand: that memory is
+freed once and used only while valid, and that shared, mutable state is not raced upon. Everything you learned about the machine
+in Volume 1 still holds underneath — Rust compiles to the same instructions, the same cache and memory model — but the proofs
+have moved from your head into the compiler. We begin, in the next chapter, with borrowing.</p>
+
+<aside class="takeaway">
+<span class="box-title">Can you… without looking?</span>
+<ul>
+<li>Name the three manual-memory bugs ownership prevents, and why C's type system cannot catch them.</li>
+<li>State the three ownership rules and what &ldquo;dropped when the owner goes out of scope&rdquo; means (RAII, no GC).</li>
+<li>Explain why single ownership means owned memory is freed exactly once and never leaked.</li>
+<li>Define a <em>move</em>: what happens to the source, and why using it afterward is a compile error.</li>
+<li>Distinguish move, <code>clone</code>, and <code>Copy</code>, and say which applies to a <code>String</code> vs an
+<code>i32</code>.</li>
+<li>Explain how ownership controls aliasing, and connect that to preventing data races (Chapter 24).</li>
+</ul>
+</aside>
+
+<aside class="recall">
+<span class="box-title">Retrieval — closed book</span>
+<p>Cover the chapter. Answer from memory; rate confidence first.</p>
+<ol>
+<li><strong>R1.</strong> What three manual-memory bugs does ownership prevent, and why can't the C compiler catch them? (&sect;27.1)</li>
+<li><strong>R2.</strong> State the three ownership rules and what &ldquo;drop&rdquo; does at end of scope. (&sect;27.2)</li>
+<li><strong>R3.</strong> What is a move — what happens to the source — and why is using a moved-from value a compile error? (&sect;27.3)</li>
+<li><strong>R4.</strong> Distinguish move, <code>clone</code>, and <code>Copy</code>; which applies to <code>String</code> vs
+<code>i32</code>? (&sect;27.3)</li>
+<li><strong>R5.</strong> How does ownership control aliasing, and why does that matter beyond memory management? (&sect;27.4)</li>
+</ol>
+</aside>
+
+<aside class="further-reading">
+<span class="box-title">Further reading</span>
+<ul>
+<li><strong>Klabnik &amp; Nichols, <em>The Rust Programming Language</em>, 2nd ed. (No Starch Press, 2023), ch. 4
+&ldquo;Understanding Ownership&rdquo; (also free at <code>doc.rust-lang.org/book</code>).</strong> The primary source for the
+ownership rules, moves, <code>clone</code>, and <code>Copy</code> of &sect;27.2&ndash;&sect;27.3; the quoted rules and
+<code>E0382</code> behavior are from here. Authors and edition verified via the publisher; the book was not compiled in this
+environment.</li>
+<li><strong>Jung, Jourdan, Krebbers &amp; Dreyer, &ldquo;RustBelt: Securing the Foundations of the Rust Programming Language,&rdquo;
+<em>Proc. ACM on Programming Languages</em> 2(POPL), Article 66 (2018), DOI 10.1145/3158154.</strong> The first machine-checked
+safety proof for a realistic subset of Rust — the formal basis for &sect;27.1's &ldquo;safety without a GC&rdquo; claim. First
+author Ralf Jung; verified via dblp and the ACM Digital Library.</li>
+<li><strong><em>The Rustonomicon</em> (official, <code>doc.rust-lang.org/nomicon</code>).</strong> The advanced guide to
+ownership, moves, and the memory model underneath <code>unsafe</code> Rust — the &ldquo;why&rdquo; behind the rules of this
+chapter. Reference for later chapters; verify against the current edition.</li>
+<li><strong>Stroustrup, <em>The C++ Programming Language</em>, 4th ed. (Addison-Wesley, 2013), on RAII and move semantics.</strong>
+The C++ lineage of the drop/RAII idea of &sect;27.2 and of moves — useful context for where Rust's model came from.</li>
+</ul>
+</aside>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise" id="ex27.1"><span class="ex-label">27.1</span> <span class="ex-tag warm">warm-up</span>
+State the three ownership rules of Rust in your own words.</div>
+
+<div class="exercise" id="ex27.2"><span class="ex-label">27.2</span> <span class="ex-tag warm">warm-up</span>
+In one sentence, what does it mean that a value is &ldquo;dropped&rdquo; when its owner goes out of scope, and what C operation
+does drop correspond to for a heap-owning value?</div>
+
+<div class="exercise" id="ex27.3"><span class="ex-label">27.3</span> <span class="ex-tag warm">warm-up</span>
+After <code>let s2 = s1;</code> where <code>s1</code> is a <code>String</code>, is <code>s1</code> still usable? What does the
+compiler do if you try to use it?</div>
+
+<div class="exercise" id="ex27.4"><span class="ex-label">27.4</span> <span class="ex-tag core">core</span>
+Take the C snippet of &sect;27.1 (alias, free, use, free). (a) Identify each of the two bugs and the line it occurs on. (b)
+Explain why it compiles in C despite being wrong. (c) Explain precisely why the analogous Rust code cannot be written — what
+happens at the second binding that removes the possibility of a double-free?</div>
+
+<div class="exercise" id="ex27.5"><span class="ex-label">27.5</span> <span class="ex-tag core">core</span>
+Explain how the three ownership rules together guarantee that owned heap memory is freed <em>exactly once</em> and is <em>never
+leaked</em>, and why this needs no garbage collector. Which rule prevents the double-free, and which prevents the leak?</div>
+
+<div class="exercise" id="ex27.6"><span class="ex-label">27.6</span> <span class="ex-tag core">core</span>
+Distinguish <em>move</em>, <code>clone</code>, and <code>Copy</code>. (a) For each, say what happens to the source value and
+whether a heap buffer is duplicated. (b) Why does <code>let y = x;</code> move when <code>x: String</code> but copy when
+<code>x: i32</code>? (c) When is reaching for <code>.clone()</code> the wrong instinct, and what should you often use instead?</div>
+
+<div class="exercise" id="ex27.7"><span class="ex-label">27.7</span> <span class="ex-tag complexity">cost</span>
+Compare the runtime cost of Rust's ownership checks with a garbage collector. (a) At what time — compile or run — is the move/drop
+machinery resolved, and what runtime cost does the ownership checking itself add? (b) Contrast the memory-reclamation behavior of
+<code>drop</code>-at-end-of-scope with a tracing GC: which is deterministic, and what does that imply for pause times and peak
+memory? (c) Why is <code>.clone()</code> a real, measurable cost while a move is essentially free — what does each do at the
+machine level?</div>
+
+<div class="exercise" id="ex27.8"><span class="ex-label">27.8</span> <span class="ex-tag faded">faded</span>
+<em>Worked, with the last step for you.</em> A Rust newcomer writes <code>let cfg = load_config();</code> then
+<code>process(cfg);</code> then <code>log(cfg);</code> and gets <code>error[E0382]: use of moved value: cfg</code> on the
+<code>log</code> line.
+<br><strong>Step 1 (given):</strong> <code>cfg</code> has an owning type (say <code>Config</code>, not <code>Copy</code>).
+<br><strong>Step 2 (given):</strong> <code>process(cfg)</code> takes its argument by value, so it <em>moves</em> <code>cfg</code>
+into <code>process</code>; after that call <code>cfg</code> is invalid.
+<br><strong>Step 3 (given):</strong> <code>log(cfg)</code> then tries to use a moved-from value, which the compiler rejects.
+<br><strong>Step 4 (you):</strong> Give two different correct fixes — one that lets both functions use the value without cloning,
+and one where cloning is genuinely appropriate — and say how you would decide between them and why blindly cloning is the wrong
+default.</div>
+
+<div class="exercise" id="ex27.9"><span class="ex-label">27.9</span> <span class="ex-tag mixed">mixed</span>
+For each, say whether assignment/passing <em>moves</em> or <em>copies</em>, and whether the source stays usable: (a)
+<code>let b = a;</code> with <code>a: String</code>; (b) <code>let b = a;</code> with <code>a: i32</code>; (c) passing a
+<code>Vec&lt;u8&gt;</code> by value to a function; (d) <code>let b = a;</code> with <code>a: (i32, bool)</code>. Justify each in a
+line, naming <code>Copy</code> where relevant.</div>
+
+<div class="exercise" id="ex27.10"><span class="ex-label">27.10</span> <span class="ex-tag mixed">mixed</span>
+Drawing on Chapters 9, 24, and 27, classify each as <em>true</em> or <em>false</em> and fix the false ones: (a) &ldquo;Rust
+achieves memory safety with a garbage collector.&rdquo; (b) &ldquo;In Rust, <code>let s2 = s1;</code> for a <code>String</code>
+leaves both <code>s1</code> and <code>s2</code> valid.&rdquo; (c) &ldquo;A move error is caught at compile time and costs nothing
+at run time.&rdquo; (d) &ldquo;<code>.clone()</code> and a move do the same thing.&rdquo; (e) &ldquo;Ownership only matters for
+memory management, not for concurrency.&rdquo;</div>
+
+<div class="exercise" id="ex27.11"><span class="ex-label">27.11</span> <span class="ex-tag stretch">stretch</span>
+Ownership controls aliasing, and aliasing is the root of both memory-corruption bugs and data races. (a) Explain how the
+single-owner rule, applied across threads by <em>moving</em> a value into a thread, prevents two threads from both owning and
+mutating the same value. (b) Argue why &ldquo;aliasing + mutation&rdquo; is the common cause of both a use-after-free (Chapter 9)
+and a data race (Chapter 24), and how ownership attacks the shared root rather than the two symptoms separately. (c) What
+remaining capability does ownership-by-move alone <em>not</em> give you — that is, why do you still need borrowing to write useful
+programs, and what will borrowing have to guarantee to stay safe?</div>
+
+<div class="exercise" id="ex27.12"><span class="ex-label">27.12</span> <span class="ex-tag lab">lab</span>
+On your own machine (a C toolchain suffices; a Rust toolchain is ideal if you can install one): (a) In C, compile and run the
+alias/free/use/free snippet of &sect;27.1; confirm it compiles without warning and observe what happens at run time (a double-free
+abort or, with a sanitizer such as <code>-fsanitize=address</code>, a diagnosed use-after-free). (b) If you have
+<code>rustc</code>, write the corresponding <code>let s2 = s1; println!("{s1}");</code> and confirm it fails to compile with
+<code>E0382</code>; if you do not, explain from this chapter exactly which line would be rejected and why. (c) Write down, for
+three variables in a small program, whether each assignment is a move or a copy, and justify from the type. Note your toolchain
+versions.</div>
+
+</section>
+</section>
